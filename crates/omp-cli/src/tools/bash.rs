@@ -120,6 +120,17 @@ fn timeout_arg(args: &Value) -> Option<f64> {
     }
 }
 
+/// Largest char boundary `<= at`: the retained windows are byte-sized, so a
+/// front drain must be moved back rather than split a UTF-8 sequence
+/// (`String::drain` panics on a non-boundary index).
+fn floor_char_boundary(s: &str, at: usize) -> usize {
+    let mut i = at.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Run a command and return `(output, exit code, wall time, outcome)`.
 ///
 /// `bash` in its own session (TS: brush runs every external command under
@@ -417,7 +428,7 @@ async fn run(
                         t.push_str(&text);
                         // Bound the tap: proc reads only need the recent window.
                         if t.len() > RETAIN_BYTES {
-                            let cut = t.len() - RETAIN_BYTES / 2;
+                            let cut = floor_char_boundary(&t, t.len() - RETAIN_BYTES / 2);
                             t.drain(..cut);
                         }
                     }
@@ -888,14 +899,19 @@ async fn start_service(
                                 let mut out = svc.output.lock().expect("service output poisoned");
                                 out.push_str(&text);
                                 if out.len() > RETAIN_BYTES {
-                                    let cut = out.len() - RETAIN_BYTES / 2;
+                                    let cut =
+                                        floor_char_boundary(&out, out.len() - RETAIN_BYTES / 2);
                                     out.drain(..cut);
                                 }
                             }
                             if !log_ready {
                                 readiness_buffer.push_str(&text);
                                 if readiness_buffer.len() > READINESS_BUFFER_CHARS {
-                                    readiness_buffer.drain(..readiness_buffer.len() - READINESS_BUFFER_CHARS);
+                                    let drop_to = floor_char_boundary(
+                                        &readiness_buffer,
+                                        readiness_buffer.len() - READINESS_BUFFER_CHARS,
+                                    );
+                                    readiness_buffer.drain(..drop_to);
                                 }
                                 if pattern.as_ref().is_some_and(|re| re.is_match(&readiness_buffer)) {
                                     log_ready = true;
@@ -993,6 +1009,12 @@ async fn start_service(
 /// the inline budget.
 fn append_notify_report(text: &str, report: &str, spill: &SpillConfig) -> String {
     let combined = format!("{text}\n\n{report}");
+    // Raw-output mode is an explicit bypass: `bound_output` left the body
+    // uncapped, so appending the report must not re-impose the inline cap
+    // (that would silently drop output the caller asked to see verbatim).
+    if crate::methodology::raw_tool_output_requested() {
+        return combined;
+    }
     if combined.len() <= spill.inline_cap() {
         return combined;
     }
@@ -1630,6 +1652,49 @@ mod tests {
         // A small report passes through unchanged.
         let small = append_notify_report("out", "[notify /x/: 1 matching line]\nx", &spill);
         assert_eq!(small, "out\n\n[notify /x/: 1 matching line]\nx");
+    }
+
+    /// Regression: the background job's output tap keeps only a recent window,
+    /// and the byte window (`RETAIN_BYTES / 2`) is not char-aligned. Draining it
+    /// at the raw byte index split a 3-byte character, `String::drain` panicked,
+    /// and the detached job never settled. Output here is well past
+    /// `RETAIN_BYTES`, so several drains run mid-character.
+    #[test]
+    fn background_tap_drains_multibyte_output_on_char_boundaries() {
+        let chunk = "\u{d55c}".repeat(1024); // U+D55C, 3 bytes on the wire
+        let cmd = format!("for i in $(seq 1 140); do printf '%s' '{chunk}'; done");
+        let tap: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (output, code, _, outcome) = rt
+            .block_on(run(
+                &std::env::temp_dir(),
+                &cmd,
+                Some(60.0),
+                &sig(),
+                None,
+                Some(tap.clone()),
+            ))
+            .unwrap();
+        assert_eq!((code, outcome), (Some(0), None));
+        let text = tap.lock().unwrap().clone();
+        assert!(text.len() <= RETAIN_BYTES, "tap {} bytes", text.len());
+        assert!(!text.is_empty(), "tap drained away all output");
+        assert_eq!(
+            text.len() % 3,
+            0,
+            "tap starts mid-character: {} bytes",
+            text.len()
+        );
+        assert!(
+            text.chars().all(|c| c == '\u{d55c}'),
+            "tap kept a broken char"
+        );
+        // The foreground buffer keeps raw bytes for the head+tail window; only
+        // the tap must stay decodable here.
+        assert!(!output.is_empty());
     }
 
     #[test]

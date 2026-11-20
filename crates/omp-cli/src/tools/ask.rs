@@ -426,12 +426,18 @@ fn parse_html_form(html: &str) -> Vec<QuestionItem> {
     // `<label for="...">` text, resolved once every element id is known (the
     // label may precede or follow the element it names).
     let mut for_labels: Vec<(String, String)> = Vec::new();
+    let tokens = tokenize(html);
     // Only controls inside `<form>` count. A fragment with no `<form>` at all
     // is read as the form body, which omp's `recoverAskHtml` tolerates.
-    let has_form = html.to_ascii_lowercase().contains("<form");
+    // Detection goes through the parsed tokens: comments are dropped and
+    // `<textarea>` bodies stay raw text, so a `<form` inside either is not a
+    // real form boundary.
+    let has_form = tokens
+        .iter()
+        .any(|token| matches!(token, Token::Tag(tag) if tag.name == "form"));
     let mut form_depth = 0_usize;
 
-    for token in tokenize(html) {
+    for token in tokens {
         let tag = match token {
             Token::Text(text) => {
                 if let Some(capture) = captures.last_mut() {
@@ -1709,6 +1715,12 @@ mod tests {
     fn controls_outside_the_form_are_not_collected() {
         let html = r#"<input name="before"><form><input name="inside"></form><input name="after">"#;
         assert_eq!(ids(&parsed(html)), vec!["inside"]);
+    }
+
+    #[test]
+    fn form_tags_in_comments_and_textarea_text_do_not_bound_the_fragment() {
+        let html = r#"<!-- <form> --><input name="a"><textarea name="t"><form></textarea><input name="b">"#;
+        assert_eq!(ids(&parsed(html)), vec!["a", "t", "b"]);
     }
 
     #[test]

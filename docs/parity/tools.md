@@ -42,7 +42,7 @@ todo, web_search, lsp, checkpoint, rewind`) and is asserted by
 | # | Tool | Ref default | Target | Status | Diff / target file |
 |---|---|---|---|---|---|
 | 1 | `read` | on | yes | **PRESENT-GAP** | Schema equal (`{path}` required, `additionalProperties:false`). Behavior + description differ — see §4. `crates/omp-cli/src/tools/read.rs` |
-| 2 | `bash` | on | yes | **PRESENT-GAP** | **Phase 1 landed** `notify` and the ref `name` regex (`^(?:\s*|[A-Za-z0-9][A-Za-z0-9._-]{0,47})$`, `maxLength:48` kept). Remaining: the 6 settings-dependent ref variants collapse to one union schema. `crates/omp-cli/src/tools/bash.rs` |
+| 2 | `bash` | on | yes | **PRESENT-GAP** | **Phase 1 landed** `notify` and the ref `name` regex (`^(?:\s*\|[A-Za-z0-9][A-Za-z0-9._-]{0,47})$`, `maxLength:48` kept). Remaining: the 6 settings-dependent ref variants collapse to one union schema. `crates/omp-cli/src/tools/bash.rs` |
 | 3 | `edit` | on | yes | **PRESENT** | 5 modes via `vendor/pi-edit`; golden records the `replace` shape and matches. `crates/omp-cli/src/tools/edit.rs` |
 | 4 | `ast_grep` | **off** | yes | **PRESENT** | `{pat,path,lang,skip}`, equal to golden. Gate `astGrep.enabled` default false. `crates/omp-cli/src/tools/ast.rs` |
 | 5 | `ast_edit` | on | yes | **PRESENT** | `{ops,paths}`, equal to golden. `crates/omp-cli/src/tools/ast.rs` |
@@ -59,7 +59,7 @@ todo, web_search, lsp, checkpoint, rewind`) and is asserted by
 | 16 | `context_notes` | **off** | **no** | **MISSING** | Ref `tools/context-notes.ts`; gate `compaction.experimentalContextManagement`. |
 | 17 | `new_context` | **off** | **no** | **MISSING** | Same gate as `context_notes`. |
 | 18 | `security_scan` | **off** | **no** | **MISSING** | Gate `security.enabled`. **Phase 1:** the dangling catalog half is cleaned — `builtin_commands.json` keeps one bare `security` entry described `"Not ported: security scans need the security-scan mode controller"` and lists no subcommands (`slash.md` §3, §5 #2). The tool itself is still unported. |
-| 19 | `task` | on | yes | **PRESENT-GAP** | `{context, tasks, model}` required `[context,tasks]` — matches golden, but the target **forbids** a top-level `model` (`"not": {}`): selectors are accepted per `tasks[]` item only. Ref gate `canSpawnAtDepth(task.maxRecursionDepth)` absent in target. `crates/omp-cli/src/tools/task.rs` |
+| 19 | `task` | on | yes | **PRESENT-GAP** | `{context, tasks, model}` required `[context,tasks]`. Golden (`ts_tools.json`) has **no** top-level `model` — its `tasks[]` item is `{task, solutionSpace, name, agent, tools}` — so the target's top-level `model: {"not": {}}` (key advertised, rejected) is **target-only**, not a golden match; selectors are accepted per `tasks[]` item only. Ref gate `canSpawnAtDepth(task.maxRecursionDepth)` absent in target. `crates/omp-cli/src/tools/task.rs` |
 | 20 | `wait` | on | yes | **PRESENT-GAP** | Schema `{type:"object",properties:{}}` byte-equal. Runtime: 30-minute `WAIT_MAX`, and a wait wakes only on an owned job/service settling, that cap, or abort — the IRC/peer-message and owed-answer legs have no port (no peer bus), so the description's answer language is unbacked. Ref gate `async` \|\| `irc` \|\| `launch` absent. `crates/omp-cli/src/tools/wait.rs` |
 | 21 | `todo` | on | yes | **PRESENT-GAP** | **Phase 1 landed** `task: anyOf[string, array<string>]` with the ref description ("verbatim task content; array targets several (not start)") and `list[].items.minItems:1`. Remaining: target-only `reason` (`block reason`) has no counterpart in `todo.ts:60-69`. `crates/omp-cli/src/tools/todo.rs` |
 | 22 | `web_search` | on | yes | **PRESENT** | **Phase 1 landed** all 6 ref params (`query, recency, limit, max_tokens, temperature, num_search_results`); `temperature` is forwarded only when supplied, as `callSearch` does. `crates/omp-cli/src/tools/web_search.rs` |
@@ -166,8 +166,10 @@ accepts the `questions` fallback the reference only recovers into HTML, `todo` s
 - **`eval`** — target `{language, code, title, timeout, reset}`; golden match. Ref additionally
   gates on `allowEval` (backend reachability).
 - **`lsp`** — target action enum of 14 values with `additionalProperties:false`; golden match.
-- **`task`** — `{context, tasks, model}` required `[context,tasks]` matches golden, but the target
-  sets `model: {"not": {}}` at the top level and accepts selectors only inside `tasks[]` items.
+- **`task`** — `{context, tasks, model}` required `[context,tasks]`. The golden schema (`ts_tools.json`)
+  carries no top-level `model` key at all (items are `{task, solutionSpace, name, agent, tools}`), so
+  this is **not** a match: the target's top-level `model: {"not": {}}` is **target-only** — it
+  advertises the key and refuses it — while model selectors are accepted only inside `tasks[]` items.
 - Unchanged and equal: `edit` (replace shape), `find`, `grep`, `ast_grep`, `ast_edit`, `checkpoint`,
   `rewind`, `think`.
 

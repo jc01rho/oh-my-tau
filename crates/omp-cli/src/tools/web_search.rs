@@ -1316,38 +1316,7 @@ async fn search_anthropic(
 ) -> Result<AnthropicApiResponse> {
     let url = format!("{base_url}/v1/messages?beta=true");
 
-    let tool_obj = {
-        let mut t = serde_json::Map::new();
-        t.insert("type".to_string(), json!(WEB_SEARCH_TOOL_TYPE));
-        t.insert("name".to_string(), json!(WEB_SEARCH_TOOL_NAME));
-        if let Some(domains) = &plan.allowed_domains {
-            t.insert("allowed_domains".to_string(), json!(domains));
-        }
-        if let Some(domains) = &plan.blocked_domains {
-            t.insert("blocked_domains".to_string(), json!(domains));
-        }
-        serde_json::Value::Object(t)
-    };
-
-    let mut body = serde_json::Map::new();
-    body.insert("model".to_string(), json!(model));
-    body.insert(
-        "max_tokens".to_string(),
-        json!(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
-    );
-    // ts `callSearch` forwards `temperature` only when the caller supplied one;
-    // the request omits the field otherwise so the API default applies.
-    if let Some(temperature) = temperature {
-        body.insert("temperature".to_string(), json!(temperature));
-    }
-    body.insert(
-        "messages".to_string(),
-        json!([{"role": "user", "content": &plan.query}]),
-    );
-    body.insert("tools".to_string(), json!([tool_obj]));
-    body.insert("system".to_string(), json!(SYSTEM_PROMPT));
-
-    let body_val = serde_json::Value::Object(body);
+    let body_val = build_request_body(model, plan, max_tokens, temperature);
 
     let response = tokio::select! {
         result = client
@@ -1375,6 +1344,60 @@ async fn search_anthropic(
         .map_err(|e| anyhow!("Failed to parse Anthropic response: {e}"))?;
 
     Ok(api_response)
+}
+
+/// Dated API versions at or after this one reject sampling parameters
+/// (`temperature`) even for models that otherwise accept them. Mirrors upstream
+/// `callSearch`'s `anthropicApiVersionAcceptsSamplingParams` gate.
+const SAMPLING_REJECTING_API_VERSION: &str = "2026-10-21";
+
+/// Whether `version` accepts `temperature` on `/v1/messages`.
+fn api_version_accepts_sampling_params(version: &str) -> bool {
+    version < SAMPLING_REJECTING_API_VERSION
+}
+
+/// Build the `/v1/messages` body for Anthropic's `web_search` tool.
+///
+/// `temperature: Some(0.0)` is a real request (deterministic sampling), not a
+/// stand-in for "unset": `claude-opus-5-5` under `2023-06-01` accepts it, so it
+/// is sent as `0.0` rather than rejected. Only a sampling-rejecting API version
+/// drops it, and then the field is omitted (never `null`) so the server default
+/// applies - the same fallback upstream's `callSearch` takes.
+fn build_request_body(
+    model: &str,
+    plan: &AnthropicQueryPlan,
+    max_tokens: Option<u32>,
+    temperature: Option<f64>,
+) -> Value {
+    let mut tool = serde_json::Map::new();
+    tool.insert("type".to_string(), json!(WEB_SEARCH_TOOL_TYPE));
+    tool.insert("name".to_string(), json!(WEB_SEARCH_TOOL_NAME));
+    if let Some(domains) = &plan.allowed_domains {
+        tool.insert("allowed_domains".to_string(), json!(domains));
+    }
+    if let Some(domains) = &plan.blocked_domains {
+        tool.insert("blocked_domains".to_string(), json!(domains));
+    }
+
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), json!(model));
+    body.insert(
+        "max_tokens".to_string(),
+        json!(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
+    );
+    let temperature =
+        temperature.filter(|_| api_version_accepts_sampling_params(ANTHROPIC_API_VERSION));
+    if let Some(temperature) = temperature {
+        body.insert("temperature".to_string(), json!(temperature));
+    }
+    body.insert(
+        "messages".to_string(),
+        json!([{"role": "user", "content": &plan.query}]),
+    );
+    body.insert("tools".to_string(), json!([Value::Object(tool)]));
+    body.insert("system".to_string(), json!(SYSTEM_PROMPT));
+
+    Value::Object(body)
 }
 
 /// Convert an Anthropic API response into a `SearchResponse`.
@@ -1736,6 +1759,9 @@ async fn web_search(params: Value, signal: AbortSignal) -> Result<AgentToolResul
     if parsed.num_search_results == Some(0) {
         bail!("Invalid web_search arguments: num_search_results must be at least 1");
     }
+    if parsed.limit == Some(0) {
+        bail!("Invalid web_search arguments: limit must be at least 1");
+    }
 
     if parsed.query.is_empty() {
         let resp = SearchResponse {
@@ -1981,6 +2007,44 @@ mod tests {
             err.contains("num_search_results must be at least 1"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn limit_zero_is_rejected() {
+        let controller = pa_agent::abort::AbortController::new();
+        let params = json!({ "query": "rust", "limit": 0 });
+        let err = match web_search(params, controller.signal()).await {
+            Ok(_) => panic!("limit: 0 should have been rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("limit must be at least 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sampling_temperature_zero_is_sent_verbatim() {
+        let plan = AnthropicQueryPlan {
+            query: "rust".to_string(),
+            allowed_domains: None,
+            blocked_domains: None,
+        };
+        let body = build_request_body("claude-opus-5-5", &plan, None, Some(0.0));
+        assert_eq!(body["model"], json!("claude-opus-5-5"));
+        assert_eq!(body["temperature"], json!(0.0));
+
+        // An absent temperature stays absent so the API default applies.
+        let body = build_request_body("claude-opus-5-5", &plan, None, None);
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn sampling_params_dropped_only_on_rejecting_api_version() {
+        assert!(api_version_accepts_sampling_params("2023-06-01"));
+        assert!(api_version_accepts_sampling_params("2025-03-05"));
+        assert!(!api_version_accepts_sampling_params("2026-10-21"));
+        assert!(!api_version_accepts_sampling_params("2027-01-01"));
     }
 
     #[test]

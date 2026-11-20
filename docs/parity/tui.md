@@ -207,8 +207,12 @@ Caveats that matter for anyone reading "green" as a guarantee:
 2. **Extract `terminal_capabilities.rs`** from the scattered logic, keeping the
    existing static behaviour as the initial implementation and adding DECRQM
    runtime adjustment behind it. This is the dependency for everything else.
-3. **Wire `tests-e2e/tui/run.py` into CI** before porting more surface, so the
-   22-green baseline becomes a regression gate instead of a manual claim.
+3. **Re-enable `ext_developer` and `new_clears` in the existing `tui-e2e` job**
+   in `.github/workflows/ci.yml` before porting more surface — that job already
+   runs `tests-e2e/tui/run.py` over the 22 green scenarios; the remaining work is
+   closing the dev-role flow (`ext_developer`) and the timing flake
+   (`new_clears`) so both can join the `--only` set. Then the whole 24-scenario
+   harness is a regression gate instead of a manual claim.
 4. **Port overlays by user-facing frequency**, starting with `model-hub` and
    `agents-hub` (existing state to render), then `usage-dashboard` and
    `session-selector` (also existing state). Defer `plan-review`,

@@ -272,10 +272,16 @@ function ctx() {
   return (ctxCache ??= makeCtx());
 }
 
+type FlagValue = boolean | string;
+type ProviderReg = { name: string; config: Json; extension: string };
+
 /** Undo log for one `loadOne` call: what it registered on host-wide state. */
 interface LoadTracker {
   subs: (() => void)[];
-  providers: string[];
+  /** Providers this load wrote, with the registration they replaced (if any). */
+  providers: { name: string; prior?: ProviderReg }[];
+  /** `flagValues` entries this load overwrote, recorded before the write. */
+  flags: Map<string, { had: boolean; prior?: FlagValue }>;
 }
 
 /** Undo everything a failed load registered, so nothing of it outlives the error. */
@@ -287,10 +293,22 @@ function rollbackLoad(ext: Ext, track: LoadTracker) {
       log("warn", `${ext.path} cleanup: ${e instanceof Error ? e.message : e}`);
     }
   }
-  for (const name of track.providers.splice(0)) {
+  for (const [name, { had, prior }] of track.flags) {
+    if (had) flagValues.set(name, prior as FlagValue);
+    else flagValues.delete(name);
+  }
+  track.flags.clear();
+  for (const { name, prior } of track.providers.splice(0).reverse()) {
     if (providers.get(name)?.extension !== ext.name) continue;
-    providers.delete(name);
-    notify("provider_unregistered", { name, extension: ext.name });
+    if (prior) {
+      // The load replaced a live registration: put it back and say so, so the
+      // core's registry never ends up pointing at the extension that failed.
+      providers.set(name, prior);
+      notify("provider_registered", { name, config: prior.config, extension: prior.extension });
+    } else {
+      providers.delete(name);
+      notify("provider_unregistered", { name, extension: ext.name });
+    }
   }
 }
 
@@ -313,8 +331,15 @@ function makeApi(ext: Ext, track: LoadTracker) {
     events: {
       on(ch: string, fn: (d: unknown) => void) {
         const off = events.on(ch, fn);
-        track.subs.push(off);
-        return off;
+        // Self-unsubscribing wrapper: a caller that unsubscribes before the load
+        // fails must not leave a dead entry for `rollbackLoad` to replay.
+        const entry = () => {
+          const i = track.subs.indexOf(entry);
+          if (i >= 0) track.subs.splice(i, 1);
+          off();
+        };
+        track.subs.push(entry);
+        return entry;
       },
       emit: events.emit,
     },
@@ -335,7 +360,10 @@ function makeApi(ext: Ext, track: LoadTracker) {
     // sees flags this extension registered (omp scopes flags per extension).
     registerFlag(name: string, options: Json) {
       ext.flags.set(name, { name, ...options });
-      if (options.default !== undefined) flagValues.set(name, options.default as boolean | string);
+      if (options.default !== undefined) {
+        if (!track.flags.has(name)) track.flags.set(name, { had: flagValues.has(name), prior: flagValues.get(name) });
+        flagValues.set(name, options.default as FlagValue);
+      }
     },
     getFlag(name: string) {
       if (!ext.flags.has(name)) return undefined;
@@ -351,13 +379,15 @@ function makeApi(ext: Ext, track: LoadTracker) {
     // Provider registrations are forwarded to the core as notifications (the Rust core owns
     // the model registry), and kept host-side so list_providers can report them.
     registerProvider(name: string, config: Json) {
+      // Only the first write of a name records the prior registration: that is
+      // the one a failed load has to hand back to the host.
+      if (!track.providers.some((p) => p.name === name)) track.providers.push({ name, prior: providers.get(name) });
       providers.set(name, { name, config, extension: ext.name });
-      track.providers.push(name);
       notify("provider_registered", { name, config, extension: ext.name });
     },
     unregisterProvider(name: string) {
       if (!providers.delete(name)) return;
-      const i = track.providers.indexOf(name);
+      const i = track.providers.findIndex((p) => p.name === name);
       if (i >= 0) track.providers.splice(i, 1);
       notify("provider_unregistered", { name, extension: ext.name });
     },
@@ -414,7 +444,7 @@ async function loadOne(path: string): Promise<{ ext?: Ext; error?: string }> {
   if (typeof factory !== "function") return { error: `Extension does not export a valid factory function: ${path}` };
   const base = basename(path).replace(/\.(ts|js)$/, "");
   const ext: Ext = { path: resolved, name: base === "index" ? basename(resolve(path, "..")) : base, handlers: new Map(), tools: new Map(), commands: new Map(), flags: new Map() };
-  const track: LoadTracker = { subs: [], providers: [] };
+  const track: LoadTracker = { subs: [], providers: [], flags: new Map() };
   const api = makeApi(ext, track);
   try {
     await (factory as (a: unknown) => unknown)(api);

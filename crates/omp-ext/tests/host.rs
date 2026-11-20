@@ -919,11 +919,10 @@ async fn failed_load_unsubscribes_events_on_listeners() {
     if common::bun_missing("failed_load_unsubscribes_events_on_listeners") {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("omp-ext-subs-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let hit = dir.join("hit");
+    let dir = tempfile::tempdir().unwrap();
+    let hit = dir.path().join("hit");
     let _ = std::fs::remove_file(&hit);
-    let ext = dir.join("subs.ts");
+    let ext = dir.path().join("subs.ts");
     std::fs::write(
         &ext,
         format!(
@@ -949,6 +948,74 @@ async fn failed_load_unsubscribes_events_on_listeners() {
     assert!(
         !hit.exists(),
         "a failed load must leave no live bus listener behind"
+    );
+    host.shutdown().await.unwrap();
+}
+
+/// A flag registered with a default writes host-wide `flagValues`. When the
+/// same load later fails, that write must be undone: the surviving extension's
+/// value for the name is restored, and a name only the failed extension
+/// registered disappears instead of staying readable through `list_flags`.
+#[tokio::test]
+async fn failed_load_rolls_back_flag_values() {
+    if common::bun_missing("failed_load_rolls_back_flag_values") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.ts");
+    std::fs::write(
+        &good,
+        "export default function (pi: any): void {\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"keep\" });\n\
+         pi.registerFlag(\"own\", { type: \"string\", default: \"own\" });\n\
+         }\n",
+    )
+    .unwrap();
+    let bad = dir.path().join("bad.ts");
+    std::fs::write(
+        &bad,
+        "export default function (pi: any): void {\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"clobbered\" });\n\
+         pi.registerFlag(\"fresh\", { type: \"string\", default: \"fresh\" });\n\
+         pi.registerShortcut(\"c\", {});\n\
+         }\n",
+    )
+    .unwrap();
+    // Loaded after the failure: reading through `getFlag` is what shows a leaked
+    // `flagValues` write. Defaultless flags, so the probe itself writes nothing.
+    let probe = dir.path().join("probe.ts");
+    let seen = dir.path().join("seen.json");
+    std::fs::write(
+        &probe,
+        format!(
+            "import {{ writeFileSync }} from \"node:fs\";\n\
+             export default function (pi: any): void {{\n\
+             \x20 pi.registerFlag(\"shared\", {{ type: \"string\" }});\n\
+             \x20 pi.registerFlag(\"fresh\", {{ type: \"string\" }});\n\
+             \x20 writeFileSync({seen:?}, JSON.stringify({{ shared: pi.getFlag(\"shared\"), fresh: pi.getFlag(\"fresh\") }}));\n\
+             }}\n",
+            seen = seen.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host
+        .load(Some(&[good, bad, probe]), None, "/tmp", None)
+        .await
+        .unwrap();
+    assert_eq!(r.loaded.len(), 2, "{r:?}");
+    assert_eq!(r.errors.len(), 1, "{r:?}");
+
+    let observed: Value = serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+    assert_eq!(
+        observed["shared"],
+        json!("keep"),
+        "a failed load must restore the flag value it overwrote, not keep its clobber"
+    );
+    assert!(
+        observed.get("fresh").is_none_or(Value::is_null),
+        "a flag only the failed load set must not survive it: {observed:?}"
     );
     host.shutdown().await.unwrap();
 }

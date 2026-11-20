@@ -596,17 +596,19 @@ fn remove_path(base: &mut Map<String, Value>, id: &str) {
     walk(base, &segments);
 }
 
-/// Record settings whose keys are user-chosen names (`modelPresets.<name>`): the name
-/// itself is saved data, so a named entry counts even when its body is empty
-/// (`modelPresets: { empty: {} }` must not fall through to a lower layer).
-const NAMED_ENTRY_RECORDS: &[&str] = &["modelPresets"];
+/// Record settings whose keys are user-chosen names (`modelPresets.<name>`,
+/// `modelTags.<name>`): the name itself is saved data, so a named entry counts even
+/// when its body is empty (`modelPresets: { empty: {} }`, `modelTags: { empty: {} }`
+/// must not fall through to a lower layer).
+const NAMED_ENTRY_RECORDS: &[&str] = &["modelPresets", "modelTags"];
 
 /// Whether `layer` supplies a value at dotted `id`: something non-null survives there.
 ///
 /// An empty object and an all-`null` object are the TS fall-back markers (a project
 /// record nulling a global role, `modelRoles: {}`), so they contribute nothing and let
 /// the lower layer own the provenance. Named-entry records are the exception: a non-null
-/// entry under a name (`modelPresets: { empty: {} }`) is itself a contribution.
+/// entry under a name (`modelPresets: { empty: {} }`, `modelTags: { empty: {} }`) is
+/// itself a contribution.
 fn layer_contributes(layer: &Map<String, Value>, id: &str) -> bool {
     let Some(value) = get_path(layer, id) else {
         return false;

@@ -221,7 +221,7 @@ bookkeeping fails a test rather than surfacing as a wrong `cfg://` label.
   `tier()`, `workspace_additional_directories()`, `stream_server_url()`,
   `images_urls_enabled()`/`images_urls_backends()` have callers. The four
   `enabled*/disabled*` allowlist helpers and `stream_redact_patterns()`
-  (`settings.rs:361`) have none.
+  (`settings.rs:361`) have no production callers (tested only in settings tests).
 - `snapcompact.*` (3 ids) and `context.policy/*`, `tools.format`, `read.toolResultPreview`
   appear as strings inside `omp-compact` / `omp-cli` but are never read through the
   store, so they sit in tier B.
