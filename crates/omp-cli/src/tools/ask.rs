@@ -8,8 +8,23 @@
 //! headless error (`Ask tool requires interactive mode`); omp's `-p` mode
 //! never registers the tool, so this is only reached by a misconfigured host.
 //!
-//! Not ported yet: the select/editor fallback used when the host never opts in
-//! to the rich dialog (`set_ask_dialog`), images in answers, and `chat` results.
+//! Upstream `ask` takes one `html` string holding a `<form>` (`askSchema`
+//! `{html: string}`) and returns the submitted form data as JSON. This port
+//! accepts that shape: [`parse_html_form`] flattens the form's named controls
+//! into the question list the dialog and renderer already speak (`<legend>` /
+//! `<label>` text becomes the question, radio/checkbox labels become options, a
+//! checkbox group is `multi`, `<textarea>` and text inputs become free-text
+//! questions), and the dialog/result path below is unchanged. A bare string is
+//! read as the html, and the pre-HTML `questions[]` shape is kept as a fallback
+//! (omp `recoverAskHtml`).
+//!
+//! Divergences from upstream, all host-driven: an option answers with its label
+//! (no `value`), per-field validation (`required`, `pattern`), image answers and
+//! the JSON form-data result text are not ported, and the model-facing schema
+//! advertises both shapes with no `required` list where omp requires `html` and
+//! relies on lenient argument validation.
+//!
+//! Not ported yet: images in answers, and `chat` results.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -21,12 +36,13 @@ use pa_agent::BoxFut;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-const DESCRIPTION: &str = r#"Ask only for materially different tradeoffs the user must decide. Default: act using code/config/docs/history and conventions. Several viable choices: pick conservative/standard, proceed, state choice.
+const DESCRIPTION: &str = r#"Ask the user by sending one HTML `<form>` in `html`: named `<input>`, `<select>` and `<textarea>` controls, `type="radio"`/`checkbox` for choices, `<legend>`/`<label>` for the question text, `checked`/`selected` for preselecting. Legacy `questions[]` (`{id, question, options: [{label, description?}], multi?, recommended?}`) is still accepted.
 
 <instruction>
+- Several viable choices: pick conservative/standard, proceed, state choice.
 - Batch related questions; 2–5 distinct options each; short labels, tradeoffs in `description`.
 - `recommended` auto-adds " (Recommended)"; `multi: true` permits multiple selections.
-- NEVER supply "Other": UI adds "Other (type your own)". Clarifying custom input? Answer first; re-ask unresolved questions.
+- NEVER supply "Other": UI adds "Other (type your own)".
 </instruction>"#;
 
 /// Labels the runtime adds to every question; options may not reuse them.
@@ -118,10 +134,424 @@ struct QuestionItem {
     recommended: Option<f64>,
 }
 
+/// Legacy pre-HTML argument shape (omp `recoverAskHtml`'s `questions` branch).
 #[derive(Debug, Deserialize)]
 struct Params {
     questions: Vec<QuestionItem>,
 }
+
+/// omp's invalid-arguments text.
+const INVALID_ASK_ERROR: &str = "Error: ask takes one `html` string holding a <form>.";
+/// omp's empty-form text (a result, not a tool failure).
+const NO_NAMED_CONTROLS_ERROR: &str = "Error: the form has no named controls. Put at least one <input>, <select> or <textarea> with a `name` attribute inside the <form>.";
+
+// =============================================================================
+// HTML form parsing (omp `parseHtmlForm`, flattened onto the question model)
+// =============================================================================
+
+/// One token of the form markup: a text run or a tag.
+enum Token {
+    Text(String),
+    Tag(HtmlTag),
+}
+
+/// A tag's lowercased name and its attributes (entity-decoded values).
+#[derive(Debug, Default)]
+struct HtmlTag {
+    name: String,
+    closing: bool,
+    attrs: Vec<(String, String)>,
+}
+
+impl HtmlTag {
+    fn attr(&self, key: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn has(&self, key: &str) -> bool {
+        self.attr(key).is_some()
+    }
+}
+
+/// A form field being built: its name, question text and (for choice fields)
+/// its options.
+#[derive(Debug, Default)]
+struct FieldDraft {
+    name: String,
+    question: Option<String>,
+    multi: bool,
+    choice: bool,
+    options: Vec<OptDraft>,
+}
+
+#[derive(Debug, Default)]
+struct OptDraft {
+    label: String,
+    value: String,
+    checked: bool,
+}
+
+/// Text being collected for the tag whose content is still open.
+enum Capture {
+    Legend(String),
+    Label(String),
+    Option {
+        field: usize,
+        index: usize,
+        text: String,
+    },
+}
+
+/// Index of the `>` that closes a tag, skipping quoted attribute values.
+fn tag_end(text: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (index, c) in text.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '>' => return Some(index),
+            None => {}
+        }
+    }
+    None
+}
+
+/// Decode the handful of HTML entities a form label can carry.
+fn decode_entities(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        let entity = [
+            "&amp;", "&lt;", "&gt;", "&quot;", "&#39;", "&apos;", "&nbsp;",
+        ]
+        .into_iter()
+        .find(|entity| tail.starts_with(*entity));
+        match entity {
+            Some("&amp;") => out.push('&'),
+            Some("&lt;") => out.push('<'),
+            Some("&gt;") => out.push('>'),
+            Some("&quot;") => out.push('"'),
+            Some("&#39;" | "&apos;") => out.push('\''),
+            Some("&nbsp;") => out.push(' '),
+            _ => out.push('&'),
+        }
+        rest = &tail[entity.map_or(1, str::len)..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn tokenize(html: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut rest = html;
+    while let Some(pos) = rest.find('<') {
+        if pos > 0 {
+            tokens.push(Token::Text(decode_entities(&rest[..pos])));
+        }
+        let after = &rest[pos..];
+        if let Some(comment) = after.strip_prefix("<!--") {
+            let end = comment.find("-->").map_or(after.len(), |i| i + 7);
+            rest = &after[end.min(after.len())..];
+            continue;
+        }
+        if after.starts_with("<!") || after.starts_with("<?") {
+            let Some(end) = tag_end(after) else { break };
+            rest = &after[end + 1..];
+            continue;
+        }
+        let Some(end) = tag_end(after) else { break };
+        if let Some(tag) = parse_tag(&after[1..end]) {
+            tokens.push(Token::Tag(tag));
+        }
+        rest = &after[end + 1..];
+    }
+    if !rest.is_empty() {
+        tokens.push(Token::Text(decode_entities(rest)));
+    }
+    tokens
+}
+
+fn parse_tag(inner: &str) -> Option<HtmlTag> {
+    let inner = inner.trim();
+    let closing = inner.starts_with('/');
+    let mut body = inner.trim_start_matches('/').trim();
+    if body.ends_with('/') {
+        body = body[..body.len() - 1].trim_end();
+    }
+    let name_len = body.find(char::is_whitespace).unwrap_or(body.len());
+    let name = body[..name_len].to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    let mut attrs = Vec::new();
+    let mut rest = body[name_len..].trim_start();
+    while !rest.is_empty() {
+        let key_len = rest
+            .find(|c: char| c.is_whitespace() || c == '=')
+            .unwrap_or(rest.len());
+        let key = rest[..key_len].to_ascii_lowercase();
+        rest = rest[key_len..].trim_start();
+        let mut value = String::new();
+        if let Some(after_eq) = rest.strip_prefix('=') {
+            let after_eq = after_eq.trim_start();
+            match after_eq.chars().next() {
+                Some(quote @ ('"' | '\'')) => {
+                    let quoted = &after_eq[1..];
+                    let end = quoted.find(quote).unwrap_or(quoted.len());
+                    value = decode_entities(&quoted[..end]);
+                    rest = quoted[end..].strip_prefix(quote).unwrap_or("").trim_start();
+                }
+                _ => {
+                    let end = after_eq.find(char::is_whitespace).unwrap_or(after_eq.len());
+                    value = decode_entities(&after_eq[..end]);
+                    rest = after_eq[end..].trim_start();
+                }
+            }
+        }
+        if !key.is_empty() {
+            attrs.push((key, value));
+        }
+    }
+    Some(HtmlTag {
+        name,
+        closing,
+        attrs,
+    })
+}
+
+/// Collapse whitespace in label/legend text (`spansText(...).replace(/\s+/g, " ")`).
+fn squash(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn field_index(
+    drafts: &mut Vec<FieldDraft>,
+    name: &str,
+    legend: Option<String>,
+    choice: bool,
+) -> usize {
+    if let Some(index) = drafts.iter().position(|draft| draft.name == name) {
+        if choice {
+            drafts[index].choice = true;
+        }
+        if drafts[index].question.is_none() {
+            drafts[index].question = legend;
+        }
+        return index;
+    }
+    drafts.push(FieldDraft {
+        name: name.to_owned(),
+        question: legend,
+        multi: false,
+        choice,
+        options: Vec::new(),
+    });
+    drafts.len() - 1
+}
+
+/// Fields of the form's named controls, in document order (omp `parseHtmlForm`
+/// flattened onto the TUI question model).
+#[allow(clippy::cast_precision_loss)] // `recommended` is omp's number-typed option index
+fn parse_html_form(html: &str) -> Vec<QuestionItem> {
+    let mut drafts: Vec<FieldDraft> = Vec::new();
+    let mut legend: Option<String> = None;
+    let mut captures: Vec<Capture> = Vec::new();
+    let mut label_depth = 0_usize;
+    let mut label_options: Vec<(usize, usize)> = Vec::new();
+    let mut label_fields: Vec<usize> = Vec::new();
+    let mut select_field: Option<usize> = None;
+
+    for token in tokenize(html) {
+        let tag = match token {
+            Token::Text(text) => {
+                match captures.last_mut() {
+                    Some(Capture::Legend(buffer)) => buffer.push_str(&text),
+                    Some(Capture::Label(buffer)) => buffer.push_str(&text),
+                    Some(Capture::Option { text: buffer, .. }) => buffer.push_str(&text),
+                    None => {}
+                }
+                continue;
+            }
+            Token::Tag(tag) => tag,
+        };
+
+        if tag.closing {
+            match tag.name.as_str() {
+                "legend" => {
+                    if matches!(captures.last(), Some(Capture::Legend(_))) {
+                        if let Some(Capture::Legend(text)) = captures.pop() {
+                            let text = squash(&text);
+                            if !text.is_empty() {
+                                legend = Some(text);
+                            }
+                        }
+                    }
+                }
+                // A legend titles only its own fieldset.
+                "fieldset" => legend = None,
+                "label" => {
+                    label_depth = label_depth.saturating_sub(1);
+                    if matches!(captures.last(), Some(Capture::Label(_))) {
+                        if let Some(Capture::Label(text)) = captures.pop() {
+                            let text = squash(&text);
+                            let question = text.trim_end_matches([':', '*']).trim().to_owned();
+                            for (field, index) in label_options.drain(..) {
+                                if drafts[field].options[index].label.is_empty() {
+                                    drafts[field].options[index].label = text.clone();
+                                }
+                            }
+                            for field in label_fields.drain(..) {
+                                if drafts[field].question.is_none() && !question.is_empty() {
+                                    drafts[field].question = Some(question.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                "option" => {
+                    if matches!(captures.last(), Some(Capture::Option { .. })) {
+                        if let Some(Capture::Option { field, index, text }) = captures.pop() {
+                            let text = squash(&text);
+                            if drafts[field].options[index].label.is_empty() {
+                                drafts[field].options[index].label = text;
+                            }
+                        }
+                    }
+                }
+                "select" => {
+                    select_field = None;
+                    if matches!(captures.last(), Some(Capture::Option { .. })) {
+                        captures.pop();
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        match tag.name.as_str() {
+            "legend" => captures.push(Capture::Legend(String::new())),
+            "label" => {
+                label_depth += 1;
+                captures.push(Capture::Label(String::new()));
+            }
+            "input" => {
+                let Some(name) = tag.attr("name").map(str::trim).filter(|n| !n.is_empty()) else {
+                    continue;
+                };
+                let kind = tag
+                    .attr("type")
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .unwrap_or_else(|| "text".to_owned());
+                match kind.as_str() {
+                    "hidden" | "submit" | "button" | "reset" | "image" | "file" => {}
+                    "radio" | "checkbox" => {
+                        let field = field_index(&mut drafts, name, legend.clone(), true);
+                        if kind == "checkbox" {
+                            drafts[field].multi = true;
+                        }
+                        let index = drafts[field].options.len();
+                        drafts[field].options.push(OptDraft {
+                            label: String::new(),
+                            value: tag.attr("value").unwrap_or(name).to_owned(),
+                            checked: tag.has("checked"),
+                        });
+                        if label_depth > 0 {
+                            label_options.push((field, index));
+                        }
+                    }
+                    _ => {
+                        let field = field_index(&mut drafts, name, legend.clone(), false);
+                        if label_depth > 0 {
+                            label_fields.push(field);
+                        }
+                    }
+                }
+            }
+            "textarea" => {
+                if let Some(name) = tag.attr("name").map(str::trim).filter(|n| !n.is_empty()) {
+                    let field = field_index(&mut drafts, name, legend.clone(), false);
+                    if label_depth > 0 {
+                        label_fields.push(field);
+                    }
+                }
+            }
+            "select" => {
+                select_field = tag
+                    .attr("name")
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(|name| {
+                        let field = field_index(&mut drafts, name, legend.clone(), true);
+                        if tag.has("multiple") {
+                            drafts[field].multi = true;
+                        }
+                        field
+                    });
+            }
+            "option" => {
+                let Some(field) = select_field else { continue };
+                let index = drafts[field].options.len();
+                drafts[field].options.push(OptDraft {
+                    label: String::new(),
+                    value: tag.attr("value").unwrap_or("").to_owned(),
+                    checked: tag.has("selected"),
+                });
+                captures.push(Capture::Option {
+                    field,
+                    index,
+                    text: String::new(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    drafts
+        .into_iter()
+        .map(|mut draft| {
+            let question = draft.question.take().unwrap_or_else(|| draft.name.clone());
+            let recommended = draft.options.iter().position(|option| option.checked);
+            let options: Vec<OptionItem> = if draft.choice {
+                draft
+                    .options
+                    .into_iter()
+                    .map(|option| OptionItem {
+                        label: if option.label.is_empty() {
+                            option.value
+                        } else {
+                            option.label
+                        },
+                        description: None,
+                        preview: None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            QuestionItem {
+                id: draft.name,
+                question,
+                header: None,
+                options,
+                multi: draft.multi.then_some(true),
+                recommended: recommended.map(|index| index as f64),
+            }
+        })
+        .collect()
+}
+
+// Question list for one call: `{html}`, a bare html string, or the legacy
+// `questions[]` array (omp `recoverAskHtml`).
 
 /// One answered question (omp `QuestionResult`).
 #[derive(Debug, Clone, PartialEq)]
@@ -160,15 +590,31 @@ pub fn tool_with_ui(ui: Arc<dyn AskUi>) -> Arc<dyn AgentTool> {
     })
 }
 
-fn parse_params(raw: Value) -> Result<Params> {
-    let params: Params =
-        serde_json::from_value(raw).map_err(|e| anyhow!("Invalid ask arguments: {e}"))?;
-    if params.questions.is_empty() {
-        return Err(anyhow!(
-            "Invalid ask arguments: questions must contain at least 1 item"
-        ));
-    }
-    for question in &params.questions {
+fn parse_params(raw: Value) -> Result<Vec<QuestionItem>> {
+    let questions = match &raw {
+        Value::String(html) => parse_html_form(html),
+        Value::Object(_) => {
+            if let Some(html) = raw.get("html").and_then(Value::as_str) {
+                if html.trim().is_empty() {
+                    return Err(anyhow!(INVALID_ASK_ERROR));
+                }
+                parse_html_form(html)
+            } else if raw.get("questions").is_some() {
+                let params: Params = serde_json::from_value(raw.clone())
+                    .map_err(|e| anyhow!("Invalid ask arguments: {e}"))?;
+                if params.questions.is_empty() {
+                    return Err(anyhow!(
+                        "Invalid ask arguments: questions must contain at least 1 item"
+                    ));
+                }
+                params.questions
+            } else {
+                return Err(anyhow!(INVALID_ASK_ERROR));
+            }
+        }
+        _ => return Err(anyhow!(INVALID_ASK_ERROR)),
+    };
+    for question in &questions {
         if let Some(reserved) = question
             .options
             .iter()
@@ -180,7 +626,7 @@ fn parse_params(raw: Value) -> Result<Params> {
             ));
         }
     }
-    Ok(params)
+    Ok(questions)
 }
 
 /// Text-level validation omp reports as a non-error result (`Error: ...`).
@@ -686,21 +1132,23 @@ impl AskTool {
         let Some(ui) = self.ui.clone() else {
             return Err(anyhow!("Ask tool requires interactive mode"));
         };
-        let params = parse_params(raw)?;
-        if let Some(text) = validate_questions(&params.questions) {
+        let questions = parse_params(raw)?;
+        // omp reports a form with no named controls as text, not as a failure.
+        if questions.is_empty() {
+            return Ok(AgentToolResult::text(NO_NAMED_CONTROLS_ERROR));
+        }
+        if let Some(text) = validate_questions(&questions) {
             return Ok(AgentToolResult::text(text));
         }
         // Hosts without the rich dialog degrade to the select/editor prompts
         // (omp checks `extensionUi.askDialog` presence).
         if !ui.has_ask_dialog() {
-            return self
-                .run_fallback(ui.as_ref(), &params.questions, signal)
-                .await;
+            return self.run_fallback(ui.as_ref(), &questions, signal).await;
         }
-        let frame: Vec<Value> = params.questions.iter().map(frame_question).collect();
+        let frame: Vec<Value> = questions.iter().map(frame_question).collect();
         let fut = ui.ask(Value::Array(frame), None);
         let response = Self::race_static(fut, signal).await?;
-        let Some(results) = results_from_response(&params.questions, response)? else {
+        let Some(results) = results_from_response(&questions, response)? else {
             return Err(cancelled());
         };
         render_results(&results)
@@ -783,10 +1231,14 @@ impl AgentTool for AskTool {
     }
 }
 
-/// Parameter schema, byte-equal (as JSON) to omp's `askSchema`.
+/// Parameter schema: omp's `askSchema` (`{html: string}`) plus the legacy
+/// `questions[]` shape it still recovers. omp marks `html` required and leans on
+/// lenient argument validation for the legacy call; this crate validates
+/// strictly, so neither shape is required here.
 #[must_use]
 pub fn schema() -> Value {
     json!({"type":"object","properties":{
+        "html":{"type":"string","description":"one HTML <form>"},
         "questions":{"type":"array","minItems":1,"items":{"type":"object","properties":{
             "id":{"type":"string"},
             "question":{"type":"string"},
@@ -799,7 +1251,7 @@ pub fn schema() -> Value {
             "multi":{"type":"boolean"},
             "recommended":{"type":"number","description":"0-based default index"}
         },"required":["id","question","options"]}}
-    },"required":["questions"]})
+    }})
 }
 #[cfg(test)]
 mod tests {
@@ -982,6 +1434,86 @@ mod tests {
                 "Error: question ids must be unique: \"a\""
             )]
         );
+    }
+
+    const FORM_HTML: &str = r#"<form>
+<fieldset><legend>Database?</legend>
+<label><input type="radio" name="storage" value="sqlite" checked> SQLite</label>
+<label><input type="radio" name="storage" value="postgres"> Postgres</label>
+</fieldset>
+<label>Notes: <textarea name="notes"></textarea></label>
+</form>"#;
+
+    #[tokio::test]
+    async fn html_form_parses_into_ask_questions() {
+        let (ui, tool) = fake(Some(json!({"answers": [
+            {"id": "storage", "selectedOptions": ["SQLite"]},
+            {"id": "notes", "selectedOptions": [], "customInput": "  hi  "}
+        ]})));
+        let result = tool
+            .run(json!({"html": FORM_HTML}), &AbortSignal::never())
+            .await
+            .unwrap();
+        assert_eq!(
+            result.content,
+            vec![ToolResultContent::text(
+                "User answers:\nstorage: SQLite\nnotes: \"hi\""
+            )]
+        );
+        let frames = ui.frames.lock();
+        assert_eq!(
+            frames[0].0,
+            json!([
+                {"id": "storage", "question": "Database?",
+                 "options": [{"label": "SQLite"}, {"label": "Postgres"}],
+                 "recommended": 0.0},
+                {"id": "notes", "question": "Notes", "options": []}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn html_checkbox_group_is_multi_and_bare_string_is_html() {
+        let html = r#"<form><fieldset><legend>Tags</legend>
+            <label><input type="checkbox" name="tags" value="a"> Alpha</label>
+            <label><input type="checkbox" name="tags" value="b"> Beta</label>
+        </fieldset></form>"#;
+        let (ui, tool) = fake(Some(json!({"answers": [
+            {"id": "tags", "selectedOptions": ["Alpha", "Beta"]}
+        ]})));
+        let result = tool
+            .run(Value::String(html.to_owned()), &AbortSignal::never())
+            .await
+            .unwrap();
+        assert_eq!(result.details["selectedOptions"], json!(["Alpha", "Beta"]));
+        assert_eq!(
+            ui.frames.lock()[0].0,
+            json!([{
+                "id": "tags", "question": "Tags", "multi": true,
+                "options": [{"label": "Alpha"}, {"label": "Beta"}]
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn html_without_named_controls_and_missing_html_are_reported() {
+        let (_, tool) = fake(None);
+        let result = tool
+            .run(
+                json!({"html": "<form><p>hello</p></form>"}),
+                &AbortSignal::never(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.content,
+            vec![ToolResultContent::text(NO_NAMED_CONTROLS_ERROR)]
+        );
+        let err = tool
+            .run(json!({"text": "no form"}), &AbortSignal::never())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), INVALID_ASK_ERROR);
     }
 
     /// Degraded-path double: scripted select/editor answers, no rich dialog.

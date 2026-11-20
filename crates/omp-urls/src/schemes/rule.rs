@@ -9,10 +9,20 @@ use crate::{InternalResource, InternalUrl, UrlCompletion, UrlCtx, UrlProvider};
 
 use super::RuleEntry;
 
+/// Error text when the rulebook itself was never ported.
+pub const NOT_IMPLEMENTED: &str =
+    "rule:// is not implemented yet in oh-my-tau (no rulebook ported)";
+
 /// Look up a rule by name; errors on a nameless URL (TS `lookupRule`/`findRule`).
+///
+/// An empty rulebook means the subsystem is absent, not that the name is wrong,
+/// so it reports [`NOT_IMPLEMENTED`] instead of the TS "Unknown rule" text.
 fn find_rule<'a>(url: &InternalUrl, rules: &'a [RuleEntry]) -> Result<&'a RuleEntry, String> {
     if url.host.is_empty() {
         return Err("rule:// URL requires a rule name: rule://<name>".to_string());
+    }
+    if rules.is_empty() {
+        return Err(NOT_IMPLEMENTED.to_string());
     }
     match rules.iter().find(|r| r.name == url.host) {
         Some(rule) => Ok(rule),
@@ -68,8 +78,8 @@ pub fn complete(rules: &[RuleEntry]) -> Vec<UrlCompletion> {
 
 /// Read-only `rule://` provider over the session rulebook.
 ///
-/// omp-rs has no TTSR rules subsystem yet, so the book is empty and every read
-/// surfaces the TS "Unknown rule" error text.
+/// oh-my-tau has no TTSR rules subsystem yet, so the book is empty and every read
+/// surfaces [`NOT_IMPLEMENTED`] rather than a misleading "Unknown rule".
 #[derive(Default)]
 pub struct RuleProvider;
 
@@ -108,8 +118,8 @@ impl UrlProvider for RuleProvider {
     }
 }
 
-/// Rules addressable by `rule://`. omp-rs does not port the TS rulebook
-/// (Cursor/Windsurf/Cline discovery) yet; an empty book degrades to TS errors.
+/// Rules addressable by `rule://`. oh-my-tau does not port the TS rulebook
+/// (Cursor/Windsurf/Cline discovery) yet; the empty book reports [`NOT_IMPLEMENTED`].
 fn active_rules() -> Vec<RuleEntry> {
     Vec::new()
 }
@@ -154,10 +164,20 @@ mod tests {
             resolve(&url, &rules).unwrap_err(),
             "Unknown rule: zzz\nAvailable: a"
         );
-        let url = parse_internal_url("rule://zzz").unwrap();
+    }
+
+    #[test]
+    fn empty_rulebook_reports_not_implemented() {
+        let url = parse_internal_url("rule://tdd").unwrap();
         assert_eq!(
             resolve(&url, &[]).unwrap_err(),
-            "Unknown rule: zzz\nAvailable: none"
+            "rule:// is not implemented yet in oh-my-tau (no rulebook ported)"
+        );
+        // A nameless URL still keeps the TS parse error.
+        let url = parse_internal_url("rule://").unwrap();
+        assert_eq!(
+            resolve(&url, &[]).unwrap_err(),
+            "rule:// URL requires a rule name: rule://<name>"
         );
     }
 

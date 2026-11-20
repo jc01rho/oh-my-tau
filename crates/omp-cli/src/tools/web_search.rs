@@ -81,7 +81,10 @@ pub fn schema() -> Value {
         "properties": {
             "query": {"type": "string"},
             "recency": {"type": "string", "enum": ["day", "week", "month", "year"]},
-            "limit": {"type": "number"}
+            "limit": {"type": "number"},
+            "max_tokens": {"type": "number"},
+            "temperature": {"type": "number"},
+            "num_search_results": {"type": "number"}
         },
         "required": ["query"],
         "additionalProperties": false
@@ -1297,12 +1300,18 @@ struct AnthropicServerToolUse {
 }
 
 /// Call Anthropic's Claude `web_search_20250305` tool.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit HTTP client, auth, model, query plan, sampling, and abort handle"
+)]
 async fn search_anthropic(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     model: &str,
     plan: &AnthropicQueryPlan,
+    max_tokens: Option<u32>,
+    temperature: Option<f64>,
     signal: &AbortSignal,
 ) -> Result<AnthropicApiResponse> {
     let url = format!("{base_url}/v1/messages?beta=true");
@@ -1322,7 +1331,15 @@ async fn search_anthropic(
 
     let mut body = serde_json::Map::new();
     body.insert("model".to_string(), json!(model));
-    body.insert("max_tokens".to_string(), json!(DEFAULT_MAX_TOKENS));
+    body.insert(
+        "max_tokens".to_string(),
+        json!(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
+    );
+    // ts `callSearch` forwards `temperature` only when the caller supplied one;
+    // the request omits the field otherwise so the API default applies.
+    if let Some(temperature) = temperature {
+        body.insert("temperature".to_string(), json!(temperature));
+    }
     body.insert(
         "messages".to_string(),
         json!([{"role": "user", "content": &plan.query}]),
@@ -1668,6 +1685,17 @@ struct WebSearchParams {
     recency: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
+    /// Upper bound on answer tokens; ts `params.max_tokens`.
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    /// Sampling temperature (0-1); ts `params.temperature`.
+    #[serde(default)]
+    temperature: Option<f64>,
+    /// ts `params.num_search_results`. Anthropic's `web_search_20250305` tool has
+    /// no per-call result count (only `max_uses`, a search budget), so the port
+    /// applies it as a cap on rendered sources alongside `limit`.
+    #[serde(default)]
+    num_search_results: Option<u32>,
 }
 
 /// Convert recency string to an `after:` ISO date (days ago).
@@ -1688,6 +1716,15 @@ fn recency_to_after(recency: &str) -> Option<String> {
 async fn web_search(params: Value, signal: AbortSignal) -> Result<AgentToolResult> {
     let parsed: WebSearchParams = serde_json::from_value(params.clone())
         .map_err(|e| anyhow!("Invalid web_search arguments: {e}"))?;
+
+    if let Some(temperature) = parsed.temperature {
+        if !temperature.is_finite() || !(0.0..=1.0).contains(&temperature) {
+            bail!("Invalid web_search arguments: temperature must be between 0 and 1, got {temperature}");
+        }
+    }
+    if parsed.num_search_results == Some(0) {
+        bail!("Invalid web_search arguments: num_search_results must be at least 1");
+    }
 
     if parsed.query.is_empty() {
         let resp = SearchResponse {
@@ -1737,6 +1774,8 @@ async fn web_search(params: Value, signal: AbortSignal) -> Result<AgentToolResul
         &api_key,
         "claude-opus-5-5",
         &plan,
+        parsed.max_tokens,
+        parsed.temperature,
         &signal,
     )
     .await?;
@@ -1759,6 +1798,12 @@ async fn web_search(params: Value, signal: AbortSignal) -> Result<AgentToolResul
 
     // Limit sources.
     if let Some(n) = parsed.limit {
+        if response.sources.len() > n as usize {
+            response.sources.truncate(n as usize);
+        }
+    }
+    // `num_search_results` caps rendered sources on Anthropic (no native field).
+    if let Some(n) = parsed.num_search_results {
         if response.sources.len() > n as usize {
             response.sources.truncate(n as usize);
         }
@@ -1798,8 +1843,11 @@ mod tests {
     fn schema_matches_ts_reference() {
         let s = schema();
         let props = s["properties"].as_object().unwrap();
-        assert_eq!(props.len(), 3);
+        assert_eq!(props.len(), 6);
         assert_eq!(props["limit"]["type"], "number");
+        assert_eq!(props["max_tokens"]["type"], "number");
+        assert_eq!(props["temperature"]["type"], "number");
+        assert_eq!(props["num_search_results"]["type"], "number");
         assert_eq!(props["query"]["type"], "string");
         assert_eq!(
             props["recency"],
@@ -1987,6 +2035,8 @@ mod tests {
             "test-key",
             "claude-opus-5-5",
             &plan,
+            None,
+            None,
             &controller.signal(),
         )
         .await
@@ -2039,6 +2089,8 @@ mod tests {
             "bad-key",
             "claude-opus-5-5",
             &plan,
+            None,
+            None,
             &controller.signal(),
         )
         .await;

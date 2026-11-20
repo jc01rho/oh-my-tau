@@ -15,7 +15,7 @@ use pa_agent::types::{AgentTool, AgentToolResult, AgentToolUpdateCallback};
 use pa_agent::BoxFut;
 use serde_json::{json, Map, Value};
 
-const DESCRIPTION: &str = "Submit subagent output: `{ data: <your output> }` for success, `{ error: \"message\" }` for failure. Never both; never a bare payload outside `data`.\n\nOmit `type` for the usual single terminal structured result. Pass `type: [\"section\"]` to submit an incremental, non-terminal section that accumulates.\nPass `type: \"result\"` to finalize; when `data` is omitted, your last assistant turn becomes the raw final result.";
+const DESCRIPTION: &str = "Submit subagent output: `{ data: <your output> }` for success, `{ error: \"message\" }` for failure.\nNever both; never a bare payload outside `data`.\n\nOmit `type` for the usual single terminal result.\nPass `type: [\"<field>\"]` with `data` to submit an incremental, non-terminal section that accumulates.\nA data-less `type: \"result\"` finalizes previously submitted sections; it is invalid when none were submitted.";
 
 const YIELD_FORMAT_HINT: &str =
     "Submit success as {\"data\":<your output>} or failure as {\"error\":\"message\"}.";
@@ -37,7 +37,7 @@ pub fn schema() -> Value {
                     {"type": "string"},
                     {"type": "array", "minItems": 1, "items": {"type": "string"}}
                 ],
-                "description": "Optional result type. A non-empty string array is incremental; a string is terminal."
+                "description": "Optional result type. A non-empty string array labels an incremental section; a string is terminal and, without data, finalizes the submitted sections."
             },
             "data": {
                 "type": "object",
@@ -234,7 +234,7 @@ mod tests {
                             {"type": "string"},
                             {"type": "array", "minItems": 1, "items": {"type": "string"}}
                         ],
-                        "description": "Optional result type. A non-empty string array is incremental; a string is terminal."
+                        "description": "Optional result type. A non-empty string array labels an incremental section; a string is terminal and, without data, finalizes the submitted sections."
                     },
                     "data": {
                         "type": "object",

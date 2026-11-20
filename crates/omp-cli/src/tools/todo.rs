@@ -22,7 +22,7 @@ use pa_agent::BoxFut;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-const DESCRIPTION: &str = "Tasks identified by verbatim content, NEVER generated IDs (task-1). Unique, stable task/phase names; lost text: view, NEVER guess.\nBefore work, init for 3+ steps, requested task sets, or new instructions. MUST list EVERY user item separately (phased/numbered/bulleted/N); NEVER omit or remember leftovers.\nAfter successful mutation: no active means earliest pending starts (phase order); multiple active means only earliest stays. Blocked NEVER starts automatically; unblock returns pending. Done out of order may rewind pointer but NEVER reopen completed. Mark done immediately; follow phase order.\nExternal waits (user/agent/service): block with optional reason suppresses stop reminder, starts next pending. Unblock when actionable; append a clearing task for agent-actionable blocker.\nNEVER call todo alone: init with first work; done/start with next action.";
+const DESCRIPTION: &str = "`todo` NEVER takes a turn of its own: emit it in the same response as your next real tool call (parallel tool calls), `init` beside the first read or action, `done`/`start` beside the next action or check. A response whose only call is `todo` wastes a full model round trip.\nTasks identified by verbatim content, NEVER generated IDs (task-1). Unique, stable task/phase names; lost text: view, NEVER guess.\nBefore work, init for 3+ steps, requested task sets, or new instructions. MUST list EVERY user item separately (phased/numbered/bulleted/N); NEVER omit or remember leftovers.\nAfter successful mutation: no active means earliest pending starts (phase order); multiple active means only earliest stays. Blocked NEVER starts automatically; unblock returns pending. Done out of order may rewind pointer but NEVER reopen completed. Mark done immediately; follow phase order.\nExternal waits (user/agent/service): block with optional reason suppresses stop reminder, starts next pending. Unblock when actionable; append a clearing task for agent-actionable blocker.\nNEVER call todo alone: init with first work; done/start with next action.";
 
 /// Default phase name for a flat `items` init (omp `DEFAULT_INIT_PHASE`).
 const DEFAULT_INIT_PHASE: &str = "Tasks";
@@ -105,14 +105,38 @@ struct ListEntry {
     items: Vec<String>,
 }
 
+/// The `task` argument: one verbatim content, or several (omp
+/// `string | string[]`). Array entries split like a string does.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TaskArg {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl TaskArg {
+    fn raw(&self) -> Vec<&str> {
+        match self {
+            Self::One(content) => vec![content.as_str()],
+            Self::Many(contents) => contents.iter().map(String::as_str).collect(),
+        }
+    }
+
+    /// omp treats `undefined`, `""` and `[]` as naming no task.
+    fn targets_none(&self) -> bool {
+        self.raw().iter().all(|content| content.is_empty())
+    }
+}
+
 /// One todo op: the tool's params object.
 #[derive(Debug, Clone, Deserialize)]
 struct Entry {
     op: Op,
     list: Option<Vec<ListEntry>>,
-    task: Option<String>,
+    task: Option<TaskArg>,
     phase: Option<String>,
     items: Option<Vec<String>>,
+    /// `block`: a note on why the task waits on someone else.
     reason: Option<String>,
 }
 
@@ -123,6 +147,101 @@ struct Entry {
 /// `truthy` in the TS source: an empty string counts as absent.
 fn present(value: Option<&str>) -> Option<&str> {
     value.filter(|v| !v.is_empty())
+}
+
+/// Whether the entry names at least one task.
+fn has_task(entry: &Entry) -> bool {
+    entry.task.as_ref().is_some_and(|task| !task.targets_none())
+}
+
+/// omp `normalizeTaskPart`: trim, then unquote a fully quoted part.
+fn normalize_task_part(part: &str) -> String {
+    let trimmed = part.trim();
+    if trimmed.len() >= 2 {
+        let first = trimmed.as_bytes()[0];
+        let last = trimmed.as_bytes()[trimmed.len() - 1];
+        if first == last && matches!(first, b'"' | b'\'' | b'`') {
+            return trimmed[1..trimmed.len() - 1].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// omp `TASK_LIST_DELIMITERS`, in order.
+#[derive(Debug, Clone, Copy)]
+enum TaskDelimiter {
+    Newline,
+    Semicolon,
+    Comma,
+    Whitespace,
+    Mixed,
+}
+
+const TASK_LIST_DELIMITERS: [(TaskDelimiter, bool); 5] = [
+    (TaskDelimiter::Newline, true),
+    (TaskDelimiter::Semicolon, true),
+    (TaskDelimiter::Comma, true),
+    (TaskDelimiter::Whitespace, false),
+    (TaskDelimiter::Mixed, false),
+];
+
+fn split_task_parts(content: &str, delimiter: TaskDelimiter) -> Vec<String> {
+    let parts: Vec<&str> = match delimiter {
+        TaskDelimiter::Newline => content.split('\n').collect(),
+        TaskDelimiter::Semicolon => content.split(';').collect(),
+        TaskDelimiter::Comma => content.split(',').collect(),
+        TaskDelimiter::Whitespace => content.split_whitespace().collect(),
+        TaskDelimiter::Mixed => content
+            .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+            .collect(),
+    };
+    parts
+        .into_iter()
+        .map(normalize_task_part)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// Split a `task` string flattening several tasks (`"a; b"`, `"a, b"`,
+/// newline- or space-separated) into the parts, mirroring omp
+/// `splitTaskList`. Only splits when every part names a known task.
+fn split_task_list(content: &str, known: &HashSet<&str>) -> Vec<String> {
+    if known.contains(content) {
+        return vec![content.to_string()];
+    }
+    let mut partial: Option<Vec<String>> = None;
+    for (delimiter, is_partial) in TASK_LIST_DELIMITERS {
+        let parts = split_task_parts(content, delimiter);
+        let named = parts
+            .iter()
+            .filter(|part| known.contains(part.as_str()))
+            .count();
+        if named > 0 && named == parts.len() {
+            return parts;
+        }
+        if partial.is_none() && is_partial && named > 0 && parts.len() > 1 {
+            partial = Some(parts);
+        }
+    }
+    partial.unwrap_or_else(|| vec![content.to_string()])
+}
+
+/// Task contents a `task` arg targets (omp `todoTaskTargets`).
+fn todo_task_targets(phases: &[TodoPhase], task: Option<&TaskArg>) -> Vec<String> {
+    let Some(task) = task else {
+        return Vec::new();
+    };
+    if task.targets_none() {
+        return Vec::new();
+    }
+    let known: HashSet<&str> = phases
+        .iter()
+        .flat_map(|phase| phase.tasks.iter().map(|t| t.content.as_str()))
+        .collect();
+    task.raw()
+        .into_iter()
+        .flat_map(|content| split_task_list(content, &known))
+        .collect()
 }
 
 fn find_task(phases: &[TodoPhase], content: &str) -> Option<(usize, usize)> {
@@ -189,16 +308,38 @@ fn resolve_phase(
     hit
 }
 
-/// Task coordinates an op targets: one task, one phase's tasks, or every task.
+/// Resolve every targeted content, recording one error per missing content.
+fn resolve_tasks(
+    phases: &[TodoPhase],
+    contents: &[String],
+    errors: &mut Vec<String>,
+) -> Vec<(usize, usize)> {
+    contents
+        .iter()
+        .filter_map(|content| resolve_task(phases, Some(content.as_str()), errors))
+        .collect()
+}
+
+/// The tasks `done`/`drop`/`rm` name: `task`, else `items` (the list models
+/// pass alongside), as contents.
+fn named_task_contents(phases: &[TodoPhase], entry: &Entry) -> Vec<String> {
+    let contents = todo_task_targets(phases, entry.task.as_ref());
+    if contents.is_empty() {
+        entry.items.clone().unwrap_or_default()
+    } else {
+        contents
+    }
+}
+
+/// Task coordinates an op targets: the named tasks, one phase's tasks, or every task.
 fn task_targets(
     phases: &[TodoPhase],
     entry: &Entry,
     errors: &mut Vec<String>,
 ) -> Vec<(usize, usize)> {
-    if present(entry.task.as_deref()).is_some() {
-        return resolve_task(phases, entry.task.as_deref(), errors)
-            .into_iter()
-            .collect();
+    let contents = named_task_contents(phases, entry);
+    if !contents.is_empty() {
+        return resolve_tasks(phases, &contents, errors);
     }
     if present(entry.phase.as_deref()).is_some() {
         return resolve_phase(phases, entry.phase.as_deref(), errors)
@@ -303,8 +444,13 @@ fn append_items(phases: &mut Vec<TodoPhase>, entry: &Entry, errors: &mut Vec<Str
 }
 
 fn remove_tasks(phases: &mut [TodoPhase], entry: &Entry, errors: &mut Vec<String>) {
-    if present(entry.task.as_deref()).is_some() {
-        if let Some((pi, ti)) = resolve_task(phases, entry.task.as_deref(), errors) {
+    let contents = named_task_contents(phases, entry);
+    if !contents.is_empty() {
+        // Resolve first, then remove high-to-low so earlier indices stay valid.
+        let mut hits = resolve_tasks(phases, &contents, errors);
+        hits.sort_unstable();
+        hits.dedup();
+        for (pi, ti) in hits.into_iter().rev() {
             phases[pi].tasks.remove(ti);
         }
         return;
@@ -330,7 +476,15 @@ fn apply_entry(phases: &mut Vec<TodoPhase>, entry: &Entry, errors: &mut Vec<Stri
     match entry.op {
         Op::Init => *phases = init_phases(entry, errors),
         Op::Start => {
-            let Some(hit) = resolve_task(phases, entry.task.as_deref(), errors) else {
+            let contents = todo_task_targets(phases, entry.task.as_ref());
+            if contents.len() > 1 {
+                errors.push(
+                    "start takes a single task: only one task can be in progress".to_string(),
+                );
+                return;
+            }
+            let Some(hit) = resolve_task(phases, contents.first().map(String::as_str), errors)
+            else {
                 return;
             };
             for (pi, phase) in phases.iter_mut().enumerate() {
@@ -353,8 +507,7 @@ fn apply_entry(phases: &mut Vec<TodoPhase>, entry: &Entry, errors: &mut Vec<Stri
             }
         }
         Op::Block => {
-            if present(entry.task.as_deref()).is_none() && present(entry.phase.as_deref()).is_none()
-            {
+            if !has_task(entry) && present(entry.phase.as_deref()).is_none() {
                 errors.push("block requires a task or phase target".to_string());
                 return;
             }
@@ -373,8 +526,7 @@ fn apply_entry(phases: &mut Vec<TodoPhase>, entry: &Entry, errors: &mut Vec<Stri
             }
         }
         Op::Unblock => {
-            if present(entry.task.as_deref()).is_none() && present(entry.phase.as_deref()).is_none()
-            {
+            if !has_task(entry) && present(entry.phase.as_deref()).is_none() {
                 errors.push("unblock requires a task or phase target".to_string());
                 return;
             }
@@ -784,13 +936,13 @@ pub fn tool() -> Arc<dyn AgentTool> {
 pub fn schema() -> Value {
     json!({"type":"object","properties":{
         "op":{"type":"string","enum":["init","start","done","rm","drop","block","unblock","append","view"]},
-        "list":{"type":"array","description":"init phases","items":{"type":"object","properties":{
+        "list":{"type":"array","description":"phases for init","items":{"type":"object","properties":{
             "phase":{"type":"string"},
             "items":{"type":"array","items":{"type":"string"},"minItems":1}
         },"required":["phase","items"]}},
-        "task":{"type":"string","description":"exact task text"},
+        "task":{"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"verbatim task content; array targets several (not start)"},
         "phase":{"type":"string"},
-        "items":{"type":"array","description":"flat init/append tasks","items":{"type":"string"}},
+        "items":{"type":"array","description":"tasks for flat init or append","items":{"type":"string"}},
         "reason":{"type":"string","description":"block reason"}
     },"required":["op"]})
 }
@@ -898,10 +1050,90 @@ mod tests {
     }
 
     #[test]
+    fn scalar_and_array_task_inputs() {
+        let init = json!({"op": "init", "list": [{"phase": "P", "items": ["a", "b", "c"]}]});
+        let tool = TodoTool::with_phases(Vec::new());
+        tool.run(&init).unwrap();
+        // `task` as an array targets every named task.
+        let result = tool
+            .run(&json!({"op": "done", "task": ["a", "b"]}))
+            .unwrap();
+        assert_eq!(result.is_error, None);
+        let tasks = result.details["phases"][0]["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["status"], json!("completed"));
+        assert_eq!(tasks[1]["status"], json!("completed"));
+        // Normalization starts the earliest remaining pending task.
+        assert_eq!(tasks[2]["status"], json!("in_progress"));
+        // `task` as a string still targets one verbatim content.
+        let result = tool.run(&json!({"op": "done", "task": "c"})).unwrap();
+        assert_eq!(
+            result.details["phases"][0]["tasks"][2]["status"],
+            json!("completed")
+        );
+
+        // A string naming several known tasks splits like a list.
+        let tool = TodoTool::with_phases(Vec::new());
+        tool.run(&init).unwrap();
+        let result = tool.run(&json!({"op": "drop", "task": "a, b"})).unwrap();
+        assert_eq!(result.is_error, None);
+        let tasks = result.details["phases"][0]["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["status"], json!("abandoned"));
+        assert_eq!(tasks[1]["status"], json!("abandoned"));
+        assert_eq!(tasks[2]["status"], json!("in_progress"));
+        // Unknown text is one target, so it errors instead of splitting.
+        let unknown = tool.run(&json!({"op": "done", "task": "a, zzz"})).unwrap();
+        assert_eq!(unknown.is_error, Some(true));
+        assert!(format!("{:?}", unknown.content).contains("not found"));
+    }
+
+    #[test]
+    fn start_rejects_multiple_tasks_and_reason_collapses() {
+        let tool = TodoTool::with_phases(Vec::new());
+        tool.run(&json!({"op": "init", "list": [{"phase": "P", "items": ["a", "b", "c"]}]}))
+            .unwrap();
+        let many = tool
+            .run(&json!({"op": "start", "task": ["a", "b"]}))
+            .unwrap();
+        assert_eq!(many.is_error, Some(true));
+        assert!(format!("{:?}", many.content).contains("start takes a single task"));
+        // Rejected call leaves state untouched (`a` is still the active task).
+        assert_eq!(
+            many.details["phases"][0]["tasks"][0]["status"],
+            json!("in_progress")
+        );
+
+        let blocked = tool
+            .run(&json!({"op": "block", "task": ["b"], "reason": "  waiting \n on  user "}))
+            .unwrap();
+        assert_eq!(blocked.is_error, None);
+        assert_eq!(
+            blocked.details["phases"][0]["tasks"][1]["blocker"],
+            json!("waiting on user")
+        );
+        // A whitespace-only reason stores no note.
+        tool.run(&json!({"op": "block", "task": "c", "reason": "   "}))
+            .unwrap();
+        let viewed = tool.run(&json!({"op": "view"})).unwrap();
+        assert_eq!(viewed.details["phases"][0]["tasks"][2].get("blocker"), None);
+    }
+
+    #[test]
     fn schema_matches_ts_shape() {
         let s = schema();
         assert_eq!(s["required"], json!(["op"]));
         assert_eq!(s["properties"]["op"]["enum"].as_array().unwrap().len(), 9);
+        assert_eq!(
+            s["properties"]["task"]["description"],
+            json!("verbatim task content; array targets several (not start)")
+        );
+        assert_eq!(
+            s["properties"]["task"]["anyOf"][0],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            s["properties"]["task"]["anyOf"][1],
+            json!({"type": "array", "items": {"type": "string"}})
+        );
         assert_eq!(
             s["properties"]["list"]["items"]["properties"]["items"]["minItems"],
             json!(1)

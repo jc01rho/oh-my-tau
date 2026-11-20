@@ -1,6 +1,8 @@
 //! `bash`: one shell command (`bash -c`, stderr merged into stdout), omp's
 //! result text: output, `Wall time: N.NN seconds`, `Command exited with code N`.
-//! Non-persistent shell (omp embeds a brush-based shell; see the port report).
+//! Non-persistent shell: omp embeds a brush-based shell, while omp-rs currently
+//! spawns an external `bash -c` (under util-linux `setsid`, see [`detached_bash`])
+//! pending the Phase 2 in-process shell port; the command semantics above match omp.
 //!
 //! omp's `async: true` backgrounds the command in the session job manager and
 //! returns `formatBackgroundNotice`; the job is inspected via `read proc://`
@@ -34,6 +36,11 @@ const MIN_TIMEOUT_SECS: f64 = 1.0;
 const MAX_TIMEOUT_SECS: f64 = 3600.0;
 /// Bytes held in memory while the command runs (the rest is dropped from the middle).
 const RETAIN_BYTES: usize = 8 * DEFAULT_MAX_BYTES;
+/// Lines one `notify` report carries; further matches are only counted
+/// (omp `NOTIFY_MAX_LINES`).
+const NOTIFY_MAX_LINES: usize = 50;
+/// Characters kept of one reported line (omp `NOTIFY_MAX_LINE_CHARS`).
+const NOTIFY_MAX_LINE_CHARS: usize = 400;
 
 /// omp `formatWallTimeNotice`.
 #[must_use]
@@ -156,13 +163,118 @@ fn local_bash_argv(script: &str) -> Vec<String> {
     }
 }
 
+/// A `notify` regex on a running command: the lines it matches are collected
+/// (bounded) and reported with the finished result.
+///
+/// omp streams these as follow-ups in 200 ms batches with a refilling
+/// 30-batch allowance (`async/notify.ts` `OutputNotifier`). omp-rs has no
+/// follow-up channel on the job surface, so the port keeps omp's per-batch
+/// bounds — [`NOTIFY_MAX_LINES`] reported lines per batch, each cut to
+/// [`NOTIFY_MAX_LINE_CHARS`], blank lines never counted, the rest only
+/// counted — and emits one batch when the command settles; the timer and the
+/// allowance therefore collapse into that single bounded report.
+pub(super) struct Notify {
+    re: regex::Regex,
+    /// The regex as given, quoted back in the report.
+    source: String,
+    state: Mutex<NotifyState>,
+}
+
+#[derive(Default)]
+struct NotifyState {
+    /// An unterminated line carried between chunks (a match is a whole line).
+    partial: String,
+    lines: Vec<String>,
+    omitted: usize,
+}
+
+impl Notify {
+    /// Compile a `notify` regex; the caller's bad pattern fails the call.
+    fn new(source: &str) -> Result<Self> {
+        let re = regex::Regex::new(source).map_err(|e| anyhow!("Invalid notify regex: {e}"))?;
+        Ok(Self {
+            re,
+            source: source.to_string(),
+            state: Mutex::new(NotifyState::default()),
+        })
+    }
+
+    /// Match the complete lines in `text`; the remainder waits for the next
+    /// chunk so a line split across reads is still matched whole.
+    fn feed(&self, text: &str) {
+        self.collect(text, false);
+    }
+
+    /// End of output: the trailing unterminated line counts as a line.
+    fn finish(&self) {
+        self.collect("", true);
+    }
+
+    fn collect(&self, text: &str, end: bool) {
+        let mut st = self.state.lock().expect("notify poisoned");
+        st.partial.push_str(text);
+        let mut lines: Vec<String> = Vec::new();
+        while let Some(i) = st.partial.find('\n') {
+            lines.push(st.partial[..i].to_string());
+            st.partial.drain(..=i);
+        }
+        if end && !st.partial.is_empty() {
+            lines.push(std::mem::take(&mut st.partial));
+        }
+        for line in lines {
+            if line.trim().is_empty() || !self.re.is_match(&line) {
+                continue;
+            }
+            if st.lines.len() < NOTIFY_MAX_LINES {
+                st.lines.push(clamp_chars(&line, NOTIFY_MAX_LINE_CHARS));
+            } else {
+                st.omitted += 1;
+            }
+        }
+    }
+
+    /// The report block, or `None` when nothing matched.
+    fn report(&self) -> Option<String> {
+        let st = self.state.lock().expect("notify poisoned");
+        if st.lines.is_empty() {
+            return None;
+        }
+        let plural = if st.lines.len() == 1 { "" } else { "s" };
+        let mut out = format!(
+            "[notify /{}/: {} matching line{plural}]",
+            self.source,
+            st.lines.len()
+        );
+        for line in &st.lines {
+            out.push('\n');
+            out.push_str(line);
+        }
+        if st.omitted > 0 {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\n… {} more matching lines", st.omitted);
+        }
+        Some(out)
+    }
+}
+
+/// Cut `s` to `max` characters (not bytes).
+fn clamp_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
 /// `tap`, when given, receives every output chunk as it arrives (the
 /// background-job surface shows it via `read proc://<id>` while running).
+/// `notify`, when given, matches every chunk as it arrives (see [`Notify`]).
 async fn run(
     cwd: &std::path::Path,
     command: &str,
     timeout: Option<f64>,
     signal: &AbortSignal,
+    notify: Option<&Notify>,
     tap: Option<Arc<Mutex<String>>>,
 ) -> Result<(String, Option<i32>, Duration, Option<&'static str>)> {
     let script = format!("exec 2>&1\n{command}");
@@ -217,6 +329,9 @@ async fn run(
             n = stdout.read(&mut chunk) => {
                 let n = n.context("reading command output")?;
                 if n == 0 { break; }
+                if let Some(notify) = notify {
+                    notify.feed(&String::from_utf8_lossy(&chunk[..n]));
+                }
                 if let Some(tap) = &tap {
                     let mut t = tap.lock().expect("job output tap poisoned");
                     t.push_str(&String::from_utf8_lossy(&chunk[..n]));
@@ -275,7 +390,7 @@ pub async fn execute(
     signal: &AbortSignal,
 ) -> Result<Executed> {
     let (raw, code, _, outcome) =
-        run(cwd, command, Some(DEFAULT_TIMEOUT_SECS), signal, None).await?;
+        run(cwd, command, Some(DEFAULT_TIMEOUT_SECS), signal, None, None).await?;
     let total_bytes = raw.len();
     let total_lines = raw.lines().count();
     let t = truncate_tail(&raw, DEFAULT_MAX_BYTES);
@@ -439,7 +554,19 @@ pub async fn bash(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|n| !n.is_empty());
-    let async_requested = args.get("async").and_then(Value::as_bool) == Some(true);
+    let notify_source = args
+        .get("notify")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // Compiled before anything runs: a bad regex fails the call instead of a
+    // job that never reports (omp `compileNotifyPattern`).
+    let notify = notify_source.map(Notify::new).transpose()?.map(Arc::new);
+    // omp: `async: true` or a `notify` regex on a plain command is an async
+    // request; with a service `name` the captured log already shows every
+    // line, so `notify` there only validates.
+    let async_requested = args.get("async").and_then(Value::as_bool) == Some(true)
+        || (notify.is_some() && name.is_none());
     let timeout = timeout_arg(&args);
     let mut notices: Vec<String> = Vec::new();
     if let Some(name) = name {
@@ -478,6 +605,14 @@ pub async fn bash(
         if !outcome.log.is_empty() {
             lines.push(outcome.log);
         }
+        // A service's captured log already carries every line, so `notify`
+        // only tells the model where to look (omp `service.notifyArmed`).
+        if let Some(notify) = &notify {
+            lines.push(format!(
+                "Output lines matching /{}/ arrive in proc://{name} while it runs.",
+                notify.source
+            ));
+        }
         return Ok(AgentToolResult::text(lines.join("\n")));
     }
     if ready_given(&args) {
@@ -488,10 +623,19 @@ pub async fn bash(
     let query = env.query();
     if async_requested {
         return Ok(start_background(
-            &env.jobs, dir, command, timeout, notices, spill, query, &signal,
+            &env.jobs,
+            dir,
+            command,
+            timeout,
+            notices,
+            spill,
+            query,
+            notify.as_ref(),
+            &signal,
         ));
     }
-    let (output, code, elapsed, outcome) = run(&dir, &command, timeout, &signal, None).await?;
+    let (output, code, elapsed, outcome) =
+        run(&dir, &command, timeout, &signal, None, None).await?;
     let mut text = finished_text(&output, elapsed, outcome, timeout, code, &spill, &query);
     if !notices.is_empty() {
         text = format!("{}\n{text}", notices.join("\n"));
@@ -761,6 +905,7 @@ fn start_background(
     notices: Vec<String>,
     spill: SpillConfig,
     query: String,
+    notify: Option<&Arc<Notify>>,
     _signal: &AbortSignal,
 ) -> AgentToolResult {
     let output: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -776,13 +921,28 @@ fn start_background(
     let job_id = registry.insert(job);
     let registry = registry.clone();
     let task_job_id = job_id.clone();
+    let task_notify = notify.cloned();
     tokio::spawn(async move {
         let controller = pa_agent::abort::AbortController::new();
-        let raw = run(&dir, &command, timeout, &controller.signal(), Some(output)).await;
+        let raw = run(
+            &dir,
+            &command,
+            timeout,
+            &controller.signal(),
+            task_notify.as_deref(),
+            Some(output),
+        )
+        .await;
+        if let Some(notify) = &task_notify {
+            notify.finish();
+        }
         let (status, result, error) = match &raw {
             Ok((output, code, elapsed, outcome)) => {
-                let text =
+                let mut text =
                     finished_text(output, *elapsed, *outcome, timeout, *code, &spill, &query);
+                if let Some(report) = task_notify.as_ref().and_then(|n| n.report()) {
+                    text = format!("{text}\n\n{report}");
+                }
                 let status = if outcome.is_none() && *code == Some(0) {
                     JobStatus::Completed
                 } else {
@@ -814,6 +974,12 @@ fn start_background(
     let mut lines: Vec<String> = Vec::new();
     lines.extend(notices);
     lines.push(jobs::background_notice(&job_id, timeout));
+    if let Some(notify) = notify {
+        lines.push(format!(
+            "Output lines matching /{}/ are reported with the job's result; read proc://{job_id}.",
+            notify.source
+        ));
+    }
     AgentToolResult::text(lines.join("\n"))
 }
 
@@ -1233,6 +1399,118 @@ mod tests {
         );
     }
 
+    /// A line split across two reads still matches whole (omp `SourceLineReader`
+    /// keeps the line boundary); non-matching and blank lines are never reported.
+    #[test]
+    fn notify_matches_whole_lines_across_chunks() {
+        let n = Notify::new("^boom$").unwrap();
+        n.feed("quiet\nbo");
+        n.feed("om\n\n  \nlast-boom\n");
+        // The split line "bo"+"om" is matched as one line; the trailing
+        // `last-boom` and the blanks do not match `^boom$`.
+        assert_eq!(
+            n.report().unwrap(),
+            "[notify /^boom$/: 1 matching line]\nboom"
+        );
+        // An unterminated last line is still a line once output ends.
+        n.feed("boom");
+        n.finish();
+        let report = n.report().unwrap();
+        assert_eq!(report, "[notify /^boom$/: 2 matching lines]\nboom\nboom");
+    }
+
+    #[test]
+    fn notify_caps_reported_lines_and_counts_the_rest() {
+        let n = Notify::new("hit").unwrap();
+        let mut text = String::new();
+        for i in 0..(NOTIFY_MAX_LINES + 5) {
+            use std::fmt::Write as _;
+            let _ = writeln!(text, "hit {i} {}", "x".repeat(NOTIFY_MAX_LINE_CHARS + 10));
+        }
+        n.feed(&text);
+        n.finish();
+        let report = n.report().unwrap();
+        assert!(
+            report.starts_with(&format!(
+                "[notify /hit/: {NOTIFY_MAX_LINES} matching lines]"
+            )),
+            "{}",
+            report.lines().next().unwrap_or_default()
+        );
+        assert!(report.ends_with("\n… 5 more matching lines"), "{report}");
+        let first = report.lines().nth(1).unwrap();
+        assert_eq!(first.chars().count(), NOTIFY_MAX_LINE_CHARS);
+    }
+
+    /// `notify` matches from the run loop (deterministic: no job polling).
+    #[test]
+    fn notify_over_a_command_reports_only_matching_lines() {
+        let n = Notify::new("ERROR|FATAL").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(run(
+            &std::env::temp_dir(),
+            "echo 'ERROR one'; echo fine; echo 'FATAL two'",
+            Some(60.0),
+            &sig(),
+            Some(&n),
+            None,
+        ))
+        .unwrap();
+        n.finish();
+        let report = n.report().unwrap();
+        assert!(
+            report.starts_with("[notify /ERROR|FATAL/: 2 matching lines]\nERROR one\nFATAL two"),
+            "{report}"
+        );
+        assert!(!report.contains("fine"), "{report}");
+    }
+
+    #[test]
+    fn invalid_notify_regex_fails_the_call_before_running() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(bash(
+                test_env(),
+                serde_json::json!({"command": "touch never-runs", "notify": "(unclosed"}),
+                sig(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("Invalid notify regex: "), "{err}");
+    }
+
+    /// omp: a plain command with `notify` starts in the background; the notice
+    /// names the regex and where the matches are reported.
+    #[tokio::test]
+    async fn notify_without_name_backgrounds_the_command() {
+        let env = test_env();
+        let r = bash(
+            env.clone(),
+            serde_json::json!({"command": "echo ERROR boom; echo ok", "notify": "ERROR"}),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let t = text_of(&r);
+        assert!(
+            t.starts_with("Backgrounded as job bg_1 (deadline 300s)"),
+            "{t}"
+        );
+        assert!(
+            t.contains(
+                "Output lines matching /ERROR/ are reported with the job's result; read proc://bg_1."
+            ),
+            "{t}"
+        );
+        assert!(env.jobs.get("bg_1").is_some(), "job registered");
+    }
+
     #[test]
     fn long_output_is_elided_in_the_middle() {
         let mut long = String::new();
@@ -1271,7 +1549,7 @@ mod tests {
             .build()
             .unwrap();
         let (output, code, _, outcome) = rt
-            .block_on(run(dir.path(), cmd, Some(60.0), &sig(), None))
+            .block_on(run(dir.path(), cmd, Some(60.0), &sig(), None, None))
             .unwrap();
         assert_eq!((code, outcome), (Some(0), None));
         let saved = std::cell::RefCell::new(Vec::<String>::new());
@@ -1344,7 +1622,7 @@ mod tests {
         assert!(plain.contains("B elided…]"), "{plain}");
         // The relevance view always carries the artifact pointer.
         let output = rt
-            .block_on(run(dir.path(), &cmd, Some(60.0), &sig(), None))
+            .block_on(run(dir.path(), &cmd, Some(60.0), &sig(), None, None))
             .unwrap()
             .0;
         let cfg = SpillConfig::load(dir.path());

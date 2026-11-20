@@ -166,11 +166,16 @@ const sm = () => ({
 });
 
 const orUndefined = (v: unknown) => (typeof v === "string" ? v : undefined);
+// ExtensionAPI/ExtensionContext members this host does not implement. They
+// throw instead of doing nothing: a registration that cannot take effect must
+// not let the extension load and report success while nothing it registered is
+// ever shown (docs/research/09-extension-model-comparison.md).
+const unsupportedNow = (what: string): never => {
+  throw new Error(`${what} is not available in the Rust extension host`);
+};
+const unsupported = (what: string) => async () => unsupportedNow(what);
 function makeCtx() {
   const noop = () => {};
-  const unsupported = (what: string) => async () => {
-    throw new Error(`${what} is not available in the Rust extension host`);
-  };
   return {
     ui: {
       notify: (message: string, type?: string) => notify("ui_notify", { message, type: type ?? "info" }),
@@ -292,7 +297,7 @@ function makeApi(ext: Ext) {
     registerCommand(name: string, options: Json) {
       ext.commands.set(name, { name, ...options });
     },
-    registerShortcut: () => {},
+    registerShortcut: () => unsupportedNow("registerShortcut"),
     // Semantics mirror pi-coding-agent loader.ts: the default seeds flagValues; getFlag only
     // sees flags this extension registered (omp scopes flags per extension).
     registerFlag(name: string, options: Json) {
@@ -303,11 +308,13 @@ function makeApi(ext: Ext) {
       if (!ext.flags.has(name)) return undefined;
       return flagValues.get(name);
     },
-    registerMessageRenderer: () => {},
-    registerAssistantThinkingRenderer: () => {},
-    registerComposerShape: () => {},
-    registerFileWriteFallback: () => {},
-    registerFileDeleteFallback: () => {},
+    // Unimplemented: this host has no renderer/composer/fallback pipeline, and a
+    // silent no-op would make an extension that installs one look installed.
+    registerMessageRenderer: () => unsupportedNow("registerMessageRenderer"),
+    registerAssistantThinkingRenderer: () => unsupportedNow("registerAssistantThinkingRenderer"),
+    registerComposerShape: () => unsupportedNow("registerComposerShape"),
+    registerFileWriteFallback: () => unsupportedNow("registerFileWriteFallback"),
+    registerFileDeleteFallback: () => unsupportedNow("registerFileDeleteFallback"),
     // Provider registrations are forwarded to the core as notifications (the Rust core owns
     // the model registry), and kept host-side so list_providers can report them.
     registerProvider(name: string, config: Json) {
@@ -332,8 +339,10 @@ function makeApi(ext: Ext) {
     setModel: async (model: unknown) => (await request("set_model", { model })) === true,
     getThinkingLevel: () => state.thinkingLevel,
     setThinkingLevel: (level: string, persist?: boolean) => notify("set_thinking_level", { level, persist }),
-    getServiceTiers: () => ({}),
-    setServiceTier: () => {},
+    // Unimplemented: nothing here knows the core's service tiers, so an empty
+    // tier map would be a wrong answer rather than a missing one.
+    getServiceTiers: () => unsupportedNow("getServiceTiers"),
+    setServiceTier: () => unsupportedNow("setServiceTier"),
     getSessionName: () => state.sessionName,
     setSessionName: async (name: string) => void (await request("set_session_name", { name })),
   };

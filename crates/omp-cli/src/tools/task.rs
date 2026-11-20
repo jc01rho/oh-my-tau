@@ -33,10 +33,10 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "yield",
     "ask",
     "todo",
-    "recall",
-    "reflect",
-    "retain",
-    "memory_edit",
+    // `recall`/`reflect`/`retain`/`memory_edit` belong to omp's memory tools;
+    // they are not registered built-ins yet, so listing them here would let an
+    // agent's tool set look read-only on names that cannot be resolved.
+    // Re-add them with the Phase 3 memory crate.
     "checkpoint",
     "rewind",
 ];

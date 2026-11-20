@@ -277,7 +277,8 @@ pub fn builtin_tools(cwd: &Path, edit_mode: EditMode) -> Vec<Arc<dyn AgentTool>>
                 "cwd":{"type":"string"},
                 "pty":{"type":"boolean"},
                 "async":{"type":"boolean"},
-                "name":{"type":"string","maxLength":48},
+                "notify":{"type":"string"},
+                "name":{"type":"string","maxLength":48,"pattern":"^(?:\\s*|[A-Za-z0-9][A-Za-z0-9._-]{0,47})$","description":"starts a long-lived supervised service under this name; omit for finite commands, async jobs included. 1-48 of [A-Za-z0-9._-]"},
                 "ready":{"type":"object","properties":{
                     "log":{"type":"string"},
                     "port":{"type":"number"},
@@ -296,7 +297,7 @@ pub fn builtin_tools(cwd: &Path, edit_mode: EditMode) -> Vec<Arc<dyn AgentTool>>
         mk(
             "glob",
             GLOB_DESCRIPTION.to_string(),
-            json!({"type":"object","properties":{"path":{"type":"string"},"hidden":{"type":"boolean"},"gitignore":{"type":"boolean"},"limit":{"type":"number"}},"additionalProperties":false}),
+            json!({"type":"object","properties":{"path":{"type":"string"},"hidden":{"type":"boolean"},"gitignore":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200}},"additionalProperties":false}),
             blocking(search::glob),
         ),
         mk(
@@ -308,7 +309,7 @@ pub fn builtin_tools(cwd: &Path, edit_mode: EditMode) -> Vec<Arc<dyn AgentTool>>
         mk(
             "write",
             WRITE_DESCRIPTION.to_string(),
-            json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}),
             blocking(edit::write),
         ),
         mk(
@@ -514,6 +515,13 @@ mod tests {
             .starts_with("Hashline patches existing files"));
         let read = tools.iter().find(|t| t.name() == "read").unwrap();
         assert_eq!(read.parameters()["required"], json!(["path"]));
+        // omp `writeSchema`: both `path` and `content` are required.
+        let write = tools.iter().find(|t| t.name() == "write").unwrap();
+        assert_eq!(write.parameters()["required"], json!(["path", "content"]));
+        assert_eq!(
+            write.parameters()["properties"],
+            json!({"path": {"type": "string"}, "content": {"type": "string"}})
+        );
     }
 
     #[test]
@@ -522,7 +530,13 @@ mod tests {
         let bash = tools.iter().find(|t| t.name() == "bash").unwrap();
         let props = &bash.parameters()["properties"];
         assert_eq!(props["async"], json!({"type": "boolean"}));
-        assert_eq!(props["name"], json!({"type": "string", "maxLength": 48}));
+        assert_eq!(props["notify"], json!({"type": "string"}));
+        assert_eq!(
+            props["name"],
+            json!({"type": "string", "maxLength": 48,
+                "pattern": "^(?:\\s*|[A-Za-z0-9][A-Za-z0-9._-]{0,47})$",
+                "description": "starts a long-lived supervised service under this name; omit for finite commands, async jobs included. 1-48 of [A-Za-z0-9._-]"})
+        );
         assert_eq!(
             props["ready"],
             json!({"type": "object", "properties": {
@@ -553,6 +567,16 @@ mod tests {
         assert_eq!(
             tools.iter().find(|t| t.name() == "glob").unwrap().description().lines().next().unwrap(),
             "Glob files/dirs: `;`-separated paths or internal URLs (`local://*.md`, `omp://**/*.md`); default workspace root."
+        );
+        // omp `findSchema`: `limit?": "1 <= number.integer <= 200"`, and `pattern`
+        // stays off the wire schema while `search::glob` accepts it as an alias.
+        assert_eq!(
+            tools
+                .iter()
+                .find(|t| t.name() == "glob")
+                .unwrap()
+                .parameters()["properties"]["limit"],
+            json!({"type": "integer", "minimum": 1, "maximum": 200})
         );
     }
 

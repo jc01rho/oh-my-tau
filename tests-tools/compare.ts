@@ -23,6 +23,27 @@ interface ToolDef {
 /** Tools compared byte-for-byte (canonical JSON + full description), not just per-param. */
 const STRICT_TOOLS = new Set(["todo", "ask", "checkpoint", "rewind", "wait", "think", "yield", "goal"]);
 
+/**
+ * Upstream built-ins omp-rs has not ported yet. They are extracted into
+ * ts_tools.json but have no Rust counterpart, so they cannot take part in the
+ * schema diff. Kept explicit: a tool that starts or stops being in this state
+ * must be handled deliberately, not silently skipped. Remove a name once its
+ * Rust tool lands.
+ */
+const NOT_PORTED_YET = new Set([
+	"context_notes",
+	"debug",
+	"github",
+	"learn",
+	"manage_skill",
+	"memory_edit",
+	"new_context",
+	"recall",
+	"reflect",
+	"retain",
+	"security_scan",
+]);
+
 /** Recursively sort object keys so JSON equality ignores key order. */
 function canonical(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(canonical);
@@ -304,17 +325,27 @@ const rustTools = parseRustTools();
 
 const tsNames = new Set(tsTools.map(t => t.name));
 const rustNames = new Set(rustTools.map(t => t.name));
-const missingInRust = [...tsNames].filter(n => !rustNames.has(n));
-const extraInRust = [...rustNames].filter(n => !tsNames.has(n));
+const onlyInTs = [...tsNames].filter(n => !rustNames.has(n)).sort();
+// Unexpected gap → real drift. Known gap → reported, excluded from the diff.
+const missingInRust = onlyInTs.filter(n => !NOT_PORTED_YET.has(n));
+const notPortedYet = onlyInTs.filter(n => NOT_PORTED_YET.has(n));
+const driftedBack = [...NOT_PORTED_YET].filter(n => rustNames.has(n)).sort();
+const extraInRust = [...rustNames].filter(n => !tsNames.has(n)).sort();
+const comparedTools = tsTools.filter(t => rustNames.has(t.name));
 
 console.log("=== tool name diff ===");
 console.log(`missing in omp-rs: ${missingInRust.join(", ") || "(none)"}`);
 console.log(`extra in omp-rs:   ${extraInRust.join(", ") || "(none)"}`);
+console.log(
+	`not ported yet:    ${notPortedYet.join(", ") || "(none)"} (${notPortedYet.length}/${tsTools.length} upstream tools skipped)`,
+);
+if (driftedBack.length > 0) {
+	console.log(`  NOTE: now present in omp-rs, drop from NOT_PORTED_YET: ${driftedBack.join(", ")}`);
+}
 console.log("\n=== per-tool parameter diff ===");
 let clean = true;
-for (const ts of tsTools) {
-	const rust = rustTools.find(t => t.name === ts.name);
-	if (!rust) continue;
+for (const ts of comparedTools) {
+	const rust = rustTools.find(t => t.name === ts.name)!;
 	const d = compare(ts, rust);
 	const descMatch = ts.description_first_line === rust.description_first_line;
 	const issues: string[] = [];
@@ -334,4 +365,12 @@ for (const ts of tsTools) {
 		console.log(`[${d.tool}] OK`);
 	}
 }
+if (notPortedYet.length > 0) {
+	console.log("\n=== not implemented in omp-rs (schema comparison skipped) ===");
+	for (const name of notPortedYet) {
+		const ts = tsTools.find(t => t.name === name)!;
+		console.log(`  ${name} (ts params: ${Object.keys(props(ts.parameters)).join(", ") || "none"})`);
+	}
+}
+
 console.log(clean ? "\nAll compared tools match." : "\nDifferences found (see above).");

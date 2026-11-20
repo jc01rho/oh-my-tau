@@ -14,7 +14,7 @@ use pa_agent::types::{AgentTool, AgentToolResult, AgentToolUpdateCallback};
 use pa_agent::BoxFut;
 use serde_json::{json, Map, Value};
 
-const DESCRIPTION: &str = "Manage active goal-mode objective.\n\nSingle `op` field:\n- `create`: starts goal; enables goal mode. Requires `objective`; optional positive `token_budget`. Only when no goal exists and none is paused.\n- `get`: returns current active/paused goal and remaining token budget.\n- `resume`: re-activates paused goal for continued work.\n- `complete`: marks goal complete only when actually done and every deliverable verified against current evidence. NEVER because budget low or turn ending.\n- `drop`: discards current goal without completing it.\n\nPaused goal from `get` → MUST `resume` before continuing work.";
+const DESCRIPTION: &str = "Manage active goal-mode objective.\n\nSingle `op` field:\n- `create`: starts goal; enables goal mode. Requires `objective`; optional positive `token_budget`. Only when no goal exists and none is paused.\n- `get`: returns current active/paused goal and remaining token budget.\n- `pause`: stops continuation while blocked on the user.\n- `resume`: re-activates paused goal for continued work.\n- `complete`: marks goal complete only when actually done and every deliverable verified against current evidence. NEVER because budget low or turn ending.\n- `drop`: discards current goal without completing it and ends goal mode; `goal` tool leaves your tool set immediately, so you cannot `create` a replacement (not even later in the same turn or eval cell). To change the objective, NEVER drop; ask the user to set the new goal.\n\nPaused goal from `get` → MUST `resume` before continuing work.";
 
 /// Parameter schema, byte-equal (as JSON) to omp's `goalSchema`.
 #[must_use]
@@ -22,7 +22,7 @@ pub fn schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "op": {"type": "string", "enum": ["create", "get", "complete", "resume", "drop"], "description": "goal operation"},
+            "op": {"type": "string", "enum": ["create", "get", "complete", "pause", "resume", "drop"], "description": "goal operation"},
             "objective": {"type": "string", "description": "goal objective"},
             "token_budget": {"type": "integer", "description": "token budget"}
         },
@@ -210,6 +210,23 @@ impl GoalRuntime {
         Ok(self.goal.clone().expect("goal checked above"))
     }
 
+    /// omp `GoalRuntime.pauseGoal`: pauses a live goal so continuation stops
+    /// while blocked on the user; `None` when nothing pausable exists
+    /// (omp returns `undefined` and the tool reports no goal).
+    #[must_use]
+    pub fn pause_goal(&mut self) -> Option<Goal> {
+        let now = Self::now_millis();
+        let goal = self.goal.as_mut()?;
+        if !matches!(goal.status, GoalStatus::Active | GoalStatus::BudgetLimited) {
+            return None;
+        }
+        self.flush_time();
+        let goal = self.goal.as_mut()?;
+        goal.status = GoalStatus::Paused;
+        goal.updated_at = now;
+        Some(goal.clone())
+    }
+
     /// omp `GoalRuntime.dropGoal`.
     pub fn drop_goal(&mut self) -> Option<Goal> {
         let now = Self::now_millis();
@@ -366,6 +383,7 @@ impl AgentTool for GoalTool {
                     Some(runtime.create_goal(&objective, budget)?)
                 }
                 "get" => runtime.state_goal().cloned(),
+                "pause" => runtime.pause_goal(),
                 "resume" => Some(runtime.resume_goal()?),
                 "drop" => runtime.drop_goal(),
                 "complete" => Some(runtime.complete_goal()?),
@@ -405,13 +423,35 @@ mod tests {
             json!({
                 "type": "object",
                 "properties": {
-                    "op": {"type": "string", "enum": ["create", "get", "complete", "resume", "drop"], "description": "goal operation"},
+                    "op": {"type": "string", "enum": ["create", "get", "complete", "pause", "resume", "drop"], "description": "goal operation"},
                     "objective": {"type": "string", "description": "goal objective"},
                     "token_budget": {"type": "integer", "description": "token budget"}
                 },
                 "required": ["op"]
             })
         );
+        assert_eq!(
+            DESCRIPTION.split("\n").next(),
+            Some("Manage active goal-mode objective.")
+        );
+        // ts_tools.json documents every op the schema accepts.
+        for op in ["create", "get", "pause", "resume", "complete", "drop"] {
+            assert!(
+                DESCRIPTION.contains(&format!("- `{op}`: ")),
+                "description documents op `{op}`"
+            );
+        }
+    }
+
+    #[test]
+    fn pause_stops_continuation_then_resume() {
+        let mut rt = GoalRuntime::default();
+        assert!(rt.pause_goal().is_none());
+        rt.create_goal("x", None).unwrap();
+        let paused = rt.pause_goal().unwrap();
+        assert_eq!(paused.status, GoalStatus::Paused);
+        assert!(rt.pause_goal().is_none());
+        assert_eq!(rt.resume_goal().unwrap().status, GoalStatus::Active);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use super::jobs::{JobStatus, ServiceState};
 use super::Env;
 
-const DESCRIPTION: &str = "Wait only when blocked with nothing else to do.\nBlocks on background jobs/services you started; returns on the first result, a message sent to you, or a steering interrupt; a safety cap returns a still-running snapshot.\nNothing you started running? Errors; NEVER wait on other agents.\nResults and messages auto-deliver. NEVER poll while work remains.";
+const DESCRIPTION: &str = "Wait only when blocked with nothing else to do.\nBlocks on background jobs/services you started, or on the answer to a question you sent this run.\nNothing you started running and no answer owed? Returns at once; so does a wait on an agent that is idle with nothing to wake it, or that is waiting on you.\n- MUST wait only on your own jobs/services, or rarely the answer to a question that blocks you.\n- NEVER wait for another agent's progress or for messages nobody owes you.\n- Agent you wait on is waiting on you? Answer it first.\n- Result in, other jobs still running? SHOULD act on it before waiting again.\n- A wait returned with nothing new and nothing else is left? Call `wait` right away with no other tool call: it then blocks up to 4m, longer for a reply.\nResults and messages auto-deliver. NEVER poll while work remains.";
 
 /// omp `WAIT_MAX_MS`.
 const WAIT_MAX: Duration = Duration::from_mins(30);
@@ -150,4 +150,26 @@ fn has_live_service(env: &Env) -> bool {
             ServiceState::Exited | ServiceState::Failed
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn description_matches_ts_descriptor() {
+        assert_eq!(
+            DESCRIPTION,
+            "Wait only when blocked with nothing else to do.\nBlocks on background jobs/services you started, or on the answer to a question you sent this run.\nNothing you started running and no answer owed? Returns at once; so does a wait on an agent that is idle with nothing to wake it, or that is waiting on you.\n- MUST wait only on your own jobs/services, or rarely the answer to a question that blocks you.\n- NEVER wait for another agent's progress or for messages nobody owes you.\n- Agent you wait on is waiting on you? Answer it first.\n- Result in, other jobs still running? SHOULD act on it before waiting again.\n- A wait returned with nothing new and nothing else is left? Call `wait` right away with no other tool call: it then blocks up to 4m, longer for a reply.\nResults and messages auto-deliver. NEVER poll while work remains."
+        );
+        assert_eq!(
+            DESCRIPTION.lines().next(),
+            Some("Wait only when blocked with nothing else to do.")
+        );
+    }
+
+    #[test]
+    fn schema_is_empty_object() {
+        assert_eq!(schema(), json!({"type": "object", "properties": {}}));
+    }
 }

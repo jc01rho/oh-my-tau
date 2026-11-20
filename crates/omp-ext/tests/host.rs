@@ -857,3 +857,54 @@ export default function (pi: any): void {
     );
     host.shutdown().await.unwrap();
 }
+
+/// ExtensionAPI members this host does not implement must fail loudly at
+/// registration time instead of loading as successful silent no-ops: an
+/// extension that installs a renderer/shortcut/fallback and gets no error
+/// believes the host honors it.
+#[tokio::test]
+async fn unimplemented_api_members_reject_registration() {
+    if common::bun_missing("unimplemented_api_members_reject_registration") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("omp-ext-unsupported-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let members = [
+        "registerShortcut(\"c\", {})",
+        "registerMessageRenderer(\"m\", () => null)",
+        "registerAssistantThinkingRenderer(() => null)",
+        "registerComposerShape({})",
+        "registerFileWriteFallback(() => undefined)",
+        "registerFileDeleteFallback(() => undefined)",
+        "getServiceTiers()",
+        "setServiceTier(\"t\")",
+    ];
+    for (i, call) in members.iter().enumerate() {
+        std::fs::write(
+            dir.join(format!("u{i}.ts")),
+            format!("export default function (pi: any): void {{ pi.{call}; }}\n"),
+        )
+        .unwrap();
+    }
+    let paths: Vec<PathBuf> = (0..members.len())
+        .map(|i| dir.join(format!("u{i}.ts")))
+        .collect();
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host.load(Some(&paths), None, "/tmp", None).await.unwrap();
+    assert!(r.loaded.is_empty(), "none of these may load: {r:?}");
+    assert_eq!(r.errors.len(), members.len(), "{r:?}");
+    for (i, call) in members.iter().enumerate() {
+        let name = call.split('(').next().unwrap();
+        let e = r
+            .errors
+            .iter()
+            .find(|e| e.path.ends_with(&format!("u{i}.ts")))
+            .unwrap_or_else(|| panic!("missing error for u{i}.ts: {r:?}"));
+        assert!(
+            e.error.contains(name) && e.error.contains("not available"),
+            "u{i}.ts must reject {name}, got: {}",
+            e.error
+        );
+    }
+    host.shutdown().await.unwrap();
+}
