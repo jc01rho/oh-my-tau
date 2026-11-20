@@ -1492,6 +1492,33 @@ mod tests {
     }
 
     #[test]
+    fn ask_single_select_recommended_submits_the_original_label() {
+        let mut ui = ExtensionUi::new();
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"ask-s","method":"ask",
+            "questions":[{"id":"s","question":"Pick one","multi":false,
+                "recommended":0,
+                "options":[{"label":"a"},{"label":"b"}]}]}),
+        );
+        let rows = snapshot(&ui).join("\n");
+        assert!(rows.contains("a (Recommended)"), "{rows}");
+        let port = FakePort::default();
+        // The cursor starts on the recommended row; Enter submits it directly.
+        ui.handle_key(key(KeyCode::Enter), &port);
+        let log = port.log.lock();
+        assert_eq!(log.len(), 1);
+        assert!(
+            log[0].starts_with("extension_ui_response(ask-s, "),
+            "{log:?}"
+        );
+        assert!(log[0].contains(r#""id":"s""#), "{log:?}");
+        assert!(log[0].contains(r#""selectedOptions":["a"]"#), "{log:?}");
+        assert!(!log[0].contains("Recommended"), "{log:?}");
+        drop(log);
+        assert!(!ui.is_active());
+    }
+
+    #[test]
     fn ask_duplicate_checked_indices_are_deduplicated() {
         let question = Question::from_value(&json!({"id":"m","question":"Pick tags",
             "multi":true,"checked":[2,0,2,0,1],

@@ -1143,3 +1143,117 @@ async fn failed_load_rolls_back_flag_values() {
     );
     host.shutdown().await.unwrap();
 }
+
+/// A load that writes a flag, loses the name to another writer, and then writes
+/// it again must roll back to the value that later write replaced -- not to the
+/// value its own first write replaced, which is stale by then.
+#[tokio::test]
+async fn failed_load_rolls_back_flag_to_the_write_it_replaced_last() {
+    if common::bun_missing("failed_load_rolls_back_flag_to_the_write_it_replaced_last") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.ts");
+    std::fs::write(
+        &good,
+        "export default function (pi: any): void {\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"a\" });\n\
+         pi.events.on(\"go\", () => pi.registerFlag(\"shared\", { type: \"string\", default: \"later\" }));\n\
+         }\n",
+    )
+    .unwrap();
+    // Synchronous ordering inside B's factory: B's first write, then A's write
+    // (from the emit), then B's second write, then B's failure.
+    let bad = dir.path().join("bad.ts");
+    std::fs::write(
+        &bad,
+        "export default function (pi: any): void {\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"b\" });\n\
+         pi.events.emit(\"go\", {});\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"b2\" });\n\
+         pi.registerShortcut(\"c\", {});\n\
+         }\n",
+    )
+    .unwrap();
+    let probe = dir.path().join("probe.ts");
+    let seen = dir.path().join("seen.json");
+    std::fs::write(
+        &probe,
+        format!(
+            "import {{ writeFileSync }} from \"node:fs\";\n\
+             export default function (pi: any): void {{\n\
+             \x20 pi.registerFlag(\"shared\", {{ type: \"string\" }});\n\
+             \x20 writeFileSync({seen:?}, JSON.stringify({{ shared: pi.getFlag(\"shared\") }}));\n\
+             }}\n",
+            seen = seen.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host
+        .load(Some(&[good, bad, probe]), None, "/tmp", None)
+        .await
+        .unwrap();
+    assert_eq!(r.loaded.len(), 2, "{r:?}");
+    assert_eq!(r.errors.len(), 1, "{r:?}");
+
+    let observed: Value = serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+    assert_eq!(
+        observed["shared"],
+        json!("later"),
+        "the rollback must undo B's second write back to what that write replaced"
+    );
+    host.shutdown().await.unwrap();
+}
+
+/// A load that unregisters a provider it never registered itself and then fails
+/// must hand that registration back: `unregisterProvider` recorded no undo for a
+/// name `registerProvider` had not touched in this load.
+#[tokio::test]
+async fn failed_load_restores_provider_it_only_unregistered() {
+    if common::bun_missing("failed_load_restores_provider_it_only_unregistered") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.ts");
+    std::fs::write(
+        &good,
+        "export default function (pi: any): void {\n\
+         pi.registerProvider(\"shared\", { model: \"a\" });\n\
+         }\n",
+    )
+    .unwrap();
+    let bad = dir.path().join("bad.ts");
+    std::fs::write(
+        &bad,
+        "export default function (pi: any): void {\n\
+         pi.unregisterProvider(\"shared\");\n\
+         pi.unregisterProvider(\"ghost\");\n\
+         pi.registerShortcut(\"c\", {});\n\
+         }\n",
+    )
+    .unwrap();
+
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host
+        .load(Some(&[good, bad]), None, "/tmp", None)
+        .await
+        .unwrap();
+    assert_eq!(r.loaded.len(), 1, "{r:?}");
+    assert_eq!(r.errors.len(), 1, "{r:?}");
+
+    let live: Value = host.request("list_providers", json!({})).await.unwrap();
+    let live = live.as_array().cloned().unwrap_or_default();
+    let shared = live
+        .iter()
+        .find(|p| p["name"] == json!("shared"))
+        .unwrap_or_else(|| panic!("the unregistered provider must come back: {live:?}"));
+    assert_eq!(shared["config"], json!({"model": "a"}));
+    assert_eq!(shared["extension"], json!("good"));
+    assert!(
+        !live.iter().any(|p| p["name"] == json!("ghost")),
+        "a name nobody registered must not be invented by the rollback: {live:?}"
+    );
+    host.shutdown().await.unwrap();
+}

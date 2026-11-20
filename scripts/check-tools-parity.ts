@@ -136,9 +136,51 @@ function runCompare(): CompareReport {
 	return report;
 }
 
+/** Documented data contract of one property omp-rs adds on top of the TS reference. */
+interface DocumentedSchema {
+	type: "string" | "number" | "boolean" | "array" | "object";
+	/** Documented fields of an object schema; any other field is undocumented. */
+	props?: Record<string, DocumentedSchema>;
+	/** Fields that must appear in the schema's `required` array. */
+	required?: string[];
+	/** Documented item schema of an array. */
+	items?: DocumentedSchema;
+}
+
+/** Legacy `ask.questions[]`, kept next to `html` until the form flow replaces it. */
+const ASK_QUESTIONS: DocumentedSchema = {
+	type: "array",
+	items: {
+		type: "object",
+		props: {
+			id: { type: "string" },
+			question: { type: "string" },
+			header: { type: "string" },
+			options: {
+				type: "array",
+				items: {
+					type: "object",
+					props: {
+						label: { type: "string" },
+						description: { type: "string" },
+						preview: { type: "string" },
+					},
+					required: ["label"],
+				},
+			},
+			multi: { type: "boolean" },
+			recommended: { type: "number" },
+		},
+		required: ["id", "question", "options"],
+	},
+};
+
+/** tau's `todo.reason`, used for blocker tracking. */
+const TODO_REASON: DocumentedSchema = { type: "string" };
+
 interface SchemaAllowance {
-	/** Properties omp-rs may add on top of the TS reference (they must stay optional). */
-	extra_props: string[];
+	/** Properties omp-rs may add on top of the TS reference, with their documented schema. */
+	extra_props: Record<string, DocumentedSchema>;
 	/** Properties the TS reference requires that omp-rs may leave optional. */
 	optional_props: string[];
 	/** Extra enum values omp-rs may accept, keyed by dotted property path (e.g. `op`). */
@@ -152,10 +194,10 @@ interface SchemaAllowance {
  */
 const PRECISE_SCHEMA_ALLOWANCES: Record<string, SchemaAllowance> = {
 	// Legacy `questions[]` still accepted next to `html`; `html` stays optional.
-	ask: { extra_props: ["questions"], optional_props: ["html"] },
+	ask: { extra_props: { questions: ASK_QUESTIONS }, optional_props: ["html"] },
 	// tau keeps `reason` on todo for blocker tracking and adds block/unblock ops.
 	todo: {
-		extra_props: ["reason"],
+		extra_props: { reason: TODO_REASON },
 		optional_props: [],
 		extra_enum_values: { op: ["block", "unblock"] },
 	},
@@ -209,6 +251,52 @@ const SCHEMA_NODE_KEYWORDS = new Set(["items", "contains", "propertyNames", "not
 /** In JSON Schema an absent `required`/`properties` means empty, not "keyword missing". */
 const ABSENT_KEYWORD_DEFAULTS: Record<string, unknown> = { required: [], properties: {} };
 
+/**
+ * A keyword that is present at all must already have its JSON Schema shape; only
+ * an omitted keyword is normalized to the empty default in ABSENT_KEYWORD_DEFAULTS.
+ */
+function keywordShapeIssue(key: string, value: unknown, side: "ts" | "omp-rs"): string | null {
+	if (key === "required" && !Array.isArray(value)) return `required: ${side}=${canonicalJson(value)} is not an array`;
+	if (key === "properties" && !isPlainObject(value))
+		return `properties: ${side}=${canonicalJson(value)} is not an object`;
+	return null;
+}
+
+/** Validate one JSON Schema node against the documented contract of an allowed extra property. */
+function checkDocumentedSchema(value: unknown, doc: DocumentedSchema, path: string, diffs: string[]): void {
+	if (!isPlainObject(value)) {
+		diffs.push(`"${path}" must be a schema object, got ${canonicalJson(value)}`);
+		return;
+	}
+	if (value.type !== doc.type) {
+		diffs.push(`"${path}" type: documented ${doc.type} omp-rs=${canonicalJson(value.type)}`);
+		return;
+	}
+	if (doc.type === "array") {
+		if (value.items !== undefined && doc.items) checkDocumentedSchema(value.items, doc.items, `${path}[]`, diffs);
+		return;
+	}
+	if (doc.type !== "object") return;
+	if (value.properties !== undefined && !isPlainObject(value.properties)) {
+		diffs.push(`"${path}" properties: ${canonicalJson(value.properties)} is not an object`);
+		return;
+	}
+	const declared = isPlainObject(value.properties) ? value.properties : {};
+	for (const name of Object.keys(declared)) {
+		const nested = childPath(path, name);
+		const docProp = doc.props?.[name];
+		if (!docProp) {
+			diffs.push(`"${nested}" is not part of the documented schema`);
+			continue;
+		}
+		checkDocumentedSchema(declared[name], docProp, nested, diffs);
+	}
+	const required = Array.isArray(value.required) ? value.required.map(String) : [];
+	for (const name of doc.required ?? []) {
+		if (!required.includes(name)) diffs.push(`"${childPath(path, name)}" is documented as required but is not`);
+	}
+}
+
 function childPath(path: string, segment: string): string {
 	return path === "" ? segment : `${path}.${segment}`;
 }
@@ -230,8 +318,14 @@ function diffSchemaNode(
 	}
 	const keys = [...new Set([...Object.keys(ts), ...Object.keys(rust)])].sort();
 	for (const key of keys) {
-		const inTs = key in ts;
-		const inRust = key in rust;
+		const inTs = Object.hasOwn(ts, key);
+		const inRust = Object.hasOwn(rust, key);
+		const tsShape = inTs ? keywordShapeIssue(key, ts[key], "ts") : null;
+		const rustShape = inRust ? keywordShapeIssue(key, rust[key], "omp-rs") : null;
+		if (tsShape !== null || rustShape !== null) {
+			diffs.push(`${where} ${tsShape ?? rustShape}`);
+			continue;
+		}
 		if (!inTs || !inRust) {
 			const absentDefault = ABSENT_KEYWORD_DEFAULTS[key];
 			if (absentDefault !== undefined) {
@@ -275,10 +369,10 @@ function diffSchemaKeyword(
 		for (const name of tsRequired) {
 			if (rustRequired.has(name)) continue;
 			if (path === "" && allow.optional_props.includes(name)) continue;
-			diffs.push(`property ${name} no longer required in omp-rs`);
+			diffs.push(`${where} property ${name} no longer required in omp-rs`);
 		}
 		for (const name of rustRequired) {
-			if (!tsRequired.has(name)) diffs.push(`property ${name} required only in omp-rs`);
+			if (!tsRequired.has(name)) diffs.push(`${where} property ${name} required only in omp-rs`);
 		}
 		return;
 	}
@@ -288,12 +382,16 @@ function diffSchemaKeyword(
 		const names = [...new Set([...Object.keys(tsProps), ...Object.keys(rustProps)])].sort();
 		for (const name of names) {
 			const nested = childPath(path, name);
-			if (!(name in tsProps)) {
-				if (path === "" && allow.extra_props.includes(name)) continue;
+			if (!Object.hasOwn(tsProps, name)) {
+				if (path === "" && Object.hasOwn(allow.extra_props, name)) {
+					// Allowed extra, but its shape must still honour the documented contract.
+					checkDocumentedSchema(rustProps[name], allow.extra_props[name], nested, diffs);
+					continue;
+				}
 				diffs.push(`unexpected extra property "${nested}" in omp-rs`);
 				continue;
 			}
-			if (!(name in rustProps)) {
+			if (!Object.hasOwn(rustProps, name)) {
 				diffs.push(`property "${nested}" missing in omp-rs`);
 				continue;
 			}
@@ -331,7 +429,7 @@ function preciseSchemaDiffs(tsSchema: JsonSchema, rustSchema: JsonSchema, allow:
 	const diffs: string[] = [];
 	diffSchemaNode(tsSchema, rustSchema, "", allow, diffs);
 	const rustRequired = schemaRequired(rustSchema);
-	for (const key of allow.extra_props) {
+	for (const key of Object.keys(allow.extra_props)) {
 		if (rustRequired.has(key)) diffs.push(`allowed extra property "${key}" must stay optional`);
 	}
 	return diffs;
@@ -386,7 +484,7 @@ for (const [name, allow] of Object.entries(PRECISE_SCHEMA_ALLOWANCES)) {
 	}
 }
 
-const remaining = differing.filter(name => name in ALLOWED_DELTAS);
+const remaining = differing.filter(name => Object.hasOwn(ALLOWED_DELTAS, name));
 
 if (failures.length > 0) {
 	console.error("parity gate: FAIL");

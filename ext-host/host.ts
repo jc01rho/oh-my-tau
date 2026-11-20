@@ -390,8 +390,18 @@ function makeApi(ext: Ext, track: LoadTracker) {
         const rec = track.flags.get(name);
         // The first write records what to hand back; a repeat write in the same
         // load only takes over the revision (the prior value is unchanged).
-        if (rec) rec.rev = rev;
-        else track.flags.set(name, { had: flagValues.has(name), prior: flagValues.get(name), priorRev: flagWrites.get(name), rev });
+        if (rec) {
+          // Unless somebody else wrote the name in between: then the value to
+          // hand back is that later write, not the one our first write replaced.
+          if (flagWrites.get(name) !== rec.rev) {
+            rec.had = flagValues.has(name);
+            rec.prior = flagValues.get(name);
+            rec.priorRev = flagWrites.get(name);
+          }
+          rec.rev = rev;
+        } else {
+          track.flags.set(name, { had: flagValues.has(name), prior: flagValues.get(name), priorRev: flagWrites.get(name), rev });
+        }
         flagValues.set(name, options.default as FlagValue);
         flagWrites.set(name, rev);
       }
@@ -417,6 +427,9 @@ function makeApi(ext: Ext, track: LoadTracker) {
       notify("provider_registered", { name, config, extension: ext.name });
     },
     unregisterProvider(name: string) {
+      // A load may unregister a provider it never registered here: the undo record
+      // is what lets `rollbackLoad` hand that registration back if the load fails.
+      if (!track.providers.some((p) => p.name === name)) track.providers.push({ name, prior: providers.get(name) });
       if (!providers.delete(name)) return;
       // The undo record stays: if this load fails later, the registration it
       // replaced still has to come back (see `rollbackLoad`).
