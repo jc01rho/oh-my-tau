@@ -164,7 +164,10 @@ pub fn shorten_path(path: &str) -> String {
     path.to_string()
 }
 
-fn floor_boundary(s: &str, mut i: usize) -> usize {
+/// Largest char boundary `<= i` (byte-sized windows move back rather than
+/// split a UTF-8 sequence: `String::drain` and slicing panic on a
+/// non-boundary index).
+pub(super) fn floor_boundary(s: &str, mut i: usize) -> usize {
     while i > 0 && !s.is_char_boundary(i) {
         i -= 1;
     }

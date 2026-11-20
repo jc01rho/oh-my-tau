@@ -86,6 +86,13 @@ const timers = new Set<ReturnType<typeof setTimeout>>();
 // flagValues with the default; the core may update values via the set_flag_value RPC.
 const flagValues = new Map<string, boolean | string>();
 const providers = new Map<string, { name: string; config: Json; extension: string }>();
+// Every write to `flagValues` (a load's `registerFlag` seed, or the core's
+// `set_flag_value`) takes the next revision, and `flagWrites` remembers which
+// revision currently holds each name. `rollbackLoad` undoes a flag only while
+// its failed load is still the latest writer: a write that landed afterwards
+// (a subsequent extension load, or the core) is not that load's to clobber.
+let writeRev = 0;
+const flagWrites = new Map<string, number>();
 let state: Json = { cwd: process.cwd(), hasUI: false, agentKind: "main", branch: [] };
 let ctxCache: unknown;
 
@@ -281,7 +288,17 @@ interface LoadTracker {
   /** Providers this load wrote, with the registration they replaced (if any). */
   providers: { name: string; prior?: ProviderReg }[];
   /** `flagValues` entries this load overwrote, recorded before the write. */
-  flags: Map<string, { had: boolean; prior?: FlagValue }>;
+  flags: Map<string, FlagWrite>;
+}
+
+/** One `flagValues` write a load made: the value it replaced, and its revision. */
+interface FlagWrite {
+  had: boolean;
+  prior?: FlagValue;
+  /** Revision of the write this one replaced (absent: nobody had written the name). */
+  priorRev?: number;
+  /** Revision this load's write holds; reset if the load writes the name again. */
+  rev: number;
 }
 
 /** Undo everything a failed load registered, so nothing of it outlives the error. */
@@ -293,19 +310,27 @@ function rollbackLoad(ext: Ext, track: LoadTracker) {
       log("warn", `${ext.path} cleanup: ${e instanceof Error ? e.message : e}`);
     }
   }
-  for (const [name, { had, prior }] of track.flags) {
+  for (const [name, { had, prior, priorRev, rev }] of track.flags) {
+    // A later write owns the name now: undoing ours would revert somebody else's value.
+    if (flagWrites.get(name) !== rev) continue;
     if (had) flagValues.set(name, prior as FlagValue);
     else flagValues.delete(name);
+    if (priorRev === undefined) flagWrites.delete(name);
+    else flagWrites.set(name, priorRev);
   }
   track.flags.clear();
   for (const { name, prior } of track.providers.splice(0).reverse()) {
-    if (providers.get(name)?.extension !== ext.name) continue;
+    const live = providers.get(name);
+    // Undo only this load's own write: a registration made after the failed load
+    // (another extension's load) is not ours to clobber, and a name the load just
+    // unregistered is absent, which is still ours to restore.
+    if (live !== undefined && live.extension !== ext.name) continue;
     if (prior) {
       // The load replaced a live registration: put it back and say so, so the
       // core's registry never ends up pointing at the extension that failed.
       providers.set(name, prior);
       notify("provider_registered", { name, config: prior.config, extension: prior.extension });
-    } else {
+    } else if (live !== undefined) {
       providers.delete(name);
       notify("provider_unregistered", { name, extension: ext.name });
     }
@@ -361,8 +386,14 @@ function makeApi(ext: Ext, track: LoadTracker) {
     registerFlag(name: string, options: Json) {
       ext.flags.set(name, { name, ...options });
       if (options.default !== undefined) {
-        if (!track.flags.has(name)) track.flags.set(name, { had: flagValues.has(name), prior: flagValues.get(name) });
+        const rev = ++writeRev;
+        const rec = track.flags.get(name);
+        // The first write records what to hand back; a repeat write in the same
+        // load only takes over the revision (the prior value is unchanged).
+        if (rec) rec.rev = rev;
+        else track.flags.set(name, { had: flagValues.has(name), prior: flagValues.get(name), priorRev: flagWrites.get(name), rev });
         flagValues.set(name, options.default as FlagValue);
+        flagWrites.set(name, rev);
       }
     },
     getFlag(name: string) {
@@ -387,8 +418,8 @@ function makeApi(ext: Ext, track: LoadTracker) {
     },
     unregisterProvider(name: string) {
       if (!providers.delete(name)) return;
-      const i = track.providers.findIndex((p) => p.name === name);
-      if (i >= 0) track.providers.splice(i, 1);
+      // The undo record stays: if this load fails later, the registration it
+      // replaced still has to come back (see `rollbackLoad`).
       notify("provider_unregistered", { name, extension: ext.name });
     },
     setLabel: (label: string) => {
@@ -999,6 +1030,8 @@ async function dispatch(method: string, p: Json): Promise<unknown> {
       return exts.flatMap((e) => [...e.flags.values()].map((f) => ({ ...f, extension: e.name, value: flagValues.get(f.name as string) })));
     case "set_flag_value":
       flagValues.set(String(p.name), p.value as boolean | string);
+      // Owns the name now: a load that fails afterwards must not undo this.
+      flagWrites.set(String(p.name), ++writeRev);
       return true;
     case "list_providers":
       return [...providers.values()].map((pr) => ({ ...pr }));

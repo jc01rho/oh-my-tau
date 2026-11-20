@@ -101,16 +101,24 @@ impl Question {
             .and_then(Value::as_f64)
             .map(|f| f as usize)
             .filter(|i| *i < options.len());
-        // Pre-checked defaults; out-of-range indices are dropped like `recommended`.
+        // Pre-checked defaults; out-of-range indices are dropped like `recommended`
+        // and repeats are deduplicated (first occurrence wins, order preserved).
         let checked: Vec<usize> =
             v.get("checked")
                 .and_then(Value::as_array)
                 .map_or_else(Vec::new, |a| {
-                    a.iter()
+                    let mut seen = Vec::new();
+                    for i in a
+                        .iter()
                         .filter_map(Value::as_u64)
                         .filter_map(|i| usize::try_from(i).ok())
                         .filter(|i| *i < options.len())
-                        .collect()
+                    {
+                        if !seen.contains(&i) {
+                            seen.push(i);
+                        }
+                    }
+                    seen
                 });
         Some(Self {
             id,
@@ -898,7 +906,7 @@ impl ExtensionUi {
                         // "✓ Done selecting": commit the checked options.
                         let selected = checked
                             .iter()
-                            .filter_map(|i| labels.get(*i).cloned())
+                            .filter_map(|i| question.options.get(*i).map(|o| o.label.clone()))
                             .collect();
                         let answer = AskAnswer {
                             id: question.id.clone(),
@@ -917,7 +925,9 @@ impl ExtensionUi {
                 } else {
                     let answer = AskAnswer {
                         id: question.id.clone(),
-                        selected_options: vec![labels[*cursor].clone()],
+                        // The submitted label is the original option label; the
+                        // " (Recommended)" suffix is display-only.
+                        selected_options: vec![question.options[*cursor].label.clone()],
                         custom_input: None,
                     };
                     Self::ask_advance(
@@ -1458,6 +1468,36 @@ mod tests {
         ui.handle_key(key(KeyCode::Enter), &port);
         let log = port.log.lock();
         assert!(log[0].contains(r#""selectedOptions":["a","c"]"#), "{log:?}");
+    }
+
+    #[test]
+    fn ask_default_checked_with_recommended_keeps_original_labels() {
+        let mut ui = ExtensionUi::new();
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"ask-r","method":"ask",
+            "questions":[{"id":"m","question":"Pick tags","multi":true,
+                "checked":[0,2],"recommended":0,
+                "options":[{"label":"a"},{"label":"b"},{"label":"c"}]}]}),
+        );
+        let rows = snapshot(&ui).join("\n");
+        assert!(rows.contains("a (Recommended)"), "{rows}");
+        let port = FakePort::default();
+        for _ in 0..3 {
+            ui.handle_key(key(KeyCode::Down), &port); // rows a, b, c -> Done
+        }
+        ui.handle_key(key(KeyCode::Enter), &port);
+        let log = port.log.lock();
+        assert!(log[0].contains(r#""selectedOptions":["a","c"]"#), "{log:?}");
+        assert!(!log[0].contains("Recommended"), "{log:?}");
+    }
+
+    #[test]
+    fn ask_duplicate_checked_indices_are_deduplicated() {
+        let question = Question::from_value(&json!({"id":"m","question":"Pick tags",
+            "multi":true,"checked":[2,0,2,0,1],
+            "options":[{"label":"a"},{"label":"b"},{"label":"c"}]}))
+        .expect("question parses");
+        assert_eq!(question.checked, vec![2, 0, 1]);
     }
 
     #[test]

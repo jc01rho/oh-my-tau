@@ -120,17 +120,6 @@ fn timeout_arg(args: &Value) -> Option<f64> {
     }
 }
 
-/// Largest char boundary `<= at`: the retained windows are byte-sized, so a
-/// front drain must be moved back rather than split a UTF-8 sequence
-/// (`String::drain` panics on a non-boundary index).
-fn floor_char_boundary(s: &str, at: usize) -> usize {
-    let mut i = at.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
 /// Run a command and return `(output, exit code, wall time, outcome)`.
 ///
 /// `bash` in its own session (TS: brush runs every external command under
@@ -428,7 +417,7 @@ async fn run(
                         t.push_str(&text);
                         // Bound the tap: proc reads only need the recent window.
                         if t.len() > RETAIN_BYTES {
-                            let cut = floor_char_boundary(&t, t.len() - RETAIN_BYTES / 2);
+                            let cut = super::util::floor_boundary(&t, t.len() - RETAIN_BYTES / 2);
                             t.drain(..cut);
                         }
                     }
@@ -900,14 +889,14 @@ async fn start_service(
                                 out.push_str(&text);
                                 if out.len() > RETAIN_BYTES {
                                     let cut =
-                                        floor_char_boundary(&out, out.len() - RETAIN_BYTES / 2);
+                                        super::util::floor_boundary(&out, out.len() - RETAIN_BYTES / 2);
                                     out.drain(..cut);
                                 }
                             }
                             if !log_ready {
                                 readiness_buffer.push_str(&text);
                                 if readiness_buffer.len() > READINESS_BUFFER_CHARS {
-                                    let drop_to = floor_char_boundary(
+                                    let drop_to = super::util::floor_boundary(
                                         &readiness_buffer,
                                         readiness_buffer.len() - READINESS_BUFFER_CHARS,
                                     );

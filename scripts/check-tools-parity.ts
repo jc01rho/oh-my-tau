@@ -141,6 +141,8 @@ interface SchemaAllowance {
 	extra_props: string[];
 	/** Properties the TS reference requires that omp-rs may leave optional. */
 	optional_props: string[];
+	/** Extra enum values omp-rs may accept, keyed by dotted property path (e.g. `op`). */
+	extra_enum_values?: Record<string, string[]>;
 }
 
 /**
@@ -151,15 +153,15 @@ interface SchemaAllowance {
 const PRECISE_SCHEMA_ALLOWANCES: Record<string, SchemaAllowance> = {
 	// Legacy `questions[]` still accepted next to `html`; `html` stays optional.
 	ask: { extra_props: ["questions"], optional_props: ["html"] },
-	// tau keeps `reason` on todo for blocker tracking.
-	todo: { extra_props: ["reason"], optional_props: [] },
+	// tau keeps `reason` on todo for blocker tracking and adds block/unblock ops.
+	todo: {
+		extra_props: ["reason"],
+		optional_props: [],
+		extra_enum_values: { op: ["block", "unblock"] },
+	},
 };
 
 type JsonSchema = Record<string, unknown>;
-
-function schemaProps(schema: JsonSchema): Record<string, JsonSchema> {
-	return (schema.properties ?? {}) as Record<string, JsonSchema>;
-}
 
 function schemaRequired(schema: JsonSchema): Set<string> {
 	const req = schema.required;
@@ -180,35 +182,157 @@ function dumpRustSchemas(): Record<string, JsonSchema> {
 	return Object.fromEntries(tools.map(t => [t.name, t.parameters]));
 }
 
-/** Structural diff: only the allowed extra properties / optional flags may differ. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Deterministic JSON with sorted object keys, so equal schemas serialize identically. */
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (isPlainObject(value)) {
+		const body = Object.keys(value)
+			.sort()
+			.map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+			.join(",");
+		return `{${body}}`;
+	}
+	return JSON.stringify(value) ?? "undefined";
+}
+
+/** Enum membership is order-insensitive; each value keeps its canonical form. */
+function canonicalValues(values: unknown): string[] {
+	return (Array.isArray(values) ? values : [values]).map(canonicalJson).sort();
+}
+
+const SCHEMA_UNION_KEYWORDS = new Set(["anyOf", "oneOf", "allOf"]);
+const SCHEMA_NODE_KEYWORDS = new Set(["items", "contains", "propertyNames", "not", "if", "then", "else"]);
+/** In JSON Schema an absent `required`/`properties` means empty, not "keyword missing". */
+const ABSENT_KEYWORD_DEFAULTS: Record<string, unknown> = { required: [], properties: {} };
+
+function childPath(path: string, segment: string): string {
+	return path === "" ? segment : `${path}.${segment}`;
+}
+
+/** Recursive canonical comparison of two schema nodes, honouring the allowance only where documented. */
+function diffSchemaNode(
+	ts: unknown,
+	rust: unknown,
+	path: string,
+	allow: SchemaAllowance,
+	diffs: string[],
+): void {
+	const where = path === "" ? "root schema" : `"${path}"`;
+	if (!isPlainObject(ts) || !isPlainObject(rust)) {
+		const tsJson = canonicalJson(ts);
+		const rustJson = canonicalJson(rust);
+		if (tsJson !== rustJson) diffs.push(`${where}: ts=${tsJson} rust=${rustJson}`);
+		return;
+	}
+	const keys = [...new Set([...Object.keys(ts), ...Object.keys(rust)])].sort();
+	for (const key of keys) {
+		const inTs = key in ts;
+		const inRust = key in rust;
+		if (!inTs || !inRust) {
+			const absentDefault = ABSENT_KEYWORD_DEFAULTS[key];
+			if (absentDefault !== undefined) {
+				diffSchemaKeyword(key, inTs ? ts[key] : absentDefault, inRust ? rust[key] : absentDefault, path, allow, diffs);
+				continue;
+			}
+			diffs.push(`${where} ${key} present only in ${inTs ? "ts" : "omp-rs"}`);
+			continue;
+		}
+		diffSchemaKeyword(key, ts[key], rust[key], path, allow, diffs);
+	}
+}
+
+function diffSchemaKeyword(
+	key: string,
+	tsValue: unknown,
+	rustValue: unknown,
+	path: string,
+	allow: SchemaAllowance,
+	diffs: string[],
+): void {
+	const where = path === "" ? "root schema" : `"${path}"`;
+	if (key === "enum") {
+		const tsValues = canonicalValues(tsValue);
+		const rustValues = canonicalValues(rustValue);
+		const missing = tsValues.filter(value => !rustValues.includes(value));
+		if (missing.length > 0) diffs.push(`${where} enum missing value(s) in omp-rs: ${missing.join(", ")}`);
+		const extra = rustValues.filter(value => !tsValues.includes(value));
+		if (extra.length > 0) {
+			const permitted = (allow.extra_enum_values?.[path] ?? []).map(canonicalJson);
+			const undocumented = extra.filter(value => !permitted.includes(value));
+			if (undocumented.length > 0)
+				diffs.push(`${where} enum has undocumented extra value(s) in omp-rs: ${undocumented.join(", ")}`);
+		}
+		return;
+	}
+	if (key === "required") {
+		const names = (value: unknown) => (Array.isArray(value) ? value.map(String) : []);
+		const tsRequired = new Set(names(tsValue));
+		const rustRequired = new Set(names(rustValue));
+		for (const name of tsRequired) {
+			if (rustRequired.has(name)) continue;
+			if (path === "" && allow.optional_props.includes(name)) continue;
+			diffs.push(`property ${name} no longer required in omp-rs`);
+		}
+		for (const name of rustRequired) {
+			if (!tsRequired.has(name)) diffs.push(`property ${name} required only in omp-rs`);
+		}
+		return;
+	}
+	if (key === "properties") {
+		const tsProps = isPlainObject(tsValue) ? tsValue : {};
+		const rustProps = isPlainObject(rustValue) ? rustValue : {};
+		const names = [...new Set([...Object.keys(tsProps), ...Object.keys(rustProps)])].sort();
+		for (const name of names) {
+			const nested = childPath(path, name);
+			if (!(name in tsProps)) {
+				if (path === "" && allow.extra_props.includes(name)) continue;
+				diffs.push(`unexpected extra property "${nested}" in omp-rs`);
+				continue;
+			}
+			if (!(name in rustProps)) {
+				diffs.push(`property "${nested}" missing in omp-rs`);
+				continue;
+			}
+			diffSchemaNode(tsProps[name], rustProps[name], nested, allow, diffs);
+		}
+		return;
+	}
+	if (key === "additionalProperties") {
+		diffSchemaNode(tsValue, rustValue, childPath(path, key), allow, diffs);
+		return;
+	}
+	if (SCHEMA_UNION_KEYWORDS.has(key)) {
+		const tsNodes = Array.isArray(tsValue) ? tsValue : [tsValue];
+		const rustNodes = Array.isArray(rustValue) ? rustValue : [rustValue];
+		if (tsNodes.length !== rustNodes.length) {
+			diffs.push(`${where} ${key} length: ts=${tsNodes.length} rust=${rustNodes.length}`);
+			return;
+		}
+		tsNodes.forEach((node, index) =>
+			diffSchemaNode(node, rustNodes[index], childPath(path, `${key}[${index}]`), allow, diffs),
+		);
+		return;
+	}
+	if (SCHEMA_NODE_KEYWORDS.has(key)) {
+		diffSchemaNode(tsValue, rustValue, childPath(path, key), allow, diffs);
+		return;
+	}
+	const tsJson = canonicalJson(tsValue);
+	const rustJson = canonicalJson(rustValue);
+	if (tsJson !== rustJson) diffs.push(`${where} ${key}: ts=${tsJson} rust=${rustJson}`);
+}
+
+/** Structural diff: only the documented extra properties, optional flags, and enum values may differ. */
 function preciseSchemaDiffs(tsSchema: JsonSchema, rustSchema: JsonSchema, allow: SchemaAllowance): string[] {
 	const diffs: string[] = [];
-	const tsProps = schemaProps(tsSchema);
-	const rustProps = schemaProps(rustSchema);
-	for (const key of Object.keys(tsProps)) {
-		if (!(key in rustProps)) {
-			diffs.push(`property "${key}" missing in omp-rs`);
-			continue;
-		}
-		const tsType = JSON.stringify(tsProps[key].type);
-		const rustType = JSON.stringify(rustProps[key].type);
-		if (tsType !== rustType) diffs.push(`property "${key}" type: ts=${tsType} rust=${rustType}`);
-	}
-	for (const key of Object.keys(rustProps)) {
-		if (!(key in tsProps) && !allow.extra_props.includes(key)) diffs.push(`unexpected extra property "${key}" in omp-rs`);
-	}
-	const tsReq = schemaRequired(tsSchema);
-	const rustReq = schemaRequired(rustSchema);
-	for (const key of new Set([...tsReq, ...rustReq])) {
-		if (tsReq.has(key) === rustReq.has(key)) continue;
-		if (!tsReq.has(key)) {
-			diffs.push(`property "${key}" required only in omp-rs`);
-			continue;
-		}
-		if (!allow.optional_props.includes(key)) diffs.push(`property "${key}" no longer required in omp-rs`);
-	}
+	diffSchemaNode(tsSchema, rustSchema, "", allow, diffs);
+	const rustRequired = schemaRequired(rustSchema);
 	for (const key of allow.extra_props) {
-		if (rustReq.has(key)) diffs.push(`allowed extra property "${key}" must stay optional`);
+		if (rustRequired.has(key)) diffs.push(`allowed extra property "${key}" must stay optional`);
 	}
 	return diffs;
 }
