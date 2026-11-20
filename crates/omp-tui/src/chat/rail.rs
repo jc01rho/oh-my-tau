@@ -201,10 +201,10 @@ fn parse(lines: &[Line<'static>]) -> Parsed {
     Parsed { header, body }
 }
 
-/// Split a family header into `(title, description)` cells: drops the
-/// leading status/tool icon and the `Title:` colon.
 type CellRun = Vec<(char, Style)>;
 
+/// Split a family header into `(title, description)` cells: drops the
+/// leading status/tool icon and the `Title:` colon.
 fn split_header(cells: &[(char, Style)]) -> (CellRun, CellRun) {
     let mut cells: Vec<(char, Style)> = cells.to_vec();
     // Leading icon: one non-alphanumeric glyph (or `$`) followed by a space.

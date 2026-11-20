@@ -985,11 +985,15 @@ pub struct SessionTypedEntry {
 /// Union of session log entries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "preserve public SessionEntry variant API and avoid per-entry heap allocation"
+)]
 pub enum SessionEntry {
     Header(SessionHeader),
     Message(SessionMessageEntry),
     ServiceTierChange(SessionServiceTierChangeEntry),
-    ModelUsage(Box<SessionModelUsageEntry>),
+    ModelUsage(SessionModelUsageEntry),
     Custom(SessionCustomEntry),
     Typed(SessionTypedEntry),
     Other(serde_json::Value),

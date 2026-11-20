@@ -59,9 +59,10 @@ The third-party pieces it pulls in at build time are:
   repository**. Only a source build of omt links an ONNX Runtime binary, and that
   binary keeps its own MIT terms and copyright notice, unaffected by omt's license.
 
-`laya-ort` also depends on `tokenizers` and `serde_json`, which carry their own
-upstream licenses (Apache-2.0 and `MIT OR Apache-2.0` respectively); no model weights
-or tokenizer vocabularies are vendored in this repository.
+`laya-ort`'s remaining direct dependencies are `tokenizers` (Apache-2.0), `serde_json`
+(`MIT OR Apache-2.0`), `anyhow` (`MIT OR Apache-2.0`), and `rayon` (`MIT OR Apache-2.0`),
+each carrying its own upstream license; none is vendored in this repository, and no model
+weights or tokenizer vocabularies are vendored here either.
 
 ## `omp-goose` generated dedup kernel
 

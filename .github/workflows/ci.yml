@@ -31,7 +31,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check --locked licenses sources
+          arguments: --all-features --locked
+          command: check
+          command-arguments: licenses sources bans
 
   parity:
     runs-on: ubuntu-latest
@@ -55,12 +57,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: python3 -m pip install --no-cache-dir pyte
       - run: cargo build --release -p omp-cli --locked
-      - run: python3 tests-e2e/tui/run.py --client rs --rs target/release/omt --out /tmp/tui-e2e-ci
+      - run: python3 tests-e2e/tui/run.py --client rs --rs "${{ github.workspace }}/target/release/omt" --out /tmp/tui-e2e-ci
 
   build:
     strategy:

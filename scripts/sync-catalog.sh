@@ -26,6 +26,10 @@ if [ ! -d "$VENDOR_SRC" ]; then
   echo "sync-catalog: clone oh-my-pi there, or set OMP_VENDOR_SRC=/path/to/oh-my-pi" >&2
   exit 1
 fi
+# Resolve to an absolute path: `cd`, OMP_TS_SRC (read by gen-data.ts) and the
+# models.json argument below must all agree even when OMP_VENDOR_SRC is passed
+# relative to the caller's cwd.
+VENDOR_SRC="$(cd "$VENDOR_SRC" && pwd)"
 if [ ! -f "$VENDOR_SRC/packages/catalog/src/models.json" ]; then
   echo "sync-catalog: $VENDOR_SRC does not look like an oh-my-pi checkout (missing packages/catalog/src/models.json)" >&2
   exit 1

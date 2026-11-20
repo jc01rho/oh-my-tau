@@ -10,8 +10,8 @@ Reference upstreams for this repository (all MIT):
 
 | Track | Repository | Branch | Import commit | Reference commit |
 | --- | --- | --- | --- | --- |
-| `main` | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) | `main` | unrecorded (`18.9.1` / `18.6.1` import) | `b636e19d10` (`v19.0.1+126`) |
-| `omp2` | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) | `omp2` | none — no crate imported from this track | `2f92f3b` |
+| `main` | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) | `main` | unrecorded (`18.9.1` / `18.6.1` import) | `b636e19d10b664950d600505d194337bbeef42f0` (`v19.0.1+126`; short form `b636e19d10`) |
+| `omp2` | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) | `omp2` | none — no crate imported from this track | `2f92f3b5aa2035d21c9f016f9ff6350795e5685a` (short form `2f92f3b`) |
 | crossterm | [crossterm-rs/crossterm](https://github.com/crossterm-rs/crossterm) | `master` | n/a — registry crate | `492b764f` (`492b764f9f132d302903ff6f2f55e96c1b8cd0ec`, crate `0.28.1`) |
 | prime-agent fork base | [PrimeIntellect-ai/prime-agent](https://github.com/PrimeIntellect-ai/prime-agent) | default | not recorded yet — see "Known gaps" | not recorded yet — see "Known gaps" |
 
@@ -20,14 +20,19 @@ conflated. `import-commit` is the revision the files under `vendor/` were actual
 from; for every `pi-*` crate it is **unrecorded** (the initial import was taken at crate
 versions `18.9.1` / `pi-predict` `18.6.1` and the SHA was never captured). `reference-commit`
 is the revision the vendored tree is measured against and meant to be updated toward — `main`
-`b636e19d10` for the `pi-*` crates, and `omp2` `2f92f3b` as the `omp2` reference track (which
-supplies no vendored crate). `vendor-src.lock` carries both fields per crate; this document
-mirrors them 1:1.
+`b636e19d10b664950d600505d194337bbeef42f0` for the `pi-*` crates, and `omp2`
+`2f92f3b5aa2035d21c9f016f9ff6350795e5685a` as the `omp2` reference track (which supplies no
+vendored crate). `vendor-src.lock` carries both fields per crate; this document mirrors them
+1:1.
 
 The machine-readable form of these pins is [`vendor-src.lock`](../vendor-src.lock) at the
-repository root, which the compat-oracle scripts read. This document is the prose/decision
-view of the same facts; the two must agree. If they ever disagree, `vendor-src.lock` is what
-tooling consumes and this file is the bug.
+repository root. It is a **pin ledger**: the durable provenance record for the vendored trees,
+and nothing reads it at build or test time. The compat-oracle and other TS-driving scripts do
+not consult it — they resolve the upstream checkout at runtime from `$OMP_TS_SRC`, falling back
+to `<repo>/vendor-src/oh-my-pi` (gitignored, not distributed; see §5.9). This document is the
+prose/decision view of the same facts, and a pin change updates both files together; where the
+two disagree, treat the disagreement as a documentation bug and reconcile them, since no
+tooling will catch it for you.
 
 ## workspace members from `vendor/`
 
@@ -47,7 +52,7 @@ Each manifest carries the provenance line `Vendored from can1357/oh-my-pi (MIT),
 | `pi-diff` | `18.9.1` | `can1357/oh-my-pi` (`main`, `crates/diff`) | unrecorded (`18.9.1`) | `b636e19d10` (`main`) | dependency-free manifest |
 | `pi-edit` | `18.9.1` | `can1357/oh-my-pi` (`main`, `crates/edit`) | unrecorded (`18.9.1`) | `b636e19d10` (`main`) | depends on `pi-ast`, `pi-diff`, `pi-walker` by path |
 | `pi-vfs` | `18.9.1` | `can1357/oh-my-pi` (`main`, `crates/vfs`) | unrecorded (`18.9.1`) | `b636e19d10` (`main`) | |
-| `pi-walker` | `18.9.1` | `can1357/oh-my-pi` (`main`, `crates/walk` -> retired into `crates/xfs`) | unrecorded (`18.9.1`) | `b636e19d10` (`main`) | deleted upstream and folded into `crates/xfs::walk`; see §4.2b |
+| `pi-walker` | `18.9.1` | `can1357/oh-my-pi` (`main`, `crates/walker` -> retired into `crates/xfs::walk`) | unrecorded (`18.9.1`) | `b636e19d10` (`main`) | deleted upstream and folded into `crates/xfs::walk`; see §4.2b |
 | `pi-predict` | `18.6.1` | `can1357/oh-my-pi` (`main`, `crates/predict`, n-gram only) | unrecorded (`18.6.1`) | `b636e19d10` (`main`) | n-gram engine only; the `smollm` and `apple` engines are not vendored |
 
 All six `pi-*` crates come from the `main` track. `pi-predict` is **not** an `omp2` crate: its
@@ -121,7 +126,7 @@ base ever moves.
 | Origin | this project — ONNX Runtime inference for the Laya judge (`laya-judge` binary), replacing the Python `laya_predict` daemon |
 | Upstream pin | none (not vendored third-party code) |
 | External dependency of note | `ort = 2.0.0-rc.11` with `download-binaries`, plus `tokenizers 0.21` |
-| License obligation | the ONNX Runtime binary license is **not** an MIT grant and must be stated in `NOTICE.md` (Phase 0.2 in the migration plan) |
+| License obligation | ONNX Runtime is MIT-licensed (Microsoft / the ONNX Runtime contributors), and that obligation, together with the `ort` dual `MIT OR Apache-2.0` notice and the fact that no ONNX Runtime binary is distributed in this repo, is already satisfied in [`NOTICE.md`](../NOTICE.md#laya-ort-and-onnx-runtime-ort) (Phase 0.2 in the migration plan) |
 
 ## 5. Update policy
 
@@ -172,7 +177,5 @@ notes") and §5.2 #7 ("pin and delta for every `vendor/*`").
   checkout and added both here and to `vendor-src.lock`.
 - `NOTICE.md` states the `pa-*` crates are modified but does not list the modified files;
   the per-crate `vendor/pa-*/NOTICE` notes close this gap and must cover all four crates.
-- The ONNX Runtime license pulled in by `laya-ort` (`ort` `download-binaries`) is not yet
-  named in `NOTICE.md`.
 - `vendor/pa-ai/src/models_generated.rs` has no generator, so its content cannot be
   reproduced from a pin (§4.10).

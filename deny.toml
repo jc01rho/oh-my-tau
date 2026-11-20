@@ -46,10 +46,21 @@ allow-git = []
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Workspace crates are in-tree path dependencies (`path = "../omp-urls"`) whose
+# version is pinned centrally in [workspace.dependencies], so they carry no
+# version requirement of their own. `allow-wildcard-paths` exempts private
+# (non-publishable) path crates, but every crates/* member still inherits the
+# workspace `publish` setting (i.e. is treated as public), where cargo-deny
+# reports a wildcard. Making this strict again requires `publish = false` in
+# each member manifest; until then wildcards are warnings, not errors.
+wildcards = "warn"
+# Keep the exemption for the vendor/* path crates and any private members.
+allow-wildcard-paths = true
 highlight = "all"
-# crossterm is patched to vendor/crossterm (xterm modifyOtherKeys decoding);
-# a second crossterm copy means the patch stopped applying.
+# crossterm is patched to vendor/crossterm 0.28.1 (xterm modifyOtherKeys
+# decoding). Only that exact patched version is permitted; any other version
+# means the patch stopped applying.
 deny = [
-    { name = "crossterm", version = "<0.29" },
+    { name = "crossterm", version = "<0.28.1" },
+    { name = "crossterm", version = ">0.28.1" },
 ]

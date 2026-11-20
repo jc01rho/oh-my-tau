@@ -6,12 +6,14 @@ lockfile-version = 1
 [upstream."can1357/oh-my-pi"]
 repo = "https://github.com/can1357/oh-my-pi"
 ref = "main"
-# Latest upstream main inspected for migration baseline (v19.0.1+126).
-# Vendored pi-* crates below were imported earlier at crate versions 18.6.1 / 18.9.1
-# (exact import commit SHA unrecorded at initial import).
-reference-commit = "b636e19d10"
-# TS oracle sources (scripts/compat-oracle/*) default to <repo>/vendor-src/oh-my-pi
-# or the checkout named by $OMP_TS_SRC.
+# Full 40-hex SHA of the upstream main inspected for the migration baseline
+# (v19.0.1+126). Vendored pi-* crates below were imported earlier at crate
+# versions 18.6.1 / 18.9.1 (exact import commit SHA unrecorded at initial import).
+reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
+# This file is a pin ledger only (provenance record for the vendored trees); no
+# script reads it. The TS oracle/porting scripts resolve their oh-my-pi checkout
+# from $OMP_TS_SRC, else <repo>/vendor-src/oh-my-pi, which is where oracle-path
+# points (gitignored, not distributed).
 oracle-path = "vendor-src/oh-my-pi"
 license = "MIT"
 license-file = "vendor/LICENSE-oh-my-pi"
@@ -19,7 +21,7 @@ license-file = "vendor/LICENSE-oh-my-pi"
 [upstream.omp2]
 repo = "https://github.com/can1357/oh-my-pi"
 ref = "omp2"
-reference-commit = "2f92f3b"
+reference-commit = "2f92f3b5aa2035d21c9f016f9ff6350795e5685a"
 license = "MIT"
 license-file = "vendor/LICENSE-oh-my-pi"
 
@@ -28,42 +30,42 @@ path = "vendor/pi-ast"
 version = "18.9.1"
 source = "can1357/oh-my-pi (main, crates/ast)"
 import-commit = "unrecorded (v18.9.1)"
-reference-commit = "b636e19d10"
+reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 
 [crates.pi-diff]
 path = "vendor/pi-diff"
 version = "18.9.1"
 source = "can1357/oh-my-pi (main, crates/diff)"
 import-commit = "unrecorded (v18.9.1)"
-reference-commit = "b636e19d10"
+reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 
 [crates.pi-edit]
 path = "vendor/pi-edit"
 version = "18.9.1"
 source = "can1357/oh-my-pi (main, crates/edit)"
 import-commit = "unrecorded (v18.9.1)"
-reference-commit = "b636e19d10"
+reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 
 [crates.pi-vfs]
 path = "vendor/pi-vfs"
 version = "18.9.1"
 source = "can1357/oh-my-pi (main, crates/vfs)"
 import-commit = "unrecorded (v18.9.1)"
-reference-commit = "b636e19d10"
+reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 
 [crates.pi-walker]
 path = "vendor/pi-walker"
 version = "18.9.1"
-source = "can1357/oh-my-pi (main, crates/walker -> retired into crates/xfs)"
+source = "can1357/oh-my-pi (main, crates/walker, retired into crates/xfs::walk)"
 import-commit = "unrecorded (v18.9.1)"
-reference-commit = "b636e19d10"
+reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 
 [crates.pi-predict]
 path = "vendor/pi-predict"
 version = "18.6.1"
 source = "can1357/oh-my-pi (main, crates/predict, ngram only)"
 import-commit = "unrecorded (v18.6.1)"
-reference-commit = "b636e19d10"
+reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 
 [deps.crossterm]
 # Patched crossterm vendored under vendor/crossterm (upstream crate version 0.28.1).

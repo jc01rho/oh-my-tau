@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 
 use crate::agent::civil;
 
-/// Process-global session-entry sink type (see [`entry_sink`](Persist::entry_sink)).
+/// Process-global session-entry sink type (see [`Persistence::entry_sink`]).
 pub type EntrySink = std::sync::Arc<dyn Fn(&str, Value) + Send + Sync>;
 
 /// ISO-8601 UTC with milliseconds, like omp ("2026-10-11T14:08:39.790Z").

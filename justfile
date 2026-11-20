@@ -34,7 +34,7 @@ lint-pedantic:
 
 # Verify locked dependency licenses and sources against deny.toml.
 deny:
-    cargo deny --locked check licenses sources
+    cargo deny --locked check licenses sources bans
 
 # ---------------------------------------------------------------------------
 # Test
@@ -63,10 +63,16 @@ golden:
 # Run the tests-e2e/tui parity scenarios against a fresh release `omt` build.
 #
 # Real PTY, isolated HOME, local mock provider; the TS `omp` baseline is used
-# when it is on PATH. Extra args pass through, e.g. `just tui-e2e --only paste`.
+# when it is on PATH, otherwise the Rust client is the default. Extra args pass
+# through, e.g. `just tui-e2e --only paste_small --client rs`.
 tui-e2e *args:
     CARGO_TARGET_DIR=target/shared cargo build --release -p omp-cli --locked
-    python3 tests-e2e/tui/run.py {{ args }}
+    client_arg=""; \
+    case " {{ args }}" in \
+      *--client*) ;; \
+      *) command -v omp >/dev/null 2>&1 || client_arg="--client rs" ;; \
+    esac; \
+    python3 tests-e2e/tui/run.py {{ args }} $client_arg
 
 # ---------------------------------------------------------------------------
 # Housekeeping
