@@ -166,10 +166,12 @@ const sm = () => ({
 });
 
 const orUndefined = (v: unknown) => (typeof v === "string" ? v : undefined);
-// ExtensionAPI/ExtensionContext members this host does not implement. They
-// throw instead of doing nothing: a registration that cannot take effect must
-// not let the extension load and report success while nothing it registered is
-// ever shown (docs/research/09-extension-model-comparison.md).
+// Unimplemented ExtensionAPI registration/service members throw instead of
+// doing nothing: a registration that cannot take effect must not let the
+// extension load and report success while nothing it registered is ever shown
+// (docs/research/09-extension-model-comparison.md). Only those registration and
+// service methods throw; the headless `makeCtx().ui` surface stays no-op, as in
+// pi-coding-agent's noOpUIContext.
 const unsupportedNow = (what: string): never => {
   throw new Error(`${what} is not available in the Rust extension host`);
 };
@@ -270,7 +272,29 @@ function ctx() {
   return (ctxCache ??= makeCtx());
 }
 
-function makeApi(ext: Ext) {
+/** Undo log for one `loadOne` call: what it registered on host-wide state. */
+interface LoadTracker {
+  subs: (() => void)[];
+  providers: string[];
+}
+
+/** Undo everything a failed load registered, so nothing of it outlives the error. */
+function rollbackLoad(ext: Ext, track: LoadTracker) {
+  for (const off of track.subs.splice(0).reverse()) {
+    try {
+      off();
+    } catch (e) {
+      log("warn", `${ext.path} cleanup: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+  for (const name of track.providers.splice(0)) {
+    if (providers.get(name)?.extension !== ext.name) continue;
+    providers.delete(name);
+    notify("provider_unregistered", { name, extension: ext.name });
+  }
+}
+
+function makeApi(ext: Ext, track: LoadTracker) {
   const api = {
     logger: {
       debug: (m: string, x?: Json) => log("debug", m, x),
@@ -284,7 +308,16 @@ function makeApi(ext: Ext) {
     get zod() {
       return loadSchemaLib("zod");
     },
-    events,
+    // `events.on` subscribes on the host-wide bus, so the unsubscribe is recorded
+    // here and replayed by `rollbackLoad` when this extension fails to load.
+    events: {
+      on(ch: string, fn: (d: unknown) => void) {
+        const off = events.on(ch, fn);
+        track.subs.push(off);
+        return off;
+      },
+      emit: events.emit,
+    },
     pi: {},
     on(event: string, handler: Handler) {
       const l = ext.handlers.get(event) ?? [];
@@ -319,10 +352,14 @@ function makeApi(ext: Ext) {
     // the model registry), and kept host-side so list_providers can report them.
     registerProvider(name: string, config: Json) {
       providers.set(name, { name, config, extension: ext.name });
+      track.providers.push(name);
       notify("provider_registered", { name, config, extension: ext.name });
     },
     unregisterProvider(name: string) {
-      if (providers.delete(name)) notify("provider_unregistered", { name, extension: ext.name });
+      if (!providers.delete(name)) return;
+      const i = track.providers.indexOf(name);
+      if (i >= 0) track.providers.splice(i, 1);
+      notify("provider_unregistered", { name, extension: ext.name });
     },
     setLabel: (label: string) => {
       ext.label = label;
@@ -377,10 +414,15 @@ async function loadOne(path: string): Promise<{ ext?: Ext; error?: string }> {
   if (typeof factory !== "function") return { error: `Extension does not export a valid factory function: ${path}` };
   const base = basename(path).replace(/\.(ts|js)$/, "");
   const ext: Ext = { path: resolved, name: base === "index" ? basename(resolve(path, "..")) : base, handlers: new Map(), tools: new Map(), commands: new Map(), flags: new Map() };
-  const api = makeApi(ext);
+  const track: LoadTracker = { subs: [], providers: [] };
+  const api = makeApi(ext, track);
   try {
     await (factory as (a: unknown) => unknown)(api);
   } catch (e) {
+    // A factory that subscribes and then throws (e.g. on an unsupported
+    // registerShortcut) must not leave a live bus listener behind: emits would
+    // keep calling a handler whose extension never loaded.
+    rollbackLoad(ext, track);
     return { error: `Failed to load extension: ${e instanceof Error ? e.message : e}` };
   }
   return { ext };

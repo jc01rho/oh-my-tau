@@ -118,7 +118,13 @@ impl TaskArg {
     fn raw(&self) -> Vec<&str> {
         match self {
             Self::One(content) => vec![content.as_str()],
-            Self::Many(contents) => contents.iter().map(String::as_str).collect(),
+            // Empty and whitespace-only entries name nothing, so drop them:
+            // `["", "a"]` still targets `a` instead of failing the batch.
+            Self::Many(contents) => contents
+                .iter()
+                .map(String::as_str)
+                .filter(|content| !content.trim().is_empty())
+                .collect(),
         }
     }
 
@@ -1084,6 +1090,29 @@ mod tests {
         let unknown = tool.run(&json!({"op": "done", "task": "a, zzz"})).unwrap();
         assert_eq!(unknown.is_error, Some(true));
         assert!(format!("{:?}", unknown.content).contains("not found"));
+    }
+
+    #[test]
+    fn blank_array_entries_are_not_targets() {
+        let init = json!({"op": "init", "list": [{"phase": "P", "items": ["a", "b"]}]});
+        // A blank entry does not poison the batch: the named task still applies.
+        let tool = TodoTool::with_phases(Vec::new());
+        tool.run(&init).unwrap();
+        let result = tool.run(&json!({"op": "done", "task": ["", "a"]})).unwrap();
+        assert_eq!(result.is_error, None);
+        assert_eq!(
+            result.details["phases"][0]["tasks"][0]["status"],
+            json!("completed")
+        );
+
+        // Nothing but blanks names no task at all (like `task: ""`).
+        let tool = TodoTool::with_phases(Vec::new());
+        tool.run(&init).unwrap();
+        let result = tool.run(&json!({"op": "drop", "task": ["", " "]})).unwrap();
+        assert_eq!(result.is_error, None);
+        let tasks = result.details["phases"][0]["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["status"], json!("abandoned"));
+        assert_eq!(tasks[1]["status"], json!("abandoned"));
     }
 
     #[test]

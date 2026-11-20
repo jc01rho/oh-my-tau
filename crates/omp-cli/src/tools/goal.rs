@@ -32,7 +32,7 @@ pub fn schema() -> Value {
 
 /// omp `GoalStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // omp GoalStatus wire shape; paused/budget-limited round-trip for parity even though omp-rs never sets them
+#[allow(dead_code)] // omp GoalStatus wire shape; `pause_goal` sets `Paused`, but `BudgetLimited` is never set and the enum is only read through `as_str`
 pub enum GoalStatus {
     Active,
     Paused,
@@ -211,12 +211,16 @@ impl GoalRuntime {
     }
 
     /// omp `GoalRuntime.pauseGoal`: pauses a live goal so continuation stops
-    /// while blocked on the user; `None` when nothing pausable exists
-    /// (omp returns `undefined` and the tool reports no goal).
+    /// while blocked on the user. Re-pausing an already-paused goal returns it
+    /// unchanged instead of reporting no goal; `None` only when no goal exists
+    /// or it is complete/dropped (the tool then reports no goal).
     #[must_use]
     pub fn pause_goal(&mut self) -> Option<Goal> {
         let now = Self::now_millis();
-        let goal = self.goal.as_mut()?;
+        let goal = self.goal.as_ref()?;
+        if goal.status == GoalStatus::Paused {
+            return Some(goal.clone());
+        }
         if !matches!(goal.status, GoalStatus::Active | GoalStatus::BudgetLimited) {
             return None;
         }
@@ -450,8 +454,14 @@ mod tests {
         rt.create_goal("x", None).unwrap();
         let paused = rt.pause_goal().unwrap();
         assert_eq!(paused.status, GoalStatus::Paused);
-        assert!(rt.pause_goal().is_none());
+        // Re-pausing an already-paused goal is idempotent, not "no goal".
+        let again = rt.pause_goal().unwrap();
+        assert_eq!(again.status, GoalStatus::Paused);
+        assert_eq!(again.id, paused.id);
         assert_eq!(rt.resume_goal().unwrap().status, GoalStatus::Active);
+        // Complete/dropped goals are not pausable.
+        rt.complete_goal().unwrap();
+        assert!(rt.pause_goal().is_none());
     }
 
     #[test]

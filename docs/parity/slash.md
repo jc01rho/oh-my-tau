@@ -93,19 +93,19 @@ tau-only names. `Handler` is the function that actually runs.
 | 12 | `/modelpreset` | PORTED | `modelpreset_command` | `list save switch delete`. |
 | 13 | `/advisor` | STUB | `dispatch_builtin_more` | Always "inactive"; `configure` is TUI-only, `dump` has nothing to copy. |
 | 14 | `/export` | PORTED | `dispatch_builtin` | HTML export, `--themes`, `--copy`/`clipboard`. |
-| 15 | `/trace` | PORTED | `trace_command` (`slash.rs:2047`) | Prints the dashboard URL for this session. |
+| 15 | `/trace` | PORTED | `trace_command` (`slash.rs:2048`) | Prints the dashboard URL for this session. |
 | 16 | `/dump` | PORTED | `dispatch_builtin` / `_more` | `all` → zip: transcript + LLM request JSON + one file per subagent. |
 | 17 | `/share` | PORTED | `features::share::command` | Encrypted link or secret gist. |
 | 18 | `/browser` | PORTED | `features::browser::command` | `headless` / `visible`. |
 | 19 | `/todo` | PARTIAL | `todo_command` (`slash.rs:1425`) | All 11 verbs ported (`phasesToMarkdown`, `findPhaseFuzzy`, `findTaskFuzzy`, `normalize_in_progress`, `commitTodos`); `edit` is TUI-only outside the TUI. |
 | 20 | `/session` | PORTED | `dispatch_builtin` | `info` / `delete` / `pin [account]`. |
 | 21 | `/jobs` | PORTED | `slash_extra::interactive::jobs_command` | `full` for untruncated command lines. |
-| 22 | `/usage` | PARTIAL | `usage_command` (`slash.rs:1659`) | `show`/`reset`; anthropic OAuth limits + reset credits. `reset` cannot select `provider/credential-id`. |
-| 23 | `/stats` | PORTED | `stats_command` (`slash.rs:2027`) | In-process dashboard, `--port`/`--host`. |
+| 22 | `/usage` | PARTIAL | `usage_command` (`slash.rs:1663`) | `show`/`reset`; anthropic OAuth limits + reset credits. `reset` cannot select `provider/credential-id`. |
+| 23 | `/stats` | PORTED | `stats_command` (`slash.rs:2029`) | In-process dashboard, `--port`/`--host`. |
 | 24 | `/changelog` | PORTED | `changelog_command` (`slash.rs:2153`) | `full` / `last [N]`; `CHANGELOG.md` beside the executable. |
 | 25 | `/tools` | PORTED | `dispatch_builtin_more` | Lists `dumpTools` state. |
 | 26 | `/context` | PORTED | `dispatch_builtin_more` | `context_report` over `contextUsage`. |
-| 27 | `/mcp` | PARTIAL | `mcp_command` (`slash.rs:2215+`) | 17 subcommands incl. `smithery-*`, edits `mcp.json` preserving unknown fields; no `reconnectMcpServer` host hook, so `reauth`/`reconnect` degrade to restart guidance. |
+| 27 | `/mcp` | PARTIAL | `mcp_command` (`slash.rs:2586`) | 17 subcommands incl. `smithery-*`, edits `mcp.json` preserving unknown fields; no `reconnectMcpServer` host hook, so `reauth`/`reconnect` degrade to restart guidance. |
 | 28 | `/ssh` | PORTED | `features::ssh::command` | `add list remove help`. |
 | 29 | `/fresh` | PORTED | `dispatch_builtin` | Resets provider stream state; transcript untouched. |
 | 30 | `/compact` | PORTED | `dispatch_builtin` | `soft`, `remote`, `snapcompact`, focus text. |

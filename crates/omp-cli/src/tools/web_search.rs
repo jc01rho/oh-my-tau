@@ -1546,6 +1546,17 @@ fn truncate(s: &str, max_len: usize) -> String {
     format!("{truncated}…")
 }
 
+/// Cap the sources that get rendered. `limit` is ts `params.limit`;
+/// `num_search_results` caps rendered sources on Anthropic (no native field),
+/// so both are applied client-side, `limit` first.
+fn cap_sources(response: &mut SearchResponse, limit: Option<u32>, num_search_results: Option<u32>) {
+    for cap in [limit, num_search_results].into_iter().flatten() {
+        if response.sources.len() > cap as usize {
+            response.sources.truncate(cap as usize);
+        }
+    }
+}
+
 fn has_renderable_search_content(response: &SearchResponse) -> bool {
     response
         .answer
@@ -1796,18 +1807,7 @@ async fn web_search(params: Value, signal: AbortSignal) -> Result<AgentToolResul
         }
     }
 
-    // Limit sources.
-    if let Some(n) = parsed.limit {
-        if response.sources.len() > n as usize {
-            response.sources.truncate(n as usize);
-        }
-    }
-    // `num_search_results` caps rendered sources on Anthropic (no native field).
-    if let Some(n) = parsed.num_search_results {
-        if response.sources.len() > n as usize {
-            response.sources.truncate(n as usize);
-        }
-    }
+    cap_sources(&mut response, parsed.limit, parsed.num_search_results);
 
     if !has_renderable_search_content(&response) {
         let mut error_resp = response;
@@ -1951,6 +1951,68 @@ mod tests {
         assert!(text.contains("2d ago"));
         assert!(text.contains("https://doc.rust-lang.org/"));
         assert!(text.contains("# Sources"));
+    }
+
+    #[tokio::test]
+    async fn temperature_out_of_range_is_rejected() {
+        for bad in [1.5_f64, -0.1] {
+            let controller = pa_agent::abort::AbortController::new();
+            let params = json!({ "query": "rust", "temperature": bad });
+            let err = match web_search(params, controller.signal()).await {
+                Ok(_) => panic!("temperature {bad} should have been rejected"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("temperature must be between 0 and 1"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn num_search_results_zero_is_rejected() {
+        let controller = pa_agent::abort::AbortController::new();
+        let params = json!({ "query": "rust", "num_search_results": 0 });
+        let err = match web_search(params, controller.signal()).await {
+            Ok(_) => panic!("num_search_results: 0 should have been rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("num_search_results must be at least 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn num_search_results_caps_rendered_sources() {
+        let source = |i: usize| SearchSource {
+            title: format!("Source {i}"),
+            url: format!("https://example.com/{i}"),
+            snippet: None,
+            published_date: None,
+            age_seconds: None,
+            author: None,
+        };
+        let mut resp = SearchResponse {
+            provider: "anthropic".to_string(),
+            answer: Some("three sources".to_string()),
+            sources: (1..=3).map(source).collect(),
+            ..Default::default()
+        };
+
+        cap_sources(&mut resp, None, Some(2));
+        assert_eq!(resp.sources.len(), 2);
+
+        let text = format_for_llm(&resp, &[]);
+        assert_eq!(text.matches("    https://example.com/").count(), 2);
+        assert!(text.contains("https://example.com/2"));
+        assert!(!text.contains("https://example.com/3"));
+
+        // A cap above the source count leaves the list untouched.
+        cap_sources(&mut resp, None, Some(5));
+        assert_eq!(resp.sources.len(), 2);
+        cap_sources(&mut resp, Some(1), None);
+        assert_eq!(resp.sources.len(), 1);
     }
 
     #[test]

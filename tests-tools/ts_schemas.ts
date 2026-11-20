@@ -213,10 +213,10 @@ for (const name of Object.keys(EXTRACTORS)) {
 
 const outDir = dirname(fileURLToPath(import.meta.url));
 const outPath = join(outDir, "ts_tools.json");
-writeFileSync(outPath, `${JSON.stringify(tools, null, "\t")}\n`);
 
 if (failures.length > 0) {
 	console.error(`FAILED tools (${failures.length}):\n${failures.join("\n\n")}`);
 	process.exit(1);
 }
+writeFileSync(outPath, `${JSON.stringify(tools, null, "\t")}\n`);
 console.log(`wrote ${outPath} with ${tools.length} tools: ${tools.map(t => t.name).join(", ")}`);

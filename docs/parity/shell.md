@@ -91,10 +91,20 @@ Schema (from `crates/omp-cli/src/tools.rs:278` and `bash()`):
 | `async` | registers `bg_N` job in `JobRegistry`, returns `Backgrounded as job bg_N (deadline Ns)`, output read via `proc://<id>` | `start_background` |
 | `name` + `ready` | service mode: piped spawn, log-regex and/or TCP probe readiness, default 30 s, `127.0.0.1` | `start_service`, 48-char `^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$` |
 | `pty` | **accepted in schema, ignored in code** | `bash.rs` has no `pty` branch; grep for `"pty"` finds schema only |
-| `notify` | absent | recorded in `docs/parity/tools.md` §4 |
+| `notify` | regex over command output; matching lines are collected under the same per-batch bounds omp `OutputNotifier` uses (`NOTIFY_MAX_LINES = 50`, `NOTIFY_MAX_LINE_CHARS = 400`, blank lines never counted, overflow only counted) and reported with the finished result; a bad pattern fails the call | `Notify` in `bash.rs`; see the one-batch note below |
 
 `pty` is the one live inconsistency: description text says "`pty` only interactive" and the
 schema advertises it, while `run`/`start_service` always pipe stdout and null stdin.
+
+`notify` is now **PRESENT-GAP** rather than absent: the Phase 1 PR compiles the caller's
+regex, matches it against whole lines (an unterminated trailing line is carried between
+reads, bounded by `NOTIFY_MAX_PARTIAL_BYTES = 1600` so a huge newline-free line cannot grow
+the buffer or force a rescan, and a line longer than the cap is judged once from its prefix
+and clamped to 400 chars). The remaining difference is delivery cadence: omp emits a
+follow-up every 200 ms with a refilling 30-batch allowance, while the target has no
+follow-up channel on the job surface and therefore emits a single bounded report when the
+command settles — the timer and the allowance collapse into that one report, so a long
+running command's matches arrive only at completion.
 
 ---
 
@@ -151,8 +161,11 @@ zsh dialect). Both are true but about different references:
 
 The `bash.rs` header comment ("omp embeds a brush-based shell; see the port report") is
 therefore accurate for omp2. `tools.md` §7 should read as a mis-scoped correction rather than
-a code defect. All `bash`-relevant deltas in `tools.md` §4 (`notify`, six schema variants,
-`name` regex vs `maxLength:48`) stand unchanged and are out of scope here.
+a code defect. Of the `bash`-relevant deltas in `tools.md` §4, `notify` is no longer open:
+`bash.rs` implements it in the Phase 1 PR, so the tools.md row should be re-read as
+"implemented, single report instead of 200 ms follow-up batches" rather than "absent". The
+six schema variants and `name` regex vs `maxLength:48` still stand unchanged and are out of
+scope here.
 
 ---
 

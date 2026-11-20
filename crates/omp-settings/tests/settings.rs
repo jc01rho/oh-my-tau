@@ -290,6 +290,48 @@ fn provenance_record_fallback_keeps_lower_layer() {
 }
 
 #[test]
+fn provenance_named_empty_preset_contributes() {
+    let root = tempdir("provenance-presets");
+    let global = root.join("config.yml");
+    fs::write(&global, "modelPresets:\n  empty: {}\n").unwrap();
+
+    // A named (but empty-bodied) preset is saved data, so the naming layer owns it.
+    let project = root.join(".omp");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("config.yml"), "modelPresets:\n  other: {}\n").unwrap();
+    let settings = Settings::load_from(Some(&global), &project);
+    assert_eq!(
+        settings.provenance("modelPresets"),
+        Some(Provenance::Project)
+    );
+    assert_eq!(
+        settings.raw()["modelPresets"]["other"],
+        serde_json::json!({})
+    );
+    assert_eq!(
+        settings.raw()["modelPresets"]["empty"],
+        serde_json::json!({})
+    );
+
+    // A global named empty entry reports Global when the project stays silent.
+    let settings = Settings::load_from(Some(&global), &root.join("no-project"));
+    assert_eq!(
+        settings.provenance("modelPresets"),
+        Some(Provenance::Global)
+    );
+
+    // An unnamed empty record is still the fall-back marker: global keeps provenance.
+    let blank = root.join("blank");
+    fs::create_dir_all(&blank).unwrap();
+    fs::write(blank.join("config.yml"), "modelPresets: {}\n").unwrap();
+    let settings = Settings::load_from(Some(&global), &blank);
+    assert_eq!(
+        settings.provenance("modelPresets"),
+        Some(Provenance::Global)
+    );
+}
+
+#[test]
 fn provenance_env_requires_parseable_value() {
     let _guard = lock_env();
     let root = tempdir("provenance-env");

@@ -908,3 +908,47 @@ async fn unimplemented_api_members_reject_registration() {
     }
     host.shutdown().await.unwrap();
 }
+
+/// A factory that subscribes with `events.on` and then throws (here on the
+/// unimplemented `registerShortcut`) must not leave its listener on the
+/// host-wide bus: `bus_emit` would otherwise keep calling into an extension
+/// that never loaded. The listener writes a marker file synchronously, so a
+/// surviving subscription shows up before `bus_emit` returns -- no sleep.
+#[tokio::test]
+async fn failed_load_unsubscribes_events_on_listeners() {
+    if common::bun_missing("failed_load_unsubscribes_events_on_listeners") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("omp-ext-subs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let hit = dir.join("hit");
+    let _ = std::fs::remove_file(&hit);
+    let ext = dir.join("subs.ts");
+    std::fs::write(
+        &ext,
+        format!(
+            "import {{ writeFileSync }} from \"node:fs\";\n\
+             export default function (pi: any): void {{\n\
+             \x20 pi.events.on(\"ch\", () => writeFileSync({hit:?}, \"hit\"));\n\
+             \x20 pi.registerShortcut(\"c\", {{}});\n\
+             }}\n",
+            hit = hit.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host.load(Some(&[ext]), None, "/tmp", None).await.unwrap();
+    assert!(r.loaded.is_empty(), "{r:?}");
+    assert_eq!(r.errors.len(), 1, "{r:?}");
+    assert!(r.errors[0].error.contains("registerShortcut"), "{r:?}");
+
+    host.request("bus_emit", json!({"channel": "ch", "data": {}}))
+        .await
+        .unwrap();
+    assert!(
+        !hit.exists(),
+        "a failed load must leave no live bus listener behind"
+    );
+    host.shutdown().await.unwrap();
+}

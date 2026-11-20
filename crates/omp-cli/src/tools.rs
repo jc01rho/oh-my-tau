@@ -569,7 +569,8 @@ mod tests {
             "Glob files/dirs: `;`-separated paths or internal URLs (`local://*.md`, `omp://**/*.md`); default workspace root."
         );
         // omp `findSchema`: `limit?": "1 <= number.integer <= 200"`, and `pattern`
-        // stays off the wire schema while `search::glob` accepts it as an alias.
+        // stays off the wire schema. NOTE: unlike upstream `GLOB_ARGUMENTS`,
+        // `search::glob` does not read `pattern` yet - wiring it is deferred.
         assert_eq!(
             tools
                 .iter()

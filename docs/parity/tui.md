@@ -85,8 +85,8 @@ needs the hold-Space gesture, which does not exist in `crates/omp-tui`).
 
 ## 2. Overlays — 12/76
 
-`crates/omp-tui/src/overlays/` holds 12 files / 12,796 lines: `mod.rs` (the
-focus stack) plus 11 modules, of which `settings_defs.rs` (3,838) is data
+`crates/omp-tui/src/overlays/` holds 12 files / 12,776 lines: `mod.rs` (the
+focus stack) plus 11 modules, of which `settings_defs.rs` (3,818) is data
 rather than a focus-owning overlay. **So 10 real overlays**: `command_palette`,
 `diff`, `help`, `large_paste`, `models`, `session_info`, `sessions`,
 `settings`, `thinking`, `tree`.
@@ -97,9 +97,9 @@ also counts the `extensions/` subdirectory's 9 files separately —
 `inspector-model`, `live-tool-session`, `state-manager`, …).
 
 Coverage is by *capability*, not by *module*: the Rust side merges several
-upstream overlays into one. `/model` → `models.rs` (2,276) absorbs
+upstream overlays into one. `/model` → `models.rs` (2,277) absorbs
 `model-browser`/`model-picker`/`model-selector`/`model-hub` partially;
-`/settings` → `settings.rs` (2,880) + `settings_defs.rs` (3,838);
+`/settings` → `settings.rs` (2,876) + `settings_defs.rs` (3,818);
 session browsing → `sessions.rs` (1,154) + `tree.rs` (386). Even crediting
 merges generously, roughly 60 upstream overlays have no Rust surface.
 
@@ -173,23 +173,26 @@ effort, extensions, ext_developer, approval, word_complete, paste_small,
 paste_large, paste_clipboard, paste_clipboard_kitty
 ```
 
-Status: **22 green**. Two scenarios are tracked as known gaps rather than
-counted green:
+Status: **22 green**. Two scenarios sit outside that count:
 
 - `ext_developer` — the developer-role extension scenario; needs
   `prepare_ext_probe` fixtures and the dev-role flow.
-- `new_clears` — `/new` must clear the transcript; the clear path is the gap.
+- `new_clears` — `/new` does clear the transcript and the scenario passes
+  locally, but it is a timing flake, so CI excludes it from the gate.
 
-Both stay in `SCENARIOS` deliberately: they are the acceptance test for the
-work that fixes them, and they must flip to green rather than be deleted.
+Both stay in `SCENARIOS` deliberately: `ext_developer` is the acceptance test
+for the work that closes the dev-role flow, and `new_clears` goes back into the
+CI `--only` set once the flake is fixed.
 
 Caveats that matter for anyone reading "green" as a guarantee:
 
 1. **Not run in this session.** The harness needs built `omt` and `omp`
    binaries (`--rs target/shared/release/omt`); the status above is the
    recorded harness result, not a re-run.
-2. **Not in CI.** Per the migration plan §2.3 the harness does not run on any
-   automated path, so this number can silently rot between manual runs.
+2. **CI runs a subset, not the whole harness.** `.github/workflows/ci.yml`
+   gates the 22 green scenarios by naming them in `--only`; `ext_developer`
+   (developer-role gap) and `new_clears` (timing flake) are left out. A
+   scenario failing outside that subset is never caught automatically.
 3. The coverage is 24 scripted paths against a mock provider — it proves
    scripted parity, not interactive-behaviour parity across overlays. The
    ~60 unported overlays have no scenario at all.

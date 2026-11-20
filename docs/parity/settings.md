@@ -88,11 +88,11 @@ Three tiers, measured by what appears outside `crates/omp-settings/src/`:
 | **B - mention-only** | the id appears as a string elsewhere (panel row, message text, log, test, tool-name table) but no accessor read | **345** |
 | **C - absent** | no occurrence anywhere outside the registry | **144** |
 
-Tier B is not consumption. It includes every one of the 379 panel rows (so editing a
-setting persists a value nothing consumes), UI-only labels such as
-`hindsightActive` / `mnemopiActive` / `autolearnActive`, and the four phantom memory
-tool names in `omp-tui/src/tools/task.rs`. Tier A is the only set with observable
-behaviour.
+Tier B is not consumption. Panel rows with no accessor read belong to tier B, so
+editing such a setting persists a value nothing consumes. The tier also holds UI-only
+labels such as `hindsightActive` / `mnemopiActive` / `autolearnActive`, and the four
+phantom memory tool names in `omp-tui/src/tools/task.rs`. Tier A is the only set with
+observable behaviour.
 
 Settings-loading crates: `omp-cli` (19 files), `omp-tui` (5), `omp-providers` (2),
 `omp-urls` (1), `omp-collab` (1).
@@ -172,37 +172,39 @@ See `docs/research/06-memory-context-gap.md` for the subsystem behind these keys
 `Settings::provenance(id) -> Option<Provenance>`, documented as "env beats project
 beats global beats default".
 
-What the implementation actually returns (`settings.rs`, ~208-229):
+Status: all four layers are now tracked. The merge records the supplying layer per
+id in a parallel `HashMap<&str, Provenance>` instead of inferring it from the merged
+map, so:
 
-- **Env** - correct. It re-checks the registry `env:` variable directly and parses it.
-- **Project** - returned for *any* value found in the merged map. Because layer 1
-  seeds the map with every registry default, a defaulted setting is found, so
-  `Project` is what comes back for essentially all 500+ defaulted ids whether the
-  value came from a config file or from the TS default.
-- **Default** - unreachable in practice: the `(None, true)` arm requires the value to
-  be absent from the merged map, but the defaults layer put it there.
-- **Global** - never constructed anywhere in the tree.
-- `None` - only for ids that have neither a configured value nor a default.
+- **Env** - reported when the registry `env:` variable is set and parses; it still
+  wins over every file layer.
+- **Project** - reported only for ids actually supplied by the project config file.
+- **Global** - reported only for ids actually supplied by the global config file.
+- **Default** - reported for ids that resolved from the registry default table
+  rather than from any configured layer.
+- `None` - only for ids that are neither configured nor defaulted.
 
-Consumers that inherit the misreport:
+Precedence stays env > project > global > default, and the per-layer merging is
+unchanged, so a set-but-unparsable value still resolves the way it did before.
+
+Consumers:
 
 - `omp-urls/src/schemes/cfg.rs:92` renders `provenance_label(...)` as the `cfg://`
-  `source:` line (`cfg.rs:271`), so every row claims to come from the project layer.
-- `omp-providers/src/fallback.rs:90` filters "only user-supplied (non-Default) keys" -
-  the filter can never reject anything.
-- `omp-cli/src/compact.rs:93` and `omp-cli/src/sysprompt.rs:55` both branch on
-  "Default-provenance key leaves the default standing"; that branch is dead, so an
-  unset key is treated as explicitly configured.
+  `source:` line (`cfg.rs:271`); each row now names the layer it really came from.
+- `omp-providers/src/fallback.rs:90` filters "only user-supplied (non-Default) keys";
+  the filter is live again, so a defaulted key is rejected as intended.
+- `omp-cli/src/compact.rs:93` and `omp-cli/src/sysprompt.rs:55` branch on
+  "Default-provenance key leaves the default standing"; that branch now fires for
+  genuinely unset keys.
 - The settings panel only ever writes the global layer, so it does not depend on the
-  API (`overlays/settings.rs:741`).
+  API (`overlays/settings.rs:741`); its writes now report `Global`.
 
-Test coverage: `crates/omp-settings/tests/settings.rs:133` is a single
-`let _ = Provenance::Default;` smoke line. No test distinguishes Global / Project /
-Env, which is why the defect survives.
-
-Fixing this requires recording the layer during merge (e.g. a parallel
-`HashMap<&str, Provenance>` per layer, or merging into `(value, layer)` pairs) rather
-than inferring from the merged map.
+Test coverage: `crates/omp-settings/tests/settings.rs` now exercises the API per layer
+in Phase 1 - `provenance_distinguishes_all_four_layers`,
+`provenance_reports_default_for_untouched_settings`,
+`provenance_record_fallback_keeps_lower_layer` and
+`provenance_named_empty_preset_contributes` - so a regression in the merge
+bookkeeping fails a test rather than surfacing as a wrong `cfg://` label.
 
 ## 7. Other behaviours confirmed
 
@@ -217,16 +219,19 @@ than inferring from the merged map.
   `images.urls.*`, `tier.*` have typed helpers in `settings.rs`. Of these only
   `model_presets()`/`model_roles()` (via `omp-cli/src/slash.rs`), `cycle_order()`,
   `tier()`, `workspace_additional_directories()`, `stream_server_url()`,
-  `stream_redact_patterns()`, `images_urls_enabled()`/`images_urls_backends()` have
-  callers; the four `enabled*/disabled*` allowlist helpers have none.
+  `images_urls_enabled()`/`images_urls_backends()` have callers. The four
+  `enabled*/disabled*` allowlist helpers and `stream_redact_patterns()`
+  (`settings.rs:361`) have none.
 - `snapcompact.*` (3 ids) and `context.policy/*`, `tools.format`, `read.toolResultPreview`
   appear as strings inside `omp-compact` / `omp-cli` but are never read through the
   store, so they sit in tier B.
 
 ## 8. Work items, in order
 
-1. Fix `provenance()` to track the supplying layer during merge; add Global / Project /
-   Env / Default tests. This unblocks correct `cfg://` labels and the two dead
+1. ~~Fix `provenance()` to track the supplying layer during merge; add Global /
+   Project / Env / Default tests.~~ Done in Phase 1: the merge records the supplying
+   layer for all four layers (Env / Project / Global / Default) and regression tests
+   cover each one. This unblocks correct `cfg://` labels and the two previously dead
    "is it user-supplied" branches (`fallback.rs`, `compact.rs`, `sysprompt.rs`).
 2. Delete or implement the four phantom accessor groups: `disabledProviders`,
    `disabledExtensions`, `enabledProviders`, `enabledModels`, plus `contextFiles.extra`.

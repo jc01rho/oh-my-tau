@@ -14,9 +14,9 @@
 //! into the question list the dialog and renderer already speak (`<legend>` /
 //! `<label>` text becomes the question, radio/checkbox labels become options, a
 //! checkbox group is `multi`, `<textarea>` and text inputs become free-text
-//! questions), and the dialog/result path below is unchanged. A bare string is
-//! read as the html, and the pre-HTML `questions[]` shape is kept as a fallback
-//! (omp `recoverAskHtml`).
+//! questions), and the dialog/result path below is unchanged. Arguments are
+//! object-only (`{html}`), matching the schema; the pre-HTML `questions[]`
+//! shape is kept as a fallback (omp `recoverAskHtml`).
 //!
 //! Divergences from upstream, all host-driven: an option answers with its label
 //! (no `value`), per-field validation (`required`, `pattern`), image answers and
@@ -132,6 +132,10 @@ struct QuestionItem {
     multi: Option<bool>,
     #[serde(default)]
     recommended: Option<f64>,
+    /// Every pre-checked option index (multi-select defaults); `recommended`
+    /// keeps carrying the first one for the single-select paths.
+    #[serde(default)]
+    checked: Vec<usize>,
 }
 
 /// Legacy pre-HTML argument shape (omp `recoverAskHtml`'s `questions` branch).
@@ -197,7 +201,11 @@ struct OptDraft {
 /// Text being collected for the tag whose content is still open.
 enum Capture {
     Legend(String),
-    Label(String),
+    Label {
+        text: String,
+        /// `for="..."` target element id, if the label names one.
+        for_target: Option<String>,
+    },
     Option {
         field: usize,
         index: usize,
@@ -269,10 +277,22 @@ fn tokenize(html: &str) -> Vec<Token> {
             continue;
         }
         let Some(end) = tag_end(after) else { break };
-        if let Some(tag) = parse_tag(&after[1..end]) {
+        let tag = parse_tag(&after[1..end]);
+        // `<textarea>` content is raw text: no markup is recognized until
+        // `</textarea>`, so a stray `<` in the body cannot become a control.
+        let raw_text = matches!(&tag, Some(tag) if !tag.closing && tag.name == "textarea");
+        if let Some(tag) = tag {
             tokens.push(Token::Tag(tag));
         }
         rest = &after[end + 1..];
+        if raw_text {
+            let lowered = rest.to_ascii_lowercase();
+            let body_end = lowered.find("</textarea").unwrap_or(rest.len());
+            rest = match rest[body_end..].find('>') {
+                Some(close) => &rest[body_end + close + 1..],
+                None => "",
+            };
+        }
     }
     if !rest.is_empty() {
         tokens.push(Token::Text(decode_entities(rest)));
@@ -336,7 +356,7 @@ fn squash(text: &str) -> String {
 fn field_index(
     drafts: &mut Vec<FieldDraft>,
     name: &str,
-    legend: Option<String>,
+    legend: Option<&str>,
     choice: bool,
 ) -> usize {
     if let Some(index) = drafts.iter().position(|draft| draft.name == name) {
@@ -344,13 +364,13 @@ fn field_index(
             drafts[index].choice = true;
         }
         if drafts[index].question.is_none() {
-            drafts[index].question = legend;
+            drafts[index].question = legend.map(str::to_owned);
         }
         return index;
     }
     drafts.push(FieldDraft {
         name: name.to_owned(),
-        question: legend,
+        question: legend.map(str::to_owned),
         multi: false,
         choice,
         options: Vec::new(),
@@ -358,91 +378,167 @@ fn field_index(
     drafts.len() - 1
 }
 
+/// Element `id`, used to resolve `<label for="...">`.
+fn element_id(tag: &HtmlTag) -> Option<&str> {
+    tag.attr("id").map(str::trim).filter(|id| !id.is_empty())
+}
+
+/// Record a legend on the innermost fieldset (index 0 is the root sentinel).
+fn set_legend(legends: &mut [Option<String>], text: String) {
+    if let Some(slot) = legends.last_mut() {
+        *slot = Some(text);
+    }
+}
+
+/// Finalize the open `<option>` body: an explicit `</option>` or the implicit
+/// close before the next `<option>` / `</select>`.
+fn close_option(drafts: &mut [FieldDraft], captures: &mut Vec<Capture>) {
+    let pending = match captures.last() {
+        Some(Capture::Option { field, index, text }) => Some((*field, *index, squash(text))),
+        _ => None,
+    };
+    let Some((field, index, text)) = pending else {
+        return;
+    };
+    if drafts[field].options[index].label.is_empty() {
+        drafts[field].options[index].label = text;
+    }
+    captures.pop();
+}
+
 /// Fields of the form's named controls, in document order (omp `parseHtmlForm`
 /// flattened onto the TUI question model).
 #[allow(clippy::cast_precision_loss)] // `recommended` is omp's number-typed option index
 fn parse_html_form(html: &str) -> Vec<QuestionItem> {
     let mut drafts: Vec<FieldDraft> = Vec::new();
-    let mut legend: Option<String> = None;
+    // Innermost fieldset's legend; index 0 is the sentinel for markup outside
+    // any fieldset, so closing the outermost fieldset clears the legend and
+    // closing a nested one restores its parent's.
+    let mut legends: Vec<Option<String>> = vec![None];
     let mut captures: Vec<Capture> = Vec::new();
     let mut label_depth = 0_usize;
     let mut label_options: Vec<(usize, usize)> = Vec::new();
     let mut label_fields: Vec<usize> = Vec::new();
     let mut select_field: Option<usize> = None;
+    // `for="..."` targets: element id -> field, and element id -> option slot.
+    let mut id_fields: Vec<(String, usize)> = Vec::new();
+    let mut id_options: Vec<(String, usize, usize)> = Vec::new();
+    // `<label for="...">` text, resolved once every element id is known (the
+    // label may precede or follow the element it names).
+    let mut for_labels: Vec<(String, String)> = Vec::new();
+    // Only controls inside `<form>` count. A fragment with no `<form>` at all
+    // is read as the form body, which omp's `recoverAskHtml` tolerates.
+    let has_form = html.to_ascii_lowercase().contains("<form");
+    let mut form_depth = 0_usize;
 
     for token in tokenize(html) {
         let tag = match token {
             Token::Text(text) => {
-                match captures.last_mut() {
-                    Some(Capture::Legend(buffer)) => buffer.push_str(&text),
-                    Some(Capture::Label(buffer)) => buffer.push_str(&text),
-                    Some(Capture::Option { text: buffer, .. }) => buffer.push_str(&text),
-                    None => {}
+                if let Some(capture) = captures.last_mut() {
+                    match capture {
+                        Capture::Legend(buffer) | Capture::Label { text: buffer, .. } => {
+                            buffer.push_str(&text);
+                        }
+                        Capture::Option { text: buffer, .. } => buffer.push_str(&text),
+                    }
                 }
                 continue;
             }
             Token::Tag(tag) => tag,
         };
 
+        // Form boundaries: controls outside a `<form>` are not collected.
+        if tag.name == "form" {
+            form_depth = if tag.closing {
+                form_depth.saturating_sub(1)
+            } else {
+                form_depth + 1
+            };
+            continue;
+        }
+        if has_form && form_depth == 0 {
+            continue;
+        }
+
         if tag.closing {
             match tag.name.as_str() {
                 "legend" => {
-                    if matches!(captures.last(), Some(Capture::Legend(_))) {
-                        if let Some(Capture::Legend(text)) = captures.pop() {
-                            let text = squash(&text);
-                            if !text.is_empty() {
-                                legend = Some(text);
-                            }
+                    if let Some(Capture::Legend(text)) = captures.last() {
+                        let text = squash(text);
+                        captures.pop();
+                        if !text.is_empty() {
+                            set_legend(&mut legends, text);
                         }
                     }
                 }
                 // A legend titles only its own fieldset.
-                "fieldset" => legend = None,
+                "fieldset" => {
+                    if legends.len() > 1 {
+                        legends.pop();
+                    } else if let Some(slot) = legends.last_mut() {
+                        *slot = None;
+                    }
+                }
                 "label" => {
                     label_depth = label_depth.saturating_sub(1);
-                    if matches!(captures.last(), Some(Capture::Label(_))) {
-                        if let Some(Capture::Label(text)) = captures.pop() {
-                            let text = squash(&text);
-                            let question = text.trim_end_matches([':', '*']).trim().to_owned();
-                            for (field, index) in label_options.drain(..) {
-                                if drafts[field].options[index].label.is_empty() {
+                    let pending = match captures.last() {
+                        Some(Capture::Label { text, for_target }) => {
+                            Some((squash(text), for_target.clone()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((text, for_target)) = pending {
+                        captures.pop();
+                        let question = text.trim_end_matches([':', '*']).trim().to_owned();
+                        let mut targets: Vec<(usize, Option<usize>)> = label_options
+                            .drain(..)
+                            .map(|(field, index)| (field, Some(index)))
+                            .collect();
+                        targets.extend(label_fields.drain(..).map(|field| (field, None)));
+                        if let Some(id) = for_target {
+                            for_labels.push((id, text.clone()));
+                        }
+                        for (field, option) in targets {
+                            match option {
+                                Some(index) if drafts[field].options[index].label.is_empty() => {
                                     drafts[field].options[index].label = text.clone();
                                 }
-                            }
-                            for field in label_fields.drain(..) {
-                                if drafts[field].question.is_none() && !question.is_empty() {
+                                None if drafts[field].question.is_none()
+                                    && !question.is_empty() =>
+                                {
                                     drafts[field].question = Some(question.clone());
                                 }
+                                _ => {}
                             }
                         }
                     }
                 }
-                "option" => {
-                    if matches!(captures.last(), Some(Capture::Option { .. })) {
-                        if let Some(Capture::Option { field, index, text }) = captures.pop() {
-                            let text = squash(&text);
-                            if drafts[field].options[index].label.is_empty() {
-                                drafts[field].options[index].label = text;
-                            }
-                        }
-                    }
-                }
+                "option" => close_option(&mut drafts, &mut captures),
                 "select" => {
+                    close_option(&mut drafts, &mut captures);
                     select_field = None;
-                    if matches!(captures.last(), Some(Capture::Option { .. })) {
-                        captures.pop();
-                    }
                 }
                 _ => {}
             }
             continue;
         }
 
+        let legend = legends.last().cloned().flatten();
+        let legend = legend.as_deref();
+
         match tag.name.as_str() {
+            "fieldset" => legends.push(None),
             "legend" => captures.push(Capture::Legend(String::new())),
             "label" => {
                 label_depth += 1;
-                captures.push(Capture::Label(String::new()));
+                captures.push(Capture::Label {
+                    text: String::new(),
+                    for_target: tag
+                        .attr("for")
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned),
+                });
             }
             "input" => {
                 let Some(name) = tag.attr("name").map(str::trim).filter(|n| !n.is_empty()) else {
@@ -455,7 +551,7 @@ fn parse_html_form(html: &str) -> Vec<QuestionItem> {
                 match kind.as_str() {
                     "hidden" | "submit" | "button" | "reset" | "image" | "file" => {}
                     "radio" | "checkbox" => {
-                        let field = field_index(&mut drafts, name, legend.clone(), true);
+                        let field = field_index(&mut drafts, name, legend, true);
                         if kind == "checkbox" {
                             drafts[field].multi = true;
                         }
@@ -468,20 +564,29 @@ fn parse_html_form(html: &str) -> Vec<QuestionItem> {
                         if label_depth > 0 {
                             label_options.push((field, index));
                         }
+                        if let Some(id) = element_id(&tag) {
+                            id_options.push((id.to_owned(), field, index));
+                        }
                     }
                     _ => {
-                        let field = field_index(&mut drafts, name, legend.clone(), false);
+                        let field = field_index(&mut drafts, name, legend, false);
                         if label_depth > 0 {
                             label_fields.push(field);
+                        }
+                        if let Some(id) = element_id(&tag) {
+                            id_fields.push((id.to_owned(), field));
                         }
                     }
                 }
             }
             "textarea" => {
                 if let Some(name) = tag.attr("name").map(str::trim).filter(|n| !n.is_empty()) {
-                    let field = field_index(&mut drafts, name, legend.clone(), false);
+                    let field = field_index(&mut drafts, name, legend, false);
                     if label_depth > 0 {
                         label_fields.push(field);
+                    }
+                    if let Some(id) = element_id(&tag) {
+                        id_fields.push((id.to_owned(), field));
                     }
                 }
             }
@@ -491,15 +596,25 @@ fn parse_html_form(html: &str) -> Vec<QuestionItem> {
                     .map(str::trim)
                     .filter(|n| !n.is_empty())
                     .map(|name| {
-                        let field = field_index(&mut drafts, name, legend.clone(), true);
+                        let field = field_index(&mut drafts, name, legend, true);
                         if tag.has("multiple") {
                             drafts[field].multi = true;
+                        }
+                        if label_depth > 0 {
+                            label_fields.push(field);
+                        }
+                        if let Some(id) = element_id(&tag) {
+                            id_fields.push((id.to_owned(), field));
                         }
                         field
                     });
             }
             "option" => {
+                close_option(&mut drafts, &mut captures);
                 let Some(field) = select_field else { continue };
+                if tag.has("disabled") {
+                    continue;
+                }
                 let index = drafts[field].options.len();
                 drafts[field].options.push(OptDraft {
                     label: String::new(),
@@ -516,11 +631,35 @@ fn parse_html_form(html: &str) -> Vec<QuestionItem> {
         }
     }
 
+    // Resolve `<label for="id">` against the collected element ids.
+    for (id, text) in for_labels {
+        let question = text.trim_end_matches([':', '*']).trim().to_owned();
+        for (target, field, index) in &id_options {
+            if *target == id && drafts[*field].options[*index].label.is_empty() {
+                drafts[*field].options[*index].label = text.clone();
+            }
+        }
+        for (target, field) in &id_fields {
+            if *target == id && drafts[*field].question.is_none() && !question.is_empty() {
+                drafts[*field].question = Some(question.clone());
+            }
+        }
+    }
+
     drafts
         .into_iter()
         .map(|mut draft| {
             let question = draft.question.take().unwrap_or_else(|| draft.name.clone());
-            let recommended = draft.options.iter().position(|option| option.checked);
+            // Every checked option, not just the first: multi-select defaults
+            // keep all of them.
+            let checked: Vec<usize> = draft
+                .options
+                .iter()
+                .enumerate()
+                .filter(|(_, option)| option.checked)
+                .map(|(index, _)| index)
+                .collect();
+            let recommended = checked.first().copied();
             let options: Vec<OptionItem> = if draft.choice {
                 draft
                     .options
@@ -545,6 +684,7 @@ fn parse_html_form(html: &str) -> Vec<QuestionItem> {
                 options,
                 multi: draft.multi.then_some(true),
                 recommended: recommended.map(|index| index as f64),
+                checked,
             }
         })
         .collect()
@@ -591,28 +731,25 @@ pub fn tool_with_ui(ui: Arc<dyn AskUi>) -> Arc<dyn AgentTool> {
 }
 
 fn parse_params(raw: Value) -> Result<Vec<QuestionItem>> {
-    let questions = match &raw {
-        Value::String(html) => parse_html_form(html),
-        Value::Object(_) => {
-            if let Some(html) = raw.get("html").and_then(Value::as_str) {
-                if html.trim().is_empty() {
-                    return Err(anyhow!(INVALID_ASK_ERROR));
-                }
-                parse_html_form(html)
-            } else if raw.get("questions").is_some() {
-                let params: Params = serde_json::from_value(raw.clone())
-                    .map_err(|e| anyhow!("Invalid ask arguments: {e}"))?;
-                if params.questions.is_empty() {
-                    return Err(anyhow!(
-                        "Invalid ask arguments: questions must contain at least 1 item"
-                    ));
-                }
-                params.questions
-            } else {
-                return Err(anyhow!(INVALID_ASK_ERROR));
-            }
+    // Dispatch is object-only (`{html}` or `{questions[]}`), as the schema
+    // declares; the harness validates arguments against it before the call, so
+    // any other shape is rejected here instead of being coerced.
+    let questions = if let Some(html) = raw.get("html").and_then(Value::as_str) {
+        if html.trim().is_empty() {
+            return Err(anyhow!(INVALID_ASK_ERROR));
         }
-        _ => return Err(anyhow!(INVALID_ASK_ERROR)),
+        parse_html_form(html)
+    } else if raw.get("questions").is_some() {
+        let params: Params = serde_json::from_value(raw.clone())
+            .map_err(|e| anyhow!("Invalid ask arguments: {e}"))?;
+        if params.questions.is_empty() {
+            return Err(anyhow!(
+                "Invalid ask arguments: questions must contain at least 1 item"
+            ));
+        }
+        params.questions
+    } else {
+        return Err(anyhow!(INVALID_ASK_ERROR));
     };
     for question in &questions {
         if let Some(reserved) = question
@@ -688,6 +825,11 @@ fn frame_question(question: &QuestionItem) -> Value {
     if let Some(recommended) = question.recommended {
         obj.insert("recommended".into(), json!(recommended));
     }
+    // Single-select defaults already travel as `recommended`; a multi-select
+    // needs every pre-checked index.
+    if question.multi == Some(true) && !question.checked.is_empty() {
+        obj.insert("checked".into(), json!(question.checked));
+    }
     Value::Object(obj)
 }
 
@@ -702,6 +844,14 @@ fn timed_out_results(questions: &[QuestionItem]) -> Vec<QuestionResult> {
         .iter()
         .map(|q| {
             let labels: Vec<String> = q.options.iter().map(|o| o.label.clone()).collect();
+            let defaults: Vec<String> = if q.multi.unwrap_or(false) {
+                q.checked
+                    .iter()
+                    .filter_map(|&index| labels.get(index).cloned())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let fallback = if labels.is_empty() {
                 None
             } else {
@@ -714,7 +864,11 @@ fn timed_out_results(questions: &[QuestionItem]) -> Vec<QuestionResult> {
                 question: q.question.clone(),
                 options: labels,
                 multi: q.multi.unwrap_or(false),
-                selected: fallback.into_iter().collect(),
+                selected: if defaults.is_empty() {
+                    fallback.into_iter().collect()
+                } else {
+                    defaults
+                },
                 custom: None,
                 timed_out: true,
             }
@@ -962,6 +1116,16 @@ impl AskTool {
     ) -> Result<Selection> {
         let multi = question.multi.unwrap_or(false);
         let mut selected: Vec<String> = previous.map(|p| p.selected.clone()).unwrap_or_default();
+        // First pass: multi-select defaults are the form's `checked`/`selected`
+        // options, all of them.
+        if multi && previous.is_none() {
+            selected = question
+                .checked
+                .iter()
+                .filter_map(|&index| question.options.get(index))
+                .map(|option| option.label.clone())
+                .collect();
+        }
         let mut custom: Option<String> = previous.and_then(|p| p.custom.clone());
         let base_prompt = match navigation.progress.take() {
             Some(progress) => format!("{} ({progress})", question.question),
@@ -1473,7 +1637,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn html_checkbox_group_is_multi_and_bare_string_is_html() {
+    async fn html_checkbox_group_is_multi() {
         let html = r#"<form><fieldset><legend>Tags</legend>
             <label><input type="checkbox" name="tags" value="a"> Alpha</label>
             <label><input type="checkbox" name="tags" value="b"> Beta</label>
@@ -1482,7 +1646,7 @@ mod tests {
             {"id": "tags", "selectedOptions": ["Alpha", "Beta"]}
         ]})));
         let result = tool
-            .run(Value::String(html.to_owned()), &AbortSignal::never())
+            .run(json!({"html": html}), &AbortSignal::never())
             .await
             .unwrap();
         assert_eq!(result.details["selectedOptions"], json!(["Alpha", "Beta"]));
@@ -1514,6 +1678,107 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), INVALID_ASK_ERROR);
+    }
+
+    #[tokio::test]
+    async fn non_object_arguments_are_rejected() {
+        let (_, tool) = fake(None);
+        let err = tool
+            .run(
+                Value::String("<form><input name=\"a\"></form>".to_owned()),
+                &AbortSignal::never(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), INVALID_ASK_ERROR);
+    }
+
+    fn parsed(html: &str) -> Vec<QuestionItem> {
+        parse_html_form(html)
+    }
+
+    fn ids(questions: &[QuestionItem]) -> Vec<&str> {
+        questions.iter().map(|q| q.id.as_str()).collect()
+    }
+
+    fn labels(question: &QuestionItem) -> Vec<&str> {
+        question.options.iter().map(|o| o.label.as_str()).collect()
+    }
+
+    #[test]
+    fn controls_outside_the_form_are_not_collected() {
+        let html = r#"<input name="before"><form><input name="inside"></form><input name="after">"#;
+        assert_eq!(ids(&parsed(html)), vec!["inside"]);
+    }
+
+    #[test]
+    fn textarea_body_is_raw_text() {
+        let html = r#"<form><label>Notes <textarea name="notes"><input name="trap"> & <b>x</b></textarea></label><input name="next"></form>"#;
+        let questions = parsed(html);
+        assert_eq!(ids(&questions), vec!["notes", "next"]);
+        assert_eq!(questions[0].question, "Notes");
+    }
+
+    #[test]
+    fn disabled_options_are_skipped_and_missing_close_ends_the_option() {
+        let html = r#"<form><select name="s">
+            <option value="a">Alpha
+            <option value="b" disabled>Beta
+            <option value="c">Gamma
+        </select></form>"#;
+        let questions = parsed(html);
+        assert_eq!(ids(&questions), vec!["s"]);
+        assert_eq!(labels(&questions[0]), vec!["Alpha", "Gamma"]);
+    }
+
+    #[test]
+    fn nested_fieldset_legends_restore_the_parent() {
+        let html = r#"<form>
+            <fieldset><legend>Outer</legend>
+                <fieldset><legend>Inner</legend><input name="a"></fieldset>
+                <input name="b">
+            </fieldset>
+            <input name="c">
+        </form>"#;
+        let questions = parsed(html);
+        assert_eq!(questions[0].question, "Inner");
+        assert_eq!(questions[1].question, "Outer");
+        assert_eq!(questions[2].question, "c");
+    }
+
+    #[test]
+    fn labels_associate_with_selects_by_for_and_by_wrapping() {
+        let html = r#"<form>
+            <label for="region">Region</label>
+            <select name="region" id="region"><option>EU</option><option>US</option></select>
+            <label>Size: <select name="size"><option>S</option><option>M</option></select></label>
+        </form>"#;
+        let questions = parsed(html);
+        assert_eq!(questions[0].question, "Region");
+        assert_eq!(questions[1].question, "Size");
+        assert_eq!(labels(&questions[1]), vec!["S", "M"]);
+    }
+
+    #[test]
+    fn label_for_a_radio_sets_that_option_label() {
+        let html = r#"<form><fieldset><legend>Pick</legend>
+            <input type="radio" name="r" id="ra" value="a"><label for="ra">Alpha</label>
+            <input type="radio" name="r" id="rb" value="b"><label for="rb">Beta</label>
+        </fieldset></form>"#;
+        let questions = parsed(html);
+        assert_eq!(questions[0].question, "Pick");
+        assert_eq!(labels(&questions[0]), vec!["Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn multi_select_defaults_carry_every_checked_index() {
+        let html = r#"<form><select name="tags" multiple>
+            <option selected>a</option><option>b</option><option selected>c</option>
+        </select></form>"#;
+        let questions = parsed(html);
+        assert_eq!(questions[0].checked, vec![0, 2]);
+        assert_eq!(questions[0].recommended, Some(0.0));
+        assert_eq!(frame_question(&questions[0])["checked"], json!([0, 2]));
     }
 
     /// Degraded-path double: scripted select/editor answers, no rich dialog.
