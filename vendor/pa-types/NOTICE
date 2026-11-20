@@ -1,0 +1,48 @@
+pa-types
+========
+
+Origin
+------
+This crate is a modified fork of the `pa-types` crate from
+PrimeIntellect-ai/prime-agent (https://github.com/PrimeIntellect-ai/prime-agent),
+the Rust side of the Prime Agent product. It is a serde port of that product's
+TypeScript shared vocabulary (TS `packages/ai/src/types.ts` and the wire/domain
+contracts under `src/`).
+
+Upstream license: MIT. The upstream license text is vendored at
+`vendor/LICENSE-prime-agent`; it also credits the original TypeScript product,
+"a port of the Prime Agent TypeScript product, originally Copyright (c) 2025
+Mario Zechner". That MIT license and copyright notice apply to this crate.
+
+Modifications by oh-my-tau
+--------------------------
+This copy has been changed. It is NOT byte-identical to upstream, and files
+carrying the upstream header are not verbatim upstream content. Substantive
+changes:
+
+* Incident classifier regexes (src/incident/patterns.rs, plus classify/parse/
+  anomaly): the log-message patterns are the TypeScript regexes from the TS
+  product's `src/cli/incident.ts`, re-expressed with the Rust `regex` crate and
+  kept 1:1 with their TypeScript sources so classification semantics match.
+  `regex` was added to Cargo.toml for this purpose only.
+* Session types (src/session.rs): the session JSONL entry schema, extended and
+  adjusted to carry this repo's session records while preserving lossless
+  round-trips (unknown fields survive via `#[serde(flatten)] rest: JsonMap`).
+* Compat types (src/ai/compat.rs, with ai/mod.rs, routing.rs, thinking_levels.rs):
+  the model-compat family (OpenAI-completions compat block, format enums,
+  OpenAI-responses and Anthropic compat blocks, `ModelCompat`/`CompatKind`),
+  adapted for the models this repo targets.
+* Platform contracts (src/platform/): AF_UNIX transport, process identity,
+  socket identity, home-dir resolution, and the suspend-to-background signal
+  control, including cfg-gated Windows named-pipe support. These carry
+  legitimate `unsafe` blocks, so this crate keeps its own `[lints.clippy]`
+  table in Cargo.toml instead of inheriting the workspace's
+  `unsafe_code = "forbid"`.
+* Other touched areas: goal, memory_release, skill_blocks, slash_commands,
+  themes, usage, daemon (framing, plane, command, outbound, worker,
+  update_flow).
+
+The MIT terms require retaining the upstream copyright and permission notice;
+see `vendor/LICENSE-prime-agent`. All modifications above are likewise released
+under the MIT license of this repository (see the repository `LICENSE` and
+`NOTICE.md`).

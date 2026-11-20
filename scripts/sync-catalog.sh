@@ -16,12 +16,26 @@
 # silently.
 #
 # Run: scripts/sync-catalog.sh
+#      OMP_VENDOR_SRC=/path/to/oh-my-pi scripts/sync-catalog.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VENDOR_SRC="${OMP_VENDOR_SRC:-$ROOT/vendor-src/oh-my-pi}"
+
+if [ ! -d "$VENDOR_SRC" ]; then
+  echo "sync-catalog: vendor source not found: $VENDOR_SRC" >&2
+  echo "sync-catalog: clone oh-my-pi there, or set OMP_VENDOR_SRC=/path/to/oh-my-pi" >&2
+  exit 1
+fi
+if [ ! -f "$VENDOR_SRC/packages/catalog/src/models.json" ]; then
+  echo "sync-catalog: $VENDOR_SRC does not look like an oh-my-pi checkout (missing packages/catalog/src/models.json)" >&2
+  exit 1
+fi
 
 # 1. pa-ai compat data (rules.json verbatim + axes/API records).
-cd "$ROOT/vendor-src/oh-my-pi"
-bun "$ROOT/runs/omp-rust/compat-oracle/gen-data.ts"
+#    gen-data.ts reads OMP_TS_SRC, so mirror the resolved root into it.
+cd "$VENDOR_SRC"
+export OMP_TS_SRC="$VENDOR_SRC"
+bun "$ROOT/scripts/compat-oracle/gen-data.ts"
 
 # 2. Slimmed TUI catalog: TS `catalog/src/models.json` → one row per model:
 #    [id, name, reasoning, vision, ctx, maxTokens, $in, $out, $cache, kind, priority]
@@ -68,8 +82,8 @@ await Bun.write(assetPath, JSON.stringify(asset));
 console.log(`tui catalog: +${added} rows, ~${updated} updated rows, ${addedProviders.length} new providers`);
 for (const line of report) console.log("  " + line);
 ' "$ROOT/crates/omp-cli/assets/tui-model-catalog.json" \
-  "$ROOT/vendor-src/oh-my-pi/packages/catalog/src/models.json"
+  "$VENDOR_SRC/packages/catalog/src/models.json"
 
-echo "synced:"
+echo "synced (vendor source: $VENDOR_SRC):"
 echo "  vendor/pa-ai/data/compat/{rules,axes}.json"
 echo "  crates/omp-cli/assets/tui-model-catalog.json (union with committed asset)"

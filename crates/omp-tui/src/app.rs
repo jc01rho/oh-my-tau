@@ -119,6 +119,10 @@ enum Maintenance {
     Retry,
 }
 
+/// Delivery hook for terminal notifications (tests capture instead of
+/// writing escape sequences / spawning `notify-send`).
+pub type NotifyHook = Arc<dyn Fn(&TerminalNotification) + Send + Sync>;
+
 /// Turn-settle notification dispatcher (chrome.md §13 P0: Bell + OSC +
 /// notify-send fallback honoring `PI_NO_DESKTOP_NOTIFY`).
 ///
@@ -128,7 +132,7 @@ enum Maintenance {
 /// `notify-send`).
 #[derive(Clone, Default)]
 pub struct NotifySink {
-    hook: Option<Arc<dyn Fn(&TerminalNotification) + Send + Sync>>,
+    hook: Option<NotifyHook>,
     record: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
@@ -4915,7 +4919,7 @@ mod paste_tests {
         // Default settings file location derives from cwd/env; keep the
         // default threshold (100 lines) and use a 120-line paste.
         let payload = "line\n".repeat(119) + "line";
-        assert!(app.handle_terminal_event(&Event::Paste(payload.clone()), &port));
+        assert!(app.handle_terminal_event(&Event::Paste(payload), &port));
         assert_eq!(
             app.overlays.open(),
             Some(OpenOverlay::LargePaste),

@@ -246,10 +246,8 @@ impl WordHost {
         let (after, ingested) = ingest_history(&mut *engine, &history, cursor.unwrap_or(0));
         changed |= ingested > 0 || cursor.is_none();
         self.cursor.store(after, Ordering::Relaxed);
-        if changed {
-            if engine.persist().is_err() || write_cursor(&dir, after).is_err() {
-                self.dirty.store(true, Ordering::Relaxed);
-            }
+        if changed && (engine.persist().is_err() || write_cursor(&dir, after).is_err()) {
+            self.dirty.store(true, Ordering::Relaxed);
         }
         let mut slot = self.slot.lock();
         if let Slot::Loading { pending } = &mut *slot {

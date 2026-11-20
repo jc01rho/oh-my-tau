@@ -386,6 +386,9 @@ impl ToolResultContent {
     }
 }
 
+// `AssistantMessage` (~424 bytes) stays inline: boxing the variant would change
+// the public `Message` API in every host crate for no runtime gain at these sizes.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase")]
 pub enum Message {

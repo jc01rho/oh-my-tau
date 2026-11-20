@@ -719,7 +719,7 @@ impl Runtime {
             AgentEvent::ToolExecutionEnd { tool_name, .. } if tool_name == "ask" => {
                 let prev = self
                     .ask_blocked
-                    .fetch_update(
+                    .try_update(
                         std::sync::atomic::Ordering::SeqCst,
                         std::sync::atomic::Ordering::SeqCst,
                         |n| Some(n.saturating_sub(1)),
@@ -2656,8 +2656,8 @@ fn seed_resumed_message(
     m: &AgentMessage,
     raw: Option<&Map<String, Value>>,
 ) {
-    let converted = serde_json::to_value(m)
-        .and_then(|v| serde_json::from_value::<pa_types::session::AgentMessage>(v));
+    let converted =
+        serde_json::to_value(m).and_then(serde_json::from_value::<pa_types::session::AgentMessage>);
     if let Ok(c) = converted {
         let _ = persist.append_message(&c, m.timestamp());
         return;

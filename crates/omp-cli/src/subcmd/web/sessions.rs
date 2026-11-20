@@ -56,7 +56,9 @@ fn scan_file(path: &Path) -> Option<Value> {
     let (mut id, mut cwd, mut title, mut first) = (None, None, None, None);
     for line in reader.lines().take(SCAN_LINES) {
         let Ok(line) = line else { break };
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         match v.get("type").and_then(Value::as_str) {
             Some("session") => {
                 id = v.get("id").and_then(Value::as_str).map(str::to_owned);
@@ -100,14 +102,16 @@ fn scan_file(path: &Path) -> Option<Value> {
 }
 
 fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut files: Vec<(i64, PathBuf)> = rd
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "jsonl"))
         .map(|p| (mtime_ms(&p), p))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|a| std::cmp::Reverse(a.0));
     files.into_iter().map(|(_, p)| p).collect()
 }
 
@@ -147,7 +151,9 @@ pub fn list_projects() -> Value {
             continue;
         }
         let files = jsonl_files(&dir);
-        let Some(newest) = files.first() else { continue };
+        let Some(newest) = files.first() else {
+            continue;
+        };
         let cwd = files
             .iter()
             .take(5)
@@ -193,7 +199,9 @@ pub fn browse(path: Option<&str>) -> Value {
 /// Only session files under a known store may be exported/opened by path.
 pub fn is_session_path(path: &Path) -> bool {
     let Some(home) = home() else { return false };
-    let Ok(canon) = std::fs::canonicalize(path) else { return false };
+    let Ok(canon) = std::fs::canonicalize(path) else {
+        return false;
+    };
     canon.extension().is_some_and(|e| e == "jsonl")
         && [home.join(".omp-rs"), omp_stats::paths::sessions_dir()]
             .iter()

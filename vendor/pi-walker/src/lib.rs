@@ -1734,6 +1734,11 @@ where
     }
 }
 
+// Upstream signature: the parameters are all distinct pieces of parallel-walk
+// state (scope, context, shared sink, dir, relative path, depth, ignore state,
+// ignore derivation flag). Bundling them into a struct would diverge from
+// upstream pi-walker and complicate future vendor syncs.
+#[allow(clippy::too_many_arguments)]
 fn walk_parallel_dir<'scope, E, S, H>(
     scope: &rayon::Scope<'scope>,
     context: &'scope ParallelWalkContext,
@@ -3145,6 +3150,10 @@ impl<H> WalkContext<'_, H> {
         Ok(false)
     }
 
+    // Upstream signature: single-call helper for the sequential/walker loop;
+    // the entry fields are passed individually to avoid temporary structs in
+    // the hot path. Kept verbatim from upstream pi-walker.
+    #[allow(clippy::too_many_arguments)]
     fn walk_current_entry<V>(
         &mut self,
         name: &OsStr,

@@ -56,7 +56,7 @@ pub enum AgentStatus {
 impl AgentStatus {
     /// Parse a status string; unknown values map to [`AgentStatus::Pending`].
     #[must_use]
-    pub fn from_str(status: &str) -> Self {
+    pub fn parse(status: &str) -> Self {
         match status {
             "running" | "started" | "active" => Self::Running,
             "completed" | "done" => Self::Completed,
@@ -220,7 +220,7 @@ impl AgentProgress {
             status: src
                 .get("status")
                 .and_then(Value::as_str)
-                .map(AgentStatus::from_str)
+                .map(AgentStatus::parse)
                 .unwrap_or(AgentStatus::Pending),
             task: get_string(src, "task")
                 .or_else(|| get_string(v, "task"))
@@ -565,11 +565,7 @@ fn render_task_call_lines(args: Option<&Value>, theme: &Theme) -> Vec<Vec<Span<'
     let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
     let view = TaskParamsView::from_value(args);
     let name = view.name.as_deref().unwrap_or("").trim();
-    let brief = view
-        .task
-        .as_ref()
-        .map(|v| task_first_line(v))
-        .unwrap_or_default();
+    let brief = view.task.as_ref().map(task_first_line).unwrap_or_default();
     if !name.is_empty() || !brief.is_empty() {
         let mut spans = vec![bullet.clone()];
         spans.push(Span::styled(
@@ -615,11 +611,7 @@ fn render_task_call_lines(args: Option<&Value>, theme: &Theme) -> Vec<Vec<Span<'
                     .fg(theme.color("accent"))
                     .add_modifier(Modifier::BOLD),
             ));
-            let brief = item
-                .task
-                .as_ref()
-                .map(|v| task_first_line(v))
-                .unwrap_or_default();
+            let brief = item.task.as_ref().map(task_first_line).unwrap_or_default();
             if !brief.is_empty() {
                 spans.push(Span::raw(": "));
                 spans.push(Span::styled(
@@ -1884,7 +1876,7 @@ impl ToolRenderer for Task {
         let brief = params
             .task
             .as_ref()
-            .map(|v| task_first_line(v))
+            .map(task_first_line)
             .or_else(|| params.context.clone())
             .unwrap_or_default();
         let header = format_agent_header_label(args.filter(|a| a.is_object()))

@@ -329,9 +329,7 @@ async fn async_main() -> Result<()> {
         bail!("omt: --mode {mode} is not supported (no {mode} subsystem)");
     }
     if !args.config.is_empty() || !args.add_dir.is_empty() {
-        eprintln!(
-            "omt: --config/--add-dir parsed but their subsystems are not in omt; ignored"
-        );
+        eprintln!("omt: --config/--add-dir parsed but their subsystems are not in omt; ignored");
     }
 
     let mut cwd = match args.cwd {
@@ -343,9 +341,7 @@ async fn async_main() -> Result<()> {
     if !args.allow_home {
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             if cwd == home.canonicalize().unwrap_or(home) {
-                eprintln!(
-                    "omt: started in ~; switching to a temp dir (pass --allow-home to stay)"
-                );
+                eprintln!("omt: started in ~; switching to a temp dir (pass --allow-home to stay)");
                 cwd = std::env::temp_dir();
             }
         }
@@ -469,8 +465,7 @@ async fn async_main() -> Result<()> {
     context::set_active(context_strategy);
     // `/sandbox` (features/sandbox.rs): `--sandbox` or the `sandbox.enabled`
     // setting turns on Landlock/seccomp confinement for tool subprocesses.
-    if args.sandbox
-        || omp_settings::Settings::load(&cwd).get_bool("sandbox.enabled") == Some(true)
+    if args.sandbox || omp_settings::Settings::load(&cwd).get_bool("sandbox.enabled") == Some(true)
     {
         crate::features::sandbox::set_enabled(true);
     }
@@ -740,14 +735,14 @@ fn exit(code: i32) -> ! {
     std::process::exit(code);
 }
 
-/// Print-mode run: extension lifecycle hook points, optional session resume
-/// (`--resume`/`--continue`/`--fork`), then the single prompt.
-#[allow(clippy::too_many_arguments)] // print-mode run context; mirrors omp's runPrint signature
 /// Set when print mode answered a handled slash command with its output
 /// (no model turn ran, so "no assistant response" is not an error).
 static PRINTED_COMMAND_OUTPUT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Print-mode run: extension lifecycle hook points, optional session resume
+/// (`--resume`/`--continue`/`--fork`), then the single prompt.
+#[allow(clippy::too_many_arguments)] // print-mode run context; mirrors omp's runPrint signature
 async fn run_print(
     agent: pa_agent::agent::Agent,
     target: agent::Target,

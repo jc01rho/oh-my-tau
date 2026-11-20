@@ -642,7 +642,7 @@ impl Session {
             model: model.to_string(),
             resolved_model: format!("{}/{}", model_info.provider, model_info.id),
             api: model_info.api.clone(),
-            provider: model_info.provider.clone(),
+            provider: model_info.provider,
             depth,
             cached: false,
             input_tokens: input,
@@ -913,15 +913,17 @@ fn append_json_log(line: &Value) {
     }
 }
 
+/// Callback type for recording sub-call session entries.
+type EntrySink = std::sync::Arc<dyn Fn(&str, Value) + Send + Sync>;
+
 /// Session-entry sink installed by the runtime ([`set_entry_sink`]): one
 /// `model_usage` entry per provider call, so `omp stats` / bench can count
 /// sub-call tokens straight from the session file.
-static ENTRY_SINK: LazyLock<
-    parking_lot::RwLock<Option<std::sync::Arc<dyn Fn(&str, Value) + Send + Sync>>>,
-> = LazyLock::new(|| parking_lot::RwLock::new(None));
+static ENTRY_SINK: LazyLock<parking_lot::RwLock<Option<EntrySink>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(None));
 
 /// Install (or clear) the sink that records sub-call accounting in the session.
-pub fn set_entry_sink(sink: Option<std::sync::Arc<dyn Fn(&str, Value) + Send + Sync>>) {
+pub fn set_entry_sink(sink: Option<EntrySink>) {
     *ENTRY_SINK.write() = sink;
 }
 
@@ -955,10 +957,13 @@ pub(crate) static TEST_BACKEND: Mutex<Option<std::sync::Arc<dyn Backend>>> = Mut
 /// `__llm_query__` host op.
 pub async fn llm_query_op(args: &Value, ctx: &OpCtx) -> Result<Value, String> {
     #[cfg(test)]
-    if let Some(backend) = TEST_BACKEND.lock().expect("test backend").clone() {
-        return SESSION
-            .query(backend.as_ref(), Limits::effective(), args, &ctx.signal)
-            .await;
+    {
+        let backend = TEST_BACKEND.lock().expect("test backend").clone();
+        if let Some(backend) = backend {
+            return SESSION
+                .query(backend.as_ref(), Limits::effective(), args, &ctx.signal)
+                .await;
+        }
     }
     SESSION
         .query(&LiveBackend, Limits::effective(), args, &ctx.signal)
@@ -1374,11 +1379,14 @@ mod tests {
         assert!(parse_args("--max-calls=x q @f").is_err());
     }
 
+    /// Scripted provider callback signature.
+    type ScriptFn = Box<dyn Fn(&str, u64) -> String + Send + Sync>;
+
     /// Scripted provider: reply `n` is `script(model, n)`; records every prompt.
     struct Script {
         calls: AtomicU64,
         prompts: Mutex<Vec<String>>,
-        script: Box<dyn Fn(&str, u64) -> String + Send + Sync>,
+        script: ScriptFn,
     }
 
     impl Script {

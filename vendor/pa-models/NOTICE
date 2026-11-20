@@ -1,0 +1,65 @@
+pa-models
+=========
+
+Origin
+------
+This crate is a modified fork of the `pa-models` crate from
+PrimeIntellect-ai/prime-agent (https://github.com/PrimeIntellect-ai/prime-agent),
+the Rust side of the Prime Agent product.
+
+Upstream in turn is a Rust port of the product's TypeScript catalog client: the
+files `model-catalog-cache.ts`, `model-catalog.ts`, `model-compat-schema.ts`,
+`provider-model-catalog.ts`, `bundled-model-catalog.ts`, and
+`prime-inference-model-catalog.ts` (upstream branch `feat/catalog-client`). The
+Rust module layout follows them one-to-one:
+
+  src/chain.rs            <- model-catalog.ts            (no-cold-start chain, refresh cadence)
+  src/cache.rs            <- model-catalog-cache.ts      (scope-keyed last-good cache)
+  src/compat.rs           <- model-compat-schema.ts      (per-`api` compat validation)
+  src/pinning.rs          <- provider-model-catalog.ts   (transport pinning)
+  src/bundled.rs          <- bundled-model-catalog.ts    (packaged snapshot assets)
+  src/prime_inference.rs  <- prime-inference-model-catalog.ts
+
+Upstream license: MIT. The upstream license text is vendored at
+`vendor/LICENSE-prime-agent`; it also credits the original TypeScript product,
+"a port of the Prime Agent TypeScript product, originally Copyright (c) 2025
+Mario Zechner". That MIT license and copyright notice apply to this crate.
+
+Modifications by oh-my-tau
+--------------------------
+This copy has been changed. It is NOT byte-identical to upstream, and files
+carrying the upstream header are not verbatim upstream content. Substantive
+changes:
+
+* Port, not a copy: the crate is a Rust rewrite of the TypeScript catalog
+  client rather than a translation of an upstream Rust source file, so module
+  names, types, and function signatures are this repo's own. Only the wire
+  contracts (`models/catalog.v1.json`, `plugins/catalog.v2.json`, and the Prime
+  Inference response shapes) are held to the TS client's behavior.
+* HTTP client: `reqwest` with `default-features = false` and only `rustls-tls`,
+  replacing whatever TLS/transport stack upstream used; the fetch layer enforces
+  a 5 s timeout, an 8 MiB cap (content-length and streaming), refused redirects,
+  and ETag `If-None-Match` / 304 snapshot reuse.
+* Cache scoping added for this repo: `CatalogCache` is keyed by source scope and
+  Prime Inference scope keys are HMAC-SHA256 of the credential over the team id,
+  which is why `hmac`, `sha2`, and `hex` appear in Cargo.toml. A `401`/`403`
+  clears only its own scope.
+* `PI_OFFLINE` handling (src/offline.rs) and the compiled fallback table in
+  src/transports.rs are this repo's: the fallback universe is fixed at build
+  time to the transports this client compiles in, and pinning refuses any
+  catalog model that does not match a compiled `(provider, api, baseUrl)` tuple.
+  Catalog data never carries request headers.
+* Compat validation (src/compat.rs) is a structural re-implementation of the TS
+  validators, deliberately independent of the permissive `pa_types` wire structs,
+  and the accepted key/type sets are adjusted to the models this repo targets.
+* Strict deserialization is enforced throughout (`deny_unknown_fields`,
+  `schemaVersion == 1`, an entry carrying a `headers` key is rejected), so a
+  future catalog version keeps the last-good snapshot instead of erroring.
+* Crate metadata is inherited from the workspace (`version`, `edition`,
+  `license`, `[lints]`), and dependencies on `pa-ai` and `pa-types` are local
+  path deps on this repo's forks rather than crates.io versions.
+
+The MIT terms require retaining the upstream copyright and permission notice;
+see `vendor/LICENSE-prime-agent`. All modifications above are likewise released
+under the MIT license of this repository (see the repository `LICENSE` and
+`NOTICE.md`).

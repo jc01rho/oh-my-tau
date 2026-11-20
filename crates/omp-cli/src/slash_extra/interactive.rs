@@ -156,7 +156,6 @@ fn code_blocks(text: &str) -> Vec<(String, String)> {
                         .all(|c| c == fence.chars().next().unwrap_or('`'))
                 {
                     let lang = trimmed[fence.len()..]
-                        .trim()
                         .split_whitespace()
                         .next()
                         .unwrap_or("")
@@ -829,7 +828,7 @@ pub async fn jobs_command(rt: &Arc<Runtime>, full: bool) -> Outcome {
                 s.pid.map(|p| format!(" · pid {p}")).unwrap_or_default()
             );
             let report = format!("Service {name}: {state}\n\n{}", s.log());
-            rows.push((Choice::with(name.clone(), state), report));
+            rows.push((Choice::with(name, state), report));
         }
     }
     if rows.is_empty() {

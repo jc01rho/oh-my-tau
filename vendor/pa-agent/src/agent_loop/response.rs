@@ -86,9 +86,12 @@ pub(crate) async fn stream_assistant_response(
     llm_messages: anyhow::Result<Vec<crate::types::Message>>,
     prepared_calls: &mut Vec<Preparation>,
 ) -> anyhow::Result<AssistantMessage> {
-    let mut partial_event: Option<Arc<crate::stream::AssistantMessageEvent>> = None;
-    let mut added_partial = false;
-    let mut timing = Timing::start();
+    let mut state = StreamState {
+        prepared_calls,
+        partial_event: None,
+        added_partial: false,
+        timing: Timing::start(),
+    };
 
     // The TS closure captures `partialMessage`/`addedPartial` by reference;
     // here the finish helper runs inline in the abort path below.
@@ -96,13 +99,13 @@ pub(crate) async fn stream_assistant_response(
         () => {{
             let mut final_message = create_aborted_assistant_message(
                 config,
-                partial_event.as_deref().and_then(event_partial),
+                state.partial_event.as_deref().and_then(event_partial),
             );
-            finalize_message(&mut final_message, config, context, &timing);
+            finalize_message(&mut final_message, config, context, &state.timing);
             // An aborted turn never reached `done`: the provider timing stays unset.
             final_message.meta.duration = None;
             final_message.meta.ttft = None;
-            if added_partial {
+            if state.added_partial {
                 *context.messages.last_mut().unwrap() = AgentMessage::from(final_message.clone());
             } else {
                 context
@@ -128,10 +131,7 @@ pub(crate) async fn stream_assistant_response(
         emit,
         stream_fn,
         llm_messages,
-        prepared_calls,
-        &mut partial_event,
-        &mut added_partial,
-        &mut timing,
+        &mut state,
     )
     .await;
 
@@ -146,6 +146,16 @@ pub(crate) async fn stream_assistant_response(
     }
 }
 
+/// Mutable stream state threaded through `streamAssistantResponse`: the
+/// caller owns it so the abort path can finalize the partial message, and the
+/// inner body receives it as one borrow instead of four `&mut` parameters.
+struct StreamState<'a> {
+    prepared_calls: &'a mut Vec<Preparation>,
+    partial_event: Option<Arc<crate::stream::AssistantMessageEvent>>,
+    added_partial: bool,
+    timing: Timing,
+}
+
 /// Inner body of `streamAssistantResponse`.
 // Direct port of the TS `try` block.
 #[allow(clippy::too_many_lines)]
@@ -156,10 +166,7 @@ async fn stream_assistant_response_inner(
     emit: &AgentEventSink,
     stream_fn: Option<&StreamFn>,
     llm_messages: anyhow::Result<Vec<crate::types::Message>>,
-    prepared_calls: &mut Vec<Preparation>,
-    partial_event: &mut Option<Arc<crate::stream::AssistantMessageEvent>>,
-    added_partial: &mut bool,
-    timing: &mut Timing,
+    state: &mut StreamState<'_>,
 ) -> anyhow::Result<AssistantMessage> {
     crate::abort::throw_if_aborted_signal(signal)?;
 
@@ -216,7 +223,7 @@ async fn stream_assistant_response_inner(
         headers: None,
     };
 
-    timing.started = std::time::Instant::now();
+    state.timing.started = std::time::Instant::now();
     let mut response = race_with_abort(
         stream_fn(config.model.clone(), llm_context, options),
         signal,
@@ -244,21 +251,21 @@ async fn stream_assistant_response_inner(
             crate::stream::AssistantMessageEvent::Start { mut partial } => {
                 stamp_credential(&mut partial, config);
                 let message = AgentMessage::from(partial.clone());
-                *added_partial = true;
+                state.added_partial = true;
                 context.messages.push(message.clone());
-                *partial_event = Some(Arc::new(crate::stream::AssistantMessageEvent::Start {
+                state.partial_event = Some(Arc::new(crate::stream::AssistantMessageEvent::Start {
                     partial,
                 }));
                 emit(AgentEvent::MessageStart { message }).await?;
             }
             mut event if event.is_delta() => {
-                timing.mark_first_token();
+                state.timing.mark_first_token();
                 if let Some(partial) = event_partial_mut(&mut event) {
                     stamp_credential(partial, config);
                 }
                 let event = Arc::new(event);
                 if let Some(partial) = event_partial(&event) {
-                    *partial_event = Some(Arc::clone(&event));
+                    state.partial_event = Some(Arc::clone(&event));
                     emit(AgentEvent::MessageUpdate {
                         message: Arc::new(AgentMessage::from(partial.clone())),
                         assistant_message_event: event,
@@ -277,8 +284,8 @@ async fn stream_assistant_response_inner(
                         }
                     }
                 }
-                finalize_message(&mut final_message, config, context, timing);
-                if *added_partial {
+                finalize_message(&mut final_message, config, context, &state.timing);
+                if state.added_partial {
                     *context.messages.last_mut().unwrap() =
                         AgentMessage::from(final_message.clone());
                 } else {
@@ -286,9 +293,9 @@ async fn stream_assistant_response_inner(
                         .messages
                         .push(AgentMessage::from(final_message.clone()));
                 }
-                *prepared_calls =
+                *state.prepared_calls =
                     prepare_dispatch(&mut final_message, context, config, signal).await;
-                if !*added_partial {
+                if !state.added_partial {
                     emit(AgentEvent::MessageStart {
                         message: AgentMessage::from(final_message.clone()),
                     })
@@ -307,16 +314,16 @@ async fn stream_assistant_response_inner(
     // Stream ended without a terminal event: resolve the final message (TS
     // awaits `response.result()` here too).
     let mut final_message = race_with_abort(response.result(), signal).await?;
-    finalize_message(&mut final_message, config, context, timing);
-    if *added_partial {
+    finalize_message(&mut final_message, config, context, &state.timing);
+    if state.added_partial {
         *context.messages.last_mut().unwrap() = AgentMessage::from(final_message.clone());
     } else {
         context
             .messages
             .push(AgentMessage::from(final_message.clone()));
     }
-    *prepared_calls = prepare_dispatch(&mut final_message, context, config, signal).await;
-    if !*added_partial {
+    *state.prepared_calls = prepare_dispatch(&mut final_message, context, config, signal).await;
+    if !state.added_partial {
         emit(AgentEvent::MessageStart {
             message: AgentMessage::from(final_message.clone()),
         })

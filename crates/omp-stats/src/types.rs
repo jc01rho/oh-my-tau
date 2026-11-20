@@ -989,7 +989,7 @@ pub enum SessionEntry {
     Header(SessionHeader),
     Message(SessionMessageEntry),
     ServiceTierChange(SessionServiceTierChangeEntry),
-    ModelUsage(SessionModelUsageEntry),
+    ModelUsage(Box<SessionModelUsageEntry>),
     Custom(SessionCustomEntry),
     Typed(SessionTypedEntry),
     Other(serde_json::Value),

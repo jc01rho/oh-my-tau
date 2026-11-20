@@ -291,7 +291,7 @@ mod tests {
         // Cache contract: appending a message may only append wire bytes —
         // never change what an earlier request already sent.
         let big = "z".repeat(600);
-        let history = vec![
+        let history = [
             tool_result("call_a", &big),
             tool_result("call_b", "small"),
             tool_result("call_c", &big),

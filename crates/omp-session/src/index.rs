@@ -343,8 +343,8 @@ fn scan_refs(buf: &[u8]) -> anyhow::Result<(Vec<EntryRef>, Vec<Malformed>)> {
     Ok((refs, malformed))
 }
 
-/// Per-line head parsing lives in [`crate::scan::head_of`] (borrowed typed
-/// parse with a `Value` fallback for JSON objects with unusual field shapes).
+// Per-line head parsing lives in `crate::scan::head_of` (borrowed typed parse
+// with a `Value` fallback for JSON objects with unusual field shapes).
 
 /// Buffered positional reader over a session journal. Branch passes walk
 /// entries mostly in file order, so a forward jump inside the buffer is a

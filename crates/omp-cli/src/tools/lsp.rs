@@ -1406,10 +1406,10 @@ impl LspTool {
                 let existing = accepted.iter_mut().find(|(u, _)| *u == uri);
                 match existing {
                     None => accepted.push((
-                        uri.clone(),
+                        uri,
                         Bucket {
                             primary_server: server_name.clone(),
-                            edits: edits.clone(),
+                            edits,
                             discarded: 0,
                             conflict_servers: Vec::new(),
                         },
@@ -1438,7 +1438,7 @@ impl LspTool {
                             }
                             bucket.discarded += discarded_old;
                             bucket.primary_server.clone_from(server_name);
-                            let mut merged = edits.clone();
+                            let mut merged = edits;
                             merged.extend(kept_old);
                             bucket.edits = merged;
                         } else {

@@ -1521,6 +1521,10 @@ pub fn create_operation(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "operation assembly mirrors the parser's mutable accumulators; a parameter struct here would duplicate the surrounding state"
+)]
 fn finish_operation(
     lines: &[String],
     end_index: usize,
@@ -1614,6 +1618,10 @@ fn finish_operation(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pattern finalization needs both operation and pending buffers plus parse flags; splitting it would obscure the single flush point"
+)]
 fn finish_pattern(
     lines: &[String],
     end_index: usize,

@@ -76,7 +76,10 @@ fn parse_args(args: &[String]) -> Result<Options> {
         let mut value = |name: &str| -> Result<String> {
             match &inline {
                 Some(v) => Ok(v.clone()),
-                None => it.next().cloned().with_context(|| format!("{name} needs a value")),
+                None => it
+                    .next()
+                    .cloned()
+                    .with_context(|| format!("{name} needs a value")),
             }
         };
         match flag {
@@ -187,7 +190,11 @@ async fn serve(opts: Options) -> Result<i32> {
         port,
         agents: Mutex::new(HashMap::new()),
     });
-    let shown_host = if addr.ip().is_unspecified() { "127.0.0.1".to_string() } else { opts.host.clone() };
+    let shown_host = if addr.ip().is_unspecified() {
+        "127.0.0.1".to_string()
+    } else {
+        opts.host.clone()
+    };
     let url = format!("http://{shown_host}:{port}/");
     println!("omt web UI: {url}");
     println!("Working directory: {}", opts.cwd.display());
@@ -247,9 +254,15 @@ fn respond(status: StatusCode, content_type: &str, body: impl Into<Bytes>) -> Re
     let mut res = Response::new(Full::new(body.into()));
     *res.status_mut() = status;
     let headers = res.headers_mut();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap_or(HeaderValue::from_static("text/plain")));
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(content_type).unwrap_or(HeaderValue::from_static("text/plain")),
+    );
     headers.insert("cache-control", HeaderValue::from_static("no-store"));
-    headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     res
 }
 
@@ -299,7 +312,8 @@ fn same_origin(host: Option<&str>, origin: Option<&str>, port: u16) -> bool {
     let host_name = host.rsplit_once(':').map_or(host, |(h, _)| h);
     let local = matches!(host_name, "127.0.0.1" | "localhost" | "[::1]");
     let host_ok = local || host.ends_with(&format!(":{port}"));
-    let origin_ok = origin.is_none_or(|o| o == format!("http://{host}") || o == format!("https://{host}"));
+    let origin_ok =
+        origin.is_none_or(|o| o == format!("http://{host}") || o == format!("https://{host}"));
     host_ok && origin_ok
 }
 
@@ -326,19 +340,26 @@ async fn route(hub: Arc<Hub>, req: Request<Incoming>) -> Response<Body> {
         return websocket(hub, req, id.to_string());
     }
     match (&method, path.as_str()) {
-        (&Method::GET, "/api/info") => json_response(StatusCode::OK, &json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "defaultCwd": hub.default_cwd.display().to_string(),
-            "home": std::env::var("HOME").unwrap_or_default(),
-        })),
-        (&Method::GET, "/api/projects") => json_response(StatusCode::OK, &sessions::list_projects()),
+        (&Method::GET, "/api/info") => json_response(
+            StatusCode::OK,
+            &json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "defaultCwd": hub.default_cwd.display().to_string(),
+                "home": std::env::var("HOME").unwrap_or_default(),
+            }),
+        ),
+        (&Method::GET, "/api/projects") => {
+            json_response(StatusCode::OK, &sessions::list_projects())
+        }
         (&Method::GET, "/api/sessions") => {
-            let cwd = query_param(&req, "cwd").map_or_else(|| hub.default_cwd.clone(), PathBuf::from);
+            let cwd =
+                query_param(&req, "cwd").map_or_else(|| hub.default_cwd.clone(), PathBuf::from);
             json_response(StatusCode::OK, &sessions::list_sessions(&cwd))
         }
-        (&Method::GET, "/api/fs") => {
-            json_response(StatusCode::OK, &sessions::browse(query_param(&req, "path").as_deref()))
-        }
+        (&Method::GET, "/api/fs") => json_response(
+            StatusCode::OK,
+            &sessions::browse(query_param(&req, "path").as_deref()),
+        ),
         (&Method::GET, "/api/agents") => {
             let list: Vec<Value> = hub.agents().iter().map(|a| a.info_json()).collect();
             json_response(StatusCode::OK, &json!({"agents": list}))
@@ -366,7 +387,10 @@ async fn route(hub: Arc<Hub>, req: Request<Incoming>) -> Response<Body> {
             match wallpapers::read(&percent_decode(&p["/wallpapers/custom/".len()..])) {
                 Some((mime, bytes)) => {
                     let mut res = respond(StatusCode::OK, mime, bytes);
-                    res.headers_mut().insert("cache-control", HeaderValue::from_static("private, max-age=86400"));
+                    res.headers_mut().insert(
+                        "cache-control",
+                        HeaderValue::from_static("private, max-age=86400"),
+                    );
                     res
                 }
                 None => error(StatusCode::NOT_FOUND, "not found"),
@@ -385,10 +409,18 @@ async fn create_agent(hub: &Arc<Hub>, req: Request<Incoming>) -> Response<Body> 
         Ok(v) => v,
         Err(e) => return error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
     };
-    let text = |k: &str| body.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+    let text = |k: &str| {
+        body.get(k)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
     let cwd = text("cwd").map_or_else(|| hub.default_cwd.clone(), PathBuf::from);
     if !cwd.is_dir() {
-        return error(StatusCode::BAD_REQUEST, &format!("not a directory: {}", cwd.display()));
+        return error(
+            StatusCode::BAD_REQUEST,
+            &format!("not a directory: {}", cwd.display()),
+        );
     }
     let resume = text("resume");
     if let Some(r) = &resume {
@@ -396,7 +428,11 @@ async fn create_agent(hub: &Arc<Hub>, req: Request<Incoming>) -> Response<Body> 
             return error(StatusCode::BAD_REQUEST, "not a session file");
         }
     }
-    let spec = Spawn { cwd, resume, model: text("model") };
+    let spec = Spawn {
+        cwd,
+        resume,
+        model: text("model"),
+    };
     match hub.spawn(spec).await {
         Ok(agent) => json_response(StatusCode::OK, &agent.info_json()),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
@@ -405,7 +441,10 @@ async fn create_agent(hub: &Arc<Hub>, req: Request<Incoming>) -> Response<Body> 
 
 async fn upload_wallpaper(req: Request<Incoming>) -> Response<Body> {
     let name = query_param(&req, "name").unwrap_or_default();
-    let body = match http_body_util::Limited::new(req.into_body(), wallpapers::MAX_UPLOAD).collect().await {
+    let body = match http_body_util::Limited::new(req.into_body(), wallpapers::MAX_UPLOAD)
+        .collect()
+        .await
+    {
         Ok(b) => b.to_bytes(),
         Err(e) => return error(StatusCode::PAYLOAD_TOO_LARGE, &format!("upload: {e}")),
     };
@@ -438,14 +477,20 @@ fn websocket(hub: Arc<Hub>, req: Request<Incoming>, id: String) -> Response<Body
         .get(UPGRADE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    let Some(key) = req.headers().get("sec-websocket-key").map(|k| derive_accept_key(k.as_bytes())) else {
+    let Some(key) = req
+        .headers()
+        .get("sec-websocket-key")
+        .map(|k| derive_accept_key(k.as_bytes()))
+    else {
         return error(StatusCode::BAD_REQUEST, "missing sec-websocket-key");
     };
     if !upgrade {
         return error(StatusCode::BAD_REQUEST, "expected a websocket upgrade");
     }
     tokio::spawn(async move {
-        let Ok(upgraded) = hyper::upgrade::on(req).await else { return };
+        let Ok(upgraded) = hyper::upgrade::on(req).await else {
+            return;
+        };
         let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
         bridge(agent, ws).await;
     });
@@ -474,7 +519,11 @@ async fn bridge(agent: Arc<Agent>, ws: WebSocketStream<TokioIo<hyper::upgrade::U
         }
     }
     if !agent.is_alive() {
-        let _ = sink.send(Message::text(json!({"type": "web_agent_exit", "code": null}).to_string())).await;
+        let _ = sink
+            .send(Message::text(
+                json!({"type": "web_agent_exit", "code": null}).to_string(),
+            ))
+            .await;
     }
     loop {
         tokio::select! {
@@ -521,7 +570,11 @@ mod tests {
         assert!(!same_origin(host, Some("https://evil.example"), 7467));
         assert!(!same_origin(host, Some("http://localhost:7467"), 7467));
         // DNS rebinding: a foreign name resolving to loopback.
-        assert!(!same_origin(Some("evil.example:80"), Some("http://evil.example:80"), 7467));
+        assert!(!same_origin(
+            Some("evil.example:80"),
+            Some("http://evil.example:80"),
+            7467
+        ));
         assert!(!same_origin(None, None, 7467));
     }
 

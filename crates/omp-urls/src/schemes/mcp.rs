@@ -77,15 +77,12 @@ pub fn uri_template_match_score(uri: &str, uri_template: &str) -> Option<(usize,
 
     // Match: each literal segment must appear in order, with any text between.
     let mut remaining = uri;
-    for (i, lit) in literal_segments.iter().enumerate() {
+    for lit in literal_segments.iter() {
         if lit.is_empty() {
             continue;
         }
-        match remaining.find(lit) {
-            Some(idx) => remaining = &remaining[idx + lit.len()..],
-            None => return None,
-        }
-        let _ = i;
+        let idx = remaining.find(lit)?;
+        remaining = &remaining[idx + lit.len()..];
     }
     let literal_chars: usize = literal_segments.iter().map(|s| s.len()).sum();
     Some((literal_chars, expression_count))

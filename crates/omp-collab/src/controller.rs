@@ -250,8 +250,8 @@ impl CollabController {
         let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let start_host = Arc::clone(&host);
-        let relay_for_start = relay_url.clone();
-        let web_for_start = web_url.clone().unwrap_or_default();
+        let relay_for_start = relay_url;
+        let web_for_start = web_url.unwrap_or_default();
         std::thread::Builder::new()
             .name("collab-host".to_string())
             .spawn(move || {
@@ -287,7 +287,7 @@ impl CollabController {
         // connect window still reaches the thread.
         *self.host.lock().unwrap() = Some(Arc::clone(&host));
         *self.host_task.lock().unwrap() = Some(HostTask {
-            stop_tx: stop_tx.clone(),
+            stop_tx,
             done_rx: Some(done_rx),
         });
         let done_rx = self

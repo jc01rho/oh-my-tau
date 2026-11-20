@@ -115,7 +115,7 @@ async fn rlm_command(rt: &Arc<Runtime>, args: &str) -> Outcome {
         }
         rlm::ContextSource::File(path) => {
             let full = if Path::new(&path).is_absolute() {
-                path.clone().into()
+                path.into()
             } else {
                 rt.cwd.join(&path)
             };
@@ -658,9 +658,7 @@ async fn collab_command(rt: &Arc<Runtime>, args: &str) -> Outcome {
                             },
                         ));
                     }
-                    lines.push(
-                        "Get a link: omt collab link <instanceId|pid> [--view]".to_string(),
-                    );
+                    lines.push("Get a link: omt collab link <instanceId|pid> [--view]".to_string());
                     output(rt, &lines.join("\n"));
                 }
                 Err(err) => output(rt, &format!("Failed to list collab hosts: {err:#}")),

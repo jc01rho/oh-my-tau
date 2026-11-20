@@ -231,6 +231,8 @@ pub(crate) fn build_params<'a>(
 /// given, receives the serialized fragments a conversion produced (the cache stores them). Every
 /// policy decision is made here exactly once, so cached and uncached requests emit identical
 /// bytes.
+// Nine inputs by design: one per policy axis the stream layer owns.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_params_streaming<'a>(
     model: &Model,
     context: &'a Context,

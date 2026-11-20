@@ -526,10 +526,8 @@ fn attach_rubric_scores(
             None => {}
         }
     }
-    if let Some(first) = result.content.first_mut() {
-        if let pa_agent::types::ToolResultContent::Text(t) = first {
-            let _ = write!(t.text, "\n\n{}", lines.trim_end());
-        }
+    if let Some(pa_agent::types::ToolResultContent::Text(t)) = result.content.first_mut() {
+        let _ = write!(t.text, "\n\n{}", lines.trim_end());
     }
     if let Some(details) = result.details.as_object_mut() {
         details.insert("rubric".into(), Value::Array(rows));

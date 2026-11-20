@@ -281,7 +281,7 @@ async fn wait_healthz(url: &str) -> reqwest::Client {
         .no_proxy()
         .build()
         .expect("client");
-    for _ in 0..30 {
+    for _ in 0..100 {
         if let Ok(r) = client.get(format!("{url}/v1/healthz")).send().await {
             if r.status() == 200 {
                 return client;

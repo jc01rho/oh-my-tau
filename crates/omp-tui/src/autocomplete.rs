@@ -664,7 +664,7 @@ fn build_slash_command_completions(
     }
     // Stable sort: equal scores keep registry order (TS falls back to usage
     // counts, which we do not track yet).
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.1));
     rows.into_iter().map(|(item, _)| item).collect()
 }
 
@@ -1034,7 +1034,7 @@ fn get_fuzzy_file_suggestions(
 
     let mut matches: Vec<(String, bool)> = Vec::new();
     let mut visited = 0usize;
-    let mut stack: Vec<(PathBuf, String)> = vec![(search_path.clone(), String::new())];
+    let mut stack: Vec<(PathBuf, String)> = vec![(search_path, String::new())];
     while let Some((dir, rel)) = stack.pop() {
         if visited >= FUZZY_WALK_ENTRY_CAP || matches.len() >= FUZZY_WALK_ENTRY_CAP {
             break;
@@ -1057,7 +1057,7 @@ fn get_fuzzy_file_suggestions(
             let is_dir = ft.is_dir()
                 || (ft.is_symlink() && std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()));
             let entry_rel = if rel.is_empty() {
-                name.clone()
+                name
             } else {
                 format!("{rel}/{name}")
             };
@@ -1108,7 +1108,7 @@ fn get_fuzzy_file_suggestions(
         suggestions.push(AutocompleteItem {
             value,
             label: format!("{entry_name}{}", if is_dir { "/" } else { "" }),
-            description: Some(display_path.clone()),
+            description: Some(display_path),
             icon_name: Some(if is_dir { "folder" } else { "file" }.to_string()),
             native_detail: (parent != "." && parent != "/").then_some(parent),
             ..AutocompleteItem::default()
@@ -1567,6 +1567,7 @@ impl Autocomplete {
 
     /// Shared tail of [`Self::apply_completion`]: file-attachment and plain
     /// path/argument replacement.
+    #[allow(clippy::too_many_arguments)]
     fn apply_path_tail(
         &self,
         lines: &[String],
@@ -1676,7 +1677,7 @@ impl Component for Autocomplete {
                 let budget = width.saturating_sub(used + 8);
                 if budget > 4 {
                     spans.push(Span::styled(
-                        format!("  {}", truncate_to(&detail.to_string(), budget)),
+                        format!("  {}", truncate_to(detail, budget)),
                         Style::default().fg(muted),
                     ));
                 }

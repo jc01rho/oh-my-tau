@@ -239,7 +239,10 @@ impl Agent {
             }
             "response" if frame.get("id").and_then(Value::as_str) == Some(RESUME_ID) => {
                 if frame.get("success").and_then(Value::as_bool) != Some(true) {
-                    let error = frame.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+                    let error = frame
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error");
                     let note: Arc<str> = Arc::from(
                         json!({"type": "web_error", "message": format!("Could not resume the session: {error}")})
                             .to_string(),
@@ -254,8 +257,14 @@ impl Agent {
                 let command = frame.get("command").and_then(Value::as_str).unwrap_or("");
                 refresh = matches!(
                     command,
-                    "new_session" | "switch_session" | "open_session" | "fork" | "branch"
-                        | "set_session_name" | "set_model" | "cycle_model"
+                    "new_session"
+                        | "switch_session"
+                        | "open_session"
+                        | "fork"
+                        | "branch"
+                        | "set_session_name"
+                        | "set_model"
+                        | "cycle_model"
                 );
             }
             "extension_ui_request" => {

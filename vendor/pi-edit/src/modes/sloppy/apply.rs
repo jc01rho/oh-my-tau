@@ -1871,6 +1871,10 @@ fn positional_rewrite_segments(
     None
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "inline preparation threads one call site's parsing state straight through; bundling it into a struct would only move the same fields"
+)]
 fn prepare_inline(
     content: &str,
     located: &Candidate,

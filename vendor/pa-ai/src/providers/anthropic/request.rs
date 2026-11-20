@@ -150,7 +150,7 @@ fn resolve_metadata_user_id(
     );
     map.insert(
         "session_id".into(),
-        json!(session_id.map_or_else(|| uuid_v4(), str::to_string)),
+        json!(session_id.map_or_else(uuid_v4, str::to_string)),
     );
     if let Some(account) = account_id.filter(|a| !a.is_empty()) {
         map.insert("account_uuid".into(), json!(account));
@@ -651,10 +651,10 @@ const MAX_STRICT_UNION: i64 = 16;
 fn is_array_node(schema: &Map<String, Value>) -> bool {
     match schema.get("type") {
         Some(Value::String(t)) if t == "array" => return true,
-        Some(Value::Array(t)) => {
-            if t.iter().any(|x| x == "array") && !t.iter().any(|x| x == "object") {
-                return true;
-            }
+        Some(Value::Array(t))
+            if t.iter().any(|x| x == "array") && !t.iter().any(|x| x == "object") =>
+        {
+            return true;
         }
         _ => {}
     }
@@ -940,11 +940,9 @@ fn normalize_strict_node(schema: &Value, budget: &mut StrictBudget) -> Option<Va
                 result.insert("properties".into(), Value::Object(properties));
                 result.insert("required".into(), Value::Array(required));
             }
-            match result.get("items").cloned() {
-                Some(items @ (Value::Array(_) | Value::Object(_))) => {
-                    result.insert("items".into(), normalize_strict_node(&items, budget)?);
-                }
-                _ => {}
+            if let Some(items @ (Value::Array(_) | Value::Object(_))) = result.get("items").cloned()
+            {
+                result.insert("items".into(), normalize_strict_node(&items, budget)?);
             }
             if let Some(Value::Array(p)) = result.get("prefixItems").cloned() {
                 result.insert(
@@ -1022,9 +1020,12 @@ fn has_object_property(schema: &Value) -> bool {
             props.values().any(|p| {
                 p.get("type").and_then(Value::as_str) == Some("object")
                     || p.get("properties").is_some()
-                    || p.get("anyOf").and_then(Value::as_array).is_some_and(|alts| {
-                        alts.iter().any(|a| a.get("type").and_then(Value::as_str) == Some("object"))
-                    })
+                    || p.get("anyOf")
+                        .and_then(Value::as_array)
+                        .is_some_and(|alts| {
+                            alts.iter()
+                                .any(|a| a.get("type").and_then(Value::as_str) == Some("object"))
+                        })
             })
         })
 }
@@ -1361,7 +1362,7 @@ fn apply_head_caching(
         };
         if system[anchor]
             .get("cache_control")
-            .map_or(true, Value::is_null)
+            .is_none_or(Value::is_null)
         {
             for block in system.iter_mut() {
                 if let Some(o) = block.as_object_mut() {
@@ -1781,9 +1782,15 @@ mod eager_streaming_tests {
 
     #[test]
     fn nested_object_tools_are_not_eager() {
-        let flat = tool("write", json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}));
-        let fused = tool("write", json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"},
-            "then_run": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}, "required": ["path", "content"]}));
+        let flat = tool(
+            "write",
+            json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}),
+        );
+        let fused = tool(
+            "write",
+            json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"},
+            "then_run": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}, "required": ["path", "content"]}),
+        );
         let out = convert_tools(&[flat, fused], false, true, true, false);
         assert_eq!(out[0].get("eager_input_streaming"), Some(&json!(true)));
         assert!(out[1].get("eager_input_streaming").is_none());

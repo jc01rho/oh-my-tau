@@ -1,0 +1,54 @@
+pa-agent
+========
+
+This crate is part of oh my tau (omt), which is distributed under the MIT
+License (see the repository root LICENSE).
+
+Upstream lineage
+----------------
+
+pa-agent is derived from Prime Agent by Prime Intellect:
+
+    https://github.com/PrimeIntellect-ai/prime-agent
+
+    The MIT License (MIT)
+    Copyright (c) 2025-2026 Prime Intellect Ltd.
+
+The upstream MIT license text is vendored at vendor/LICENSE-prime-agent and is
+reproduced by reference: it must accompany any redistribution of this crate.
+Prime Agent is itself a port of the Prime Agent TypeScript product, originally
+Copyright (c) 2025 Mario Zechner, used under the MIT License.
+
+omt modifications
+-----------------
+
+This copy is a modified fork, not a verbatim vendored upstream release. Files
+under src/ and tests/ have been edited for omt; the changes are covered by the
+same MIT terms as the rest of omt. The crate is built as a workspace member
+(name/version/edition/license inherited from the workspace Cargo.toml, license
+= "MIT"), and it depends only on workspace dependencies plus reqwest.
+
+Surface that differs from or extends the upstream TypeScript/Primer Agent loop,
+as present in this tree:
+
+  * src/proxy.rs - streams completions through a proxy server
+    (POST {proxyUrl}/api/stream) instead of calling providers directly; the
+    server strips the `partial` field and the partial assistant message is
+    reconstructed client-side from SSE `data:` lines.
+  * Compaction epoch - `AgentLoopConfig::compaction_epoch` (src/agent_loop/mod.rs)
+    and `Agent::compaction_epoch` / `set_compaction_epoch` (src/agent.rs) record
+    the epoch on assistant `contextSnapshot`s.
+  * System prompt hook - `AgentLoopConfig::get_system_prompt`, resolved per model
+    call in src/agent_loop/response.rs, overriding the context system prompt.
+  * Per-run routing fields - `service_tier` and `credential_id` on the loop
+    config, carried into stream requests and stamped onto assistant messages.
+  * src/scripted.rs and tests/agent_loop_scripted.rs, tests/listener_reentry.rs -
+    scripted provider/dispatcher doubles used by omt's test suite.
+  * `prepare_dispatch` (src/agent_loop/response.rs) freezes the context message
+    list before running `beforeToolCall` hooks so hooks and tool executions
+    snapshot one version of the history.
+
+Upstream revision history is not vendored here, so this list is a description of
+the current tree, not an authoritative diff against a pinned upstream commit.
+
+Files added by omt (this NOTICE) are original to omt and MIT-licensed.
