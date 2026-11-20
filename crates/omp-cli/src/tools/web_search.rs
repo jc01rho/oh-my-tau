@@ -81,7 +81,10 @@ pub fn schema() -> Value {
         "properties": {
             "query": {"type": "string"},
             "recency": {"type": "string", "enum": ["day", "week", "month", "year"]},
-            "limit": {"type": "number"}
+            "limit": {"type": "number"},
+            "max_tokens": {"type": "number"},
+            "temperature": {"type": "number"},
+            "num_search_results": {"type": "number"}
         },
         "required": ["query"],
         "additionalProperties": false
@@ -1297,40 +1300,23 @@ struct AnthropicServerToolUse {
 }
 
 /// Call Anthropic's Claude `web_search_20250305` tool.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit HTTP client, auth, model, query plan, sampling, and abort handle"
+)]
 async fn search_anthropic(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     model: &str,
     plan: &AnthropicQueryPlan,
+    max_tokens: Option<u32>,
+    temperature: Option<f64>,
     signal: &AbortSignal,
 ) -> Result<AnthropicApiResponse> {
     let url = format!("{base_url}/v1/messages?beta=true");
 
-    let tool_obj = {
-        let mut t = serde_json::Map::new();
-        t.insert("type".to_string(), json!(WEB_SEARCH_TOOL_TYPE));
-        t.insert("name".to_string(), json!(WEB_SEARCH_TOOL_NAME));
-        if let Some(domains) = &plan.allowed_domains {
-            t.insert("allowed_domains".to_string(), json!(domains));
-        }
-        if let Some(domains) = &plan.blocked_domains {
-            t.insert("blocked_domains".to_string(), json!(domains));
-        }
-        serde_json::Value::Object(t)
-    };
-
-    let mut body = serde_json::Map::new();
-    body.insert("model".to_string(), json!(model));
-    body.insert("max_tokens".to_string(), json!(DEFAULT_MAX_TOKENS));
-    body.insert(
-        "messages".to_string(),
-        json!([{"role": "user", "content": &plan.query}]),
-    );
-    body.insert("tools".to_string(), json!([tool_obj]));
-    body.insert("system".to_string(), json!(SYSTEM_PROMPT));
-
-    let body_val = serde_json::Value::Object(body);
+    let body_val = build_request_body(model, plan, max_tokens, temperature);
 
     let response = tokio::select! {
         result = client
@@ -1358,6 +1344,60 @@ async fn search_anthropic(
         .map_err(|e| anyhow!("Failed to parse Anthropic response: {e}"))?;
 
     Ok(api_response)
+}
+
+/// Dated API versions at or after this one reject sampling parameters
+/// (`temperature`) even for models that otherwise accept them. Mirrors upstream
+/// `callSearch`'s `anthropicApiVersionAcceptsSamplingParams` gate.
+const SAMPLING_REJECTING_API_VERSION: &str = "2026-10-21";
+
+/// Whether `version` accepts `temperature` on `/v1/messages`.
+fn api_version_accepts_sampling_params(version: &str) -> bool {
+    version < SAMPLING_REJECTING_API_VERSION
+}
+
+/// Build the `/v1/messages` body for Anthropic's `web_search` tool.
+///
+/// `temperature: Some(0.0)` is a real request (deterministic sampling), not a
+/// stand-in for "unset": `claude-opus-5-5` under `2023-06-01` accepts it, so it
+/// is sent as `0.0` rather than rejected. Only a sampling-rejecting API version
+/// drops it, and then the field is omitted (never `null`) so the server default
+/// applies - the same fallback upstream's `callSearch` takes.
+fn build_request_body(
+    model: &str,
+    plan: &AnthropicQueryPlan,
+    max_tokens: Option<u32>,
+    temperature: Option<f64>,
+) -> Value {
+    let mut tool = serde_json::Map::new();
+    tool.insert("type".to_string(), json!(WEB_SEARCH_TOOL_TYPE));
+    tool.insert("name".to_string(), json!(WEB_SEARCH_TOOL_NAME));
+    if let Some(domains) = &plan.allowed_domains {
+        tool.insert("allowed_domains".to_string(), json!(domains));
+    }
+    if let Some(domains) = &plan.blocked_domains {
+        tool.insert("blocked_domains".to_string(), json!(domains));
+    }
+
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), json!(model));
+    body.insert(
+        "max_tokens".to_string(),
+        json!(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
+    );
+    let temperature =
+        temperature.filter(|_| api_version_accepts_sampling_params(ANTHROPIC_API_VERSION));
+    if let Some(temperature) = temperature {
+        body.insert("temperature".to_string(), json!(temperature));
+    }
+    body.insert(
+        "messages".to_string(),
+        json!([{"role": "user", "content": &plan.query}]),
+    );
+    body.insert("tools".to_string(), json!([Value::Object(tool)]));
+    body.insert("system".to_string(), json!(SYSTEM_PROMPT));
+
+    Value::Object(body)
 }
 
 /// Convert an Anthropic API response into a `SearchResponse`.
@@ -1529,6 +1569,17 @@ fn truncate(s: &str, max_len: usize) -> String {
     format!("{truncated}…")
 }
 
+/// Cap the sources that get rendered. `limit` is ts `params.limit`;
+/// `num_search_results` caps rendered sources on Anthropic (no native field),
+/// so both are applied client-side, `limit` first.
+fn cap_sources(response: &mut SearchResponse, limit: Option<u32>, num_search_results: Option<u32>) {
+    for cap in [limit, num_search_results].into_iter().flatten() {
+        if response.sources.len() > cap as usize {
+            response.sources.truncate(cap as usize);
+        }
+    }
+}
+
 fn has_renderable_search_content(response: &SearchResponse) -> bool {
     response
         .answer
@@ -1668,6 +1719,17 @@ struct WebSearchParams {
     recency: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
+    /// Upper bound on answer tokens; ts `params.max_tokens`.
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    /// Sampling temperature (0-1); ts `params.temperature`.
+    #[serde(default)]
+    temperature: Option<f64>,
+    /// ts `params.num_search_results`. Anthropic's `web_search_20250305` tool has
+    /// no per-call result count (only `max_uses`, a search budget), so the port
+    /// applies it as a cap on rendered sources alongside `limit`.
+    #[serde(default)]
+    num_search_results: Option<u32>,
 }
 
 /// Convert recency string to an `after:` ISO date (days ago).
@@ -1688,6 +1750,18 @@ fn recency_to_after(recency: &str) -> Option<String> {
 async fn web_search(params: Value, signal: AbortSignal) -> Result<AgentToolResult> {
     let parsed: WebSearchParams = serde_json::from_value(params.clone())
         .map_err(|e| anyhow!("Invalid web_search arguments: {e}"))?;
+
+    if let Some(temperature) = parsed.temperature {
+        if !temperature.is_finite() || !(0.0..=1.0).contains(&temperature) {
+            bail!("Invalid web_search arguments: temperature must be between 0 and 1, got {temperature}");
+        }
+    }
+    if parsed.num_search_results == Some(0) {
+        bail!("Invalid web_search arguments: num_search_results must be at least 1");
+    }
+    if parsed.limit == Some(0) {
+        bail!("Invalid web_search arguments: limit must be at least 1");
+    }
 
     if parsed.query.is_empty() {
         let resp = SearchResponse {
@@ -1737,6 +1811,8 @@ async fn web_search(params: Value, signal: AbortSignal) -> Result<AgentToolResul
         &api_key,
         "claude-opus-5-5",
         &plan,
+        parsed.max_tokens,
+        parsed.temperature,
         &signal,
     )
     .await?;
@@ -1757,12 +1833,7 @@ async fn web_search(params: Value, signal: AbortSignal) -> Result<AgentToolResul
         }
     }
 
-    // Limit sources.
-    if let Some(n) = parsed.limit {
-        if response.sources.len() > n as usize {
-            response.sources.truncate(n as usize);
-        }
-    }
+    cap_sources(&mut response, parsed.limit, parsed.num_search_results);
 
     if !has_renderable_search_content(&response) {
         let mut error_resp = response;
@@ -1798,8 +1869,11 @@ mod tests {
     fn schema_matches_ts_reference() {
         let s = schema();
         let props = s["properties"].as_object().unwrap();
-        assert_eq!(props.len(), 3);
+        assert_eq!(props.len(), 6);
         assert_eq!(props["limit"]["type"], "number");
+        assert_eq!(props["max_tokens"]["type"], "number");
+        assert_eq!(props["temperature"]["type"], "number");
+        assert_eq!(props["num_search_results"]["type"], "number");
         assert_eq!(props["query"]["type"], "string");
         assert_eq!(
             props["recency"],
@@ -1905,6 +1979,106 @@ mod tests {
         assert!(text.contains("# Sources"));
     }
 
+    #[tokio::test]
+    async fn temperature_out_of_range_is_rejected() {
+        for bad in [1.5_f64, -0.1] {
+            let controller = pa_agent::abort::AbortController::new();
+            let params = json!({ "query": "rust", "temperature": bad });
+            let err = match web_search(params, controller.signal()).await {
+                Ok(_) => panic!("temperature {bad} should have been rejected"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("temperature must be between 0 and 1"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn num_search_results_zero_is_rejected() {
+        let controller = pa_agent::abort::AbortController::new();
+        let params = json!({ "query": "rust", "num_search_results": 0 });
+        let err = match web_search(params, controller.signal()).await {
+            Ok(_) => panic!("num_search_results: 0 should have been rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("num_search_results must be at least 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_zero_is_rejected() {
+        let controller = pa_agent::abort::AbortController::new();
+        let params = json!({ "query": "rust", "limit": 0 });
+        let err = match web_search(params, controller.signal()).await {
+            Ok(_) => panic!("limit: 0 should have been rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("limit must be at least 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sampling_temperature_zero_is_sent_verbatim() {
+        let plan = AnthropicQueryPlan {
+            query: "rust".to_string(),
+            allowed_domains: None,
+            blocked_domains: None,
+        };
+        let body = build_request_body("claude-opus-5-5", &plan, None, Some(0.0));
+        assert_eq!(body["model"], json!("claude-opus-5-5"));
+        assert_eq!(body["temperature"], json!(0.0));
+
+        // An absent temperature stays absent so the API default applies.
+        let body = build_request_body("claude-opus-5-5", &plan, None, None);
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn sampling_params_dropped_only_on_rejecting_api_version() {
+        assert!(api_version_accepts_sampling_params("2023-06-01"));
+        assert!(api_version_accepts_sampling_params("2025-03-05"));
+        assert!(!api_version_accepts_sampling_params("2026-10-21"));
+        assert!(!api_version_accepts_sampling_params("2027-01-01"));
+    }
+
+    #[test]
+    fn num_search_results_caps_rendered_sources() {
+        let source = |i: usize| SearchSource {
+            title: format!("Source {i}"),
+            url: format!("https://example.com/{i}"),
+            snippet: None,
+            published_date: None,
+            age_seconds: None,
+            author: None,
+        };
+        let mut resp = SearchResponse {
+            provider: "anthropic".to_string(),
+            answer: Some("three sources".to_string()),
+            sources: (1..=3).map(source).collect(),
+            ..Default::default()
+        };
+
+        cap_sources(&mut resp, None, Some(2));
+        assert_eq!(resp.sources.len(), 2);
+
+        let text = format_for_llm(&resp, &[]);
+        assert_eq!(text.matches("    https://example.com/").count(), 2);
+        assert!(text.contains("https://example.com/2"));
+        assert!(!text.contains("https://example.com/3"));
+
+        // A cap above the source count leaves the list untouched.
+        cap_sources(&mut resp, None, Some(5));
+        assert_eq!(resp.sources.len(), 2);
+        cap_sources(&mut resp, Some(1), None);
+        assert_eq!(resp.sources.len(), 1);
+    }
+
     #[test]
     fn parse_page_age_parses_human_string() {
         assert_eq!(parse_page_age("2 days ago"), Some(172_800.0));
@@ -1987,6 +2161,8 @@ mod tests {
             "test-key",
             "claude-opus-5-5",
             &plan,
+            None,
+            None,
             &controller.signal(),
         )
         .await
@@ -2039,6 +2215,8 @@ mod tests {
             "bad-key",
             "claude-opus-5-5",
             &plan,
+            None,
+            None,
             &controller.signal(),
         )
         .await;

@@ -1,6 +1,8 @@
 //! `bash`: one shell command (`bash -c`, stderr merged into stdout), omp's
 //! result text: output, `Wall time: N.NN seconds`, `Command exited with code N`.
-//! Non-persistent shell (omp embeds a brush-based shell; see the port report).
+//! Non-persistent shell: omp embeds a brush-based shell, while omp-rs currently
+//! spawns an external `bash -c` (under util-linux `setsid`, see [`detached_bash`])
+//! pending the Phase 2 in-process shell port; the command semantics above match omp.
 //!
 //! omp's `async: true` backgrounds the command in the session job manager and
 //! returns `formatBackgroundNotice`; the job is inspected via `read proc://`
@@ -34,6 +36,17 @@ const MIN_TIMEOUT_SECS: f64 = 1.0;
 const MAX_TIMEOUT_SECS: f64 = 3600.0;
 /// Bytes held in memory while the command runs (the rest is dropped from the middle).
 const RETAIN_BYTES: usize = 8 * DEFAULT_MAX_BYTES;
+/// Lines one `notify` report carries; further matches are only counted
+/// (omp `NOTIFY_MAX_LINES`).
+const NOTIFY_MAX_LINES: usize = 50;
+/// Characters kept of one reported line (omp `NOTIFY_MAX_LINE_CHARS`).
+const NOTIFY_MAX_LINE_CHARS: usize = 400;
+/// Bytes of an unterminated line buffered while waiting for its newline.
+/// Past it the line is judged once from its bounded prefix and the rest of
+/// the line is skipped, so a command that prints a huge line without
+/// newlines cannot grow the buffer or make every read rescan it (a reported
+/// line is clamped to [`NOTIFY_MAX_LINE_CHARS`] characters either way).
+const NOTIFY_MAX_PARTIAL_BYTES: usize = NOTIFY_MAX_LINE_CHARS * 4;
 
 /// omp `formatWallTimeNotice`.
 #[must_use]
@@ -156,13 +169,187 @@ fn local_bash_argv(script: &str) -> Vec<String> {
     }
 }
 
+/// A `notify` regex on a running command: the lines it matches are collected
+/// (bounded) and reported with the finished result.
+///
+/// omp streams these as follow-ups in 200 ms batches with a refilling
+/// 30-batch allowance (`async/notify.ts` `OutputNotifier`). omp-rs has no
+/// follow-up channel on the job surface, so the port keeps omp's per-batch
+/// bounds — [`NOTIFY_MAX_LINES`] reported lines per batch, each cut to
+/// [`NOTIFY_MAX_LINE_CHARS`], blank lines never counted, the rest only
+/// counted — and emits one batch when the command settles; the timer and the
+/// allowance therefore collapse into that single bounded report.
+pub(super) struct Notify {
+    re: regex::Regex,
+    /// The regex as given, quoted back in the report.
+    source: String,
+    state: Mutex<NotifyState>,
+}
+
+#[derive(Default)]
+struct NotifyState {
+    /// An unterminated line carried between chunks (a match is a whole line).
+    /// Bounded by [`NOTIFY_MAX_PARTIAL_BYTES`].
+    partial: String,
+    /// Skipping the remainder of an over-long line already judged from its
+    /// bounded prefix (its newline has not arrived yet).
+    skipping: bool,
+    lines: Vec<String>,
+    omitted: usize,
+}
+
+impl Notify {
+    /// Compile a `notify` regex; the caller's bad pattern fails the call.
+    fn new(source: &str) -> Result<Self> {
+        let re = regex::Regex::new(source).map_err(|e| anyhow!("Invalid notify regex: {e}"))?;
+        Ok(Self {
+            re,
+            source: source.to_string(),
+            state: Mutex::new(NotifyState::default()),
+        })
+    }
+
+    /// Match the complete lines in `text`; the remainder waits for the next
+    /// chunk so a line split across reads is still matched whole.
+    fn feed(&self, text: &str) {
+        self.collect(text, false);
+    }
+
+    /// End of output: the trailing unterminated line counts as a line.
+    fn finish(&self) {
+        self.collect("", true);
+    }
+
+    fn collect(&self, text: &str, end: bool) {
+        let mut st = self.state.lock().expect("notify poisoned");
+        let mut lines: Vec<String> = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            if st.skipping {
+                // Inside an over-long line: only its newline matters.
+                match rest.find('\n') {
+                    Some(i) => {
+                        st.skipping = false;
+                        rest = &rest[i + 1..];
+                    }
+                    None => rest = "",
+                }
+                continue;
+            }
+            if let Some(i) = rest.find('\n') {
+                let mut line = std::mem::take(&mut st.partial);
+                line.push_str(&rest[..i]);
+                lines.push(line);
+                rest = &rest[i + 1..];
+            } else {
+                st.partial.push_str(rest);
+                rest = "";
+                if st.partial.len() > NOTIFY_MAX_PARTIAL_BYTES {
+                    let pending = std::mem::take(&mut st.partial);
+                    if !pending.trim().is_empty() && self.re.is_match(&pending) {
+                        lines.push(pending);
+                    }
+                    st.skipping = true;
+                }
+            }
+        }
+        if end {
+            if !st.skipping && !st.partial.is_empty() {
+                lines.push(std::mem::take(&mut st.partial));
+            }
+            st.partial.clear();
+            st.skipping = false;
+        }
+        for line in lines {
+            if line.trim().is_empty() || !self.re.is_match(&line) {
+                continue;
+            }
+            if st.lines.len() < NOTIFY_MAX_LINES {
+                st.lines.push(clamp_chars(&line, NOTIFY_MAX_LINE_CHARS));
+            } else {
+                st.omitted += 1;
+            }
+        }
+    }
+
+    /// The report block, or `None` when nothing matched.
+    fn report(&self) -> Option<String> {
+        let st = self.state.lock().expect("notify poisoned");
+        if st.lines.is_empty() {
+            return None;
+        }
+        let plural = if st.lines.len() == 1 { "" } else { "s" };
+        let mut out = format!(
+            "[notify /{}/: {} matching line{plural}]",
+            self.source,
+            st.lines.len()
+        );
+        for line in &st.lines {
+            out.push('\n');
+            out.push_str(line);
+        }
+        if st.omitted > 0 {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\n… {} more matching lines", st.omitted);
+        }
+        Some(out)
+    }
+}
+
+/// Decode `bytes` as UTF-8, carrying an incomplete trailing sequence over to
+/// the next read instead of turning it into U+FFFD: a character split across
+/// two `read`s (e.g. `0xC3` then `0xA9 0x0A`) arrives whole. Genuinely invalid
+/// bytes still degrade to one U+FFFD per bad sequence, like `from_utf8_lossy`.
+fn decode_chunk(bytes: &[u8], carry: &mut Vec<u8>) -> String {
+    carry.extend_from_slice(bytes);
+    let mut out = String::with_capacity(carry.len());
+    let mut start = 0;
+    loop {
+        match std::str::from_utf8(&carry[start..]) {
+            Ok(s) => {
+                out.push_str(s);
+                start = carry.len();
+                break;
+            }
+            Err(e) => {
+                let valid = start + e.valid_up_to();
+                out.push_str(std::str::from_utf8(&carry[start..valid]).expect("valid prefix"));
+                match e.error_len() {
+                    // A truncated sequence at the end of the chunk: wait.
+                    None => {
+                        start = valid;
+                        break;
+                    }
+                    Some(len) => {
+                        out.push('\u{FFFD}');
+                        start = valid + len;
+                    }
+                }
+            }
+        }
+    }
+    carry.drain(..start);
+    out
+}
+
+/// Cut `s` to `max` characters (not bytes).
+fn clamp_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
 /// `tap`, when given, receives every output chunk as it arrives (the
 /// background-job surface shows it via `read proc://<id>` while running).
+/// `notify`, when given, matches every chunk as it arrives (see [`Notify`]).
 async fn run(
     cwd: &std::path::Path,
     command: &str,
     timeout: Option<f64>,
     signal: &AbortSignal,
+    notify: Option<&Notify>,
     tap: Option<Arc<Mutex<String>>>,
 ) -> Result<(String, Option<i32>, Duration, Option<&'static str>)> {
     let script = format!("exec 2>&1\n{command}");
@@ -204,6 +391,9 @@ async fn run(
     let mut stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
+    // Bytes of a multi-byte character still split across reads; decoded once
+    // the rest arrives so a split sequence is never mangled into U+FFFD.
+    let mut carry: Vec<u8> = Vec::new();
     let deadline = async {
         match timeout {
             Some(t) => tokio::time::sleep(Duration::from_secs_f64(t)).await,
@@ -217,13 +407,19 @@ async fn run(
             n = stdout.read(&mut chunk) => {
                 let n = n.context("reading command output")?;
                 if n == 0 { break; }
-                if let Some(tap) = &tap {
-                    let mut t = tap.lock().expect("job output tap poisoned");
-                    t.push_str(&String::from_utf8_lossy(&chunk[..n]));
-                    // Bound the tap: proc reads only need the recent window.
-                    if t.len() > RETAIN_BYTES {
-                        let cut = t.len() - RETAIN_BYTES / 2;
-                        t.drain(..cut);
+                if notify.is_some() || tap.is_some() {
+                    let text = decode_chunk(&chunk[..n], &mut carry);
+                    if let Some(notify) = notify {
+                        notify.feed(&text);
+                    }
+                    if let Some(tap) = &tap {
+                        let mut t = tap.lock().expect("job output tap poisoned");
+                        t.push_str(&text);
+                        // Bound the tap: proc reads only need the recent window.
+                        if t.len() > RETAIN_BYTES {
+                            let cut = super::util::floor_boundary(&t, t.len() - RETAIN_BYTES / 2);
+                            t.drain(..cut);
+                        }
                     }
                 }
                 buf.extend_from_slice(&chunk[..n]);
@@ -244,6 +440,17 @@ async fn run(
     } else {
         child.wait().await.context("waiting for command")?.code()
     };
+    if !carry.is_empty() {
+        // End of output: a truncated sequence now really is invalid text.
+        let tail = String::from_utf8_lossy(&carry).into_owned();
+        if let Some(notify) = notify {
+            notify.feed(&tail);
+        }
+        if let Some(tap) = &tap {
+            tap.lock().expect("job output tap poisoned").push_str(&tail);
+        }
+        carry.clear();
+    }
     Ok((
         String::from_utf8_lossy(&buf).into_owned(),
         code,
@@ -275,7 +482,7 @@ pub async fn execute(
     signal: &AbortSignal,
 ) -> Result<Executed> {
     let (raw, code, _, outcome) =
-        run(cwd, command, Some(DEFAULT_TIMEOUT_SECS), signal, None).await?;
+        run(cwd, command, Some(DEFAULT_TIMEOUT_SECS), signal, None, None).await?;
     let total_bytes = raw.len();
     let total_lines = raw.lines().count();
     let t = truncate_tail(&raw, DEFAULT_MAX_BYTES);
@@ -439,7 +646,19 @@ pub async fn bash(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|n| !n.is_empty());
-    let async_requested = args.get("async").and_then(Value::as_bool) == Some(true);
+    let notify_source = args
+        .get("notify")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // Compiled before anything runs: a bad regex fails the call instead of a
+    // job that never reports (omp `compileNotifyPattern`).
+    let notify = notify_source.map(Notify::new).transpose()?.map(Arc::new);
+    // omp: `async: true` or a `notify` regex on a plain command is an async
+    // request; with a service `name` the captured log already shows every
+    // line, so `notify` there only validates.
+    let async_requested = args.get("async").and_then(Value::as_bool) == Some(true)
+        || (notify.is_some() && name.is_none());
     let timeout = timeout_arg(&args);
     let mut notices: Vec<String> = Vec::new();
     if let Some(name) = name {
@@ -478,6 +697,14 @@ pub async fn bash(
         if !outcome.log.is_empty() {
             lines.push(outcome.log);
         }
+        // A service's captured log already carries every line, so `notify`
+        // only tells the model where to look (omp `service.notifyArmed`).
+        if let Some(notify) = &notify {
+            lines.push(format!(
+                "Output lines matching /{}/ arrive in proc://{name} while it runs.",
+                notify.source
+            ));
+        }
         return Ok(AgentToolResult::text(lines.join("\n")));
     }
     if ready_given(&args) {
@@ -488,10 +715,19 @@ pub async fn bash(
     let query = env.query();
     if async_requested {
         return Ok(start_background(
-            &env.jobs, dir, command, timeout, notices, spill, query, &signal,
+            &env.jobs,
+            dir,
+            command,
+            timeout,
+            notices,
+            spill,
+            query,
+            notify.as_ref(),
+            &signal,
         ));
     }
-    let (output, code, elapsed, outcome) = run(&dir, &command, timeout, &signal, None).await?;
+    let (output, code, elapsed, outcome) =
+        run(&dir, &command, timeout, &signal, None, None).await?;
     let mut text = finished_text(&output, elapsed, outcome, timeout, code, &spill, &query);
     if !notices.is_empty() {
         text = format!("{}\n{text}", notices.join("\n"));
@@ -652,14 +888,19 @@ async fn start_service(
                                 let mut out = svc.output.lock().expect("service output poisoned");
                                 out.push_str(&text);
                                 if out.len() > RETAIN_BYTES {
-                                    let cut = out.len() - RETAIN_BYTES / 2;
+                                    let cut =
+                                        super::util::floor_boundary(&out, out.len() - RETAIN_BYTES / 2);
                                     out.drain(..cut);
                                 }
                             }
                             if !log_ready {
                                 readiness_buffer.push_str(&text);
                                 if readiness_buffer.len() > READINESS_BUFFER_CHARS {
-                                    readiness_buffer.drain(..readiness_buffer.len() - READINESS_BUFFER_CHARS);
+                                    let drop_to = super::util::floor_boundary(
+                                        &readiness_buffer,
+                                        readiness_buffer.len() - READINESS_BUFFER_CHARS,
+                                    );
+                                    readiness_buffer.drain(..drop_to);
                                 }
                                 if pattern.as_ref().is_some_and(|re| re.is_match(&readiness_buffer)) {
                                     log_ready = true;
@@ -750,6 +991,25 @@ async fn start_service(
     })
 }
 
+/// Append a `notify` report to a finished job's text, keeping the combined
+/// inline result within the spill cap: the report is appended after
+/// [`finished_text`] already capped the body, so without this second cap a
+/// large report would push `job.result` (read verbatim through `proc://`) past
+/// the inline budget.
+fn append_notify_report(text: &str, report: &str, spill: &SpillConfig) -> String {
+    let combined = format!("{text}\n\n{report}");
+    // Raw-output mode is an explicit bypass: `bound_output` left the body
+    // uncapped, so appending the report must not re-impose the inline cap
+    // (that would silently drop output the caller asked to see verbatim).
+    if crate::methodology::raw_tool_output_requested() {
+        return combined;
+    }
+    if combined.len() <= spill.inline_cap() {
+        return combined;
+    }
+    enforce_inline_byte_cap(&combined, spill.inline_cap(), || save_artifact(&combined))
+}
+
 /// omp `BashTool` async mode: register a `bg_N` job, run it detached, and
 /// return `formatBackgroundNotice` (the result is read later via `proc://`).
 #[allow(clippy::too_many_arguments)] // job plumbing: registry, command, limits, spill policy, request query
@@ -761,6 +1021,7 @@ fn start_background(
     notices: Vec<String>,
     spill: SpillConfig,
     query: String,
+    notify: Option<&Arc<Notify>>,
     _signal: &AbortSignal,
 ) -> AgentToolResult {
     let output: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -776,13 +1037,28 @@ fn start_background(
     let job_id = registry.insert(job);
     let registry = registry.clone();
     let task_job_id = job_id.clone();
+    let task_notify = notify.cloned();
     tokio::spawn(async move {
         let controller = pa_agent::abort::AbortController::new();
-        let raw = run(&dir, &command, timeout, &controller.signal(), Some(output)).await;
+        let raw = run(
+            &dir,
+            &command,
+            timeout,
+            &controller.signal(),
+            task_notify.as_deref(),
+            Some(output),
+        )
+        .await;
+        if let Some(notify) = &task_notify {
+            notify.finish();
+        }
         let (status, result, error) = match &raw {
             Ok((output, code, elapsed, outcome)) => {
-                let text =
+                let mut text =
                     finished_text(output, *elapsed, *outcome, timeout, *code, &spill, &query);
+                if let Some(report) = task_notify.as_ref().and_then(|n| n.report()) {
+                    text = append_notify_report(&text, &report, &spill);
+                }
                 let status = if outcome.is_none() && *code == Some(0) {
                     JobStatus::Completed
                 } else {
@@ -814,6 +1090,12 @@ fn start_background(
     let mut lines: Vec<String> = Vec::new();
     lines.extend(notices);
     lines.push(jobs::background_notice(&job_id, timeout));
+    if let Some(notify) = notify {
+        lines.push(format!(
+            "Output lines matching /{}/ are reported with the job's result; read proc://{job_id}.",
+            notify.source
+        ));
+    }
     AgentToolResult::text(lines.join("\n"))
 }
 
@@ -1233,6 +1515,269 @@ mod tests {
         );
     }
 
+    /// A line split across two reads still matches whole (omp `SourceLineReader`
+    /// keeps the line boundary); non-matching and blank lines are never reported.
+    #[test]
+    fn notify_matches_whole_lines_across_chunks() {
+        let n = Notify::new("^boom$").unwrap();
+        n.feed("quiet\nbo");
+        n.feed("om\n\n  \nlast-boom\n");
+        // The split line "bo"+"om" is matched as one line; the trailing
+        // `last-boom` and the blanks do not match `^boom$`.
+        assert_eq!(
+            n.report().unwrap(),
+            "[notify /^boom$/: 1 matching line]\nboom"
+        );
+        // An unterminated last line is still a line once output ends.
+        n.feed("boom");
+        n.finish();
+        let report = n.report().unwrap();
+        assert_eq!(report, "[notify /^boom$/: 2 matching lines]\nboom\nboom");
+    }
+
+    /// A multi-byte character split across two reads survives: `0xC3` alone is
+    /// not a character, so decoding per read would emit U+FFFD and lose it.
+    #[test]
+    fn decode_chunk_carries_split_utf8_across_reads() {
+        let mut carry = Vec::new();
+        assert_eq!(decode_chunk(&[b'a', 0xC3], &mut carry), "a");
+        assert_eq!(carry, vec![0xC3]);
+        assert_eq!(decode_chunk(&[0xA9, 0x0A], &mut carry), "\u{e9}\n");
+        assert!(carry.is_empty());
+        // A 3-byte character split three ways, then a 4-byte one.
+        assert_eq!(decode_chunk(&[0xE2], &mut carry), "");
+        assert_eq!(decode_chunk(&[0x82], &mut carry), "");
+        assert_eq!(decode_chunk(&[0xAC, 0xF0], &mut carry), "\u{20ac}");
+        assert_eq!(decode_chunk(&[0x9F, 0xA6, 0x80], &mut carry), "\u{1f980}");
+        assert!(carry.is_empty());
+        // Genuinely invalid bytes still degrade to one U+FFFD per sequence.
+        assert_eq!(decode_chunk(&[0xFF, b'x'], &mut carry), "\u{FFFD}x");
+        assert!(carry.is_empty());
+    }
+
+    /// A `notify` match on a character split across the read boundary: the
+    /// line is matched on its decoded text, not on a replacement char.
+    #[test]
+    fn notify_matches_a_line_split_mid_character() {
+        let n = Notify::new("caf\u{e9}").unwrap();
+        let mut carry = Vec::new();
+        n.feed(&decode_chunk(b"hit: caf\xC3", &mut carry));
+        n.feed(&decode_chunk(b"\xA9 done\n", &mut carry));
+        n.finish();
+        assert_eq!(
+            n.report().unwrap(),
+            "[notify /caf\u{e9}/: 1 matching line]\nhit: caf\u{e9} done"
+        );
+    }
+
+    /// A huge line without newlines stays bounded: the buffer never exceeds
+    /// the partial cap, the line is judged once from its prefix, and the rest
+    /// is skipped rather than rescanned on every read.
+    #[test]
+    fn notify_bounds_partial_line_without_newlines() {
+        let n = Notify::new("needle").unwrap();
+        n.feed("needle");
+        for _ in 0..1000 {
+            n.feed(&"x".repeat(4096));
+            let len = n.state.lock().unwrap().partial.len();
+            assert!(len <= NOTIFY_MAX_PARTIAL_BYTES, "partial grew to {len}");
+        }
+        // The newline ends the skipped remainder; a following line still counts.
+        n.feed("\nneedle again\n");
+        n.finish();
+        let report = n.report().unwrap();
+        let mut lines = report.lines();
+        assert_eq!(lines.next().unwrap(), "[notify /needle/: 2 matching lines]");
+        // The over-long line was judged once from its bounded prefix and is
+        // reported clamped, not at its original (megabyte) length.
+        let first = lines.next().unwrap();
+        assert!(first.starts_with("needle"), "{first}");
+        assert_eq!(first.chars().count(), NOTIFY_MAX_LINE_CHARS);
+        assert_eq!(lines.next().unwrap(), "needle again");
+        assert!(n.state.lock().unwrap().partial.is_empty());
+    }
+
+    /// A huge non-matching line is dropped without reaching the report.
+    #[test]
+    fn notify_drops_an_unmatched_unbounded_line() {
+        let n = Notify::new("hit").unwrap();
+        n.feed(&"y".repeat(NOTIFY_MAX_PARTIAL_BYTES * 4));
+        n.finish();
+        assert!(n.report().is_none());
+        assert!(n.state.lock().unwrap().partial.is_empty());
+    }
+
+    /// The report is appended after the body was capped, so the combined job
+    /// result must be capped too before it becomes `proc://` text.
+    #[test]
+    fn notify_report_append_respects_the_inline_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".omp")).unwrap();
+        std::fs::write(
+            dir.path().join(".omp/config.yml"),
+            "tools:\n  artifactSpillThreshold: 8\n  artifactHeadBytes: 20\n  artifactTailBytes: 20\n  artifactTailLines: 500\n",
+        )
+        .unwrap();
+        let spill = SpillConfig::load(dir.path());
+        let n = Notify::new("hit").unwrap();
+        for i in 0..NOTIFY_MAX_LINES {
+            n.feed(&format!("hit {i} {}\n", "q".repeat(NOTIFY_MAX_LINE_CHARS)));
+        }
+        n.finish();
+        let report = n.report().unwrap();
+        assert!(
+            report.len() > spill.inline_cap(),
+            "report {} bytes",
+            report.len()
+        );
+        let body = "line\n".repeat(4000);
+        let text = append_notify_report(&body, &report, &spill);
+        assert!(
+            text.len() <= spill.inline_cap(),
+            "result {} bytes",
+            text.len()
+        );
+        assert!(text.contains("B elided…]"), "elision marker kept: {text}");
+        // A small report passes through unchanged.
+        let small = append_notify_report("out", "[notify /x/: 1 matching line]\nx", &spill);
+        assert_eq!(small, "out\n\n[notify /x/: 1 matching line]\nx");
+    }
+
+    /// Regression: the background job's output tap keeps only a recent window,
+    /// and the byte window (`RETAIN_BYTES / 2`) is not char-aligned. Draining it
+    /// at the raw byte index split a 3-byte character, `String::drain` panicked,
+    /// and the detached job never settled. Output here is well past
+    /// `RETAIN_BYTES`, so several drains run mid-character.
+    #[test]
+    fn background_tap_drains_multibyte_output_on_char_boundaries() {
+        let chunk = "\u{d55c}".repeat(1024); // U+D55C, 3 bytes on the wire
+        let cmd = format!("for i in $(seq 1 140); do printf '%s' '{chunk}'; done");
+        let tap: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (output, code, _, outcome) = rt
+            .block_on(run(
+                &std::env::temp_dir(),
+                &cmd,
+                Some(60.0),
+                &sig(),
+                None,
+                Some(tap.clone()),
+            ))
+            .unwrap();
+        assert_eq!((code, outcome), (Some(0), None));
+        let text = tap.lock().unwrap().clone();
+        assert!(text.len() <= RETAIN_BYTES, "tap {} bytes", text.len());
+        assert!(!text.is_empty(), "tap drained away all output");
+        assert_eq!(
+            text.len() % 3,
+            0,
+            "tap starts mid-character: {} bytes",
+            text.len()
+        );
+        assert!(
+            text.chars().all(|c| c == '\u{d55c}'),
+            "tap kept a broken char"
+        );
+        // The foreground buffer keeps raw bytes for the head+tail window; only
+        // the tap must stay decodable here.
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn notify_caps_reported_lines_and_counts_the_rest() {
+        let n = Notify::new("hit").unwrap();
+        let mut text = String::new();
+        for i in 0..(NOTIFY_MAX_LINES + 5) {
+            use std::fmt::Write as _;
+            let _ = writeln!(text, "hit {i} {}", "x".repeat(NOTIFY_MAX_LINE_CHARS + 10));
+        }
+        n.feed(&text);
+        n.finish();
+        let report = n.report().unwrap();
+        assert!(
+            report.starts_with(&format!(
+                "[notify /hit/: {NOTIFY_MAX_LINES} matching lines]"
+            )),
+            "{}",
+            report.lines().next().unwrap_or_default()
+        );
+        assert!(report.ends_with("\n… 5 more matching lines"), "{report}");
+        let first = report.lines().nth(1).unwrap();
+        assert_eq!(first.chars().count(), NOTIFY_MAX_LINE_CHARS);
+    }
+
+    /// `notify` matches from the run loop (deterministic: no job polling).
+    #[test]
+    fn notify_over_a_command_reports_only_matching_lines() {
+        let n = Notify::new("ERROR|FATAL").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(run(
+            &std::env::temp_dir(),
+            "echo 'ERROR one'; echo fine; echo 'FATAL two'",
+            Some(60.0),
+            &sig(),
+            Some(&n),
+            None,
+        ))
+        .unwrap();
+        n.finish();
+        let report = n.report().unwrap();
+        assert!(
+            report.starts_with("[notify /ERROR|FATAL/: 2 matching lines]\nERROR one\nFATAL two"),
+            "{report}"
+        );
+        assert!(!report.contains("fine"), "{report}");
+    }
+
+    #[test]
+    fn invalid_notify_regex_fails_the_call_before_running() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(bash(
+                test_env(),
+                serde_json::json!({"command": "touch never-runs", "notify": "(unclosed"}),
+                sig(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("Invalid notify regex: "), "{err}");
+    }
+
+    /// omp: a plain command with `notify` starts in the background; the notice
+    /// names the regex and where the matches are reported.
+    #[tokio::test]
+    async fn notify_without_name_backgrounds_the_command() {
+        let env = test_env();
+        let r = bash(
+            env.clone(),
+            serde_json::json!({"command": "echo ERROR boom; echo ok", "notify": "ERROR"}),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let t = text_of(&r);
+        assert!(
+            t.starts_with("Backgrounded as job bg_1 (deadline 300s)"),
+            "{t}"
+        );
+        assert!(
+            t.contains(
+                "Output lines matching /ERROR/ are reported with the job's result; read proc://bg_1."
+            ),
+            "{t}"
+        );
+        assert!(env.jobs.get("bg_1").is_some(), "job registered");
+    }
+
     #[test]
     fn long_output_is_elided_in_the_middle() {
         let mut long = String::new();
@@ -1271,7 +1816,7 @@ mod tests {
             .build()
             .unwrap();
         let (output, code, _, outcome) = rt
-            .block_on(run(dir.path(), cmd, Some(60.0), &sig(), None))
+            .block_on(run(dir.path(), cmd, Some(60.0), &sig(), None, None))
             .unwrap();
         assert_eq!((code, outcome), (Some(0), None));
         let saved = std::cell::RefCell::new(Vec::<String>::new());
@@ -1344,7 +1889,7 @@ mod tests {
         assert!(plain.contains("B elided…]"), "{plain}");
         // The relevance view always carries the artifact pointer.
         let output = rt
-            .block_on(run(dir.path(), &cmd, Some(60.0), &sig(), None))
+            .block_on(run(dir.path(), &cmd, Some(60.0), &sig(), None, None))
             .unwrap()
             .0;
         let cfg = SpillConfig::load(dir.path());

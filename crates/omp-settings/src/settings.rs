@@ -86,6 +86,12 @@ pub struct Settings {
     merged: Map<String, Value>,
     /// Dotted paths present in no TS setting (group prefix, exact id, or record subtree).
     unknown: Vec<String>,
+    /// Global config file contents as written (no defaults merged in).
+    global_layer: Map<String, Value>,
+    /// Project `.omp/config.yml` + `.omp/config.yaml` contents as written.
+    project_layer: Map<String, Value>,
+    /// Environment overrides actually parsed and applied.
+    env_layer: Map<String, Value>,
     /// Sources actually read, for diagnostics.
     global_path: Option<PathBuf>,
     project_path: Option<PathBuf>,
@@ -112,20 +118,23 @@ impl Settings {
         let mut merged = defaults_layer().clone();
 
         // Layer 2: global config.yml / config.yaml.
+        let mut global_layer = Map::new();
         let global_path = global_yaml.and_then(load_yaml_file);
-        if let Some((path, value)) = &global_path {
+        if let Some((_, value)) = &global_path {
             if let Some(obj) = value.as_object() {
                 deep_merge(&mut merged, obj.clone());
+                global_layer.clone_from(obj);
             }
-            let _ = path;
         }
 
         // Layer 3: project .omp/config.yml then config.yaml (later wins).
+        let mut project_layer = Map::new();
         let mut project_path = None;
         for name in ["config.yml", "config.yaml"] {
             let candidate = project_dir.join(name);
             if let Some((_, value)) = load_yaml_file(&candidate) {
                 if let Some(obj) = value.as_object() {
+                    deep_merge(&mut project_layer, obj.clone());
                     deep_merge(&mut merged, obj.clone());
                 }
                 project_path = Some(candidate);
@@ -133,22 +142,25 @@ impl Settings {
         }
 
         // Layer 4: environment overrides.
-        let mut applied_env = Map::new();
+        let mut env_layer = Map::new();
         for def in SETTINGS {
             if let Some(env_name) = def.env {
                 if let Ok(raw) = std::env::var(env_name) {
                     if let Some(value) = parse_env_value(def, &raw) {
-                        set_path(&mut applied_env, def.id, value);
+                        set_path(&mut env_layer, def.id, value);
                     }
                 }
             }
         }
-        deep_merge(&mut merged, applied_env);
+        deep_merge(&mut merged, env_layer.clone());
 
         let unknown = collect_unknown(&merged);
         Self {
             merged,
             unknown,
+            global_layer,
+            project_layer,
+            env_layer,
             global_path: global_path.map(|(p, _)| p),
             project_path,
         }
@@ -205,28 +217,29 @@ impl Settings {
     }
 
     /// Which layer effectively supplies `id` (env beats project beats global beats default).
+    ///
+    /// Each layer is tracked separately at load time, so a value inherited from the
+    /// global file reports [`Provenance::Global`] and a registry default reports
+    /// [`Provenance::Default`], independently of what the merged map happens to hold.
+    ///
+    /// `None` when `id` is not a registered setting, or when no layer supplies it and the
+    /// registry has no TS default (`default_yaml: None`, e.g. `browser.cdpUrl`).
     #[must_use]
     pub fn provenance(&self, id: &str) -> Option<Provenance> {
-        lookup(id)?;
-        // Env wins: re-check the variable directly.
-        if let Some(def) = lookup(id) {
-            if let Some(env_name) = def.env {
-                if std::env::var(env_name)
-                    .ok()
-                    .and_then(|raw| parse_env_value(def, &raw))
-                    .is_some()
-                {
-                    return Some(Provenance::Env);
-                }
-            }
+        let def = lookup(id)?;
+        if layer_contributes(&self.env_layer, id) {
+            return Some(Provenance::Env);
         }
-        let value = get_path(&self.merged, id);
-        let has_default = lookup(id).and_then(|def| def.default_yaml).is_some();
-        match (value, has_default) {
-            (Some(_), _) => Some(Provenance::Project), // merged value present; layer detail below
-            (None, true) => Some(Provenance::Default),
-            (None, false) => None,
+        if layer_contributes(&self.project_layer, id) {
+            return Some(Provenance::Project);
         }
+        if layer_contributes(&self.global_layer, id) {
+            return Some(Provenance::Global);
+        }
+        if def.default_yaml.is_some() {
+            return Some(Provenance::Default);
+        }
+        None
     }
 
     /// Path of the global config.yml actually read, if any.
@@ -581,6 +594,40 @@ fn remove_path(base: &mut Map<String, Value>, id: &str) {
     }
     let segments: Vec<&str> = id.split('.').collect();
     walk(base, &segments);
+}
+
+/// Record settings whose keys are user-chosen names (`modelPresets.<name>`,
+/// `modelTags.<name>`): the name itself is saved data, so a named entry counts even
+/// when its body is empty (`modelPresets: { empty: {} }`, `modelTags: { empty: {} }`
+/// must not fall through to a lower layer).
+const NAMED_ENTRY_RECORDS: &[&str] = &["modelPresets", "modelTags"];
+
+/// Whether `layer` supplies a value at dotted `id`: something non-null survives there.
+///
+/// An empty object and an all-`null` object are the TS fall-back markers (a project
+/// record nulling a global role, `modelRoles: {}`), so they contribute nothing and let
+/// the lower layer own the provenance. Named-entry records are the exception: a non-null
+/// entry under a name (`modelPresets: { empty: {} }`, `modelTags: { empty: {} }`) is
+/// itself a contribution.
+fn layer_contributes(layer: &Map<String, Value>, id: &str) -> bool {
+    let Some(value) = get_path(layer, id) else {
+        return false;
+    };
+    if has_settled_value(value) {
+        return true;
+    }
+    NAMED_ENTRY_RECORDS.contains(&id)
+        && value
+            .as_object()
+            .is_some_and(|obj| obj.values().any(|entry| !entry.is_null()))
+}
+
+fn has_settled_value(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Object(obj) => obj.values().any(has_settled_value),
+        _ => true,
+    }
 }
 
 fn get_path<'a>(base: &'a Map<String, Value>, id: &str) -> Option<&'a Value> {

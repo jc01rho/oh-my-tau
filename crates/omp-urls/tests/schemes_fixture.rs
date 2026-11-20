@@ -187,6 +187,20 @@ fn history_unknown_agent_lists_known() {
 }
 
 #[test]
+fn rule_read_says_not_implemented() {
+    let (_dir, _artifacts, ctx) = fixture();
+    let provider = omp_urls::schemes::rule::RuleProvider;
+    let url = parse_internal_url("rule://tdd").unwrap();
+    let err = provider.read(&url, &ctx).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "rule:// is not implemented yet in oh-my-tau (no rulebook ported)"
+    );
+    assert!(provider.locate(&url, &ctx).is_none());
+    assert!(provider.complete("", &ctx).is_empty());
+}
+
+#[test]
 fn fuzzy_suggest_ranks_subsequence() {
     let candidates = vec!["Reviewer".to_string(), "Cleanup4".to_string()];
     assert_eq!(

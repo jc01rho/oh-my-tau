@@ -857,3 +857,403 @@ export default function (pi: any): void {
     );
     host.shutdown().await.unwrap();
 }
+
+/// ExtensionAPI members this host does not implement must fail loudly at
+/// registration time instead of loading as successful silent no-ops: an
+/// extension that installs a renderer/shortcut/fallback and gets no error
+/// believes the host honors it.
+#[tokio::test]
+async fn unimplemented_api_members_reject_registration() {
+    if common::bun_missing("unimplemented_api_members_reject_registration") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("omp-ext-unsupported-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let members = [
+        "registerShortcut(\"c\", {})",
+        "registerMessageRenderer(\"m\", () => null)",
+        "registerAssistantThinkingRenderer(() => null)",
+        "registerComposerShape({})",
+        "registerFileWriteFallback(() => undefined)",
+        "registerFileDeleteFallback(() => undefined)",
+        "getServiceTiers()",
+        "setServiceTier(\"t\")",
+    ];
+    for (i, call) in members.iter().enumerate() {
+        std::fs::write(
+            dir.join(format!("u{i}.ts")),
+            format!("export default function (pi: any): void {{ pi.{call}; }}\n"),
+        )
+        .unwrap();
+    }
+    let paths: Vec<PathBuf> = (0..members.len())
+        .map(|i| dir.join(format!("u{i}.ts")))
+        .collect();
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host.load(Some(&paths), None, "/tmp", None).await.unwrap();
+    assert!(r.loaded.is_empty(), "none of these may load: {r:?}");
+    assert_eq!(r.errors.len(), members.len(), "{r:?}");
+    for (i, call) in members.iter().enumerate() {
+        let name = call.split('(').next().unwrap();
+        let e = r
+            .errors
+            .iter()
+            .find(|e| e.path.ends_with(&format!("u{i}.ts")))
+            .unwrap_or_else(|| panic!("missing error for u{i}.ts: {r:?}"));
+        assert!(
+            e.error.contains(name) && e.error.contains("not available"),
+            "u{i}.ts must reject {name}, got: {}",
+            e.error
+        );
+    }
+    host.shutdown().await.unwrap();
+}
+
+/// A factory that subscribes with `events.on` and then throws (here on the
+/// unimplemented `registerShortcut`) must not leave its listener on the
+/// host-wide bus: `bus_emit` would otherwise keep calling into an extension
+/// that never loaded. The listener writes a marker file synchronously, so a
+/// surviving subscription shows up before `bus_emit` returns -- no sleep.
+#[tokio::test]
+async fn failed_load_unsubscribes_events_on_listeners() {
+    if common::bun_missing("failed_load_unsubscribes_events_on_listeners") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let hit = dir.path().join("hit");
+    let _ = std::fs::remove_file(&hit);
+    let ext = dir.path().join("subs.ts");
+    std::fs::write(
+        &ext,
+        format!(
+            "import {{ writeFileSync }} from \"node:fs\";\n\
+             export default function (pi: any): void {{\n\
+             \x20 pi.events.on(\"ch\", () => writeFileSync({hit:?}, \"hit\"));\n\
+             \x20 pi.registerShortcut(\"c\", {{}});\n\
+             }}\n",
+            hit = hit.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host.load(Some(&[ext]), None, "/tmp", None).await.unwrap();
+    assert!(r.loaded.is_empty(), "{r:?}");
+    assert_eq!(r.errors.len(), 1, "{r:?}");
+    assert!(r.errors[0].error.contains("registerShortcut"), "{r:?}");
+
+    host.request("bus_emit", json!({"channel": "ch", "data": {}}))
+        .await
+        .unwrap();
+    assert!(
+        !hit.exists(),
+        "a failed load must leave no live bus listener behind"
+    );
+    host.shutdown().await.unwrap();
+}
+
+/// A load that registers a provider, unregisters it again and then fails must
+/// still hand back the registration it replaced: dropping its undo record in
+/// `unregisterProvider` lost the prior provider for good.
+#[tokio::test]
+async fn failed_load_restores_provider_it_unregistered() {
+    if common::bun_missing("failed_load_restores_provider_it_unregistered") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.ts");
+    std::fs::write(
+        &good,
+        "export default function (pi: any): void {\n\
+         pi.registerProvider(\"shared\", { model: \"a\" });\n\
+         }\n",
+    )
+    .unwrap();
+    let bad = dir.path().join("bad.ts");
+    std::fs::write(
+        &bad,
+        "export default function (pi: any): void {\n\
+         pi.registerProvider(\"shared\", { model: \"b\" });\n\
+         pi.unregisterProvider(\"shared\");\n\
+         pi.registerProvider(\"own\", { model: \"own\" });\n\
+         pi.registerShortcut(\"c\", {});\n\
+         }\n",
+    )
+    .unwrap();
+
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host
+        .load(Some(&[good, bad]), None, "/tmp", None)
+        .await
+        .unwrap();
+    assert_eq!(r.loaded.len(), 1, "{r:?}");
+    assert_eq!(r.errors.len(), 1, "{r:?}");
+
+    let live: Value = host.request("list_providers", json!({})).await.unwrap();
+    let live = live.as_array().cloned().unwrap_or_default();
+    let shared = live
+        .iter()
+        .find(|p| p["name"] == json!("shared"))
+        .unwrap_or_else(|| panic!("prior provider must come back: {live:?}"));
+    assert_eq!(
+        shared["config"],
+        json!({"model": "a"}),
+        "the failed load's unregister must be rolled back to the prior registration"
+    );
+    assert_eq!(shared["extension"], json!("good"));
+    assert!(
+        !live.iter().any(|p| p["name"] == json!("own")),
+        "a provider only the failed load registered must not survive it: {live:?}"
+    );
+    host.shutdown().await.unwrap();
+}
+
+/// A flag write that lands after a failing load's own write (here an already
+/// loaded extension writing from its own `api` during that load) owns the name:
+/// the rollback must leave it alone instead of reverting to the older value.
+#[tokio::test]
+async fn failed_load_does_not_clobber_a_later_flag_write() {
+    if common::bun_missing("failed_load_does_not_clobber_a_later_flag_write") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.ts");
+    std::fs::write(
+        &good,
+        "export default function (pi: any): void {\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"a\" });\n\
+         pi.events.on(\"go\", () => pi.registerFlag(\"shared\", { type: \"string\", default: \"later\" }));\n\
+         }\n",
+    )
+    .unwrap();
+    // Synchronous ordering: the emit runs A's handler inside B's factory, so B's
+    // rollback happens after A's later write -- no timing involved.
+    let bad = dir.path().join("bad.ts");
+    std::fs::write(
+        &bad,
+        "export default function (pi: any): void {\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"b\" });\n\
+         pi.registerFlag(\"own\", { type: \"string\", default: \"own\" });\n\
+         pi.events.emit(\"go\", {});\n\
+         pi.registerShortcut(\"c\", {});\n\
+         }\n",
+    )
+    .unwrap();
+    let probe = dir.path().join("probe.ts");
+    let seen = dir.path().join("seen.json");
+    std::fs::write(
+        &probe,
+        format!(
+            "import {{ writeFileSync }} from \"node:fs\";\n\
+             export default function (pi: any): void {{\n\
+             \x20 pi.registerFlag(\"shared\", {{ type: \"string\" }});\n\
+             \x20 pi.registerFlag(\"own\", {{ type: \"string\" }});\n\
+             \x20 writeFileSync({seen:?}, JSON.stringify({{ shared: pi.getFlag(\"shared\"), own: pi.getFlag(\"own\") }}));\n\
+             }}\n",
+            seen = seen.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host
+        .load(Some(&[good, bad, probe]), None, "/tmp", None)
+        .await
+        .unwrap();
+    assert_eq!(r.loaded.len(), 2, "{r:?}");
+    assert_eq!(r.errors.len(), 1, "{r:?}");
+
+    let observed: Value = serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+    assert_eq!(
+        observed["shared"],
+        json!("later"),
+        "the rollback must not clobber a write made after the failed load's own"
+    );
+    assert!(
+        observed.get("own").is_none_or(Value::is_null),
+        "the failed load's own flag write is still rolled back: {observed:?}"
+    );
+    host.shutdown().await.unwrap();
+}
+
+/// A flag registered with a default writes host-wide `flagValues`. When the
+/// same load later fails, that write must be undone: the surviving extension's
+/// value for the name is restored, and a name only the failed extension
+/// registered disappears instead of staying readable through `list_flags`.
+#[tokio::test]
+async fn failed_load_rolls_back_flag_values() {
+    if common::bun_missing("failed_load_rolls_back_flag_values") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.ts");
+    std::fs::write(
+        &good,
+        "export default function (pi: any): void {\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"keep\" });\n\
+         pi.registerFlag(\"own\", { type: \"string\", default: \"own\" });\n\
+         }\n",
+    )
+    .unwrap();
+    let bad = dir.path().join("bad.ts");
+    std::fs::write(
+        &bad,
+        "export default function (pi: any): void {\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"clobbered\" });\n\
+         pi.registerFlag(\"fresh\", { type: \"string\", default: \"fresh\" });\n\
+         pi.registerShortcut(\"c\", {});\n\
+         }\n",
+    )
+    .unwrap();
+    // Loaded after the failure: reading through `getFlag` is what shows a leaked
+    // `flagValues` write. Defaultless flags, so the probe itself writes nothing.
+    let probe = dir.path().join("probe.ts");
+    let seen = dir.path().join("seen.json");
+    std::fs::write(
+        &probe,
+        format!(
+            "import {{ writeFileSync }} from \"node:fs\";\n\
+             export default function (pi: any): void {{\n\
+             \x20 pi.registerFlag(\"shared\", {{ type: \"string\" }});\n\
+             \x20 pi.registerFlag(\"fresh\", {{ type: \"string\" }});\n\
+             \x20 writeFileSync({seen:?}, JSON.stringify({{ shared: pi.getFlag(\"shared\"), fresh: pi.getFlag(\"fresh\") }}));\n\
+             }}\n",
+            seen = seen.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host
+        .load(Some(&[good, bad, probe]), None, "/tmp", None)
+        .await
+        .unwrap();
+    assert_eq!(r.loaded.len(), 2, "{r:?}");
+    assert_eq!(r.errors.len(), 1, "{r:?}");
+
+    let observed: Value = serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+    assert_eq!(
+        observed["shared"],
+        json!("keep"),
+        "a failed load must restore the flag value it overwrote, not keep its clobber"
+    );
+    assert!(
+        observed.get("fresh").is_none_or(Value::is_null),
+        "a flag only the failed load set must not survive it: {observed:?}"
+    );
+    host.shutdown().await.unwrap();
+}
+
+/// A load that writes a flag, loses the name to another writer, and then writes
+/// it again must roll back to the value that later write replaced -- not to the
+/// value its own first write replaced, which is stale by then.
+#[tokio::test]
+async fn failed_load_rolls_back_flag_to_the_write_it_replaced_last() {
+    if common::bun_missing("failed_load_rolls_back_flag_to_the_write_it_replaced_last") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.ts");
+    std::fs::write(
+        &good,
+        "export default function (pi: any): void {\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"a\" });\n\
+         pi.events.on(\"go\", () => pi.registerFlag(\"shared\", { type: \"string\", default: \"later\" }));\n\
+         }\n",
+    )
+    .unwrap();
+    // Synchronous ordering inside B's factory: B's first write, then A's write
+    // (from the emit), then B's second write, then B's failure.
+    let bad = dir.path().join("bad.ts");
+    std::fs::write(
+        &bad,
+        "export default function (pi: any): void {\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"b\" });\n\
+         pi.events.emit(\"go\", {});\n\
+         pi.registerFlag(\"shared\", { type: \"string\", default: \"b2\" });\n\
+         pi.registerShortcut(\"c\", {});\n\
+         }\n",
+    )
+    .unwrap();
+    let probe = dir.path().join("probe.ts");
+    let seen = dir.path().join("seen.json");
+    std::fs::write(
+        &probe,
+        format!(
+            "import {{ writeFileSync }} from \"node:fs\";\n\
+             export default function (pi: any): void {{\n\
+             \x20 pi.registerFlag(\"shared\", {{ type: \"string\" }});\n\
+             \x20 writeFileSync({seen:?}, JSON.stringify({{ shared: pi.getFlag(\"shared\") }}));\n\
+             }}\n",
+            seen = seen.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host
+        .load(Some(&[good, bad, probe]), None, "/tmp", None)
+        .await
+        .unwrap();
+    assert_eq!(r.loaded.len(), 2, "{r:?}");
+    assert_eq!(r.errors.len(), 1, "{r:?}");
+
+    let observed: Value = serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+    assert_eq!(
+        observed["shared"],
+        json!("later"),
+        "the rollback must undo B's second write back to what that write replaced"
+    );
+    host.shutdown().await.unwrap();
+}
+
+/// A load that unregisters a provider it never registered itself and then fails
+/// must hand that registration back: `unregisterProvider` recorded no undo for a
+/// name `registerProvider` had not touched in this load.
+#[tokio::test]
+async fn failed_load_restores_provider_it_only_unregistered() {
+    if common::bun_missing("failed_load_restores_provider_it_only_unregistered") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.ts");
+    std::fs::write(
+        &good,
+        "export default function (pi: any): void {\n\
+         pi.registerProvider(\"shared\", { model: \"a\" });\n\
+         }\n",
+    )
+    .unwrap();
+    let bad = dir.path().join("bad.ts");
+    std::fs::write(
+        &bad,
+        "export default function (pi: any): void {\n\
+         pi.unregisterProvider(\"shared\");\n\
+         pi.unregisterProvider(\"ghost\");\n\
+         pi.registerShortcut(\"c\", {});\n\
+         }\n",
+    )
+    .unwrap();
+
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let r = host
+        .load(Some(&[good, bad]), None, "/tmp", None)
+        .await
+        .unwrap();
+    assert_eq!(r.loaded.len(), 1, "{r:?}");
+    assert_eq!(r.errors.len(), 1, "{r:?}");
+
+    let live: Value = host.request("list_providers", json!({})).await.unwrap();
+    let live = live.as_array().cloned().unwrap_or_default();
+    let shared = live
+        .iter()
+        .find(|p| p["name"] == json!("shared"))
+        .unwrap_or_else(|| panic!("the unregistered provider must come back: {live:?}"));
+    assert_eq!(shared["config"], json!({"model": "a"}));
+    assert_eq!(shared["extension"], json!("good"));
+    assert!(
+        !live.iter().any(|p| p["name"] == json!("ghost")),
+        "a name nobody registered must not be invented by the rollback: {live:?}"
+    );
+    host.shutdown().await.unwrap();
+}

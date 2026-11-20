@@ -23,6 +23,37 @@ interface ToolDef {
 /** Tools compared byte-for-byte (canonical JSON + full description), not just per-param. */
 const STRICT_TOOLS = new Set(["todo", "ask", "checkpoint", "rewind", "wait", "think", "yield", "goal"]);
 
+/**
+ * Upstream built-ins omp-rs has not ported yet. They are extracted into
+ * ts_tools.json but have no Rust counterpart, so they cannot take part in the
+ * schema diff. Kept explicit: a tool that starts or stops being in this state
+ * must be handled deliberately, not silently skipped. Remove a name once its
+ * Rust tool lands.
+ */
+const NOT_PORTED_YET = new Set([
+	"context_notes",
+	"debug",
+	"github",
+	"learn",
+	"manage_skill",
+	"memory_edit",
+	"new_context",
+	"recall",
+	"reflect",
+	"retain",
+	"security_scan",
+]);
+
+/** Modules whose bare `tool()` factory registers a differently named tool. */
+const MODULE_TOOL_ALIAS: Record<string, string> = { yield_tool: "yield" };
+
+/**
+ * Tools whose parameter diff is structural and owned by
+ * scripts/check-tools-parity.ts (precise, per-property allowances). A blanket
+ * canonical-JSON line here would hide which property actually differs.
+ */
+const PRECISE_PARAM_TOOLS = new Set(["ask", "todo"]);
+
 /** Recursively sort object keys so JSON equality ignores key order. */
 function canonical(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(canonical);
@@ -299,27 +330,83 @@ function compare(ts: ToolDef, rust: ToolDef): ParamDiff {
 	return diff;
 }
 
+/**
+ * Tool names the Rust registry itself registers (`builtin_tools` /
+ * `hidden_tools` bodies in tools.rs), read independently of the per-tool schema
+ * extraction above. Schema parsing is hand-written per tool, so a tool can be
+ * registered in Rust before its schema parser lands; `driftedBack` must see it
+ * anyway instead of being masked by a stale extractor.
+ */
+function rustRegisteredNames(): Set<string> {
+	const src = readFileSync(RUST_TOOLS, "utf8");
+	const bodyOf = (signature: string): string => {
+		const at = src.indexOf(signature);
+		if (at < 0) throw new Error(`registry fn not found in tools.rs: ${signature}`);
+		const end = src.indexOf("\n}", at);
+		return end < 0 ? src.slice(at) : src.slice(at, end);
+	};
+	const bodies = bodyOf("pub fn builtin_tools(") + bodyOf("pub fn hidden_tools(");
+	const names = new Set<string>();
+	// `mk("name", ...)` literal registrations.
+	for (const m of bodies.matchAll(/\bmk\(\s*"([A-Za-z_][A-Za-z0-9_]*)"/g)) names.add(m[1]);
+	// Factory registrations: `wait::tool(..)`, `ask::tool()`, `yield_tool::tool()`,
+	// `checkpoint::rewind_tool()`. Named `<name>_tool` factories carry the tool
+	// name in the function; bare `tool()` takes it from the module (aliased when
+	// the module only hosts the tool, e.g. `yield_tool::tool()` -> `yield`).
+	for (const m of bodies.matchAll(/\b([a-z_][a-z0-9_]*)::([a-z_][a-z0-9_]*)\s*\(/g)) {
+		const [, mod, fn] = m;
+		if (fn === "tool") names.add(MODULE_TOOL_ALIAS[mod] ?? mod);
+		else if (fn.endsWith("_tool")) names.add(fn.slice(0, -"_tool".length));
+	}
+	// `Arc::new(eval::EvalTool::new(..))`-style struct registrations.
+	for (const m of bodies.matchAll(/\b([a-z_][a-z0-9_]*)::[A-Z][A-Za-z0-9]*Tool::new\s*\(/g)) names.add(m[1]);
+	return names;
+}
+
 const tsTools = JSON.parse(readFileSync(TS_JSON, "utf8")) as ToolDef[];
 const rustTools = parseRustTools();
 
+// `--dump-rust-tools`: emit the parsed Rust schemas as JSON for
+// scripts/check-tools-parity.ts, which diffs ask/todo structurally.
+if (process.argv.includes("--dump-rust-tools")) {
+	console.log(JSON.stringify(rustTools));
+	process.exit(0);
+}
+
 const tsNames = new Set(tsTools.map(t => t.name));
 const rustNames = new Set(rustTools.map(t => t.name));
-const missingInRust = [...tsNames].filter(n => !rustNames.has(n));
-const extraInRust = [...rustNames].filter(n => !tsNames.has(n));
+const registeredRustNames = rustRegisteredNames();
+const onlyInTs = [...tsNames].filter(n => !rustNames.has(n)).sort();
+// Unexpected gap → real drift. Known gap → reported, excluded from the diff.
+const missingInRust = onlyInTs.filter(n => !NOT_PORTED_YET.has(n));
+const notPortedYet = onlyInTs.filter(n => NOT_PORTED_YET.has(n));
+// Registered in Rust (registry, not schema parse) → the entry is stale.
+const driftedBack = [...NOT_PORTED_YET].filter(n => registeredRustNames.has(n)).sort();
+// Listed as not ported but unknown to the TS reference → the entry is stale.
+const staleNotPorted = [...NOT_PORTED_YET].filter(n => !tsNames.has(n)).sort();
+const extraInRust = [...rustNames].filter(n => !tsNames.has(n)).sort();
+const comparedTools = tsTools.filter(t => rustNames.has(t.name));
 
 console.log("=== tool name diff ===");
 console.log(`missing in omp-rs: ${missingInRust.join(", ") || "(none)"}`);
 console.log(`extra in omp-rs:   ${extraInRust.join(", ") || "(none)"}`);
+console.log(
+	`not ported yet:    ${notPortedYet.join(", ") || "(none)"} (${notPortedYet.length}/${tsTools.length} upstream tools skipped)`,
+);
+// Machine-parsed by scripts/check-tools-parity.ts: a non-empty list fails the gate.
+console.log(`drifted-back:      ${driftedBack.join(", ") || "(none)"}`);
+console.log(`stale not-ported:  ${staleNotPorted.join(", ") || "(none)"}`);
 console.log("\n=== per-tool parameter diff ===");
 let clean = true;
-for (const ts of tsTools) {
-	const rust = rustTools.find(t => t.name === ts.name);
-	if (!rust) continue;
+for (const ts of comparedTools) {
+	const rust = rustTools.find(t => t.name === ts.name)!;
 	const d = compare(ts, rust);
 	const descMatch = ts.description_first_line === rust.description_first_line;
 	const issues: string[] = [];
 	if (STRICT_TOOLS.has(ts.name)) {
-		if (JSON.stringify(canonical(ts.parameters)) !== JSON.stringify(canonical(rust.parameters))) issues.push("parameters differ from TS (canonical JSON)");
+		if (!PRECISE_PARAM_TOOLS.has(ts.name) && JSON.stringify(canonical(ts.parameters)) !== JSON.stringify(canonical(rust.parameters))) {
+			issues.push("parameters differ from TS (canonical JSON)");
+		}
 		if (ts.description !== rust.description) issues.push("full description differs from TS");
 	}
 	if (d.missing_in_rust.length) issues.push(`missing in rust: ${d.missing_in_rust.join(", ")}`);
@@ -334,4 +421,12 @@ for (const ts of tsTools) {
 		console.log(`[${d.tool}] OK`);
 	}
 }
+if (notPortedYet.length > 0) {
+	console.log("\n=== not implemented in omp-rs (schema comparison skipped) ===");
+	for (const name of notPortedYet) {
+		const ts = tsTools.find(t => t.name === name)!;
+		console.log(`  ${name} (ts params: ${Object.keys(props(ts.parameters)).join(", ") || "none"})`);
+	}
+}
+
 console.log(clean ? "\nAll compared tools match." : "\nDifferences found (see above).");

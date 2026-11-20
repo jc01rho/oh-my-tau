@@ -86,6 +86,13 @@ const timers = new Set<ReturnType<typeof setTimeout>>();
 // flagValues with the default; the core may update values via the set_flag_value RPC.
 const flagValues = new Map<string, boolean | string>();
 const providers = new Map<string, { name: string; config: Json; extension: string }>();
+// Every write to `flagValues` (a load's `registerFlag` seed, or the core's
+// `set_flag_value`) takes the next revision, and `flagWrites` remembers which
+// revision currently holds each name. `rollbackLoad` undoes a flag only while
+// its failed load is still the latest writer: a write that landed afterwards
+// (a subsequent extension load, or the core) is not that load's to clobber.
+let writeRev = 0;
+const flagWrites = new Map<string, number>();
 let state: Json = { cwd: process.cwd(), hasUI: false, agentKind: "main", branch: [] };
 let ctxCache: unknown;
 
@@ -166,11 +173,18 @@ const sm = () => ({
 });
 
 const orUndefined = (v: unknown) => (typeof v === "string" ? v : undefined);
+// Unimplemented ExtensionAPI registration/service members throw instead of
+// doing nothing: a registration that cannot take effect must not let the
+// extension load and report success while nothing it registered is ever shown
+// (docs/research/09-extension-model-comparison.md). Only those registration and
+// service methods throw; the headless `makeCtx().ui` surface stays no-op, as in
+// pi-coding-agent's noOpUIContext.
+const unsupportedNow = (what: string): never => {
+  throw new Error(`${what} is not available in the Rust extension host`);
+};
+const unsupported = (what: string) => async () => unsupportedNow(what);
 function makeCtx() {
   const noop = () => {};
-  const unsupported = (what: string) => async () => {
-    throw new Error(`${what} is not available in the Rust extension host`);
-  };
   return {
     ui: {
       notify: (message: string, type?: string) => notify("ui_notify", { message, type: type ?? "info" }),
@@ -265,7 +279,65 @@ function ctx() {
   return (ctxCache ??= makeCtx());
 }
 
-function makeApi(ext: Ext) {
+type FlagValue = boolean | string;
+type ProviderReg = { name: string; config: Json; extension: string };
+
+/** Undo log for one `loadOne` call: what it registered on host-wide state. */
+interface LoadTracker {
+  subs: (() => void)[];
+  /** Providers this load wrote, with the registration they replaced (if any). */
+  providers: { name: string; prior?: ProviderReg }[];
+  /** `flagValues` entries this load overwrote, recorded before the write. */
+  flags: Map<string, FlagWrite>;
+}
+
+/** One `flagValues` write a load made: the value it replaced, and its revision. */
+interface FlagWrite {
+  had: boolean;
+  prior?: FlagValue;
+  /** Revision of the write this one replaced (absent: nobody had written the name). */
+  priorRev?: number;
+  /** Revision this load's write holds; reset if the load writes the name again. */
+  rev: number;
+}
+
+/** Undo everything a failed load registered, so nothing of it outlives the error. */
+function rollbackLoad(ext: Ext, track: LoadTracker) {
+  for (const off of track.subs.splice(0).reverse()) {
+    try {
+      off();
+    } catch (e) {
+      log("warn", `${ext.path} cleanup: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+  for (const [name, { had, prior, priorRev, rev }] of track.flags) {
+    // A later write owns the name now: undoing ours would revert somebody else's value.
+    if (flagWrites.get(name) !== rev) continue;
+    if (had) flagValues.set(name, prior as FlagValue);
+    else flagValues.delete(name);
+    if (priorRev === undefined) flagWrites.delete(name);
+    else flagWrites.set(name, priorRev);
+  }
+  track.flags.clear();
+  for (const { name, prior } of track.providers.splice(0).reverse()) {
+    const live = providers.get(name);
+    // Undo only this load's own write: a registration made after the failed load
+    // (another extension's load) is not ours to clobber, and a name the load just
+    // unregistered is absent, which is still ours to restore.
+    if (live !== undefined && live.extension !== ext.name) continue;
+    if (prior) {
+      // The load replaced a live registration: put it back and say so, so the
+      // core's registry never ends up pointing at the extension that failed.
+      providers.set(name, prior);
+      notify("provider_registered", { name, config: prior.config, extension: prior.extension });
+    } else if (live !== undefined) {
+      providers.delete(name);
+      notify("provider_unregistered", { name, extension: ext.name });
+    }
+  }
+}
+
+function makeApi(ext: Ext, track: LoadTracker) {
   const api = {
     logger: {
       debug: (m: string, x?: Json) => log("debug", m, x),
@@ -279,7 +351,23 @@ function makeApi(ext: Ext) {
     get zod() {
       return loadSchemaLib("zod");
     },
-    events,
+    // `events.on` subscribes on the host-wide bus, so the unsubscribe is recorded
+    // here and replayed by `rollbackLoad` when this extension fails to load.
+    events: {
+      on(ch: string, fn: (d: unknown) => void) {
+        const off = events.on(ch, fn);
+        // Self-unsubscribing wrapper: a caller that unsubscribes before the load
+        // fails must not leave a dead entry for `rollbackLoad` to replay.
+        const entry = () => {
+          const i = track.subs.indexOf(entry);
+          if (i >= 0) track.subs.splice(i, 1);
+          off();
+        };
+        track.subs.push(entry);
+        return entry;
+      },
+      emit: events.emit,
+    },
     pi: {},
     on(event: string, handler: Handler) {
       const l = ext.handlers.get(event) ?? [];
@@ -292,30 +380,60 @@ function makeApi(ext: Ext) {
     registerCommand(name: string, options: Json) {
       ext.commands.set(name, { name, ...options });
     },
-    registerShortcut: () => {},
+    registerShortcut: () => unsupportedNow("registerShortcut"),
     // Semantics mirror pi-coding-agent loader.ts: the default seeds flagValues; getFlag only
     // sees flags this extension registered (omp scopes flags per extension).
     registerFlag(name: string, options: Json) {
       ext.flags.set(name, { name, ...options });
-      if (options.default !== undefined) flagValues.set(name, options.default as boolean | string);
+      if (options.default !== undefined) {
+        const rev = ++writeRev;
+        const rec = track.flags.get(name);
+        // The first write records what to hand back; a repeat write in the same
+        // load only takes over the revision (the prior value is unchanged).
+        if (rec) {
+          // Unless somebody else wrote the name in between: then the value to
+          // hand back is that later write, not the one our first write replaced.
+          if (flagWrites.get(name) !== rec.rev) {
+            rec.had = flagValues.has(name);
+            rec.prior = flagValues.get(name);
+            rec.priorRev = flagWrites.get(name);
+          }
+          rec.rev = rev;
+        } else {
+          track.flags.set(name, { had: flagValues.has(name), prior: flagValues.get(name), priorRev: flagWrites.get(name), rev });
+        }
+        flagValues.set(name, options.default as FlagValue);
+        flagWrites.set(name, rev);
+      }
     },
     getFlag(name: string) {
       if (!ext.flags.has(name)) return undefined;
       return flagValues.get(name);
     },
-    registerMessageRenderer: () => {},
-    registerAssistantThinkingRenderer: () => {},
-    registerComposerShape: () => {},
-    registerFileWriteFallback: () => {},
-    registerFileDeleteFallback: () => {},
+    // Unimplemented: this host has no renderer/composer/fallback pipeline, and a
+    // silent no-op would make an extension that installs one look installed.
+    registerMessageRenderer: () => unsupportedNow("registerMessageRenderer"),
+    registerAssistantThinkingRenderer: () => unsupportedNow("registerAssistantThinkingRenderer"),
+    registerComposerShape: () => unsupportedNow("registerComposerShape"),
+    registerFileWriteFallback: () => unsupportedNow("registerFileWriteFallback"),
+    registerFileDeleteFallback: () => unsupportedNow("registerFileDeleteFallback"),
     // Provider registrations are forwarded to the core as notifications (the Rust core owns
     // the model registry), and kept host-side so list_providers can report them.
     registerProvider(name: string, config: Json) {
+      // Only the first write of a name records the prior registration: that is
+      // the one a failed load has to hand back to the host.
+      if (!track.providers.some((p) => p.name === name)) track.providers.push({ name, prior: providers.get(name) });
       providers.set(name, { name, config, extension: ext.name });
       notify("provider_registered", { name, config, extension: ext.name });
     },
     unregisterProvider(name: string) {
-      if (providers.delete(name)) notify("provider_unregistered", { name, extension: ext.name });
+      // A load may unregister a provider it never registered here: the undo record
+      // is what lets `rollbackLoad` hand that registration back if the load fails.
+      if (!track.providers.some((p) => p.name === name)) track.providers.push({ name, prior: providers.get(name) });
+      if (!providers.delete(name)) return;
+      // The undo record stays: if this load fails later, the registration it
+      // replaced still has to come back (see `rollbackLoad`).
+      notify("provider_unregistered", { name, extension: ext.name });
     },
     setLabel: (label: string) => {
       ext.label = label;
@@ -332,8 +450,10 @@ function makeApi(ext: Ext) {
     setModel: async (model: unknown) => (await request("set_model", { model })) === true,
     getThinkingLevel: () => state.thinkingLevel,
     setThinkingLevel: (level: string, persist?: boolean) => notify("set_thinking_level", { level, persist }),
-    getServiceTiers: () => ({}),
-    setServiceTier: () => {},
+    // Unimplemented: nothing here knows the core's service tiers, so an empty
+    // tier map would be a wrong answer rather than a missing one.
+    getServiceTiers: () => unsupportedNow("getServiceTiers"),
+    setServiceTier: () => unsupportedNow("setServiceTier"),
     getSessionName: () => state.sessionName,
     setSessionName: async (name: string) => void (await request("set_session_name", { name })),
   };
@@ -368,10 +488,15 @@ async function loadOne(path: string): Promise<{ ext?: Ext; error?: string }> {
   if (typeof factory !== "function") return { error: `Extension does not export a valid factory function: ${path}` };
   const base = basename(path).replace(/\.(ts|js)$/, "");
   const ext: Ext = { path: resolved, name: base === "index" ? basename(resolve(path, "..")) : base, handlers: new Map(), tools: new Map(), commands: new Map(), flags: new Map() };
-  const api = makeApi(ext);
+  const track: LoadTracker = { subs: [], providers: [], flags: new Map() };
+  const api = makeApi(ext, track);
   try {
     await (factory as (a: unknown) => unknown)(api);
   } catch (e) {
+    // A factory that subscribes and then throws (e.g. on an unsupported
+    // registerShortcut) must not leave a live bus listener behind: emits would
+    // keep calling a handler whose extension never loaded.
+    rollbackLoad(ext, track);
     return { error: `Failed to load extension: ${e instanceof Error ? e.message : e}` };
   }
   return { ext };
@@ -918,6 +1043,8 @@ async function dispatch(method: string, p: Json): Promise<unknown> {
       return exts.flatMap((e) => [...e.flags.values()].map((f) => ({ ...f, extension: e.name, value: flagValues.get(f.name as string) })));
     case "set_flag_value":
       flagValues.set(String(p.name), p.value as boolean | string);
+      // Owns the name now: a load that fails afterwards must not undo this.
+      flagWrites.set(String(p.name), ++writeRev);
       return true;
     case "list_providers":
       return [...providers.values()].map((pr) => ({ ...pr }));
