@@ -179,12 +179,6 @@ CPU·블로킹 I/O·할당 병목만 `crates/natives` N-API 뒤의 12개 Rust �
 - **메모리**: `crates/memory` 없음 (`omp2` 6,428줄 SQLite+4-voice RRF / TS `mnemopi` 20,970줄).
   `omp-settings/src/schema.rs`에 74개 메모리 키가 dead config로만 존재하고, `/memory`는
   `slash.rs:757-776` 리터럴 스텁이며, `memory://` URL 스킴 미등록, `rule://`은 빈 벡터 반환.
-### 4.4 컨텍스트 파일 — 부분 구현
-
-`sysprompt.rs:153-192`는 `AGENTS.md`/`CLAUDE.md` 상향 탐색만 구현했다. `.omp/AGENTS.md`
-(우선순위 100), 사용자 스코프 `~/.omp/agent/AGENTS.md`, `RULES.md` 끈끈한 규칙(`rules: []`
-하드코딩), `GEMINI.md`, `.github/copilot-instructions.md` 등이 누락됐다.
-
 ### 4.3c `oh-my-tau` 고유 자산 (이식 중 절대 삭제 금지)
 
 업스트림 `main`과 `omp2` 어느 쪽에도 없는 포크 고유 자산은 보존한다:
@@ -196,6 +190,12 @@ CPU·블로킹 I/O·할당 병목만 `crates/natives` N-API 뒤의 12개 Rust �
 - **`omp-wasm`(741줄)**: `wasmi` 기반 무의존 샌드박스 플러그인 호스트.
 - **`omt web` UI(`crates/omp-cli/src/subcmd/web/`, 포트 7467)** + wave 1~3 슬래시 커맨드(`/plan`, `/wt`, `/btw`, `/loop`, `/shake`, `/restart`, `/skills`, `/marketplace`, `/share`, `/ssh`, `/browser`, `/computer`, `/budget`, `/sandbox`, `omt daemon`) + `omp-collab`, `omp-auth-broker`.
 - **`vendor/crossterm` 패치**: xterm `modifyOtherKeys` (`CSI 27;mods;code~`) 1건.
+
+### 4.4 컨텍스트 파일 — 부분 구현
+
+`sysprompt.rs:153-192`는 `AGENTS.md`/`CLAUDE.md` 상향 탐색만 구현했다. `.omp/AGENTS.md`
+(우선순위 100), 사용자 스코프 `~/.omp/agent/AGENTS.md`, `RULES.md` 끈끈한 규칙(`rules: []`
+하드코딩), `GEMINI.md`, `.github/copilot-instructions.md` 등이 누락됐다.
 
 ### 4.5 세션(`omp-session`)·압축(`omp-compact`)·토크나이징·Handoff
 
@@ -233,7 +233,7 @@ TUI 11개 프로브 `run.py`), `scripts/compat-oracle/`가 있으나 **전부 CI
 | --- | --- | --- | --- |
 | **기능 행렬** | `terminal-capabilities.ts` (1,602줄) | `render.rs`·`images.rs`·`notify.rs`에 분산 | **최우선 통합**: DECRQM 런타임 프로브 포함 단일 `terminal_capabilities.rs` |
 | **오버레이** | 76개 | 12개 | ~64개 누락. 빈도 높은 `model-hub`·`agents-hub`·`usage-dashboard`·`session-selector` 우선 이식 |
-| **키바인딩** | 79개 (`32 tui + 47 app`) | 70개 | 11개 누락 (`app.session.pin/unpin`, `app.tree.next/previousBranch` 등) |
+| **키바인딩** | 79개 (`32 tui + 47 app`) | 70개 | 9개 누락 (`app.session.pin/unpin`, `app.tree.next/previousBranch` 등) |
 | **차트·HTML 폼·앱** | 차트 11.2k + 폼 3.2k + 앱 14개 | 0줄 | 사용자 회귀 적은 후순위 Phase로 분리 (`ask` HTML 폼 수요에 따라 선별) |
 | **네이티브 테마/모션** | shimmer/gradient/831 심볼 | 기본 토큰 9종 / 809 심볼 / 4종 매직키워드 | `omp2` `theme.rs`(oklch/lab/lch)와 `mermaid`/`graphviz` 렌더러만 선별 차용 |
 | **검증** | 386 테스트 파일 | `tests-tui/` 픽스처만 존재, E2E는 `tests-e2e/tui/run.py` | `tests-e2e/tui/run.py`를 CI에 즉시 연결 |
@@ -272,7 +272,8 @@ TUI 11개 프로브 `run.py`), `scripts/compat-oracle/`가 있으나 **전부 CI
 | **업스트림 커밋 SHA 핀 (`vendor-src.lock` / `PINS.md`)** | 적용 (`v5.1.52`) | 현재 버전만 적고 SHA 미기록 | **채택·신설** |
 | **기계 판독 가능 패리티 원장 + 골든/오라클 테스트** | 적용 | `tests-golden/`·`compat-oracle` 이미 존재(CI 미연동) | **채택·강화** |
 | **변경 델타 노트 (`vendor/pa-*/NOTICE`, `pi-*` 델타)** | 동작 델타 스펙 | `NOTICE.md`에 "modified"만 적고 파일 목록 누락 | **채택 (MIT 준수)** |
-| **`deny.toml` / `about.toml` 라이선스 CI 게이트** | `THIRD_PARTY_LICENSES` | 부재 (`laya-ort` 런타임 라이선스 미명시 포함) | **채택 (`omp2` `deny.toml` 이식)** |
+| **포함 런타임·생성물 라이선스 (`laya-ort` ONNX, `omp-goose` C)** | 해당 없음 | `NOTICE.md`에 외부 런타임·생성 코드 라이선스 미명시 | **채택 (Phase 0.2 명시)** |
+| **`deny.toml` 라이선스 CI 게이트** | `THIRD_PARTY_LICENSES` | 부재(`about.toml`은 배포 번들 생성 필요 시 후속 선택) | **채택 (`omp2` `deny.toml` 이식)** |
 
 ### 5.2 핵심 설계 원칙 7개
 
@@ -296,37 +297,40 @@ TUI 11개 프로브 `run.py`), `scripts/compat-oracle/`가 있으나 **전부 CI
 | 0.2 | `omp2`의 `deny.toml` 이식 + `cargo deny check licenses sources` CI 잡 추가 | 라이선스 게이트 통과, `laya-ort` ONNX 런타임 라이선스 `NOTICE.md` 명시 |
 | 0.3 | `vendor-src.lock`(또는 `docs/vendor-pins.md`) + `vendor/pa-*/NOTICE` 신설 | `pi-*`/`pa-*`/골든 픽스처의 기준 업스트림 SHA 및 `pa-*` 수정 파일 명시 |
 | 0.4 | `scripts/sync-catalog.sh` 경로 버그 수정(`runs/omp-rust/compat-oracle` → `scripts/compat-oracle`) | `vendor-src` 있을 때 재현 가능하게 동작 |
-| 0.5 | `tests-golden/compare.ts` + `tests-tools/compare.ts` + `tests-e2e/tui/run.py` CI 연동 | 19개 기존 차이 원장화, TUI 실PTY 프로브 CI 실행 |
-| 0.6 | `justfile` 도입 (`check`, `test`, `lint`, `golden`, `e2e`, `ci`) | 단일 명령 진입점 확립 |
+| 0.5 | `tests-golden/compare.ts` + `tests-tools/compare.ts` + `tests-e2e/tui/run.py` + `verify-models-db.ts` 스모크 CI 연동 | 19개 기존 차이 원장화, TUI 실PTY·DB 스모크 CI 실행 |
+| 0.6 | `justfile` 도입 (`check`, `test`, `lint`, `golden`, `e2e`, `ci`) | 단일 명령 진입점 확립, **`just ci` green = Phase 1 착수 게이트** |
 
 ### Phase 1 — 패리티 원장 및 조용한 열화 제거
 
 | # | 작업 | 완료 조건 |
 | --- | --- | --- |
 | 1.1 | `docs/parity/{tools,slash,settings,tui,shell}.md` 원장 구축 | 전 항목 상태·근거 파일 매핑 |
-| 1.2 | 스키마 불일치 4종 수정(`ask` HTML 폼 + 레거시 복구, `todo` `string\|string[]`, `web_search` 3파라미터, `bash.notify`/설정별 스키마) + `glob` 상한 | `tests-tools/compare.ts` diff 0 |
-| 1.3 | `tests-tools/ts_tools.json`을 최신 `main`(`b636e19d10`) 기준으로 32종 전체 재추출 | 누락 11종 골든 스키마 확보 |
+| 1.2 | `tests-tools/ts_tools.json`을 최신 `main`(`b636e19d10`) 기준으로 32종 전체 재추출 | 누락 11종 골든 스키마 확보(1.3 게이트의 기준선) |
+| 1.3 | 스키마 불일치 4종 수정(`ask` HTML 폼 + 레거시 복구, `todo` `string\|string[]`, `web_search` 3파라미터, `bash.notify`/설정별 스키마) + `glob` 상한 | `tests-tools/compare.ts` 32종 기준 diff 0 |
 | 1.4 | 끊긴 선언 3건 정리 (`task.rs` 유령 메모리 도구, `builtin_commands.json` `security`, `settings_defs.rs` `github`) | 구현 없는 광고 0건 |
 | 1.5 | `ext-host/host.ts`의 `noop` ~12개 메서드를 `UnsupportedExtensionApi` 명시 오류로 전환 | 거짓 성공 0건 |
-| 1.6 | `rule://` 빈 구현 명시 오류화, `schema.rs` 미소비 74개 메모리 키 마킹, `bash.rs:3` 주석 수정 | 조용한 폴백 0건 |
+| 1.6 | `rule://` 빈 구현 명시 오류화, `omp-urls` 쓰기 미지원 명시화, `omp-settings::provenance()` `Global` 판별 결함 수정, `schema.rs` 미소비 74개 메모리 키 마킹, `bash.rs:3` 주석 수정 | 조용한 폴백 0건 + `provenance` 단위 테스트 통과 |
 
 ### Phase 2 — 셸·빌트인 이식 (`omp2` `shell` + `shell-builtins`)
 
+(`omp2` `crates/shell`은 `pi-vfs`가 아닌 `omp-core`/`xutf`에만 의존하므로 Phase 2.5와 독립적으로 착수 가능하다.)
+
 | # | 작업 | 완료 조건 |
 | --- | --- | --- |
-| 2.1 | `omp2`의 `crates/shell`(48.5k) + `crates/shell-builtins`(90.4k)를 `vendor/`에 벤더링 | 워크스페이스 빌드·musl 정적 빌드·바이너리 크기 측정 통과 |
+| 2.1 | `omp2`의 `crates/shell`(48.5k) + `crates/shell-builtins`(90.4k)를 `vendor/`에 벤더링 (`omp-core` 경량 의존 분리 포함) | 워크스페이스 빌드·musl 정적 빌드·바이너리 크기 측정 통과 |
 | 2.2 | `omp-cli/src/tools/bash.rs`를 in-process `ShellBuilder` + `DynHost`로 배선 | `bash_command` 골든 통과, 파이프·리다이렉트·heredoc 동일 출력 |
-| 2.3 | `rm`/`mv`/`ln` 레지스트리 분리 + `PathPolicy`/`ProcessGroupPolicy`/`SpawnWrapper`를 `omp-sandbox`와 결합 | 샌드박스·정책 경계 회귀 통과 |
+| 2.3 | `rm`/`mv`/`ln` 레지스트리 분리 + `PathPolicy`/`ProcessGroupPolicy`/`SpawnWrapper`를 `omp-sandbox`와 결합 | 샌드박스·정책 경계 회귀 통과(기존 `omp-sandbox` 테스트 포함) |
 | 2.4 | `analysis.rs` 정적 AST 검사 + 취소 경계(ADR 0011, `-pgid` 시그널) + `dyn` 빌트인 브리지 배선 | 취소·동적 도구 로스터 불변 검증 |
 
 ### Phase 2.5 — `vendor/pi-*` 동기화 및 `omp-xfs` 전환
 
-의존 순서대로 진행해 컴파일 깨짐을 국소화한다:
-1. **`pi-vfs` (18.9.1 → 19.0.1)**: `Scope` 기반 open + 취소(`read_until_cancelled`) + `Fs::write/symlink` 이식.
-2. **`omp-xfs` 도입 & `pi-walker` 은퇴**: `main`의 `crates/xfs/src/walk` 이식 후 `omp-cli/src/tools/{find,search}.rs`를 `Tree`/`Walk`/`Batch` API로 재작성, `vendor/pi-walker` 제거.
-3. **`pi-ast` (18.9.1 → 19.0.1)**: `ast::search`/`outline`/`debug` 이식 후 `omp-cli/src/tools/ast.rs` 재작성.
-4. **`pi-diff` & `pi-edit` (18.9.1 → 19.0.1)**: `ComponentArena` + `xutf`, `Rejection` taxonomy + `max_columns` + 5개 프롬프트 반영.
-5. **`pi-predict` (18.6.1 → 19.0.1)**: 우선 `ngram` 리팩터링 반영, `smollm`/`apple`은 feature 게이트(`predict-local`)로 선택 이식.
+| # | 작업 | 완료 조건 |
+| --- | --- | --- |
+| 2.5.1 | `pi-vfs` (`18.9.1 → 19.0.1`): `Scope` 기반 open + `read_until_cancelled` + `Fs::write/symlink` 이식 | `pi-vfs` 단위·취소 테스트 통과 |
+| 2.5.2 | `omp-xfs` 도입 & `pi-walker` 은퇴: `main`의 `crates/xfs/src/walk` 이식 후 `tools/{find,search}.rs`를 `Tree`/`Walk`/`Batch`로 재작성 | `vendor/pi-walker` 제거 후 워크스페이스 빌드 green, `find`/`grep`/`glob` 테스트 통과 |
+| 2.5.3 | `pi-ast` (`18.9.1 → 19.0.1`): `ast::search`/`outline`/`debug` 이식 후 `tools/ast.rs` 재작성 | `ast_grep`/`ast_edit` 스키마·실행 테스트 통과 |
+| 2.5.4 | `pi-diff` & `pi-edit` (`18.9.1 → 19.0.1`): `ComponentArena` + `xutf`, `Rejection` taxonomy + `max_columns` + 5프롬프트 반영 | `edit` 모드별 골든 테스트 통과 |
+| 2.5.5 | `pi-predict` (`18.6.1 → 19.0.1`): `ngram` 리팩터링 반영 (`smollm`/`apple`은 `predict-local` feature 게이트 선택) | 단어 완성 테스트 및 default 빌드 통과 |
 
 ### Phase 3 — 도구·메모리·컨텍스트·Handoff 완성
 
@@ -340,35 +344,45 @@ TUI 11개 프로브 `run.py`), `scripts/compat-oracle/`가 있으나 **전부 CI
 
 ### Phase 4 — 프로바이더·추론·MCP/RPC 정렬
 
-- `models_generated.rs` 수동 관리 제거(카탈로그 생성 스크립트 자동화), `model_id.contains(...)` 분기
-  추방(KDL/카탈로그 데이터화), `ByteEstimate` → `utok` 정밀 토크나이저 + 카탈로그 기반 이미지 패치 과금 +
-  프레임 청구(5024 하드코딩 제거) 교체.
-- `omp-mcp`에 OAuth·세션 간 도구 캐싱·데몬 공유(`main` `acdfffa248`), `omp-cli/src/rpc.rs`에
-  `omp-rpc` v2 프레임 청킹·`xd://` 호스트 도구·`host_uri` 정렬.
+| # | 작업 | 완료 조건 |
+| --- | --- | --- |
+| 4.1 | `models_generated.rs` 생성 스크립트 자동화 + `model_id.contains(...)` 분기 KDL/카탈로그 데이터화 | `omp-providers`/`pa-ai` grep 상 하드코딩 모델 분기 0건 |
+| 4.2 | `ByteEstimate` → 정밀 토크나이저(`tiktoken-rs` 또는 `main` `countTokens` 내장 BPE 테이블 포팅) + 이미지 패치 과금 + 프레임 청구(5024 제거) | TS 참조 `tokenizer.ts` 대비 오차 허용치 내 단위·골든 테스트 통과 |
+| 4.3 | `omp-mcp`에 OAuth·세션 간 도구 캐싱·데몬 기반 서버 공유(`main` `acdfffa248`) 이식 | 멀티 세션 MCP 공유 통합 테스트 통과 |
+| 4.4 | `omp-cli/src/rpc.rs`에 `omp-rpc` v2 청킹(1 MiB `rpc_chunk`)·`get_messages_page`·`xd://` 호스트 도구·`host_uri` 정렬 | `sdk/rust/omp-rpc` 호환 스모크 테스트 통과 |
 
 ### Phase 5 — VCS·워크트리·격리 PAL
 
-- `gix`(gitoxide) 도입으로 `features/worktree.rs` 및 `sysprompt.rs`의 subprocess `git` 호출 제거, 구조화 에러화.
-- `main`의 `crates/vcs` (`worktree_add` + `keep_changes` + `git/filter.rs`) + `crates/iso`(Linux 우선:
-  `linux_reflink`/`overlayfs`/`btrfs`/`rcopy`) + `omp2` `worktree_cmd.rs`(`.omp-isolation-owner` PID 고아 GC) 결합.
-- `omp-sandbox`(Landlock V9 + seccomp) 회귀 테스트 고정.
+| # | 작업 | 완료 조건 |
+| --- | --- | --- |
+| 5.1 | `gix`(gitoxide) 도입으로 `features/worktree.rs`·`sysprompt.rs`의 subprocess `git` 호출 및 stderr 문자열 매칭 제거 | 워크스페이스 내 읽기용 `Command::new("git")` 0건(grep 게이트) |
+| 5.2 | `main` `crates/vcs` (`worktree_add` + `keep_changes` + `git/filter.rs`) + `crates/iso` Linux 백엔드(`linux_reflink`/`overlayfs`/`btrfs`/`rcopy`) 이식 | `worktree_clone_carry` 동등 통합 테스트 통과 |
+| 5.3 | `omp2` `worktree_cmd.rs`의 `.omp-isolation-owner` PID 기반 고아 워크트리 GC 이식 + `omp-sandbox` 회귀 테스트 고정 | 고아 GC 및 Landlock+seccomp 테스트 통과 |
 
 ### Phase 6 — 확장 런타임 결정 및 고도화
 
-- **단기(트랙 A)**: `ext-host` 45개 이벤트 커버리지 원장 작성, `noop` 제거 검증, `runEphemeralTurn` 구현 또는 명시적 오류화, `omp-wasm` 훅 ABI 확장 여부 검토.
-- **장기(트랙 B — 주인 결정 필요)**: `omp2` 식 임베디드 CPython 3.14t 전환은 기존 TS 확장 생태계를 폐기하므로 별도 ADR 및 주인 승인 시에만 착수.
+| # | 작업 | 완료 조건 |
+| --- | --- | --- |
+| 6.1 | `ext-host` 45개 이벤트 커버리지 원장 작성 및 `noop` 제거(Phase 1.5) 회귀 검증 | `tests-e2e/ext/conformance.py` 미설명 diff 0건 |
+| 6.2 | `runEphemeralTurn` 구현 또는 명시적 오류 계약화, `omp-wasm` 훅 ABI 확장 타당성 검토 | 계약 테스트 통과 |
+| 6.3 | 장기 트랙 B(`omp2` 임베디드 CPython 3.14t 전환) vs 트랙 A(Bun + WASM 유지) 결정 ADR 작성 | 주인 승인 전 트랙 B 구현 금지 명문화 |
 
 ### Phase 7 — 압축(`snapcompact`)·세션 분기 심화
 
-- `omp2` `crates/snapcompact`(2,042줄, 폰트 포함) 벤더링 + TS `normalize`/`wrap`/`planArchive` 이식 +
-  `Archive` 쓰기 및 `blob:sha256:` 프레임 해석 구현. JSONL v3 유지 하에 분기 메타데이터 1급화 검토.
+| # | 작업 | 완료 조건 |
+| --- | --- | --- |
+| 7.1 | `omp2` `crates/snapcompact`(2,042줄, 폰트 포함) 벤더링 + TS `normalize`/`wrap`/`planArchive` 이식 | `snapcompact` 골든·렌더 테스트 통과 |
+| 7.2 | `Archive` 쓰기 및 `blob:sha256:` 프레임 해석 구현 (`methodOrder` `soft` 부재 시 조용히 꺼지는 게이팅 개선 포함) | `"unavailable"` 갭 0건 + 라운드트립 테스트 통과 |
+| 7.3 | JSONL v3 호환 하에 `label` 쓰기·`session_info`/`child_usage_attributed`·`tree_parity.rs` 픽스처 정합 보완 | `omp-session` 라운드트립 + 트리 패리티 테스트 통과 |
 
 ### Phase 8 — `omp-tui` 단계적 패리티 & 최종 정리
 
-- **1단계**: `terminal_capabilities.rs` 단일 행렬 통합(DECRQM 프로브 포함) + 누락 키바인딩 11종 추가.
-- **2단계**: 고빈도 오버레이 4종 우선 이식(`model-hub`, `agents-hub`, `usage-dashboard`, `session-selector`).
-- **3단계**: `omp2` `theme.rs`(oklch/lab/lch)·`mermaid`/`graphviz` 렌더러·컴포넌트 적합성 테스트 패턴 선별 차용.
-- **4단계**: 차트·HTML 폼·서브앱(14종)은 수요 확인 후 별도 트랙으로 처리, 전 원장·벤더 핀·릴리스 노트 정합.
+| # | 작업 | 완료 조건 |
+| --- | --- | --- |
+| 8.1 | `terminal_capabilities.rs` 단일 행렬 통합(DECRQM 런타임 프로브 포함) + 누락 키바인딩 9종 추가 | `tests-e2e/tui/run.py` 실PTY 게이트 통과 |
+| 8.2 | 고빈도 오버레이 4종 우선 이식(`model-hub`, `agents-hub`, `usage-dashboard`, `session-selector`) | 각 오버레이 PTY 프로브 통과 |
+| 8.3 | `omp2` `theme.rs`(oklch/lab/lch)·`mermaid`/`graphviz` 렌더러·컴포넌트 적합성 테스트 패턴 선별 차용 | 테마·렌더 단위 테스트 통과 |
+| 8.4 | 차트·HTML 폼·서브앱(14종) 수요 기반 별도 트랙 확정, 전 원장·`vendor-src.lock`·릴리스 노트 정합 | 전 원장 CI 산출물 0 diff |
 
 ---
 
@@ -381,19 +395,21 @@ TUI 11개 프로브 `run.py`), `scripts/compat-oracle/`가 있으나 **전부 CI
 | Phase | 마이크로 조각 ID 및 단위 (각 1 워커 병렬 실행 가능) | 모델 라우팅 |
 | --- | --- | --- |
 | **P0** | `P0-1` `deny.toml` 이식, `P0-2` `vendor-src.lock` 작성, `P0-3` `vendor/pa-*/NOTICE` 4파일 각각 작성, `P0-4` `sync-catalog.sh` 수정, `P0-5` `ci.yml` lint/fmt 잡, `P0-6` `ci.yml` golden/tools 잡, `P0-7` `ci.yml` TUI PTY 잡, `P0-8` `justfile` 작성 | `oc-deepseek-v4.1-flash-free` (전부) |
-| **P1** | `P1-1~5` `docs/parity/*.md` 5개 각각 작성, `P1-6` `ts_tools.json` 32종 재추출, `P1-7` `web_search` 스키마+테스트, `P1-8` `todo` 스키마+테스트, `P1-9` `bash.notify` 스키마+테스트, `P1-10` `glob` 스키마+테스트, `P1-11` `ask` HTML 폼+복구(설계 확인), `P1-12` 끊긴 선언 3건 각각 제거, `P1-13` `ext-host` noop 메서드별 throw 전환+테스트, `P1-14` `rule://`·`schema.rs`·`bash.rs:3` 수정 | `oc-deepseek-v4.1-flash-free` (`P1-11` 리뷰만 상위 모델) |
+| **P1** | `P1-1~5` `docs/parity/*.md` 5개 각각 작성, `P1-6` `ts_tools.json` 32종 재추출(선행), `P1-7` `web_search` 스키마+테스트, `P1-8` `todo` 스키마+테스트, `P1-9` `bash.notify` 스키마+테스트, `P1-10` `glob` 스키마+테스트, `P1-11` `ask` HTML 폼+복구(설계 확인), `P1-12` 끊긴 선언 3건 각각 제거, `P1-13` `ext-host` noop 메서드별 throw 전환+테스트, `P1-14` `rule://`·`omp-urls`·`provenance`·`schema.rs`·`bash.rs:3` 수정 | `oc-deepseek-v4.1-flash-free` (`P1-11` 리뷰만 상위 모델) |
 | **P2** | `P2-1` `vendor/omp-shell*` 편입 및 빌드 확인, `P2-2` `DynHost` 어댑터 배선, `P2-3` `PathPolicy`/`omp-sandbox` 연결, `P2-4` `-pgid` 취소 테스트, `P2-5` `analysis.rs` 정책 테스트, `P2-6` 파이프/heredoc 골든 QA 5종, `P2-7` `dyn` 브리지 통합 | `P2-1~2` 상위 모델 설계 검수, `P2-3~7` 스웜 병렬 |
 | **P2.5** | `P2.5-1` `pi-vfs` 동기화+테스트, `P2.5-2` `omp-xfs/walk` 벤더링, `P2.5-3` `find.rs` 재작성+테스트, `P2.5-4` `search.rs` 재작성+테스트, `P2.5-5` `pi-ast` 동기화, `P2.5-6` `tools/ast.rs` 재작성+테스트, `P2.5-7` `pi-diff` 동기화, `P2.5-8` `pi-edit` 동기화+5프롬프트, `P2.5-9` `pi-predict` 반영 | `P2.5-3/4/6` API 재작성은 상위 모델 리뷰, 나머지 스웜 |
 | **P3** | `P3-1` `/handoff` 슬래시+RPC 배선+E2E, `P3-2~8` `read` 핸들러 7종(archive/sqlite/pdf/json/binary/notebook/http) 각 1워커, `P3-9` `memory://` 스킴+테스트, `P3-10` `omp-memory` SQLite 스키마+FTS, `P3-11~15` `recall/retain/reflect/memory_edit/learn` 각 1워커, `P3-16` `.omp/AGENTS.md`·`RULES.md` 탐색+테스트, `P3-17` 설정 게이트 22종 테스트 | `P3-10` 설계만 상위 모델, 나머지 전부 스웜 병렬 |
-| **P4** | `P4-1` `models_generated.rs` 생성기 스크립트, `P4-2` `model_id.contains` grep 제거, `P4-3` `utok` 토크나이저+3모드 테스트, `P4-4` 이미지 패치 과금 테이블, `P4-5` `omp-mcp` OAuth/공유 데몬, `P4-6` `rpc.rs` v2 청킹+테스트 | `P4-5/6` 설계 검수 상위 모델, 나머지 스웜 |
+| **P4** | `P4-1` `models_generated.rs` 생성기 스크립트, `P4-2` `model_id.contains` grep 제거, `P4-3` BPE 토크나이저(`tiktoken-rs` 등)+3모드 테스트, `P4-4` 이미지 패치 과금 테이블, `P4-5` `omp-mcp` OAuth/공유 데몬, `P4-6` `rpc.rs` v2 청킹+테스트 | `P4-5/6` 설계 검수 상위 모델, 나머지 스웜 |
 | **P5** | `P5-1` `gix` 읽기 경로(status/branch/log/diff) 각 1워커, `P5-2` `sysprompt.rs` 중복 제거, `P5-3` `omp-iso` 백엔드별(reflink/overlayfs/btrfs/rcopy) 각 1워커, `P5-4` `keep_changes` 이월+테스트, `P5-5` `.omp-isolation-owner` 고아 GC+테스트, `P5-6` `omp-sandbox` 회귀 테스트 | 전부 스웜 (동시 10+ 병렬) |
 | **P6** | `P6-1` `ext-host` 45개 이벤트 커버리지 원장 작성, `P6-2` `runEphemeralTurn` 구현 또는 명시적 오류화+테스트, `P6-3` `omp-wasm` 훅 ABI 확장 설계·타당성 검토, `P6-4` 트랙 A(Bun 유지) vs 트랙 B(CPython 3.14t) 결정 ADR 작성 | `P6-3/4` 설계 상위 모델, `P6-1/2` 스웜 |
 | **P7** | `P7-1` `omp-snapcompact` 벤더링, `P7-2` `normalize`+유닛테스트, `P7-3` `wrap`/`planArchive`+골든테스트, `P7-4` `Archive` 쓰기+`blob:sha256:` 해석 | 전부 스웜 병렬 |
-| **P8** | `P8-1` `terminal_capabilities.rs` 통합+DECRQM, `P8-2` 누락 키바인딩 11종, `P8-3~6` 오버레이 4종(`model-hub`/`agents-hub`/`usage`/`sessions`) 각 1워커, `P8-7` PTY QA 프로브 4종 추가, `P8-8` `oklch`/mermaid 차용 | `P8-1` 상위 모델 검수, 나머지 스웜 |
+| **P8** | `P8-1` `terminal_capabilities.rs` 통합+DECRQM, `P8-2` 누락 키바인딩 9종, `P8-3~6` 오버레이 4종(`model-hub`/`agents-hub`/`usage`/`sessions`) 각 1워커, `P8-7` PTY QA 프로브 4종 추가, `P8-8` `oklch`/mermaid 차용 | `P8-1` 상위 모델 검수, 나머지 스웜 |
 
 ---
 
 ## 7. 우선순위와 근거
+
+실행 권장 순서는 **`P0 → P1 → P2 → P2.5 → P3 → P5 → P4 → P7 → P8 → P6`** 이다(§6 번호는 영역별 논리 구조이며, 실제 실행에서는 `git` fork+exec 제거(Phase 5)를 카탈로그/토크나이저 정리(Phase 4)보다 먼저 수행한다).
 
 | 순위 | 단계 | 근거 |
 | --- | --- | --- |
