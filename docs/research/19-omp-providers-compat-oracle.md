@@ -1,0 +1,61 @@
+<results>
+<files>
+- /home/whrho/git/oh-my-tau/crates/omp-providers/src/lib.rs - The resolver core: `resolve_in` (selector -> `ResolvedModel`), `Config::load` (models.yml + config.yml via omp-settings), `find_model` (4-tier lookup), `finish_model` (compat merge + `pa_ai::compat::materialize`), `pick_thinking`/`clamp_level`/`provisional_auto`, `cache_model` (models.db read), `env_key`, `auth_details`, `merge_compat`, `apply_overrides`.
+- /home/whrho/git/oh-my-tau/crates/omp-providers/src/auth.rs - Per-request credential resolution: broker-vs-local store, OAuth refresh with leases + CAS, credential pools for account rotation, `recover` on 401, `structured_key` for Google CCA providers.
+- /home/whrho/git/oh-my-tau/crates/omp-providers/src/login/mod.rs - `omp login/logout`: `Target` (Local `agent.db` vs broker), per-provider flow dispatch, OAuth `data` shaping (`base_oauth`, `codex_data`, `authorizedAt`).
+- /home/whrho/git/oh-my-tau/crates/omp-providers/src/login/store.rs - `LocalStore` write paths (`upsert`, `disable`, `disable_provider`), identity keys (`identity_key`, `oauth_identifiers`, `provider_identity_key`), broker upload/list/disable, schema version 8.
+- /home/whrho/git/oh-my-tau/crates/omp-providers/src/login/providers.rs - The 80-entry `/login` roster in TS `_order.kdl` order, `store_as` aliasing (`zai-coding-plan`->`zai`, `openai-codex-device`->`openai-codex`), `UNPORTED` (empty).
+- /home/whrho/git/oh-my-tau/crates/omp-providers/src/login/api_key.rs + api_key_providers.json + gen_api_key_providers.py - Generated API-key provider rules from TS `rules/auth/*.kdl` `login "api-key"` blocks.
+- /home/whrho/git/oh-my-tau/crates/omp-providers/src/discovery.rs - `refresh`/`refresh_async`: /models fetch, merge with existing cache row, write TS-schema `model_cache` row with `MATERIALIZATION_POLICY`, TTL gating.
+- /home/whrho/git/oh-my-tau/crates/omp-providers/build.rs - Computes `OMP_MODEL_MATERIALIZATION_POLICY = app-{version}:builder-1:rules-{n}-{base36(wyhash(rules.json))}`; prefers `vendor-src/oh-my-pi` over the in-repo `vendor/pa-ai/data/compat/rules.json`.
+- /home/whrho/git/oh-my-tau/scripts/sync-catalog.sh - Regenerates `vendor/pa-ai/data/compat/{rules,axes}.json` and unions the TUI catalog.
+- /home/whrho/git/oh-my-tau/scripts/verify-models-db.ts - Reads a models.db row through the real TS `readModelCache` to prove policy/schema/payload parity.
+- /home/whrho/git/oh-my-tau/scripts/compat-oracle/{README.md,gen-data.ts,oracle.ts,bodies.ts} - TS ground-truth generators for rules/axes data, resolved-policy dumps, and request-body dumps.
+- /home/whrho/git/oh-my-tau/vendor/pa-ai/src/compat/mod.rs - Embeds `rules.json` + `axes.json` via `include_str!`, exposes `rules()`/`axes()` OnceLocks.
+- /home/whrho/git/oh-my-tau/vendor/pa-ai/src/compat/resolve.rs - `resolve_model_policy` (4-layer layering) and `ModelSpec`/`ResolvedModelPolicy`.
+- /home/whrho/git/oh-my-tau/vendor/pa-ai/src/compat/model.rs - `materialize` (policy -> `thinking_level_map`), `model_from_catalog_row` (drops stale resolved `compat`, keeps `compatConfig`), `compat_overrides`.
+- /home/whrho/git/oh-my-tau/vendor/pa-ai/src/compat/oracle.rs - Rust side of the oracle test: replays `dump.jsonl` through `resolve_model_policy`, asserts JSON equality, skips if fixture missing.
+- /home/whrho/git/oh-my-tau/vendor/pa-ai/src/models_generated.rs - Hand-maintained compiled fallback catalog (no generator).
+- /home/whrho/git/oh-my-tau/crates/omp-cli/src/subcmd/models.rs - The only consumer of `assets/tui-model-catalog.json` (`/model` browser, `bundled_catalog`).
+- /home/whrho/git/oh-my-tau/.github/workflows/ci.yml - CI runs only `cargo test --workspace`; no catalog/parity script is wired in.
+</files>
+
+<answer>
+Four subsystems, all ports of the TypeScript `oh-my-pi` implementation with byte/behaviour parity as the design goal.
+
+**1. Model catalogs (4-tier resolution, later tiers only fill gaps).**
+`resolve_in` in `crates/omp-providers/src/lib.rs` turns `provider/id[:thinking]` (or a `modelRoles` name, recursively resolved with a depth-5 loop guard) into a `ResolvedModel`. Model lookup in `find_model` is ordered:
+1. `models.yml` `providers.<p>.models[]` custom entry -> `custom_model` (defaults: api from provider or `default_api_for`, baseUrl from entry/provider/`base_url_for`, ctx 128k, maxTokens 16384).
+2. `models.db` `model_cache` via `cache_model` — `SELECT models ... WHERE provider_id = ?1 OR provider_id LIKE 'p:%'`, newest first, rows parsed by `pa_ai::compat::model_from_catalog_row` (which discards the stored resolved `compat` and keeps `compatConfig`).
+3. `pa_ai::models_generated::get_model` — a hand-maintained compiled fallback catalog.
+4. Synthesize a minimal model if the provider has a `baseUrl` in `models.yml`.
+Then provider-level `baseUrl`/`api` overrides apply (with a Google CCA-host exception), then `finish_model` runs provider `compat:` + `disableStrictTools` merges, `modelOverrides`, and one `pa_ai::compat::materialize` call that produces the resolved policy and the `thinking_level_map`.
+
+Three separate catalog artifacts exist and must not be confused:
+- `vendor/pa-ai/data/compat/rules.json` + `axes.json` (439 KB + 7 KB) — the compat rule tree, embedded with `include_str!`.
+- `vendor/pa-ai/src/models_generated.rs` (186 KB) — Rust compiled fallback catalog, explicitly hand-maintained, no generator.
+- `crates/omp-cli/assets/tui-model-catalog.json` (480 KB) — slim row arrays `[id,name,reasoning,vision,ctx,maxTokens,$in,$out,$cache,kind,priority]`, read only by `crates/omp-cli/src/subcmd/models.rs` for the `/model` browser.
+
+**2. OAuth / credentials.**
+Resolution order per request (`resolve_in`): `models.yml` `apiKey` (supports `!command` stdout, or env-var-name indirection, or literal; `auth: none` yields an empty key so no `Authorization` header is sent) -> `env_key` (aliases `KIMI_API_KEY`, `OPENCODE_API_KEY`, `INCEPTION_API_KEY`, `ATRIA_API_KEY`, else `pa_ai::env_api_keys`) -> `auth::credential`.
+`auth.rs` picks the store: a configured broker (`OMP_AUTH_BROKER_URL`/`_TOKEN`, `auth.broker.url`/`.token` in config.yml, or `<~/.omp>/auth-broker.token`) *replaces* the local store and never silently falls back; otherwise `agent.db` `auth_credentials`. OAuth rows within 60 s of expiry (or forced) are refreshed locally under a 15 s DB lease (`auth_credential_refresh_leases`, 20 s wait, 50 ms poll) with a compare-and-set `UPDATE ... WHERE data = ?`, so concurrent processes cannot double-refresh; a lost CAS adopts the peer's fresher row. Refresh flows are per-provider: `kimi-code` (form grant to auth.kimi.com), `google-gemini-cli`/`google-antigravity` (Google token endpoint with base64-obfuscated installed-app client ids, requires `projectId`), plus `pa_ai::oauth` for anthropic/openai-codex/xai-oauth/github-copilot. `recover` force-refreshes once after a 401 and returns only a *different* bearer. `CredentialPool` exposes alternates so a rate-limited provider can rotate accounts. `structured_key`/`structured_key_by_id` serialize the whole OAuth row as JSON for the two Google CCA providers, because a bare access token yields `project: ""` and 404s.
+Login writes (`login/store.rs`) target `LocalStore` or the broker. `upsert` runs one IMMEDIATE transaction: OAuth login disables existing `api_key` rows ("replaced by oauth login"), matching rows are updated (identity-key based) and duplicates disabled, then superseded tombstones are purged best-effort. Rows are byte-compatible with TS: `AUTH_SCHEMA_VERSION = 8`, `identity_key` from `extractOAuthCredentialIdentifiers` (account/email/project/org plus JWT claims, including the `https://api.openai.com/auth` ChatGPT claims), `org-scoped-identity` composite `base|org` keys for anthropic/openai-codex/factory-droid. Logout is a soft delete via `disabled_cause`; every read filters `disabled_cause IS NULL`.
+
+**3. models.db parity.**
+`discovery.rs` writes `model_cache` rows in the exact TS schema (13 columns incl. `materialization_policy`, `models_hash`, `header_omitted_model_ids`, `header_restore_version`). `MATERIALIZATION_POLICY` is computed at *build* time in `crates/omp-providers/build.rs` as `app-{coding-agent version}:builder-1:rules-{rules.version}-{base36(wyhash(compact rules.json))}`, where the hash must equal `Bun.hash(JSON.stringify(RULES)).toString(36)` — implemented via `omp_stats::parser::wyhash` plus a hand-rolled `base36`. `models_hash` is `{base36(len)}:{base36(wyhash)}`. TS readers (`catalog/src/model-cache.ts`) delete any row whose policy differs, so a stale `rules.json` silently invalidates the cache; `scripts/verify-models-db.ts` is the manual check that drives the real TS `readModelCache` (2 h TTL, `mockprov` default) and exits 1 on rejection. Discovery is additive (previously cached ids survive), authoritative=1, skips the network for 2 h on authoritative rows / 5 min otherwise, and deletes the `model_cache_refresh` side row on every payload write.
+
+**4. Compat rules.**
+`rules.json` (the compiled TS rule tree: taxonomy + cascade) and `axes.json` (wire/request axis applicability + `API_COMPAT_RECORDS`) are generated by `scripts/compat-oracle/gen-data.ts` from `vendor-src/oh-my-pi`, then embedded in `vendor/pa-ai/src/compat/mod.rs`. `resolve_model_policy` (`vendor/pa-ai/src/compat/resolve.rs`) layers, later wins: (1) unconditional per-API defaults, (2) host-derived flags (URL/provider detection, host x identity branches), (3) cascade axes from the rule tree, (4) spec-authored sparse overrides + undefined fixups. It tracks declared-but-undefined keys separately because TS distinguishes them. Output: `identity`, full `compat` record, `thinking`, `catalog`, `request`.
+`materialize` (`compat/model.rs`) applies `applyCatalogAssignments` (`omitMaxOutputTokens`) and, when the policy yields thinking, forces `reasoning = true` and derives `thinking_level_map` (one entry per ladder effort, wire value from `effortMap`, `off` unsupported when `requiresEffort`) unless the model already carries an explicit map. The resolved record is *never stored* — it is re-derived from sparse overrides on every load, which is why a cached row with an outdated `compat` is safe.
+Parity is enforced by `vendor/pa-ai/src/compat/oracle.rs` + `openai_completions::body_parity_tests` + `transport_parity_tests`, replaying `dump.jsonl` / `bodies.jsonl` / `bodies-transport.jsonl` from `$OMP_COMPAT_ORACLE_DIR`, else `target/compat-oracle/`, else legacy `runs/omp-rust/compat-oracle/`. TS errors must map to Rust errors and JSON must match exactly (null compat/thinking sections normalized away).
+
+**Important caveat for this checkout:** `vendor-src/` and `runs/` are both gitignored and absent here, so `scripts/sync-catalog.sh` currently fails at step 1 — it hardcodes `cd "$ROOT/vendor-src/oh-my-pi"` and `runs/omp-rust/compat-oracle/gen-data.ts`, whereas `gen-data.ts` actually lives at `scripts/compat-oracle/gen-data.ts`. The oracle tests also self-skip when no fixture exists. CI (`.github/workflows/ci.yml`) only runs `cargo test --workspace` — neither `sync-catalog.sh` nor `verify-models-db.ts` is wired in, so parity drift is caught only when the fixtures happen to be present or when the TS side reads a written db.
+</answer>
+
+<next_steps>
+- To change catalog data: edit `vendor/pa-ai/data/compat/rules.json`/`axes.json` only via `scripts/compat-oracle/gen-data.ts` (from a real `vendor-src/oh-my-pi` checkout); any rules change shifts `MATERIALIZATION_POLICY` and requires a rebuild plus a fresh `bun scripts/verify-models-db.ts <db>`.
+- To change model resolution, start at `find_model`/`finish_model` in `crates/omp-providers/src/lib.rs`; to change request shape, start at `vendor/pa-ai/src/compat/resolve.rs` and re-run the three oracle tests.
+- To change credentials, the read path is `auth.rs` (`resolve_with`/`local_row_credential`) and the write path is `login/store.rs` (`LocalStore::upsert`); keep `AUTH_SCHEMA_VERSION` and the `data` JSON key order aligned with TS.
+- If you need the sync/oracle scripts to run here, first restore `vendor-src/oh-my-pi` (gitignored) and fix `scripts/sync-catalog.sh`'s `runs/omp-rust/compat-oracle/gen-data.ts` path, which does not exist in this tree.
+</next_steps>
+</results>
