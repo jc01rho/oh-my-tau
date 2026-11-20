@@ -901,10 +901,10 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
             .await
             .unwrap_or_default();
             let mut models: Vec<Value> = catalog
-                    .iter()
-                    .filter(|b| b.available && b.kind.is_empty() && !b.model.id.is_empty())
-                    .map(|b| model_info(&b.model))
-                    .collect();
+                .iter()
+                .filter(|b| b.available && b.kind.is_empty() && !b.model.id.is_empty())
+                .map(|b| model_info(&b.model))
+                .collect();
             if let Some((p, i)) = current {
                 if !models
                     .iter()

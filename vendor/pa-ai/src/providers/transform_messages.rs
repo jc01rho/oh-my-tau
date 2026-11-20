@@ -199,7 +199,7 @@ pub fn transform_messages_with_options(
                 if !existing.contains(&tool_call.id) {
                     result.push(Message::ToolResult(ToolResultMessage {
                         tool_call_id: tool_call.id.clone(),
-                        tool_name: tool_call.name.clone(),
+                        tool_name: tool_call.name,
                         content: vec![UserOrToolContent::Text(TextContent {
                             text: "No result provided".to_string(),
                             text_signature: None,

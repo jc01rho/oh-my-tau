@@ -394,10 +394,7 @@ fn main() -> Result<(), String> {
                 args.max_steps,
             );
             raws.extend(outcome.trajectory.raw_states().iter().copied());
-            eprintln!(
-                "calibrate problem: steps={} correct={}",
-                outcome.steps, "n/a"
-            );
+            eprintln!("calibrate problem: steps={} correct=n/a", outcome.steps);
         }
         let norm = Normalizer::fit(&raws);
         let payload = json!({

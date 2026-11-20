@@ -838,9 +838,14 @@ mod tests {
             );
         }
         if !root.join("ext-host/host.ts").is_file() {
-            return Some("ext-host/host.ts is missing (test needs a full repository checkout)".into());
+            return Some(
+                "ext-host/host.ts is missing (test needs a full repository checkout)".into(),
+            );
         }
-        if !root.join("crates/omp-ext/tests/fixtures/mutating.ts").is_file() {
+        if !root
+            .join("crates/omp-ext/tests/fixtures/mutating.ts")
+            .is_file()
+        {
             return Some(
                 "crates/omp-ext/tests/fixtures/mutating.ts is missing (test needs a full repository checkout)"
                     .into(),
@@ -861,8 +866,7 @@ mod tests {
     #[cfg(unix)]
     fn is_executable(path: std::path::PathBuf) -> bool {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(&path)
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     }
 
     #[cfg(not(unix))]
@@ -1269,7 +1273,7 @@ mod tests {
         });
         let old = ExtUpdateEncoder::chain_id(&old).unwrap();
         h.enc.resync_flag().fetch_max(old, Ordering::SeqCst);
-        h.text(0).push_str("a");
+        h.text(0).push('a');
         let f = h.send(|partial| Ev::TextDelta {
             content_index: 0,
             delta: "a".into(),
@@ -1278,7 +1282,7 @@ mod tests {
         assert!(is_full(&f), "rejected chain restarts full");
         // A second rejection of the old chain arrives late.
         h.enc.resync_flag().fetch_max(old, Ordering::SeqCst);
-        h.text(0).push_str("b");
+        h.text(0).push('b');
         let f = h.send(|partial| Ev::TextDelta {
             content_index: 0,
             delta: "b".into(),

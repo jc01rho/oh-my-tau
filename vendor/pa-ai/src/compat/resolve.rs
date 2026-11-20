@@ -480,15 +480,13 @@ fn detect_openai_compat(
         && (u("zai") || u("zhipu") || u("opencode"))
     {
         Some(GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS)
-    } else if facts.is("mimo") && u("xiaomi") {
-        Some(300_000)
-    } else if reasoning_capable
-        && facts.is("kimi")
-        && (facts.family(&["k3"]) || facts.family(&["k2.7-code"]))
-        && u("moonshotNative")
+    } else if (facts.is("mimo") && u("xiaomi"))
+        || (reasoning_capable
+            && facts.is("kimi")
+            && (facts.family(&["k3"]) || facts.family(&["k2.7-code"]))
+            && u("moonshotNative"))
+        || (reasoning_capable && facts.is("deepseek") && u("deepseekDirect"))
     {
-        Some(300_000)
-    } else if reasoning_capable && facts.is("deepseek") && u("deepseekDirect") {
         Some(300_000)
     } else if d.is_local_serving_backend {
         Some(LOCAL_OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS)

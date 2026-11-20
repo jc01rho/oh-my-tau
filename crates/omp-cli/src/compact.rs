@@ -1624,7 +1624,7 @@ mod tests {
         assert!(guard.session_alive());
 
         // A pending `/tree` move moves the append point: stale.
-        persist.branch_to(Some(e1.clone())).expect("branch_to");
+        persist.branch_to(Some(e1)).expect("branch_to");
         assert!(guard.check_commit(&persist).is_err(), "navigation discards");
 
         // Any append ends the pending move AND advances the tip: stale either way.

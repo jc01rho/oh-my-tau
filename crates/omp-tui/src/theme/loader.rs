@@ -446,8 +446,10 @@ fn resolve_var_refs(
 
 /// Materialize a parsed theme onto a [`Theme`] (TS `createTheme`).
 fn build_theme(name: &str, parsed: &ParsedTheme) -> Result<LoadedTheme, ThemeError> {
-    let mut theme = Theme::default();
-    theme.glyph_set = parsed.symbol_preset.to_owned();
+    let mut theme = Theme {
+        glyph_set: parsed.symbol_preset.to_owned(),
+        ..Default::default()
+    };
     for (token, resolved) in &parsed.colors {
         let color = match resolved {
             None => Color::Reset,

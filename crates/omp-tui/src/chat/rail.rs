@@ -201,9 +201,11 @@ fn parse(lines: &[Line<'static>]) -> Parsed {
     Parsed { header, body }
 }
 
+type CellRun = Vec<(char, Style)>;
+
 /// Split a family header into `(title, description)` cells: drops the
 /// leading status/tool icon and the `Title:` colon.
-fn split_header(cells: &[(char, Style)]) -> (Vec<(char, Style)>, Vec<(char, Style)>) {
+fn split_header(cells: &[(char, Style)]) -> (CellRun, CellRun) {
     let mut cells: Vec<(char, Style)> = cells.to_vec();
     // Leading icon: one non-alphanumeric glyph (or `$`) followed by a space.
     let icon_len = cells.iter().take_while(|(c, _)| *c != ' ').count();
@@ -399,10 +401,7 @@ pub fn restyle(
         if s.starts_with('⟦') && s.ends_with('⟧') && (s.contains("Wall:") || s.contains("Timeout:"))
         {
             if let Some(rest) = s.split("Wall: ").nth(1) {
-                wall = rest
-                    .split(|c| c == ' ' || c == '|' || c == '⟧')
-                    .next()
-                    .map(str::to_owned);
+                wall = rest.split([' ', '|', '⟧']).next().map(str::to_owned);
             }
             return false;
         }

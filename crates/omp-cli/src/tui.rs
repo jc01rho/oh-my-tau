@@ -100,7 +100,7 @@ pub async fn run(
     }
     let (model, model_name) = {
         let m = rt.agent.model().await;
-        (format!("{}/{}", m.provider, m.id), m.name.clone())
+        (format!("{}/{}", m.provider, m.id), m.name)
     };
     rt.enable_context_usage_frames();
     crate::slash_extra::mark_interactive_ui();
@@ -243,7 +243,7 @@ fn group_thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

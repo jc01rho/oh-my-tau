@@ -423,9 +423,9 @@ pub async fn eval(env: Arc<Env>, args: Value, ctx: CallCtx) -> Result<AgentToolR
         text.push('\n');
     }
     if replayed {
-        let _ = write!(
+        let _ = writeln!(
             text,
-            "Replayed {} setup cell{}.\n",
+            "Replayed {} setup cell{}.",
             results.len(),
             if results.len() == 1 { "" } else { "s" }
         );

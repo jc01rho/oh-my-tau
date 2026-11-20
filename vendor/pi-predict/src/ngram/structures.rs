@@ -190,7 +190,7 @@ impl Fenwick {
         tree.extend(values);
         let n = tree.len() - 1;
         for i in 1..=n {
-            let parent = i + (i & i.wrapping_neg());
+            let parent = i + i.isolate_lowest_one();
             if parent <= n {
                 tree[parent] += tree[i];
             }
@@ -203,7 +203,7 @@ impl Fenwick {
         let mut j = i + 1;
         while j < self.tree.len() {
             self.tree[j] += delta;
-            j += j & j.wrapping_neg();
+            j += j.isolate_lowest_one();
         }
     }
 
@@ -213,7 +213,7 @@ impl Fenwick {
         let mut j = end;
         while j > 0 {
             sum += self.tree[j];
-            j -= j & j.wrapping_neg();
+            j -= j.isolate_lowest_one();
         }
         sum
     }

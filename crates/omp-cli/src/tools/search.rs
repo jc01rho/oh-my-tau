@@ -629,10 +629,10 @@ pub fn grep_with_cancel(
             if cancelled(cancel) {
                 return Err(pa_agent::abort::aborted_error());
             }
-            let slots: Vec<OnceLock<Option<(Vec<Match>, usize, bool)>>> =
-                std::iter::repeat_with(OnceLock::new)
-                    .take(chunk.len())
-                    .collect();
+            type FileSlot = OnceLock<Option<(Vec<Match>, usize, bool)>>;
+            let slots: Vec<FileSlot> = std::iter::repeat_with(OnceLock::new)
+                .take(chunk.len())
+                .collect();
             let indices: Vec<usize> = (0..chunk.len()).collect();
             let searched = pi_walker::parallel_for_each_init(
                 &indices,
@@ -818,7 +818,8 @@ pub fn grep_with_cancel(
     if is_multi_scope {
         let entries: Vec<(String, bool)> =
             window.iter().map(|h| (h.shown.clone(), false)).collect();
-        let rendered: HashMap<usize, (Vec<String>, Vec<String>, Option<String>)> = window
+        type RenderedBlock = (Vec<String>, Vec<String>, Option<String>);
+        let rendered: HashMap<usize, RenderedBlock> = window
             .iter()
             .enumerate()
             .map(|(i, h)| (i, render(h)))

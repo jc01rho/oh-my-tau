@@ -523,7 +523,9 @@ impl pa_agent::types::AgentTool for BashTool {
 
 #[tokio::test]
 async fn ext_hooks_rewrite_input_and_deliver_additional_context_through_the_loop() {
-    if common::bun_missing("ext_hooks_rewrite_input_and_deliver_additional_context_through_the_loop") {
+    if common::bun_missing(
+        "ext_hooks_rewrite_input_and_deliver_additional_context_through_the_loop",
+    ) {
         return;
     }
     use pa_agent::agent::{Agent, AgentInitialState, AgentOptions};

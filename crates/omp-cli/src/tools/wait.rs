@@ -59,8 +59,8 @@ fn watch_snapshot(env: &Env) -> Vec<Watched> {
     for (id, job) in env.jobs.sorted() {
         let finished = match job.status {
             JobStatus::Running => None,
-            JobStatus::Completed => job.result.clone(),
-            JobStatus::Failed => job.error.clone(),
+            JobStatus::Completed => job.result,
+            JobStatus::Failed => job.error,
         };
         out.push(Watched { id, finished });
     }

@@ -1,6 +1,5 @@
 //! Stored-credential access for every request path (TS `AuthStorage.getApiKey`
-//! + `auth-retry`): credentials are resolved per request, never once per
-//! process.
+//! + `auth-retry`): credentials are resolved per request, never once per process.
 //!
 //! * A configured auth broker (`OMP_AUTH_BROKER_URL`/`_TOKEN`, `auth.broker.url`/`.token` in
 //!   `config.yml`, `<config root>/auth-broker.token`; TS `resolveAuthBrokerConfig`) *replaces*
@@ -1322,19 +1321,17 @@ pub fn structured_key_by_id(dir: &AgentDir, provider: &str, id: i64) -> Option<S
             .and_then(Value::as_str)
             .map(std::string::ToString::to_string)
     };
-    Some(
-        serde_json::to_string(&serde_json::json!({
-            "apiEndpoint": pick("apiEndpoint"),
-            "token": token,
-            "enterpriseUrl": pick("enterpriseUrl"),
-            "projectId": project_id,
-            "refreshToken": pick("refresh"),
-            "expiresAt": data.get("expires").and_then(|e| e.as_i64().or_else(|| e.as_f64().map(|f| f as i64))),
-            "email": pick("email"),
-            "accountId": pick("accountId"),
-        }))
-        .ok()?,
-    )
+    serde_json::to_string(&serde_json::json!({
+        "apiEndpoint": pick("apiEndpoint"),
+        "token": token,
+        "enterpriseUrl": pick("enterpriseUrl"),
+        "projectId": project_id,
+        "refreshToken": pick("refresh"),
+        "expiresAt": data.get("expires").and_then(|e| e.as_i64().or_else(|| e.as_f64().map(|f| f as i64))),
+        "email": pick("email"),
+        "accountId": pick("accountId"),
+    }))
+    .ok()
 }
 
 /// After a provider 401 for `failed`: force-refresh that credential and return the replacement,

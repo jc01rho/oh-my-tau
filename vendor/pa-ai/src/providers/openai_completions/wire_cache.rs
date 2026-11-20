@@ -131,7 +131,7 @@ pub(crate) fn build_params_cached<'a>(
     let opts = options.cloned().unwrap_or_default();
     let reasoning = opts.reasoning_effort.map(|level| level.wire_name());
     let disable_reasoning = opts.reasoning_enabled == Some(false);
-    let tool_choice = opts.tool_choice.clone();
+    let tool_choice = opts.tool_choice;
 
     let cacheable = enabled()
         && compat.cache_control_format.as_deref() != Some("anthropic")
@@ -288,13 +288,15 @@ mod tests {
 
     fn options_of(case: &Value) -> OpenAICompletionsOptions {
         let o = &case["options"];
-        let mut base = StreamOptions::default();
-        base.max_tokens = o.get("maxTokens").and_then(Value::as_u64);
-        base.temperature = o.get("temperature").and_then(Value::as_f64);
-        base.session_id = o
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let base = StreamOptions {
+            max_tokens: o.get("maxTokens").and_then(Value::as_u64),
+            temperature: o.get("temperature").and_then(Value::as_f64),
+            session_id: o
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ..Default::default()
+        };
         let mut opts = OpenAICompletionsOptions::from_base(base);
         opts.reasoning_effort = o
             .get("reasoning")
@@ -453,7 +455,7 @@ mod tests {
             uncached_body(&model, &base, Some(&options))
         );
 
-        let mut changed = base.clone();
+        let mut changed = base;
         changed.system_prompt = Some("a different system prompt".to_string());
         assert_eq!(
             cached_body(&model, &changed, Some(&options)),

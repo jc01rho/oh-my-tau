@@ -102,13 +102,12 @@ fn row_parts(entry: &HudEntry, width: usize) -> (String, Option<(char, usize)>, 
     }
     // Bar: filled `━` / empty `─`, width min(18, remaining-1), floor 4.
     let remaining = width.saturating_sub(tail.chars().count() + 1);
-    let bar_width = remaining.min(18).max(4);
+    let bar_width = remaining.clamp(4, 18);
     let bar = entry.total.map(|total| {
-        let filled = if total == 0 {
-            0
-        } else {
-            ((bar_width as u64 * entry.done) / total).min(bar_width as u64)
-        };
+        let filled = (bar_width as u64 * entry.done)
+            .checked_div(total)
+            .unwrap_or(0)
+            .min(bar_width as u64);
         (if filled > 0 { '━' } else { '─' }, filled as usize)
     });
     (entry.label.clone(), bar, tail)
@@ -127,7 +126,7 @@ pub fn render_hud_row(entry: &HudEntry, width: usize, theme: &Theme) -> Line<'st
     // Bar width: min(18, remaining-1), floor 4 (progress-bar min).
     let remaining = (width - tail_len).saturating_sub(1);
     let bar_len = if bar.is_some() {
-        remaining.min(18).max(4)
+        remaining.clamp(4, 18)
     } else {
         0
     };
@@ -137,15 +136,15 @@ pub fn render_hud_row(entry: &HudEntry, width: usize, theme: &Theme) -> Line<'st
     let mut spans: Vec<Span<'static>> = Vec::new();
     if show_label {
         spans.push(Span::styled(
-            label.clone(),
+            label,
             Style::default().fg(theme.color("text_muted")),
         ));
         spans.push(Span::raw(" "));
     }
     if let Some((glyph, filled)) = bar {
         let filled = filled.min(bar_len);
-        let filled_str: String = std::iter::repeat(glyph).take(filled).collect();
-        let empty_str: String = std::iter::repeat('─').take(bar_len - filled).collect();
+        let filled_str: String = std::iter::repeat_n(glyph, filled).collect();
+        let empty_str: String = "─".repeat(bar_len - filled);
         spans.push(Span::styled(
             filled_str,
             Style::default().fg(theme.color("accent")),

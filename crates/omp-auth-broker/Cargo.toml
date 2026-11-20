@@ -2,6 +2,7 @@
 name = "omp-auth-broker"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Rust port of `omp auth-broker serve`: the credential vault daemon omp clients pull snapshots and OAuth refreshes from"
 
 [[bin]]

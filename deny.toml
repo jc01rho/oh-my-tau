@@ -1,0 +1,66 @@
+# cargo-deny policy for oh-my-tau.
+#
+# Every dependency in Cargo.lock must clear one of the licenses allowed below.
+# File-level copyleft / non-standard licenses are package-scoped exceptions so
+# that each addition stays visible in review instead of silently widening the
+# allowlist; unused allowances and exceptions are hard failures so the policy
+# cannot rot as dependencies come and go.
+[graph]
+targets = []
+all-features = true
+
+[licenses]
+include-dev = true
+include-build = true
+unused-allowed-license = "deny"
+unused-license-exception = "deny"
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Zlib",
+]
+exceptions = []
+
+# Vendored crates (vendor/*) are path dependencies published nowhere and
+# rewritten in-tree; their manifests carry the workspace MIT license.
+[licenses.private]
+ignore = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git dependencies in Cargo.lock today; a new one is a policy decision.
+allow-git = []
+
+[bans]
+multiple-versions = "warn"
+# Workspace crates are in-tree path dependencies (`path = "../omp-urls"`) whose
+# version is pinned centrally in [workspace.dependencies], so they carry no
+# version requirement of their own. `allow-wildcard-paths` exempts private
+# (non-publishable) path crates, but every crates/* member still inherits the
+# workspace `publish` setting (i.e. is treated as public), where cargo-deny
+# reports a wildcard. Making this strict again requires `publish = false` in
+# each member manifest; until then wildcards are warnings, not errors.
+wildcards = "warn"
+# Keep the exemption for the vendor/* path crates and any private members.
+allow-wildcard-paths = true
+highlight = "all"
+# crossterm is patched to vendor/crossterm 0.28.1 (xterm modifyOtherKeys
+# decoding). Only that exact patched version is permitted; any other version
+# means the patch stopped applying.
+deny = [
+    { name = "crossterm", version = "<0.28.1" },
+    { name = "crossterm", version = ">0.28.1" },
+]

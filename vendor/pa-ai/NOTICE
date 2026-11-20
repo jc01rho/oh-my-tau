@@ -1,0 +1,94 @@
+pa-ai
+=====
+
+Origin
+------
+This crate is a modified fork of the `pa-ai` crate from
+PrimeIntellect-ai/prime-agent (https://github.com/PrimeIntellect-ai/prime-agent),
+the Rust side of the Prime Agent product. It is a Rust port of that product's
+TypeScript `packages/ai` tree (provider clients, model registry, streaming,
+usage accounting) and the model-policy engine of its TypeScript
+`packages/catalog/src/compat/*` tree.
+
+Upstream license: MIT, Copyright (c) 2025-2026 Prime Intellect Ltd. The
+upstream license text is vendored at `vendor/LICENSE-prime-agent`; it also
+credits the original TypeScript product, "a port of the Prime Agent TypeScript
+product, originally Copyright (c) 2025 Mario Zechner". That MIT license and
+copyright notice apply to this crate.
+
+Its only first-party (workspace) dependency is `pa-types`, one-way; wire/domain
+types live there and are re-exported from `src/types.rs`. Everything else in
+`Cargo.toml` is a crates.io dependency.
+
+Modifications by oh-my-tau
+--------------------------
+This copy has been changed. It is NOT byte-identical to upstream, and files
+carrying the upstream header are not verbatim upstream content. Substantive
+changes:
+
+* Compat engine (`src/compat/`): a port of the TS model-policy compat engine
+  (`packages/catalog/src/compat/*`). `src/compat/resolve.rs` is the single
+  resolver (`resolve_model_policy`) layering per-API defaults, host-derived
+  flags, compat-cascade axes, and sparse spec overrides; it preserves the TS
+  distinction between a declared-`undefined` key and an undeclared key.
+  Supporting modules: `cascade.rs` (rule-tree axis resolution),
+  `hosts.rs` (endpoint host classification and Anthropic endpoint-shape
+  predicates, marker matching via `regex`), `revision.rs` (identifier revision
+  triples), `taxonomy.rs`, `model.rs` (wire `Model` <-> resolver glue and
+  thinking-metadata materialization), `view.rs`, `mod.rs`.
+* Generated compat rule data (`data/compat/rules.json`, `data/compat/axes.json`,
+  ~446 KB combined) is compiled into the crate with `include_str!` and parsed
+  into `OnceLock` singletons by `src/compat/mod.rs`. The data is generated from
+  the TS tree by `scripts/compat-oracle/gen-data.ts` (repo root), not hand
+  edited; the axes table carries the TS `AXES` wire/request keys and
+  `API_COMPAT_RECORDS`.
+* Compat oracle test (`src/compat/oracle.rs`, test-only): asserts the Rust
+  resolver reproduces TS `resolveModelPolicy` for every (provider, model) in a
+  dump of the local model database plus the bundled catalog. Fixture lookup
+  honors `$OMP_COMPAT_ORACLE_DIR`, then `<repo>/target/compat-oracle/`, then the
+  legacy `<repo>/runs/omp-rust/compat-oracle/`; fixtures are produced by
+  `scripts/compat-oracle/oracle.ts` and are not distributed in this repository.
+* Compiled fallback catalog (`src/models_generated.rs`, ~4.6k lines): the
+  runtime catalog chain is validated disk cache -> packaged bundled snapshot ->
+  this compiled table. It is a hand-maintained port of the TS
+  `packages/ai/src/models.generated.ts` `MODELS` layout (same provider/model
+  ordering, `thinkingLevelMap` pairs, and the `compat` subset the TS fallback
+  file carries); there is no generator, so refreshes are manual.
+* Bedrock transport (`src/providers/bedrock/h2.rs`, `eventstream.rs`,
+  `goaway.rs`, `auth.rs`, `src/utils_inner/h2_classify.rs`): the default
+  transport is h2c prior-knowledge HTTP/2 over cleartext, mirroring the TS
+  client's `NodeHttp2Handler` (isolated session per request, no transport
+  retries or timeout), with `H2TlsAlpn` for https endpoints and an http1
+  fallback selected by `AWS_BEDROCK_FORCE_HTTP1=1` or a configured proxy.
+  Failure texts are pinned to the TS strings and classified through
+  `utils_inner::h2_classify`. This required adding `h2` (with `stream`) and
+  `bytes` to `Cargo.toml`, and enabling the `http2` feature on the shared
+  `reqwest` client while every non-bedrock provider stays `http1_only()`.
+* Provider surface: providers beyond the upstream set, including `devin`
+  (model-router/agent wire), `kimi` (device-identity common headers),
+  `google_gemini_cli`, `openrouter`, `systemone` (structured-decision
+  protocol), `azure_openai_responses`, `openai_codex_responses` (WebSocket
+  session, exposed as `codex_debug`), plus the `faux` test provider and
+  `simple_options` token-ceiling helpers.
+* OAuth flows (`src/oauth/`): Anthropic callback, GitHub Copilot, Kimi,
+  OpenAI Codex, xAI, shared PKCE and provider-http plumbing; `src/env_api_keys.rs`
+  resolves credentials from the environment.
+* Diagnostics and utilities (`src/utils_inner/`, re-exported as
+  `pa_ai::utils`): provider-error shapes with per-SDK user-facing texts and
+  diagnostic names, connection-error profiles, stream-failure classification
+  and retry, overflow detection, JSON repair/streaming parsing, SSE decoding,
+  unicode sanitization, and an HTTP inspector.
+* Parity and differential test harnesses: `src/transport_parity_tests.rs`,
+  `src/prime_inference_differential_test.rs`, per-provider `*_tests.rs`
+  (e.g. `providers/anthropic/stream_tests.rs`,
+  `providers/openai_completions/body_parity_tests.rs`), and
+  `tests/differential/` (a Python replay server plus a TS driver used to diff
+  Rust output against the TypeScript implementation). The differential
+  fixtures under `tests/testdata/` are captures of provider wire traffic.
+* Crate documentation (`src/lib.rs`, `README.md`) reflects this fork's surface
+  (e.g. the `codex_debug` module, `kimi_common_headers`, the `utils` facade),
+  and `Cargo.toml` declares workspace-inherited version/edition/license/lints
+  plus the dependencies the ports above required.
+
+Nothing in this crate is relicensed: the fork remains under the upstream MIT
+terms reproduced in `vendor/LICENSE-prime-agent`.

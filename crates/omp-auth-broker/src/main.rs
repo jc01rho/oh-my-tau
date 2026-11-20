@@ -425,19 +425,20 @@ fn parse_int_prefix(raw: &str) -> Option<i64> {
 async fn read_json(
     req: Request<Incoming>,
     allow_empty: bool,
-) -> std::result::Result<Value, Response<Body>> {
+) -> std::result::Result<Value, Box<Response<Body>>> {
     let raw = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
-        Err(e) => return Err(error(400, &format!("Invalid request body: {e}"))),
+        Err(e) => return Err(Box::new(error(400, &format!("Invalid request body: {e}")))),
     };
     if raw.is_empty() {
         return if allow_empty {
             Ok(json!({}))
         } else {
-            Err(error(400, "Request body required"))
+            Err(Box::new(error(400, "Request body required")))
         };
     }
-    serde_json::from_slice(&raw).map_err(|e| error(400, &format!("Invalid JSON body: {e}")))
+    serde_json::from_slice(&raw)
+        .map_err(|e| Box::new(error(400, &format!("Invalid JSON body: {e}"))))
 }
 
 fn str_field<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
@@ -751,7 +752,7 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Bod
         (&Method::POST, "/v1/usage/observed") => {
             let body = match read_json(req, false).await {
                 Ok(b) => b,
-                Err(res) => return Ok(res),
+                Err(res) => return Ok(*res),
             };
             let report = match client_report(&body) {
                 Ok(r) => r,
@@ -777,7 +778,7 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Bod
         (&Method::POST, "/v1/credential") => {
             let body = match read_json(req, false).await {
                 Ok(b) => b,
-                Err(res) => return Ok(res),
+                Err(res) => return Ok(*res),
             };
             let provider = str_field(&body, "provider").filter(|p| !p.is_empty());
             let Some(provider) = provider else { return Ok(error(400, "provider must be a non-empty string")) };
@@ -831,7 +832,7 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Bod
         (&Method::POST, "disable") => {
             let body = match read_json(req, true).await {
                 Ok(b) => b,
-                Err(res) => return Ok(res),
+                Err(res) => return Ok(*res),
             };
             if body.get("cause").is_some_and(|c| !c.is_string()) {
                 return Ok(error(400, "cause must be a string"));
@@ -853,7 +854,7 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Bod
         (&Method::POST, "block") => {
             let body = match read_json(req, false).await {
                 Ok(b) => b,
-                Err(res) => return Ok(res),
+                Err(res) => return Ok(*res),
             };
             let (Some(key), Some(scope), Some(until)) = (
                 str_field(&body, "providerKey").filter(|k| !k.is_empty()),
@@ -875,7 +876,7 @@ async fn route(state: Arc<State>, req: Request<Incoming>) -> Result<Response<Bod
         (&Method::DELETE, "block") => {
             let body = match read_json(req, false).await {
                 Ok(b) => b,
-                Err(res) => return Ok(res),
+                Err(res) => return Ok(*res),
             };
             let (Some(key), Some(scope)) = (
                 str_field(&body, "providerKey").filter(|k| !k.is_empty()),

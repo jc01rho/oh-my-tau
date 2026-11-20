@@ -215,7 +215,7 @@ const GAMUT_EPSILON: f64 = 1e-4;
 
 fn in_srgb_gamut(rgb: [f64; 3]) -> bool {
     rgb.iter()
-        .all(|&ch| ch >= -GAMUT_EPSILON && ch <= 1.0 + GAMUT_EPSILON)
+        .all(|&ch| (-GAMUT_EPSILON..=1.0 + GAMUT_EPSILON).contains(&ch))
 }
 
 /// Convert OKLCH to a `#rrggbb` hex string, gamut-mapping by chroma

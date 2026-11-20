@@ -88,10 +88,8 @@ fn has_unrepresentable_strict_object_map(schema: &Map<String, Value>) -> bool {
                     return true;
                 }
             }
-            Value::Array(a) => {
-                if a.iter().any(check) {
-                    return true;
-                }
+            Value::Array(a) if a.iter().any(check) => {
+                return true;
             }
             _ => {}
         }

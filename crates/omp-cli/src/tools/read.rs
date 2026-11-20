@@ -1099,10 +1099,7 @@ mod tests {
         let e = env(dir.path());
         let out = text_of(&read(&e, &serde_json::json!({"path": "a.txt"})).unwrap());
         let expected = "[a.txt#0793]\n1:line 1\n2:line 2\n3:line 3\n4:line 4\n5:line 5";
-        assert_eq!(
-            out, expected,
-            "omt read output diverged from TS formatting"
-        );
+        assert_eq!(out, expected, "omt read output diverged from TS formatting");
     }
 
     #[test]

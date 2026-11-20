@@ -581,7 +581,7 @@ fn build_input(model: &Model, view: &ModelView, context: &Context, o: &InputOpti
                         format!("{text_result}\n{NON_VISION_IMAGE_PLACEHOLDER}")
                     }
                 } else if !text_result.is_empty() {
-                    text_result.clone()
+                    text_result
                 } else if has_images {
                     "(see attached image)".to_string()
                 } else {
@@ -968,12 +968,13 @@ fn should_send_service_tier(provider: &str, tier: ServiceTier) -> bool {
 }
 
 fn clamp_output_to_model_max(view: &ModelView, model: &Model) -> Option<u64> {
-    view.is("clampOutputToModelMax").then(|| {
-        if model.max_tokens == 0 {
-            OPENAI_MAX_OUTPUT_TOKENS
-        } else {
-            model.max_tokens
-        }
+    if !view.is("clampOutputToModelMax") {
+        return None;
+    }
+    Some(if model.max_tokens == 0 {
+        OPENAI_MAX_OUTPUT_TOKENS
+    } else {
+        model.max_tokens
     })
 }
 

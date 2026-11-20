@@ -1019,16 +1019,14 @@ impl ModelPicker {
                     ..
                 },
                 ChipAction::Level(level),
-            ) => {
-                if level != initial {
-                    self.role_map
-                        .insert(role.clone(), format!("{}:{level}", model.selector()));
-                    if role == "default" {
-                        self.pending.push(Action::SetThinkingLevel(level.clone()));
-                        self.current_level = level;
-                    }
-                    self.emit_roles();
+            ) if level != initial => {
+                self.role_map
+                    .insert(role.clone(), format!("{}:{level}", model.selector()));
+                if role == "default" {
+                    self.pending.push(Action::SetThinkingLevel(level.clone()));
+                    self.current_level = level;
                 }
+                self.emit_roles();
             }
             _ => {}
         }
@@ -1519,7 +1517,7 @@ impl ModelPicker {
         [line1, truncate_spans(chips, bw)]
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn browser_lines(
         &self,
         st: &St,
@@ -2076,9 +2074,10 @@ mod tests {
     }
 
     fn picker() -> ModelPicker {
-        let mut p = ModelPicker::default();
-        p.models = catalog();
-        p
+        ModelPicker {
+            models: catalog(),
+            ..Default::default()
+        }
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -2254,10 +2253,12 @@ mod tests {
 
     #[test]
     fn wheel_scrolls_list_window() {
-        let mut p = ModelPicker::default();
-        p.models = (0..100)
-            .map(|i| ModelEntry::new("p", &format!("m{i:03}"), Some(1000)))
-            .collect();
+        let mut p = ModelPicker {
+            models: (0..100)
+                .map(|i| ModelEntry::new("p", &format!("m{i:03}"), Some(1000)))
+                .collect(),
+            ..Default::default()
+        };
         p.on_open();
         let _ = draw(&p, 120, 40);
         let l = p.layout.borrow().clone();

@@ -196,7 +196,7 @@ impl StatsJudge for FakeJudge {
             let _guard = InFlight(Arc::clone(&self.in_flight));
             let quick = self
                 .quick
-                .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |n| {
+                .try_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |n| {
                     n.checked_sub(1)
                 })
                 .is_ok();

@@ -533,7 +533,7 @@ async fn stream_with_deltas(
         partial: partial.clone(),
     });
 
-    for index in 0..message.content.len() {
+    for (index, block) in message.content.iter().cloned().enumerate() {
         if signal.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             let aborted = create_aborted_message(&partial);
             writer.push(AssistantMessageEvent::Error {
@@ -543,8 +543,6 @@ async fn stream_with_deltas(
             writer.end(Some(aborted));
             return;
         }
-
-        let block = message.content[index].clone();
 
         match block {
             AssistantContent::Thinking(thinking_block) => {

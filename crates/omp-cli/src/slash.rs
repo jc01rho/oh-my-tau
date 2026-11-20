@@ -984,8 +984,6 @@ fn slow_command(rt: &Runtime, args: &str) -> Outcome {
                     } else {
                         "Slow mode is on (flex tier).".to_string()
                     }
-                } else if anthropic {
-                    "Slow mode is off.".to_string()
                 } else {
                     "Slow mode is off.".to_string()
                 },
@@ -1003,7 +1001,7 @@ fn slow_command(rt: &Runtime, args: &str) -> Outcome {
             rt.set_service_tier(enabled.then_some(pa_types::ai::ServiceTier::Flex));
             output(
                 rt,
-                &if enabled {
+                if enabled {
                     "Slow mode on: requests use the flex tier (lower cost, higher latency)."
                 } else {
                     "Slow mode off."
@@ -2750,8 +2748,8 @@ async fn modelpreset_command(rt: &Runtime, args: &str) -> Outcome {
                     &format!("Invalid preset name \"{name}\": use a letter, then letters, digits, - or _"),
                 );
             }
-            let roles = settings.get("modelRoles").clone();
-            let level = settings.get("defaultThinkingLevel").clone();
+            let roles = settings.get("modelRoles");
+            let level = settings.get("defaultThinkingLevel");
             let mut presets = read_model_presets(&settings);
             presets.insert(
                 name.clone(),

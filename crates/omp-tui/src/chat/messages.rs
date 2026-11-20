@@ -1244,8 +1244,8 @@ impl Messages {
                 path,
                 status: ToolStatus::Pending,
                 preview: None,
-                tool: name.clone(),
-                args: args.clone(),
+                tool: name,
+                args,
                 details: Value::Null,
             };
             let open = self.open_group.or_else(|| self.reusable_group());

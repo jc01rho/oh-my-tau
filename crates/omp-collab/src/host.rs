@@ -358,7 +358,8 @@ impl CollabHost {
         inner
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(tx) = inner.abort_start.lock().unwrap().take() {
+        let abort_start = inner.abort_start.lock().unwrap().take();
+        if let Some(tx) = abort_start {
             let _ = tx.send(()).await;
         }
         self.send_frame(&json!({ "t": "bye", "reason": reason }), 0);
@@ -383,7 +384,8 @@ impl CollabHost {
         {
             return;
         }
-        if let Some(pub_) = inner.publication.lock().unwrap().take() {
+        let publication = inner.publication.lock().unwrap().take();
+        if let Some(pub_) = publication {
             pub_.close().await;
         }
         inner.peers.lock().unwrap().clear();
@@ -443,13 +445,15 @@ impl CollabHost {
         if last.as_deref() == Some(json.as_str()) {
             return;
         }
-        *last = Some(json.clone());
+        *last = Some(json);
         drop(last);
         self.send_frame(&json!({ "t": "state", "state": state }), 0);
     }
 
     fn broadcast_allowed(&self) -> bool {
-        !self.ending() && self.inner.peers.lock().unwrap().len() > 0 && self.session_still_current()
+        !self.ending()
+            && !self.inner.peers.lock().unwrap().is_empty()
+            && self.session_still_current()
     }
 
     fn session_still_current(&self) -> bool {
@@ -468,7 +472,7 @@ impl CollabHost {
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "anonymous".to_string());
         let mut participants = vec![json!({ "name": display_name, "role": "host" })];
-        for (_, p) in self.inner.peers.lock().unwrap().iter() {
+        for p in self.inner.peers.lock().unwrap().values() {
             let mut pj = json!({ "name": p.name, "role": "guest" });
             if !p.can_write {
                 pj["readOnly"] = Value::Bool(true);
@@ -560,7 +564,7 @@ impl CollabHost {
         self.inner.peers.lock().unwrap().insert(
             from_peer,
             Peer {
-                name: clean_name.clone(),
+                name: clean_name,
                 can_write,
             },
         );

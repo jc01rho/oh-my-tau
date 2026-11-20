@@ -125,9 +125,14 @@ fn fingerprint_changes_after_append() {
 
     let before = trace_fingerprint_for_etag(file.to_str().unwrap()).expect("fingerprint");
     // Same mtime granularity can hide an append on coarse-timestamp
-    // filesystems; the memo/fingerprint contract only requires the key to
-    // change, and mtime is the load-bearing half of it.
+    // filesystems; bump mtime explicitly so the test never flakes on fast tmpfs.
     std::fs::write(&file, format!("{line}\n{line}\n")).expect("append session");
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .expect("open appended session")
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+        .expect("bump mtime");
     let after = trace_fingerprint_for_etag(file.to_str().unwrap()).expect("fingerprint");
     assert_ne!(
         before, after,

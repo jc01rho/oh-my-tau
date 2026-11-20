@@ -1442,8 +1442,7 @@ impl SettingsOverlay {
         lines.push((Line::from(Span::styled(format!("  {hint}"), dim)), None));
 
         map.menu.clear();
-        let mut y = top;
-        for (line, opt) in lines {
+        for (y, (line, opt)) in (top..).zip(lines) {
             if y >= bottom {
                 break;
             }
@@ -1459,7 +1458,6 @@ impl SettingsOverlay {
                     height: 1,
                 },
             );
-            y += 1;
         }
         bottom
     }
@@ -2028,11 +2026,9 @@ impl Component for SettingsOverlay {
                 let size = ((height * height) / list.len()).clamp(1, height);
                 let travel = height - size;
                 let max_offset = list.len() - height;
-                let thumb_start = if max_offset == 0 {
-                    0
-                } else {
-                    (start.saturating_mul(travel) + max_offset / 2) / max_offset
-                };
+                let thumb_start = (start.saturating_mul(travel) + max_offset / 2)
+                    .checked_div(max_offset)
+                    .unwrap_or(0);
                 for (r, line) in pane_lines.iter_mut().enumerate() {
                     let used: usize = line.spans.iter().map(|span| span.content.len()).sum();
                     let pad = (row_width as usize).saturating_sub(used);

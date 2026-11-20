@@ -848,11 +848,7 @@ fn policy_state(messages: &[AgentMessage], table: &SlotTable) -> crate::context_
         block_since_ref_turns: 0,
         offloads_total: 0,
         offload_reads: 0,
-        cache_hit_pct: if input == 0 {
-            0
-        } else {
-            (100 * cached / input) as usize
-        },
+        cache_hit_pct: (100 * cached).checked_div(input).unwrap_or(0) as usize,
         excerpt,
     }
 }
@@ -1388,7 +1384,7 @@ mod tests {
             since, 2,
             "last restatement was in the turn right after the block"
         );
-        let mut h2 = h.clone();
+        let mut h2 = h;
         h2.insert(5, asst(json!([{"type":"toolCall","id":"e1","name":"eval","arguments":{"code":"open('/x/block-2.txt').read()"}}]), "toolUse"));
         assert_eq!(offload_reads(&h2, &[(2, "ref".into())]), 1);
         assert_eq!(offload_reads(&h2, &[]), 0);

@@ -130,44 +130,57 @@ impl Store {
             conn: Mutex::new(conn),
         };
         let conn = store.conn()?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS auth_change_revision (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL);
-             INSERT OR IGNORE INTO auth_change_revision (id, revision) VALUES (1, 0);
-             CREATE TABLE IF NOT EXISTS auth_credential_blocks (
-                credential_id INTEGER NOT NULL, provider_key TEXT NOT NULL, block_scope TEXT NOT NULL DEFAULT '',
-                blocked_until_ms INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-                PRIMARY KEY (credential_id, provider_key, block_scope));
-             CREATE INDEX IF NOT EXISTS idx_auth_credential_blocks_expires ON auth_credential_blocks(blocked_until_ms);
-             CREATE TABLE IF NOT EXISTS auth_credential_refresh_leases (
-                credential_id INTEGER PRIMARY KEY, owner TEXT NOT NULL, expires_at_ms INTEGER NOT NULL, updated_at INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS usage_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at INTEGER NOT NULL, provider TEXT NOT NULL,
-                account_key TEXT NOT NULL, email TEXT, account_id TEXT, limit_id TEXT NOT NULL, label TEXT NOT NULL,
-                window_label TEXT, used_fraction REAL, status TEXT, resets_at INTEGER);
-             CREATE INDEX IF NOT EXISTS idx_usage_history_recorded ON usage_history(recorded_at);
-             CREATE TABLE IF NOT EXISTS clients (install_id TEXT PRIMARY KEY, hostname TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS client_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at INTEGER NOT NULL, install_id TEXT NOT NULL,
-                provider TEXT NOT NULL, model TEXT NOT NULL, requests INTEGER NOT NULL, input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL, cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
-                cost_usd REAL NOT NULL DEFAULT 0);
-             CREATE INDEX IF NOT EXISTS idx_client_usage_recorded ON client_usage(recorded_at);",
-        )?;
-        for table in ["auth_credentials", "auth_credential_blocks"] {
-            for event in ["INSERT", "UPDATE", "DELETE"] {
-                conn.execute_batch(&format!(
-                    "CREATE TRIGGER IF NOT EXISTS auth_change_revision_{table}_{ev} AFTER {event} ON {table}
-                     BEGIN UPDATE auth_change_revision SET revision = revision + 1 WHERE id = 1; END;",
-                    ev = event.to_lowercase()
-                ))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let init_res = (|| -> Result<()> {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS auth_change_revision (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL);
+                 INSERT OR IGNORE INTO auth_change_revision (id, revision) VALUES (1, 0);
+                 CREATE TABLE IF NOT EXISTS auth_credential_blocks (
+                    credential_id INTEGER NOT NULL, provider_key TEXT NOT NULL, block_scope TEXT NOT NULL DEFAULT '',
+                    blocked_until_ms INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (credential_id, provider_key, block_scope));
+                 CREATE INDEX IF NOT EXISTS idx_auth_credential_blocks_expires ON auth_credential_blocks(blocked_until_ms);
+                 CREATE TABLE IF NOT EXISTS auth_credential_refresh_leases (
+                    credential_id INTEGER PRIMARY KEY, owner TEXT NOT NULL, expires_at_ms INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE IF NOT EXISTS usage_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at INTEGER NOT NULL, provider TEXT NOT NULL,
+                    account_key TEXT NOT NULL, email TEXT, account_id TEXT, limit_id TEXT NOT NULL, label TEXT NOT NULL,
+                    window_label TEXT, used_fraction REAL, status TEXT, resets_at INTEGER);
+                 CREATE INDEX IF NOT EXISTS idx_usage_history_recorded ON usage_history(recorded_at);
+                 CREATE TABLE IF NOT EXISTS clients (install_id TEXT PRIMARY KEY, hostname TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+                 CREATE TABLE IF NOT EXISTS client_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at INTEGER NOT NULL, install_id TEXT NOT NULL,
+                    provider TEXT NOT NULL, model TEXT NOT NULL, requests INTEGER NOT NULL, input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL, cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+                    cost_usd REAL NOT NULL DEFAULT 0);
+                 CREATE INDEX IF NOT EXISTS idx_client_usage_recorded ON client_usage(recorded_at);",
+            )?;
+            for table in ["auth_credentials", "auth_credential_blocks"] {
+                for event in ["INSERT", "UPDATE", "DELETE"] {
+                    conn.execute_batch(&format!(
+                        "CREATE TRIGGER IF NOT EXISTS auth_change_revision_{table}_{ev} AFTER {event} ON {table}
+                         BEGIN UPDATE auth_change_revision SET revision = revision + 1 WHERE id = 1; END;",
+                        ev = event.to_lowercase()
+                    ))?;
+                }
             }
-        }
-        let has_app: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('client_usage') WHERE name = 'app'")?
-            .exists([])?;
-        if !has_app {
-            conn.execute_batch("ALTER TABLE client_usage ADD COLUMN app TEXT NOT NULL DEFAULT ''")?;
+            let has_app: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('client_usage') WHERE name = 'app'")?
+                .exists([])?;
+            if !has_app {
+                conn.execute_batch(
+                    "ALTER TABLE client_usage ADD COLUMN app TEXT NOT NULL DEFAULT ''",
+                )?;
+            }
+            Ok(())
+        })();
+        match init_res {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
         }
         drop(conn);
         Ok(store)

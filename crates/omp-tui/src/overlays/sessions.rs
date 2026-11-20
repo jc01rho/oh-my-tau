@@ -125,7 +125,7 @@ pub fn scan_session_dir(dir: &Path) -> Vec<SessionSummary> {
             out.push(summary);
         }
     }
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by_key(|a| std::cmp::Reverse(a.modified));
     out
 }
 
@@ -390,7 +390,7 @@ impl SessionPicker {
             SessionScope::AllProjects => &self.all_dirs,
         };
         self.sessions = dirs.iter().flat_map(scan_source).collect();
-        self.sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+        self.sessions.sort_by_key(|a| std::cmp::Reverse(a.modified));
         self.refilter();
     }
 

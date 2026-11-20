@@ -117,18 +117,13 @@ fn provider_target() -> Result<crate::adapter::ProviderTarget, String> {
 // ---------------------------------------------------------------------------
 
 /// Terminal or current state of one handle (TS `EvalHandleState`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum HandleStatus {
+    #[default]
     Running,
     Completed,
     Failed,
     Cancelled,
-}
-
-impl Default for HandleStatus {
-    fn default() -> Self {
-        Self::Running
-    }
 }
 
 impl HandleStatus {
@@ -858,7 +853,6 @@ async fn execute_completion(
         if response.stop_reason == StopReason::Error {
             let message = response
                 .error_message
-                .clone()
                 .unwrap_or_else(|| "completion() request failed.".to_string());
             last_error = Some(message.clone());
             if index + 1 >= candidates.len() {
@@ -2242,7 +2236,7 @@ fn start_turns(pool: &Arc<WorkPool>, starts: Vec<TurnStart>) {
                 text,
                 &agent_id_taken,
             );
-            start_turns(&pool, next);
+            start_turns(pool, next);
             continue;
         }
         let run = launch_agent(&handle, spec, &*pool.launcher);
@@ -2478,7 +2472,7 @@ fn run_status(args: &Value) -> Result<Value, String> {
         .get("item")
         .ok_or_else(|| "handle request requires an item".to_string())?;
     let (kind, id) = parse_handle_ref(item)?;
-    Ok(lookup_handle(&kind, &id)?.snapshot())
+    Ok(lookup_handle(kind, &id)?.snapshot())
 }
 
 fn run_cancel(args: &Value) -> Result<Value, String> {
@@ -2824,7 +2818,7 @@ mod tests {
     async fn workpool_ops_drive_worker_runs() {
         // Reads the recursion-depth env through `create_workpool`: serialize
         // with the depth-env tests.
-        let _depth_env = DEPTH_ENV_LOCK.lock();
+        let depth_env = DEPTH_ENV_LOCK.lock();
         let launcher = Arc::new(MockLauncher::default());
         let dyn_launcher: Arc<dyn Launcher> = launcher.clone();
         let cwd = PathBuf::from(".");
@@ -2865,6 +2859,10 @@ mod tests {
             assert!(runs[0].0.prompt.contains("one"));
             assert_eq!(runs[1].0.id.as_deref(), Some("test-pool-e2e-2"));
         }
+        // The depth env is only read synchronously by `create`/`push`, so the
+        // guard is released before the awaits below.
+        drop(depth_env);
+
         // Workers are agent handles: messageable and cancellable.
         assert_eq!(
             deliver_message("test-pool-e2e-1", "hint").await.unwrap(),
@@ -2892,6 +2890,9 @@ mod tests {
         assert_eq!(peek["batches"][1]["status"], "cancelled");
         assert_eq!(peek["batches"][1]["output"], AGENT_CANCELLED_TEXT);
 
+        // No awaits remain; re-taking the depth-env lock serializes the
+        // remaining env reads with the other depth-env tests.
+        let _depth_env = DEPTH_ENV_LOCK.lock();
         let closed = run_workpool_with(
             &json!({"op": "close", "name": "test-pool-e2e"}),
             &cwd,
@@ -3005,10 +3006,7 @@ mod tests {
         fn cancel(&self) -> bool {
             // The kill is requested but the run stays unresolved until
             // `release()` (a real child still has to be reaped).
-            if self.inner.cancelled.swap(true, Ordering::SeqCst) {
-                return false;
-            }
-            true
+            !self.inner.cancelled.swap(true, Ordering::SeqCst)
         }
 
         fn output_tokens(&self) -> u64 {
@@ -3023,7 +3021,7 @@ mod tests {
     impl Launcher for SlowMockLauncher {
         fn launch(&self, spec: omp_task::TaskSpec) -> (Arc<dyn RunCtl>, RunFuture) {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let id = spec.id.clone().unwrap_or_default();
+            let id = spec.id.unwrap_or_default();
             let run = Arc::new(SlowMockRun {
                 inner: MockRun {
                     id: id.clone(),
@@ -3046,7 +3044,7 @@ mod tests {
     /// to settle before erroring (TS `handle-bridge.ts` `Promise.allSettled`).
     #[tokio::test]
     async fn aborted_wait_cancels_then_waits_for_settlement() {
-        let _depth_env = DEPTH_ENV_LOCK.lock();
+        let depth_env = DEPTH_ENV_LOCK.lock();
         let launcher = Arc::new(SlowMockLauncher {
             runs: Mutex::new(Vec::new()),
         });
@@ -3065,6 +3063,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(launcher.runs.lock().unwrap().len(), 2);
+
+        // The depth env is only read synchronously by `create`/`push`; release
+        // the guard before the awaits below.
+        drop(depth_env);
 
         let controller = pa_agent::abort::AbortController::new();
         let signal = controller.signal();

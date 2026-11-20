@@ -465,8 +465,7 @@ impl EvalBridge {
             // The model-facing intent field is not part of the tool schema.
             obj.remove("i");
         }
-        let mut params = validate_tool_arguments(tool.name(), tool.parameters(), &params)
-            .map_err(|e| e.to_string())?;
+        let mut params = validate_tool_arguments(tool.name(), tool.parameters(), &params)?;
         let signal = &self.ctx.signal;
         let mut call = ToolCall {
             id: format!("{}:{name}", self.ctx.tool_call_id),
@@ -501,8 +500,7 @@ impl EvalBridge {
                 }
                 if let Some(revised) = outcome.args {
                     // Hook revisions are untrusted input to the tool schema.
-                    params = validate_tool_arguments(tool.name(), tool.parameters(), &revised)
-                        .map_err(|e| e.to_string())?;
+                    params = validate_tool_arguments(tool.name(), tool.parameters(), &revised)?;
                     call.arguments = revised;
                 }
             }

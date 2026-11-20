@@ -68,53 +68,53 @@ pub struct Loaded {
 /// I/O failure.
 pub fn load(path: &Path) -> Result<Loaded> {
     let buf = scan::FileBuf::read(path)?;
-    /// One line's parse result, in file order after assembly.
-    enum Item {
-        Line(Line),
-        Malformed(Malformed),
-        Blank,
-    }
-    let parse = |n: usize, bytes: &[u8]| -> Item {
+    let parse = |n: usize, bytes: &[u8], lines: &mut Vec<Line>, malformed: &mut Vec<Malformed>| {
         let raw = scan::decode_line(bytes);
         if raw.trim().is_empty() {
-            return Item::Blank;
+            return;
         }
         let raw = raw.into_owned();
         match serde_json::from_str::<FileEntry>(&raw) {
-            Ok(entry) => Item::Line(Line { raw, entry }),
-            Err(_) => Item::Malformed(Malformed { line_no: n, raw }),
+            Ok(entry) => lines.push(Line { raw, entry }),
+            Err(_) => malformed.push(Malformed { line_no: n, raw }),
         }
     };
-    let items: Vec<Item> = if buf.as_slice().len() > scan::PAR_THRESHOLD {
-        use rayon::prelude::*;
-        let buf = buf.as_slice();
-        let spans = scan::line_spans(buf);
-        let threads = rayon::current_num_threads().max(1);
-        let chunk = (spans.len() / (threads * 8)).clamp(256, 4096).max(1);
-        spans
-            .par_chunks(chunk)
-            .map(|c| {
-                c.iter()
-                    .map(|&(n, o, l)| parse(n, &buf[o as usize..o as usize + l as usize]))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<Vec<_>>>()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-    } else {
-        scan::line_spans(buf.as_slice())
-            .into_iter()
-            .map(|(n, o, l)| parse(n, &buf.as_slice()[o as usize..o as usize + l as usize]))
-            .collect()
-    };
+    let spans = scan::line_spans(buf.as_slice());
     let mut lines = Vec::new();
     let mut malformed = Vec::new();
-    for item in items {
-        match item {
-            Item::Line(l) => lines.push(l),
-            Item::Malformed(m) => malformed.push(m),
-            Item::Blank => {}
+    if buf.as_slice().len() > scan::PAR_THRESHOLD {
+        use rayon::prelude::*;
+        let buf = buf.as_slice();
+        let threads = rayon::current_num_threads().max(1);
+        let chunk = (spans.len() / (threads * 8)).clamp(256, 4096).max(1);
+        let parts = spans
+            .par_chunks(chunk)
+            .map(|c| {
+                let mut lines = Vec::new();
+                let mut malformed = Vec::new();
+                for &(n, o, l) in c {
+                    parse(
+                        n,
+                        &buf[o as usize..o as usize + l as usize],
+                        &mut lines,
+                        &mut malformed,
+                    );
+                }
+                (lines, malformed)
+            })
+            .collect::<Vec<_>>();
+        for (l, m) in parts {
+            lines.extend(l);
+            malformed.extend(m);
+        }
+    } else {
+        for (n, o, l) in spans {
+            parse(
+                n,
+                &buf.as_slice()[o as usize..o as usize + l as usize],
+                &mut lines,
+                &mut malformed,
+            );
         }
     }
     let title_slot = lines.first().and_then(|l| match l.omp() {

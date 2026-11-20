@@ -12,6 +12,9 @@ use serde_json::{Map, Value};
 
 use crate::agent::civil;
 
+/// Process-global session-entry sink type (see [`Persistence::entry_sink`]).
+pub type EntrySink = std::sync::Arc<dyn Fn(&str, Value) + Send + Sync>;
+
 /// ISO-8601 UTC with milliseconds, like omp ("2026-10-11T14:08:39.790Z").
 #[must_use]
 pub fn iso_from_ms(ms: i64) -> String {
@@ -149,7 +152,7 @@ impl Persistence {
     /// this session, for subsystems that only see a process-global hook (RLM
     /// sub-call accounting). Writes are best-effort.
     #[must_use]
-    pub fn entry_sink(&self) -> std::sync::Arc<dyn Fn(&str, serde_json::Value) + Send + Sync> {
+    pub fn entry_sink(&self) -> EntrySink {
         let writer = std::sync::Arc::clone(&self.writer);
         let nav_leaf = Arc::clone(&self.nav_leaf);
         std::sync::Arc::new(move |kind, payload| {

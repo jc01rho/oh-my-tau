@@ -39,9 +39,6 @@ pa-ai = { path = "vendor/pa-ai" }
 pa-agent = { path = "vendor/pa-agent" }
 thiserror = "2"
 futures = "0.3"
-toml = "0.9"
-# Dev-only; the default fork/timeout features are unused.
-proptest = { version = "1.11", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

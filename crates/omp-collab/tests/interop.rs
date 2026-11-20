@@ -470,10 +470,12 @@ async fn ts_guest_interops_with_rust_host() {
 // ═══════════════ Test B: wire-level rust host vs the same TS guest ═══════════════
 
 /// What the wire host saw, for protocol-level assertions.
+type HelloLog = Vec<(u32, String, bool, Option<String>)>;
+
 #[derive(Default)]
 struct WireHostLog {
     /// `(peer, name, writeToken present, writeToken value)` per hello.
-    hellos: Mutex<Vec<(u32, String, bool, Option<String>)>>,
+    hellos: Mutex<HelloLog>,
     prompts: Mutex<Vec<(u32, String)>>,
     transcript_requests: Mutex<Vec<u32>>,
 }
@@ -484,6 +486,7 @@ struct WireHostLog {
 /// exactly like TS `host.ts:707` (transport-liveness gate, not a peer-list
 /// gate). Every outbound frame is the typed [`CollabFrame`] serde encoding;
 /// every inbound frame must parse as [`CollabFrame`].
+#[allow(clippy::too_many_arguments)]
 async fn run_wire_host(
     relay_url: String,
     room_id: String,
@@ -539,12 +542,11 @@ async fn run_wire_host(
                     match frame {
                         CollabFrame::Hello { proto, name, write_token } => {
                             assert_eq!(proto, COLLAB_PROTO as u32, "TS guest speaks proto 3");
-                            match &write_token {
-                                Some(token) => assert_eq!(
+                            if let Some(token) = &write_token {
+                                assert_eq!(
                                     token, &write_token_b64,
                                     "TS guest must echo the link's write token verbatim"
-                                ),
-                                None => {}
+                                );
                             }
                             let can_write = write_token.is_some();
                             log.hellos.lock().unwrap().push((

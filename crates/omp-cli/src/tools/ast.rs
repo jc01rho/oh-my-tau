@@ -151,6 +151,10 @@ fn clamp_line(text: &str) -> String {
         .collect()
 }
 
+/// One scanned file's contribution: relative path, absolute path, matches,
+/// and an optional parse-error note.
+type ScannedFile = Option<(String, PathBuf, Vec<AstMatch>, Option<String>)>;
+
 #[cfg(test)]
 /// `ast_grep`: structural search.
 ///
@@ -198,39 +202,37 @@ pub fn ast_grep_with_cancel(
     // read/parsed/matched in parallel on the rayon pool; `collect` keeps
     // input order and short-circuits on the first invalid pattern, matching
     // the previous serial `?` semantics.
-    let scanned: Vec<Option<(String, PathBuf, Vec<AstMatch>, Option<String>)>> = files
+    let scanned: Vec<ScannedFile> = files
         .par_iter()
-        .map(
-            |file| -> Result<Option<(String, PathBuf, Vec<AstMatch>, Option<String>)>> {
-                if cancelled(cancel) {
-                    return Err(pa_agent::abort::aborted_error());
+        .map(|file| -> Result<ScannedFile> {
+            if cancelled(cancel) {
+                return Err(pa_agent::abort::aborted_error());
+            }
+            let Ok(source) = std::fs::read_to_string(file) else {
+                return Ok(None);
+            };
+            let Ok(language) = language_or_infer(lang, file) else {
+                return Ok(None);
+            };
+            let patterns = compile_search_patterns(&pattern, language)
+                .map_err(|error| anyhow::anyhow!("Invalid pattern: {error}"))?;
+            let mut parse_error = None;
+            if let Some(tree) = parse_cached(&source, language)? {
+                if tree.root_node().has_error() {
+                    parse_error = Some(parse_error_note(file, env));
                 }
-                let Ok(source) = std::fs::read_to_string(file) else {
-                    return Ok(None);
-                };
-                let Ok(language) = language_or_infer(lang, file) else {
-                    return Ok(None);
-                };
-                let patterns = compile_search_patterns(&pattern, language)
-                    .map_err(|error| anyhow::anyhow!("Invalid pattern: {error}"))?;
-                let mut parse_error = None;
-                if let Some(tree) = parse_cached(&source, language)? {
-                    if tree.root_node().has_error() {
-                        parse_error = Some(parse_error_note(file, env));
-                    }
-                }
-                let matches = collect_matches(&source, language, &patterns);
-                if matches.is_empty() {
-                    return Ok(Some((String::new(), file.clone(), Vec::new(), parse_error)));
-                }
-                Ok(Some((
-                    format_path_relative_to_cwd(file, &env.cwd, false),
-                    file.clone(),
-                    matches,
-                    parse_error,
-                )))
-            },
-        )
+            }
+            let matches = collect_matches(&source, language, &patterns);
+            if matches.is_empty() {
+                return Ok(Some((String::new(), file.clone(), Vec::new(), parse_error)));
+            }
+            Ok(Some((
+                format_path_relative_to_cwd(file, &env.cwd, false),
+                file.clone(),
+                matches,
+                parse_error,
+            )))
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut per_file: Vec<(String, PathBuf, Vec<AstMatch>)> = Vec::new();
     for entry in scanned.into_iter().flatten() {
@@ -423,7 +425,7 @@ pub fn ast_edit_with_cancel(
         }
         // Replay one rule at a time: the first match on the working text gives
         // a line/column-accurate anchor for the `-`/`+` preview rows.
-        let mut work = source.clone();
+        let mut work = source;
         let mut file_replacements = 0u64;
         let mut anchors: Vec<(usize, usize, String, String)> = Vec::new();
         for (rule, (pattern_text, _)) in compiled.iter().zip(rules.iter()) {

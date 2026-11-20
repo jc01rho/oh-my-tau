@@ -650,14 +650,14 @@ impl MistralStreamState {
                         .unwrap_or_default()
                         .to_string();
                     output.content.push(AssistantContent::ToolCall(ToolCall {
-                        id: call_id.clone(),
+                        id: call_id,
                         name,
                         arguments: Map::default(),
                         thought_signature: None,
                         rest: Map::default(),
                     }));
                     let index = output.content.len() - 1;
-                    self.tool_blocks_by_key.insert(key.clone(), index);
+                    self.tool_blocks_by_key.insert(key, index);
                     writer.push(AssistantMessageEvent::ToolcallStart {
                         content_index: index as u64,
                         partial: output.clone(),
