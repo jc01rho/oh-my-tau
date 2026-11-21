@@ -1,28 +1,30 @@
 //! `ast_grep` (structural search) and `ast_edit` (AST-aware rewrite) on the
-//! vendored `pi-ast` engine, matching omp's TS tool semantics: `pat`/`path`/
-//! `lang`/`skip` parameters, 50-match default limit with skip pagination,
-//! parse-error normalization, and `ast_edit` op validation + per-replacement
-//! diff preview lines. omp-rs has no staged-rewrite `resolve` surface, so
-//! `ast_edit` applies rewrites in place instead of staging behind `xd://resolve`.
+//! `pi-ast` 19.0.1 `search` engine, matching omp's TS tool semantics:
+//! `pat`/`path`/`lang`/`skip` parameters, 50-match default limit with skip
+//! pagination, parse-error normalization, and `ast_edit` op validation +
+//! per-replacement diff preview lines. omp-rs has no staged-rewrite `resolve`
+//! surface, so `ast_edit` applies rewrites in place instead of staging behind
+//! `xd://resolve`.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
+use omp_vfs::Fs;
+use omp_xfs::glob::Selector;
+use pa_agent::abort::{aborted_error, throw_if_aborted, AbortSignal};
 use pa_agent::types::AgentToolResult;
-use rayon::prelude::*;
 use serde_json::{json, Value};
 
-use super::util::{
-    cancelled, format_path_relative_to_cwd, path_list, resolve_to_cwd, str_arg, CancelFlag,
-};
-use super::Env;
 use pi_ast::language::SupportLang;
-use pi_ast::ops::{
-    collect_matches, compile_rewrite_rules, compile_search_patterns, resolve_supported_lang,
-    rewrite_source, AstMatch,
+use pi_ast::ops::resolve_supported_lang;
+use pi_ast::search::{
+    discover, find_page, rewrite, Candidate, Discover, MatchStrictness, Mode, Page, Query, Rewrite,
 };
-use pi_ast::parse_cache::parse_cached;
+
+use super::util::{format_path_relative_to_cwd, path_list, resolve_to_cwd, str_arg};
+use super::Env;
 
 pub(crate) const AST_GREP_DESCRIPTION: &str = "Structural code search via ast-grep. Use when syntax shape matters more than text (calls, declarations, language constructs).\n\n<instruction>\n- Narrow each call to one language. `pat` is ONE AST pattern; separate calls for unrelated patterns.\n- Set `lang` when extension inference is ambiguous (for example, `cpp` for `.h`); `.cu` and `.cuh` infer as C++.\n- `$NAME` captures one node; `$_` matches without binding; `$$$NAME` zero-or-more; `$$$` zero-or-more unbound.\n  - Use `$$$NAME`, NOT `$$NAME` (invalid). Names UPPERCASE, whole node — `prefix$VAR` fails.\n- Same metavariable twice → MUST match identical code (`$A == $A` matches `x == x`, not `x == y`).\n- Patterns MUST parse as single AST node. Non-standalone → wrap: `class $_ { … }`.\n- C++ expression-statement calls need trailing `;`: `ns::doThing($ARG);`, `$CALLEE($ARG);`.\n- TS: tolerate annotations — `async function $NAME($$$ARGS): $_ { $$$BODY }`.\n- Declaration forms are distinct — `function foo`, method `foo()`, `const foo = () => {}`; search the right form before concluding absence.\n- Loosest existence check: `pat: \"executeBash\"` with narrow `path`.\n</instruction>\n\n<critical>\n- AVOID repo-root scans — narrow `path` first.\n- Parse issues = query failure, not absence: fix pattern or tighten `path` before concluding \"no matches\".\n</critical>";
 pub(crate) const AST_EDIT_DESCRIPTION: &str = "Structural AST-aware rewrites via ast-grep. Use for codemods where text replace is unsafe. Mixed-language paths are fine: each file is parsed in its own language, and a pattern only rewrites files it parses in.\n\n- Metavariables in `pat` (`$A`, `$$$ARGS`) substitute into `out`.\n- **Patterns match AST structure, not text.** `$NAME` = one node; `$_` = unbound; `$$$NAME` = zero-or-more.\n  - Use `$$$NAME`, NOT `$$NAME` (invalid). Names UPPERCASE, whole node — partial like `prefix$VAR` fails.\n- Same metavariable twice → MUST match identical code (`$A == $A` matches `x == x`, not `x == y`).\n- Rewrite patterns MUST parse as single AST node. Non-standalone → wrap: `class $_ { … }`.\n- TS: tolerate annotations — `async function $NAME($$$ARGS): $_ { $$$BODY }`. Delete with empty `out`: `{\"pat\":\"console.log($$$)\",\"out\":\"\"}`.\n- 1:1 substitution — no splitting/merging captures.\n- Changes are applied immediately.\n- Parse issues → malformed rewrite, not clean no-op. For one-off text edits, prefer the Edit tool.";
@@ -80,20 +82,21 @@ pub fn schema_ast_edit() -> Value {
     })
 }
 
-/// Files under `entries` (files, dirs or globs, cwd-relative) that infer to a
-/// supported language, sorted and capped at [`MAX_AST_FILES`].
-fn scope_files(env: &Env, entries: &[String]) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = Vec::new();
+/// Discover candidate source files under `entries` (files, directories, or
+/// globs relative to `env.cwd`), normalizing display paths relative to `env.cwd`
+/// and capping at [`MAX_AST_FILES`].
+async fn scope_candidates(
+    fs: &Fs,
+    env: &Env,
+    entries: &[String],
+    lang: Option<SupportLang>,
+) -> Result<(Vec<Candidate>, HashMap<String, PathBuf>)> {
+    let mut by_path: HashMap<PathBuf, Candidate> = HashMap::new();
     for raw in entries {
         let resolved = resolve_to_cwd(raw, &env.cwd);
-        if resolved.is_file() {
-            files.push(resolved);
-            continue;
-        }
-        let (base, glob): (PathBuf, String) = if resolved.is_dir() {
-            (resolved, "**/*".to_string())
+        let (root, include) = if resolved.exists() {
+            (resolved, None)
         } else {
-            // Split a glob expression at its first wildcard character.
             let text = raw.replace('\\', "/");
             let cut = text.find(['*', '?', '[']).unwrap_or(text.len());
             let base_raw = text[..cut].trim_end_matches('/');
@@ -101,45 +104,52 @@ fn scope_files(env: &Env, entries: &[String]) -> Result<Vec<PathBuf>> {
             if !base.is_dir() {
                 bail!("Path not found: {raw}");
             }
-            (base, text[cut..].to_string())
+            let glob_part = &text[cut..];
+            let selector = if glob_part.is_empty() {
+                None
+            } else {
+                Some(
+                    Selector::new(glob_part, false)
+                        .map_err(|e| anyhow::anyhow!("Invalid glob {raw}: {e}"))?,
+                )
+            };
+            (base, selector)
         };
-        for matched in pi_ast::ops::collect_matched_files(&base, &[glob])? {
-            files.push(matched.absolute_path);
+        let opts = Discover {
+            include,
+            exclude: None,
+            hidden: false,
+            gitignore: true,
+            node_modules: false,
+            follow_links: false,
+            workers: None,
+            lang,
+        };
+        let found = discover(fs, &root, &opts)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for mut candidate in found {
+            candidate.display = format_path_relative_to_cwd(&candidate.path, &env.cwd, false);
+            by_path.entry(candidate.path.clone()).or_insert(candidate);
         }
     }
-    files.retain(|file| SupportLang::from_path(file).is_some());
-    files.sort();
-    files.dedup();
-    files.truncate(MAX_AST_FILES);
-    Ok(files)
+    let mut candidates: Vec<Candidate> = by_path.into_values().collect();
+    candidates.sort_by(|a, b| a.display.cmp(&b.display));
+    candidates.truncate(MAX_AST_FILES);
+    let mut display_to_path = HashMap::with_capacity(candidates.len());
+    for c in &candidates {
+        display_to_path.insert(c.display.clone(), c.path.clone());
+    }
+    Ok((candidates, display_to_path))
 }
 
-fn parse_error_note(file: &Path, env: &Env) -> String {
-    format!(
-        "{}: parse error (syntax tree contains error nodes)",
-        format_path_relative_to_cwd(file, &env.cwd, false)
-    )
-}
-
-fn cap_parse_errors(errors: Vec<String>) -> (Vec<String>, usize) {
-    let total = errors.len();
-    let mut capped: Vec<String> = errors.into_iter().take(MAX_PARSE_ERRORS).collect();
+fn cap_warnings(warnings: Vec<String>) -> (Vec<String>, usize) {
+    let total = warnings.len();
+    let mut capped: Vec<String> = warnings.into_iter().take(MAX_PARSE_ERRORS).collect();
     if total > MAX_PARSE_ERRORS {
         capped.push(format!("… and {} more", total - MAX_PARSE_ERRORS));
     }
     (capped, total)
-}
-
-fn language_or_infer(explicit: Option<&str>, path: &Path) -> Result<SupportLang> {
-    match explicit {
-        Some(name) => resolve_supported_lang(name),
-        None => SupportLang::from_path(path).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Unable to infer language from file extension: {}. Specify `lang` explicitly.",
-                path.display()
-            )
-        }),
-    }
 }
 
 fn clamp_line(text: &str) -> String {
@@ -151,34 +161,38 @@ fn clamp_line(text: &str) -> String {
         .collect()
 }
 
-/// One scanned file's contribution: relative path, absolute path, matches,
-/// and an optional parse-error note.
-type ScannedFile = Option<(String, PathBuf, Vec<AstMatch>, Option<String>)>;
+fn append_diagnostics(
+    model: &mut Vec<String>,
+    warnings: Vec<String>,
+    missing_grammars: &[&'static str],
+) {
+    let (capped, total) = cap_warnings(warnings);
+    if !capped.is_empty() {
+        model.push(String::new());
+        model.push(format!(
+            "Parse errors (showing {} of {total}):",
+            capped.len()
+        ));
+        model.extend(capped);
+    }
+    if !missing_grammars.is_empty() {
+        model.push(String::new());
+        model.push(format!(
+            "Skipped missing grammars: {}",
+            missing_grammars.join(", ")
+        ));
+    }
+}
 
-#[cfg(test)]
 /// `ast_grep`: structural search.
 ///
 /// # Errors
-/// Empty `pat`, invalid `skip`, unknown `lang`, unresolvable paths, or an
-/// invalid pattern.
-pub fn ast_grep(env: &Env, args: &Value) -> Result<AgentToolResult> {
-    ast_grep_with_cancel(env, args, &CancelFlag::default())
-}
-
-/// [`ast_grep`] with a cooperative cancel flag; per-file read/parse/match
-/// work runs on the `rayon` pool inside the registry's `spawn_blocking`
-/// section, collected in path order so output stays byte-identical.
-///
-/// # Errors
-/// Empty `pat`, invalid `skip`, unknown `lang`, unresolvable paths, or an
-/// invalid pattern.
+/// Empty `pat`, invalid `skip`, unknown `lang`, unresolvable paths, or
+/// cancellation.
 #[allow(clippy::too_many_lines)]
-pub fn ast_grep_with_cancel(
-    env: &Env,
-    args: &Value,
-    cancel: &CancelFlag,
-) -> Result<AgentToolResult> {
-    let pattern = str_arg(args, "pat")?.trim().to_string();
+pub async fn ast_grep(env: Arc<Env>, args: Value, signal: AbortSignal) -> Result<AgentToolResult> {
+    throw_if_aborted(&signal)?;
+    let pattern = str_arg(&args, "pat")?.trim().to_string();
     if pattern.is_empty() {
         bail!("`pat` must be a non-empty pattern");
     }
@@ -190,89 +204,61 @@ pub fn ast_grep_with_cancel(
             _ => bail!("skip must be a non-negative number"),
         },
     };
-    let lang = args.get("lang").and_then(Value::as_str);
+    let lang_str = args.get("lang").and_then(Value::as_str);
+    let explicit_lang = lang_str.map(resolve_supported_lang).transpose()?;
     let mut entries = path_list(args.get("path").and_then(Value::as_str));
     if entries.is_empty() {
         entries.push(".".into());
     }
-    let files = scope_files(env, &entries)?;
 
-    let mut parse_errors: Vec<String> = Vec::new();
-    // (relative path, absolute path, matches) kept in path order. Files are
-    // read/parsed/matched in parallel on the rayon pool; `collect` keeps
-    // input order and short-circuits on the first invalid pattern, matching
-    // the previous serial `?` semantics.
-    let scanned: Vec<ScannedFile> = files
-        .par_iter()
-        .map(|file| -> Result<ScannedFile> {
-            if cancelled(cancel) {
-                return Err(pa_agent::abort::aborted_error());
-            }
-            let Ok(source) = std::fs::read_to_string(file) else {
-                return Ok(None);
-            };
-            let Ok(language) = language_or_infer(lang, file) else {
-                return Ok(None);
-            };
-            let patterns = compile_search_patterns(&pattern, language)
-                .map_err(|error| anyhow::anyhow!("Invalid pattern: {error}"))?;
-            let mut parse_error = None;
-            if let Some(tree) = parse_cached(&source, language)? {
-                if tree.root_node().has_error() {
-                    parse_error = Some(parse_error_note(file, env));
-                }
-            }
-            let matches = collect_matches(&source, language, &patterns);
-            if matches.is_empty() {
-                return Ok(Some((String::new(), file.clone(), Vec::new(), parse_error)));
-            }
-            Ok(Some((
-                format_path_relative_to_cwd(file, &env.cwd, false),
-                file.clone(),
-                matches,
-                parse_error,
-            )))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut per_file: Vec<(String, PathBuf, Vec<AstMatch>)> = Vec::new();
-    for entry in scanned.into_iter().flatten() {
-        let (relative, absolute, matches, parse_error) = entry;
-        if let Some(note) = parse_error {
-            parse_errors.push(note);
-        }
-        if matches.is_empty() {
-            continue;
-        }
-        per_file.push((relative, absolute, matches));
+    let fs = Fs::native();
+    let run = async {
+        let (candidates, display_to_path) =
+            scope_candidates(&fs, &env, &entries, explicit_lang).await?;
+        let patterns = [pattern];
+        let query = Query {
+            patterns: &patterns,
+            lang: lang_str,
+            selector: None,
+            strictness: MatchStrictness::Smart,
+            captures: false,
+        };
+        let page = Page {
+            offset: skip,
+            limit: DEFAULT_AST_LIMIT,
+        };
+        find_page(&fs, candidates, &query, page)
+            .await
+            .map(|fp| (fp, display_to_path))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    };
+    let (find_res, display_to_path) = tokio::select! {
+        res = run => res?,
+        () = signal.aborted() => return Err(aborted_error()),
+    };
+    if signal.is_aborted() {
+        return Err(aborted_error());
     }
-    per_file.sort_by(|a, b| a.0.cmp(&b.0));
-    // TS flattens the visible window over all files, ordered by path then
-    // position: skip globally, then take the default limit.
-    let mut flat: Vec<(&str, &PathBuf, &AstMatch)> = Vec::new();
-    for (relative, absolute, matches) in &per_file {
-        for m in matches {
-            flat.push((relative, absolute, m));
-        }
-    }
-    let total_matches = flat.len();
-    let visible = total_matches.saturating_sub(skip);
-    let limit_reached = visible > DEFAULT_AST_LIMIT;
 
-    let (capped_parse_errors, parse_errors_total) = cap_parse_errors(parse_errors);
-    if visible == 0 {
-        let mut text = if capped_parse_errors.is_empty() {
+    let (capped_warnings, warnings_total) = cap_warnings(find_res.report.warnings.clone());
+    if find_res.hits.is_empty() {
+        let mut text = if capped_warnings.is_empty() {
             "No matches found".to_string()
         } else {
             "No matches found. Parse issues mean the query may be mis-scoped; narrow `path` before concluding absence."
                 .to_string()
         };
-        if !capped_parse_errors.is_empty() {
+        if !capped_warnings.is_empty() {
             text.push_str("\n\nParse errors (showing ");
-            text.push_str(&capped_parse_errors.len().to_string());
+            text.push_str(&capped_warnings.len().to_string());
             text.push_str(" of ");
-            text.push_str(&parse_errors_total.to_string());
+            text.push_str(&warnings_total.to_string());
             text.push(':');
-            text.extend(capped_parse_errors.iter().map(|e| format!("\n{e}")));
+            text.extend(capped_warnings.iter().map(|e| format!("\n{e}")));
+        }
+        if !find_res.report.missing_grammars.is_empty() {
+            text.push_str("\n\nSkipped missing grammars: ");
+            text.push_str(&find_res.report.missing_grammars.join(", "));
         }
         return Ok(AgentToolResult::text(text));
     }
@@ -280,24 +266,20 @@ pub fn ast_grep_with_cancel(
     // Render per file, mirroring the `grep` tool: hashline snapshot tags when
     // active, `*line:text` match rows, continuation lines space-marked.
     let mut model: Vec<String> = Vec::new();
-    let window: Vec<(&str, &PathBuf, &AstMatch)> = flat
-        .into_iter()
-        .skip(skip)
-        .take(DEFAULT_AST_LIMIT)
-        .collect();
-    let mut last_file: Option<&str> = None;
-    for (relative, absolute, _m) in &window {
-        if last_file == Some(relative) {
-            continue;
+    let mut idx = 0usize;
+    while idx < find_res.hits.len() {
+        let relative = &find_res.hits[idx].display;
+        let mut end = idx + 1;
+        while end < find_res.hits.len() && find_res.hits[end].display == *relative {
+            end += 1;
         }
-        last_file = Some(relative);
         if !model.is_empty() {
             model.push(String::new());
         }
-        let tag = if env.hashline {
-            env.store.record_file(absolute, None)
-        } else {
-            None
+        let absolute = display_to_path.get(relative);
+        let tag = match (env.hashline, absolute) {
+            (true, Some(abs)) => env.store.record_file(abs, None),
+            _ => None,
         };
         if let Some(t) = &tag {
             model.push(format!("[{relative}#{t}]"));
@@ -305,10 +287,11 @@ pub fn ast_grep_with_cancel(
             model.push(format!("{relative}:"));
         }
         let mut lines: Vec<String> = Vec::new();
-        for (_, _, m) in window.iter().filter(|(r, _, _)| *r == *relative) {
-            for (offset, line) in m.text.split('\n').enumerate() {
+        for hit in &find_res.hits[idx..end] {
+            let start_row = hit.matched.span.start_pos.line + 1;
+            for (offset, line) in hit.matched.text.split('\n').enumerate() {
                 let marker = if offset == 0 { '*' } else { ' ' };
-                let row = m.line + offset;
+                let row = start_row + offset;
                 if tag.is_some() {
                     lines.push(format!("{marker}{row}:{line}"));
                 } else {
@@ -316,54 +299,37 @@ pub fn ast_grep_with_cancel(
                 }
             }
         }
-        if let Some(t) = &tag {
+        if let (Some(t), Some(abs)) = (&tag, absolute) {
             env.store.record_seen_lines(
-                absolute,
+                abs,
                 t,
                 &pi_edit::store::seen_lines_from_body(&lines.join("\n")),
             );
         }
         model.extend(lines);
+        idx = end;
     }
-    if limit_reached {
+    if find_res.limit_reached {
         model.push(String::new());
         model.push("Result limit reached; narrow path or increase limit.".into());
     }
-    if !capped_parse_errors.is_empty() {
-        model.push(String::new());
-        model.push(format!(
-            "Parse errors (showing {} of {}):",
-            capped_parse_errors.len(),
-            parse_errors_total
-        ));
-        model.extend(capped_parse_errors.iter().cloned());
-    }
+    append_diagnostics(
+        &mut model,
+        find_res.report.warnings,
+        &find_res.report.missing_grammars,
+    );
     Ok(AgentToolResult::text(model.join("\n")))
 }
 
-#[cfg(test)]
 /// `ast_edit`: AST-aware rewrite. Applies matching rewrites per file (each file
 /// is parsed in its own language; a pattern only rewrites files it parses in).
 ///
 /// # Errors
-/// Missing/empty/duplicate `ops` patterns, unresolvable paths, or overlapping
-/// replacements within one file.
-pub fn ast_edit(env: &Env, args: &Value) -> Result<AgentToolResult> {
-    ast_edit_with_cancel(env, args, &CancelFlag::default())
-}
-
-/// [`ast_edit`] with a cooperative cancel flag checked between files (the
-/// rewrite pass stays serial: files are written in place in input order).
-///
-/// # Errors
-/// Missing/empty/duplicate `ops` patterns, unresolvable paths, or overlapping
-/// replacements within one file.
+/// Missing/empty/duplicate `ops` patterns, unresolvable paths, overlapping
+/// replacements within one file, or cancellation.
 #[allow(clippy::too_many_lines)]
-pub fn ast_edit_with_cancel(
-    env: &Env,
-    args: &Value,
-    cancel: &CancelFlag,
-) -> Result<AgentToolResult> {
+pub async fn ast_edit(env: Arc<Env>, args: Value, signal: AbortSignal) -> Result<AgentToolResult> {
+    throw_if_aborted(&signal)?;
     let ops = args
         .get("ops")
         .and_then(Value::as_array)
@@ -399,137 +365,84 @@ pub fn ast_edit_with_cancel(
     if entries.is_empty() {
         bail!("`paths` must include at least one path");
     }
-    let files = scope_files(env, &entries)?;
 
-    let mut total_replacements = 0u64;
-    let mut parse_errors: Vec<String> = Vec::new();
-    let mut sections: Vec<String> = Vec::new();
-    let mut files_touched = 0usize;
-    for file in &files {
-        if cancelled(cancel) {
-            return Err(pa_agent::abort::aborted_error());
-        }
-        let Ok(source) = std::fs::read_to_string(file) else {
-            continue;
+    let fs = Fs::native();
+    let run = async {
+        let (candidates, _) = scope_candidates(&fs, &env, &entries, None).await?;
+        let rw = Rewrite {
+            rules: &rules,
+            lang: None,
+            selector: None,
+            strictness: MatchStrictness::Smart,
+            max_replacements: usize::MAX,
+            max_files: MAX_AST_FILES,
+            fail_on_parse_error: false,
+            skip_overlaps: false,
+            mode: Mode::Write,
         };
-        let Ok(language) = language_or_infer(None, file) else {
-            continue;
-        };
-        let compiled = compile_rewrite_rules(&rules, language).map_err(|(index, error)| {
-            anyhow::anyhow!("Invalid pattern in ops[{index}]: {error}")
-        })?;
-        if let Some(tree) = parse_cached(&source, language)? {
-            if tree.root_node().has_error() {
-                parse_errors.push(parse_error_note(file, env));
-            }
-        }
-        // Replay one rule at a time: the first match on the working text gives
-        // a line/column-accurate anchor for the `-`/`+` preview rows.
-        let mut work = source;
-        let mut file_replacements = 0u64;
-        let mut anchors: Vec<(usize, usize, String, String)> = Vec::new();
-        for (rule, (pattern_text, _)) in compiled.iter().zip(rules.iter()) {
-            let _ = pattern_text;
-            let patterns = &rule.patterns;
-            loop {
-                let matches = collect_matches(&work, language, patterns);
-                let Some(first) = matches.first() else {
-                    break;
-                };
-                let mut line = 1usize;
-                let mut col = 1usize;
-                let mut offset = 0usize;
-                while offset < first.byte_start {
-                    match work[offset..].find('\n') {
-                        Some(nl) if offset + nl < first.byte_start => {
-                            line += 1;
-                            col = 1;
-                            offset += nl + 1;
-                        }
-                        _ => {
-                            col += first.byte_start - offset;
-                            offset = first.byte_start;
-                        }
-                    }
-                }
-                let (next, count) = rewrite_source(&work, language, std::slice::from_ref(rule))
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                if count == 0 {
-                    break;
-                }
-                // Before/after text of the first replacement of this pass.
-                let after = extract_replacement(&work, &next, first);
-                anchors.push((line, col, first.text.clone(), after));
-                if next == work {
-                    break; // idempotent rewrite; avoid spinning
-                }
-                work = next;
-                file_replacements = file_replacements.saturating_add(u64::from(count));
-            }
-        }
-        if file_replacements == 0 {
-            continue;
-        }
-        std::fs::write(file, &work)?;
-        total_replacements += file_replacements;
-        files_touched += 1;
-        let mut lines: Vec<String> = Vec::new();
-        for (line, col, before, after) in &anchors {
-            lines.push(format!("-{line}:{col} {}", clamp_line(before)));
-            lines.push(format!("+{line}:{col} {}", clamp_line(after)));
-        }
-        sections.push(format!(
-            "{}:",
-            format_path_relative_to_cwd(file, &env.cwd, false)
-        ));
-        sections.extend(lines);
+        rewrite(&fs, candidates, &rw)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    };
+    let edited = tokio::select! {
+        res = run => res?,
+        () = signal.aborted() => return Err(aborted_error()),
+    };
+    if signal.is_aborted() {
+        return Err(aborted_error());
     }
 
-    let (capped_parse_errors, parse_errors_total) = cap_parse_errors(parse_errors);
+    let mut total_replacements = 0usize;
+    let mut sections: Vec<String> = Vec::new();
+    for file_edit in &edited.files {
+        if file_edit.changes.is_empty() {
+            continue;
+        }
+        total_replacements += file_edit.changes.len();
+        sections.push(format!("{}:", file_edit.display));
+        for change in &file_edit.changes {
+            let line = change.span.start_pos.line + 1;
+            let col = change.span.start_pos.column + 1;
+            sections.push(format!("-{line}:{col} {}", clamp_line(&change.before)));
+            sections.push(format!("+{line}:{col} {}", clamp_line(&change.after)));
+        }
+    }
+
     if total_replacements == 0 {
+        let (capped, total) = cap_warnings(edited.report.warnings);
         let mut text = "No replacements made".to_string();
-        if !capped_parse_errors.is_empty() {
+        if !capped.is_empty() {
             text.push_str("\n\nParse errors (showing ");
-            text.push_str(&capped_parse_errors.len().to_string());
+            text.push_str(&capped.len().to_string());
             text.push_str(" of ");
-            text.push_str(&parse_errors_total.to_string());
+            text.push_str(&total.to_string());
             text.push(':');
-            text.extend(capped_parse_errors.iter().map(|e| format!("\n{e}")));
+            text.extend(capped.iter().map(|e| format!("\n{e}")));
+        }
+        if !edited.report.missing_grammars.is_empty() {
+            text.push_str("\n\nSkipped missing grammars: ");
+            text.push_str(&edited.report.missing_grammars.join(", "));
         }
         return Ok(AgentToolResult::text(text));
     }
+
+    let files_touched = edited
+        .files
+        .iter()
+        .filter(|f| !f.changes.is_empty())
+        .count();
     let mut model = vec![format!(
         "Applied {total_replacements} replacement{} in {files_touched} file{}.",
         if total_replacements == 1 { "" } else { "s" },
         if files_touched == 1 { "" } else { "s" }
     )];
     model.extend(sections);
-    if !capped_parse_errors.is_empty() {
-        model.push(String::new());
-        model.push(format!(
-            "Parse errors (showing {} of {}):",
-            capped_parse_errors.len(),
-            parse_errors_total
-        ));
-        model.extend(capped_parse_errors.iter().cloned());
-    }
+    append_diagnostics(
+        &mut model,
+        edited.report.warnings,
+        &edited.report.missing_grammars,
+    );
     Ok(AgentToolResult::text(model.join("\n")))
-}
-
-/// Replacement text at `first`'s span: `next` equals `work` with that span
-/// substituted, so the after-text is `next` with the before-span removed.
-fn extract_replacement(work: &str, next: &str, first: &AstMatch) -> String {
-    let start = first.byte_start;
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    let delta = first.byte_end as isize + next.len() as isize - work.len() as isize;
-    let end = delta.max(0).cast_unsigned();
-    let end = end.min(next.len());
-    let end = if next.is_char_boundary(end) {
-        end
-    } else {
-        work.len()
-    };
-    clamp_line(next.get(start..end).unwrap_or(""))
 }
 
 #[cfg(test)]
@@ -537,7 +450,7 @@ mod tests {
     use super::*;
     use crate::tools::Env;
 
-    #[allow(clippy::match_wildcard_for_single_variants)] // wildcard is deliberate: forward-compatible with future content variants
+    #[allow(clippy::match_wildcard_for_single_variants)]
     fn text_of(result: &AgentToolResult) -> String {
         result
             .content
@@ -550,8 +463,8 @@ mod tests {
             .join("\n")
     }
 
-    fn env(dir: &Path) -> Env {
-        Env::new(dir, false)
+    fn env(dir: &std::path::Path) -> Arc<Env> {
+        Arc::new(Env::new(dir, false))
     }
 
     /// Rust + TS fixtures: two functions in Rust, two calls in TS.
@@ -571,24 +484,31 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn ast_grep_finds_matches_across_languages() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ast_grep_finds_matches_across_languages() {
         let dir = fixture();
-        let result =
-            ast_grep(&env(dir.path()), &json!({"pat": "beta($A)", "path": "src"})).unwrap();
+        let result = ast_grep(
+            env(dir.path()),
+            json!({"pat": "beta($A)", "path": "src"}),
+            AbortSignal::never(),
+        )
+        .await
+        .unwrap();
         let text = text_of(&result);
         assert!(text.contains("src/app.ts:"), "{text}");
         assert!(text.contains("src/lib.rs:"), "{text}");
         assert!(text.contains("*1|beta(1)"), "{text}");
     }
 
-    #[test]
-    fn ast_grep_lang_override_scopes_to_one_language() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ast_grep_lang_override_scopes_to_one_language() {
         let dir = fixture();
         let result = ast_grep(
-            &env(dir.path()),
-            &json!({"pat": "function alpha() { beta($A); }", "path": "src", "lang": "typescript"}),
+            env(dir.path()),
+            json!({"pat": "function alpha() { beta($A); }", "path": "src", "lang": "typescript"}),
+            AbortSignal::never(),
         )
+        .await
         .unwrap();
         let text = text_of(&result);
         assert!(text.contains("src/app.ts:"), "{text}");
@@ -596,36 +516,63 @@ mod tests {
         assert!(!text.contains("*1|fn alpha"), "{text}");
     }
 
-    #[test]
-    fn ast_grep_skip_paginates_matches() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ast_grep_skip_paginates_matches() {
         let dir = fixture();
-        let env = env(dir.path());
-        let all = text_of(&ast_grep(&env, &json!({"pat": "$F($A)", "path": "src"})).unwrap());
-        let skipped =
-            text_of(&ast_grep(&env, &json!({"pat": "$F($A)", "path": "src", "skip": 1})).unwrap());
+        let e = env(dir.path());
+        let all = text_of(
+            &ast_grep(
+                e.clone(),
+                json!({"pat": "$F($A)", "path": "src"}),
+                AbortSignal::never(),
+            )
+            .await
+            .unwrap(),
+        );
+        let skipped = text_of(
+            &ast_grep(
+                e,
+                json!({"pat": "$F($A)", "path": "src", "skip": 1}),
+                AbortSignal::never(),
+            )
+            .await
+            .unwrap(),
+        );
         assert!(
             all.lines().count() > skipped.lines().count(),
             "{all}\n---\n{skipped}"
         );
     }
 
-    #[test]
-    fn ast_grep_no_match_and_empty_pattern() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ast_grep_no_match_and_empty_pattern() {
         let dir = fixture();
-        let env = env(dir.path());
-        let miss = text_of(&ast_grep(&env, &json!({"pat": "nonexistent($$$)"})).unwrap());
+        let e = env(dir.path());
+        let miss = text_of(
+            &ast_grep(
+                e.clone(),
+                json!({"pat": "nonexistent($$$)"}),
+                AbortSignal::never(),
+            )
+            .await
+            .unwrap(),
+        );
         assert_eq!(miss, "No matches found");
-        assert!(ast_grep(&env, &json!({"pat": "   "})).is_err());
+        assert!(ast_grep(e, json!({"pat": "   "}), AbortSignal::never())
+            .await
+            .is_err());
     }
 
-    #[test]
-    fn ast_edit_rewrites_rust_and_ts_fixtures() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ast_edit_rewrites_rust_and_ts_fixtures() {
         let dir = fixture();
-        let env = env(dir.path());
+        let e = env(dir.path());
         let result = ast_edit(
-            &env,
-            &json!({"ops": [{"pat": "beta($A)", "out": "gamma($A)"}], "paths": ["src"]}),
+            e,
+            json!({"ops": [{"pat": "beta($A)", "out": "gamma($A)"}], "paths": ["src"]}),
+            AbortSignal::never(),
         )
+        .await
         .unwrap();
         let text = text_of(&result);
         assert!(
@@ -641,44 +588,52 @@ mod tests {
         assert!(ts.contains("gamma(1)"), "{ts}");
     }
 
-    #[test]
-    fn ast_edit_delete_op_and_no_match() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ast_edit_delete_op_and_no_match() {
         let dir = fixture();
-        let env = env(dir.path());
+        let e = env(dir.path());
         let result = ast_edit(
-            &env,
-            &json!({"ops": [{"pat": "beta($A)", "out": ""}], "paths": ["src/lib.rs"]}),
+            e.clone(),
+            json!({"ops": [{"pat": "beta($A)", "out": ""}], "paths": ["src/lib.rs"]}),
+            AbortSignal::never(),
         )
+        .await
         .unwrap();
         assert!(text_of(&result).contains("Applied 1 replacement in 1 file."));
         let miss = ast_edit(
-            &env,
-            &json!({"ops": [{"pat": "nope($$$)", "out": "x"}], "paths": ["src"]}),
+            e,
+            json!({"ops": [{"pat": "nope($$$)", "out": "x"}], "paths": ["src"]}),
+            AbortSignal::never(),
         )
+        .await
         .unwrap();
         assert_eq!(text_of(&miss), "No replacements made");
     }
 
-    #[test]
-    fn ast_edit_validates_ops() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ast_edit_validates_ops() {
         let dir = fixture();
-        let env = env(dir.path());
+        let e = env(dir.path());
         let dup = ast_edit(
-            &env,
-            &json!({"ops": [
+            e.clone(),
+            json!({"ops": [
                 {"pat": "beta($A)", "out": "x"},
                 {"pat": "beta($A)", "out": "y"}
             ], "paths": ["src"]}),
+            AbortSignal::never(),
         )
+        .await
         .unwrap_err();
         assert!(
             dup.to_string().contains("Duplicate rewrite pattern"),
             "{dup}"
         );
         let empty = ast_edit(
-            &env,
-            &json!({"ops": [{"pat": "", "out": "x"}], "paths": ["src"]}),
+            e,
+            json!({"ops": [{"pat": "", "out": "x"}], "paths": ["src"]}),
+            AbortSignal::never(),
         )
+        .await
         .unwrap_err();
         assert!(
             empty.to_string().contains("must be a non-empty pattern"),

@@ -160,10 +160,7 @@ impl QueryState {
         self.before.push_str(before);
         self.version = model.version;
         self.context = context_before(before, before.len(), &mut self.u, &mut self.v);
-        let mut at = before.len().saturating_sub(model.params.cache_window);
-        while !before.is_char_boundary(at) {
-            at += 1;
-        }
+        let at = before.ceil_char_boundary(before.len().saturating_sub(model.params.cache_window));
         self.window_at = at;
         if model.params.cache_weight > 0.0 {
             lowercase_aligned(&before[at..], &mut self.window);
@@ -314,7 +311,8 @@ impl QueryState {
         let (lo, hi) = model.vocab.base_range(key);
         let (wlo, whi) = model.web.words.range(key);
 
-        // Merge-join the history and web followers of `v` inside the prefix range.
+        // Merge-join the history and web followers of `v` inside the prefix
+        // range.
         let (mut disc2, mut sum_pw, mut disc3) = (0.0f64, 0.0f64, 0.0f64);
         let (mut a, a_end) = ctx.followers.map_or((0, 0), |f| {
             (f.lower_bound(lo as u32), f.lower_bound(hi as u32))
@@ -371,7 +369,8 @@ impl QueryState {
                 disc3 += (f64::from(self.cands[slot].c3) - p.d3).max(0.0);
             }
         }
-        // Unigram candidates: range top-k over base ids plus every overflow match.
+        // Unigram candidates: range top-k over base ids plus every overflow
+        // match.
         self.top.clear();
         model.top_k(lo, hi, p.top_k, &mut self.heap, &mut self.top);
         for at in 0..self.top.len() {
@@ -520,10 +519,7 @@ impl QueryState {
             if idx == 0 {
                 break;
             }
-            limit = idx + key.len() - 1;
-            while !window.is_char_boundary(limit) {
-                limit -= 1;
-            }
+            limit = window.floor_char_boundary(idx + key.len() - 1);
         }
         self.window = window;
         mass

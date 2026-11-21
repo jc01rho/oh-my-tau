@@ -45,12 +45,17 @@ mod provider;
 mod runtime;
 mod types;
 
+#[cfg(test)]
+mod tests;
+
 pub use dir::{DirEntry, ReadDir};
 pub use error::{
     cancelled, crosses_devices, invalid_argument, is_a_directory, is_cancelled, no_provider,
     not_a_directory, permission_denied, read_only_filesystem, unsupported,
 };
 pub use file::{File, FileHandle};
+#[cfg(unix)]
+pub use file::{POLL_SLICE, fd_reads_can_block, readable_within, reads_can_block, wait_readable};
 pub use fs::{BlockingFs, Fs};
 pub use metadata::Metadata;
 pub use options::{
@@ -58,7 +63,8 @@ pub use options::{
 };
 pub use path::{
     absolute_path, child_path, decode_segment, encode_segment, file_name, is_virtual_path,
-    join_path, normalize_lexically, parent_path, relative_path, url_scheme, with_file_name,
+    join_path, msys_drive, normalize_lexically, parent_path, relative_path, url_scheme,
+    with_file_name,
 };
 pub use provider::FileSystem;
 pub use types::{FileId, FileKind, FileTime, FileType, NodeKind, Permissions, StatFs, SymlinkKind};

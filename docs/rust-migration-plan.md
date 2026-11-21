@@ -330,7 +330,7 @@ TUI 11개 프로브 `run.py`), `scripts/compat-oracle/`가 있으나 **전부 CI
 | 2.5.2 | `omp-xfs` 도입 & `pi-walker` 은퇴: `main`의 `crates/xfs/src/walk` 이식 후 `tools/{find,search}.rs`를 `Tree`/`Walk`/`Batch`로 재작성 | `vendor/pi-walker` 제거 후 워크스페이스 빌드 green, `find`/`grep`/`glob` 테스트 통과 |
 | 2.5.3 | `pi-ast` (`18.9.1 → 19.0.1`): `ast::search`/`outline`/`debug` 이식 후 `tools/ast.rs` 재작성 | `ast_grep`/`ast_edit` 스키마·실행 테스트 통과 |
 | 2.5.4 | `pi-diff` & `pi-edit` (`18.9.1 → 19.0.1`): `ComponentArena` + `xutf`, `Rejection` taxonomy + `max_columns` + 5프롬프트 반영 | `edit` 모드별 골든 테스트 통과 |
-| 2.5.5 | `pi-predict` (`18.6.1 → 19.0.1`): `ngram` 리팩터링 반영 (`smollm`/`apple`은 `predict-local` feature 게이트 선택) | 단어 완성 테스트 및 default 빌드 통과 |
+| 2.5.5 | `pi-predict` (`18.6.1 → 19.0.1`): `ngram` 리팩터링 반영 (`smollm`/`apple`은 상류에서 macOS 타깃 의존성만 분기하며 `predict-local` feature는 없음; `ngram` 전용 유지 및 명시적 미지원 오류) | 단어 완성 테스트 및 default 빌드 통과 |
 
 ### Phase 3 — 도구·메모리·컨텍스트·Handoff 완성
 

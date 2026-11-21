@@ -5,7 +5,7 @@
 //! Columns are **byte** offsets (the [`crate::editor`] cursor convention); the
 //! TS length caps count UTF-16 units and so do the ones here.
 
-use pi_predict::prose::{is_js_space, is_prose_word, is_word_char, mask_non_prose, utf16_len};
+use pi_predict::prose::{is_js_space, is_word_char, mask_non_prose};
 
 /// Context sent with each query: the editor text before the word, capped to
 /// its last [`BEFORE_LIMIT`] UTF-16 units.
@@ -14,6 +14,48 @@ pub const BEFORE_LIMIT: usize = 2_000;
 const MAX_PROSE_BUFFER_LENGTH: usize = 20_000;
 /// Lines above this many UTF-16 units get no prose assistance at all.
 const MAX_PROSE_LINE_LENGTH: usize = 1_000;
+/// A word touching any of these characters is code, not prose.
+const CODEISH: &[char] = &['\\', '/', '@', '_', '=', ':', '{', '}', '[', ']', '<', '>'];
+
+/// Length in UTF-16 units (the unit the TS caps count).
+///
+/// Upstream `pi_predict::prose::utf16_len`, which is crate-private there.
+fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
+/// Line-level `isProseWord`: the word survives the mask, its
+/// whitespace-delimited token has no code characters, digits or camelCase,
+/// and the line is not a slash command or an arrow.
+///
+/// Upstream `pi_predict::prose::is_prose_word`, which is crate-private there.
+fn is_prose_word(line: &str, masked_line: &str, start: usize, end: usize) -> bool {
+    if masked_line[start..end].chars().all(is_js_space) {
+        return false;
+    }
+    let token_start = line[..start]
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| is_js_space(c))
+        .map_or(0, |(at, c)| at + c.len_utf8());
+    let token_end = line[end..]
+        .find(is_js_space)
+        .map_or(line.len(), |at| end + at);
+    let token = &line[token_start..token_end];
+    let mut previous_lower = false;
+    for c in token.chars() {
+        if CODEISH.contains(&c) || c.is_ascii_digit() {
+            return false;
+        }
+        if previous_lower && c.is_uppercase() {
+            return false;
+        }
+        previous_lower = c.is_lowercase();
+    }
+    !line.trim_start_matches(is_js_space).starts_with('/')
+        && !line.starts_with("->")
+        && !line.starts_with("=>")
+}
 
 /// The prose word ending at the cursor and the editor text before it: what an
 /// engine is asked to complete.

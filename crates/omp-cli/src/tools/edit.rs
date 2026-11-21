@@ -2,18 +2,23 @@
 //! vendored `pi-edit` engine exactly as `omp`'s native `EditSession` does)
 //! and `write`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use omp_xfs::{walk, Fs};
 use pa_agent::types::AgentToolResult;
 use pi_edit::engine::FileOp;
 use pi_edit::error::{EditError, EditResult};
-use pi_edit::path_policy::PathPolicy;
+use pi_edit::path_policy::{PathPolicy, RecoveryGlob};
 use pi_edit::session::{
     ApplyRequest, EditWriter, Session, SessionConfig, WriteRequest, WriteResponse,
 };
-use pi_edit::EditMode;
+use pi_edit::{EditMode, Resolved};
 use serde_json::{json, Value};
 
 use super::util::{format_path_relative_to_cwd, resolve_to_cwd, str_arg};
@@ -59,6 +64,16 @@ pub fn schema(mode: EditMode) -> Value {
         }),
     }
 }
+
+/// Narrowest per-line cap any display path applies, in UTF-8 bytes (`grep`'s
+/// `MAX_COLUMN`; `read`'s 768 is wider). Without recorded read provenance,
+/// hashline anchors on longer lines are rejected because their display may
+/// have been cut (omp `displayMaxColumns`).
+const DISPLAY_MAX_COLUMNS: usize = 512;
+
+/// Longest a missing-target recovery searches the working tree (omp
+/// `RECOVERY_TIMEOUT`).
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn policy(cwd: &Path) -> PathPolicy {
     PathPolicy {
@@ -109,22 +124,28 @@ impl EditWriter for FsWriter {
     }
 }
 
-/// Run one edit call.
-///
-/// # Errors
-/// The engine's model-facing message (parse, locate, apply or write failure).
-pub async fn edit(env: &Env, args: &Value) -> Result<AgentToolResult> {
-    let config = SessionConfig {
+/// The session a tool call runs with.
+fn session_config(env: &Env) -> SessionConfig {
+    SessionConfig {
         mode: env.edit_mode,
         policy: policy(&env.cwd),
         allow_fuzzy: true,
         fuzzy_threshold: 0.95,
         enforce_seen_lines: true,
+        max_columns: DISPLAY_MAX_COLUMNS,
         raw_input: false,
-    };
-    let mut session = Session::new(config, env.store.clone());
+    }
+}
+
+/// Run one edit call.
+///
+/// # Errors
+/// The engine's model-facing message (parse, locate, apply or write failure).
+pub async fn edit(env: &Env, args: &Value) -> Result<AgentToolResult> {
+    let mut session = Session::new(session_config(env), env.store.clone());
     session.set_args_json(&args.to_string());
     session.finish();
+    recover_missing_paths(&mut session, &env.cwd).await;
     let outcome = session
         .apply(ApplyRequest::default(), &FsWriter)
         .await
@@ -132,6 +153,66 @@ pub async fn edit(env: &Env, args: &Value) -> Result<AgentToolResult> {
     let mut result = AgentToolResult::text(outcome.text.clone());
     result.details = edit_details(&outcome);
     Ok(result)
+}
+
+/// Answer every missing target the finished payload names with the one file
+/// under `cwd` whose path ends with it, so a path relative to another
+/// directory still edits (omp's apply-phase recovery). The engine itself never
+/// walks: it records misses and reruns once the host answers them.
+async fn recover_missing_paths(session: &mut Session, cwd: &Path) {
+    let mut answered: HashSet<String> = HashSet::new();
+    loop {
+        let mut missing = session.apply_recovery_misses();
+        missing.retain(|authored| answered.insert(authored.clone()));
+        if missing.is_empty() {
+            return;
+        }
+        for authored in missing {
+            let answer = recover_one(cwd, &authored).await;
+            session.provide_recovery(authored, answer);
+        }
+    }
+}
+
+/// The single file or directory below `cwd` whose path ends with the missing
+/// `authored` path (hidden entries included, ignore files honoured, `.git`
+/// pruned). `None` when there is no match, more than one, or the search
+/// outlives [`RECOVERY_TIMEOUT`]; the walk stops at the second match.
+async fn recover_one(cwd: &Path, authored: &str) -> Option<Resolved> {
+    let glob = RecoveryGlob::new(authored)?;
+    let matches = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&matches);
+    let root = cwd.to_path_buf();
+    let opts = walk::Options {
+        hidden: true,
+        gitignore: true,
+        skip_git: true,
+        ..walk::Options::default()
+    };
+    let fs = Fs::native();
+    let search = walk::collect(&fs, &root, &opts, false, move |_, entry| {
+        if !glob.matches(entry.path, entry.name(), entry.file_type) {
+            return walk::Action::Skip;
+        }
+        if seen.fetch_add(1, Ordering::AcqRel) == 0 {
+            walk::Action::Continue
+        } else {
+            walk::Action::Stop
+        }
+    });
+    // Dropping the timed-out future cancels the walk.
+    let found = tokio::time::timeout(RECOVERY_TIMEOUT, search)
+        .await
+        .ok()?
+        .ok()?;
+    if matches.load(Ordering::Acquire) != 1 {
+        return None;
+    }
+    let display = found.iter().next()?.path_lossy().into_owned();
+    Some(Resolved {
+        absolute: cwd.join(&display),
+        display,
+    })
 }
 
 /// omp `EditToolDetails`: the numbered `diff` (+ `firstChangedLine`, `op`,
@@ -376,6 +457,81 @@ mod tests {
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
             "hello rust\n"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_file_is_recovered_by_unique_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("deep/src")).unwrap();
+        std::fs::write(dir.path().join("deep/src/a.ts"), "old\n").unwrap();
+        std::fs::write(dir.path().join("deep/src/other.ts"), "keep\n").unwrap();
+        let env = Env::with_mode(dir.path(), EditMode::Replace);
+        edit(
+            &env,
+            &json!({"path": "src/a.ts", "old_string": "old", "new_string": "new"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("deep/src/a.ts")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("deep/src/other.ts")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_suffix_is_not_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["deep", "other"] {
+            std::fs::create_dir_all(dir.path().join(sub).join("src")).unwrap();
+            std::fs::write(dir.path().join(sub).join("src/a.ts"), "old\n").unwrap();
+        }
+        let env = Env::with_mode(dir.path(), EditMode::Replace);
+        let err = edit(
+            &env,
+            &json!({"path": "src/a.ts", "old_string": "old", "new_string": "new"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("src/a.ts"), "{err}");
+        for sub in ["deep", "other"] {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(sub).join("src/a.ts")).unwrap(),
+                "old\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn over_cap_anchor_without_read_provenance_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // `max_columns: 512` bounds the display: a longer line may have been
+        // cut, so an anchor on it cannot be trusted from a stale store.
+        let wide = format!("{}\n", "x".repeat(600));
+        std::fs::write(dir.path().join("f.txt"), &wide).unwrap();
+        let env = Env::new(dir.path(), true);
+        let tag = pi_edit::store::file_hash(&wide);
+        let err = edit(
+            &env,
+            &json!({"input": format!("[f.txt#{tag}]\nCUT 1.=1\n")}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("column cap"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            wide
+        );
+    }
+
+    #[test]
+    fn session_config_carries_the_display_column_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::new(dir.path(), true);
+        assert_eq!(session_config(&env).max_columns, 512);
     }
 
     #[test]

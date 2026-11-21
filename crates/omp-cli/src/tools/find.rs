@@ -3,18 +3,29 @@
 //! has no judge provider yet, so this is the lexical stage alone: files are
 //! ranked by case-insensitive keyword occurrences (omp `jfind/lexical.ts`),
 //! scored as a 0–1 probability, and rendered in omp's exact report format.
+//!
+//! The walk is [`omp_xfs::walk`] over an [`omp_vfs::Fs`]: host roots take the
+//! native fast path, `scheme://` roots are listed and read through the vfs
+//! provider in place, and dropping the search future cancels the walk.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use pa_agent::types::AgentToolResult;
-use pi_walker::{WalkDetail, WalkRequest};
-use rayon::prelude::*;
-
-use super::util::{
-    cancelled, format_bytes, format_path_relative_to_cwd, resolve_to_cwd, str_arg, CancelFlag,
+use async_trait::async_trait;
+use futures::{stream, StreamExt};
+use omp_urls::{Registry, UrlCtx, UrlTarget};
+use omp_vfs::{
+    BlockingFs, DirEntry, FileHandle, FileKind, FileSystem, Metadata, Permissions, ReadDir,
 };
+use omp_xfs::walk::{self, Action, Options};
+use omp_xfs::{FileType, Fs};
+use pa_agent::abort::{aborted_error, throw_if_aborted, AbortSignal};
+use pa_agent::types::AgentToolResult;
+use tokio_util::sync::CancellationToken;
+
+use super::util::{format_bytes, format_path_relative_to_cwd, resolve_to_cwd, str_arg};
 use super::Env;
 
 /// Ranges shown per hit in the model-facing text (omp `RANGES_SHOWN`).
@@ -69,17 +80,241 @@ fn score(count: usize) -> f64 {
     1.0 - 1.0 / (1.0 + f64::from(u32::try_from(count).unwrap_or(u32::MAX)))
 }
 
-fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let request = WalkRequest::new(root.to_path_buf())
-        .hidden(false)
-        .gitignore(true)
-        .detail(WalkDetail::Minimal)
-        .emit_root(false);
-    Ok(request
-        .collect_files()
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+/// Display spelling of `path`: cwd-relative for host paths, the URL verbatim
+/// for internal URLs (`omp://`, `local://`, …), which no host path describes.
+fn display_path(path: &Path, cwd: &Path, trailing_slash: bool) -> String {
+    if omp_vfs::is_virtual_path(path) {
+        let mut display = path.display().to_string();
+        if trailing_slash && !display.ends_with('/') {
+            display.push('/');
+        }
+        display
+    } else {
+        format_path_relative_to_cwd(path, cwd, trailing_slash)
+    }
+}
+
+// ------------------------------------------------------------ URL filesystem
+
+/// What an internal URL names, once the registry has routed it.
+enum UrlNode {
+    /// A file-backed scheme's entry on the host (`local://`, `skill://`, …).
+    Host(PathBuf),
+    /// A virtual scheme's rendered resource (`omp://`, `cfg://`, `rule://`, …).
+    Bytes(Vec<u8>),
+    /// A virtual scheme's root, which lists its scheme's completions.
+    Directory,
+}
+
+fn virtual_metadata(kind: FileKind, len: u64, mode: u32) -> Metadata {
+    Metadata::new(
+        omp_vfs::FileType::from_kind(kind),
+        len,
+        Permissions::from_mode(mode),
+    )
+}
+
+fn host_error(error: &anyhow::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string())
+}
+
+/// An [`omp_vfs::FileSystem`] over the internal URL registry, so a `scheme://`
+/// scope is listed and read in place instead of being mistaken for a host path.
+///
+/// File-backed schemes resolve to their host backing entry per operation;
+/// virtual schemes expose the resolved resource as one read-only file, and a
+/// resource the provider reports as a directory lists that scheme's
+/// completions as children (the docs corpus under `omp://` is flat, so every
+/// such directory is a scheme root).
+struct UrlFs {
+    registry: &'static Registry,
+    ctx: UrlCtx,
+}
+
+impl std::fmt::Debug for UrlFs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UrlFs").finish_non_exhaustive()
+    }
+}
+
+impl UrlFs {
+    fn resolve(&self, path: &Path) -> std::io::Result<UrlNode> {
+        let text = path.to_str().ok_or_else(omp_vfs::invalid_argument)?;
+        let target = self
+            .registry
+            .target(text, &self.ctx)
+            .map_err(|error| host_error(&error))?
+            .ok_or_else(|| host_error(&anyhow::anyhow!("not an internal URL: {text}")))?;
+        match target {
+            UrlTarget::File { path, .. } => Ok(UrlNode::Host(path)),
+            UrlTarget::Resource { url, .. } => {
+                let resource = self
+                    .registry
+                    .resolve(&url.raw_href, &self.ctx)
+                    .map_err(|error| host_error(&error))?;
+                if resource.is_directory {
+                    Ok(UrlNode::Directory)
+                } else {
+                    Ok(UrlNode::Bytes(resource.content.into_bytes()))
+                }
+            }
+        }
+    }
+}
+
+/// A read-only in-memory [`FileHandle`] over one virtual resource.
+#[derive(Debug)]
+struct ResourceFile {
+    bytes: Vec<u8>,
+    pos: parking_lot::Mutex<u64>,
+}
+
+impl ResourceFile {
+    fn len(&self) -> u64 {
+        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    }
+}
+
+#[async_trait]
+impl FileHandle for ResourceFile {
+    async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let start = usize::try_from(*self.pos.lock())
+            .unwrap_or(usize::MAX)
+            .min(self.bytes.len());
+        let len = buf.len().min(self.bytes.len() - start);
+        buf[..len].copy_from_slice(&self.bytes[start..start + len]);
+        *self.pos.lock() += u64::try_from(len).unwrap_or(u64::MAX);
+        Ok(len)
+    }
+
+    async fn write(&self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(omp_vfs::unsupported("write"))
+    }
+
+    async fn seek(&self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let end = i64::try_from(self.bytes.len()).unwrap_or(i64::MAX);
+        let mut cursor = self.pos.lock();
+        let current = i64::try_from(*cursor).unwrap_or(i64::MAX);
+        let next = match pos {
+            std::io::SeekFrom::Start(n) => {
+                i64::try_from(n).map_err(|_| omp_vfs::invalid_argument())?
+            }
+            std::io::SeekFrom::End(n) => end.saturating_add(n),
+            std::io::SeekFrom::Current(n) => current.saturating_add(n),
+        };
+        *cursor = u64::try_from(next).map_err(|_| omp_vfs::invalid_argument())?;
+        Ok(*cursor)
+    }
+
+    async fn metadata(&self) -> std::io::Result<Metadata> {
+        Ok(virtual_metadata(FileKind::File, self.len(), 0o444))
+    }
+}
+
+#[async_trait]
+impl FileSystem for UrlFs {
+    async fn open(
+        &self,
+        path: &Path,
+        _options: &omp_vfs::OpenOptions,
+    ) -> std::io::Result<omp_vfs::File> {
+        match self.resolve(path)? {
+            UrlNode::Host(host) => std::fs::File::open(host).map(omp_vfs::File::from),
+            UrlNode::Bytes(bytes) => Ok(omp_vfs::File::from_handle(ResourceFile {
+                bytes,
+                pos: parking_lot::Mutex::new(0),
+            })),
+            UrlNode::Directory => Err(omp_vfs::is_a_directory()),
+        }
+    }
+
+    async fn metadata(&self, path: &Path) -> std::io::Result<Metadata> {
+        match self.resolve(path)? {
+            UrlNode::Host(host) => std::fs::metadata(host).map(Metadata::from),
+            UrlNode::Bytes(bytes) => {
+                let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                Ok(virtual_metadata(FileKind::File, len, 0o444))
+            }
+            UrlNode::Directory => Ok(virtual_metadata(FileKind::Dir, 0, 0o555)),
+        }
+    }
+
+    async fn read_dir(&self, path: &Path) -> std::io::Result<ReadDir> {
+        match self.resolve(path)? {
+            UrlNode::Host(host) => {
+                let mut entries = Vec::new();
+                for entry in std::fs::read_dir(host)? {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    let file_type = entry.file_type()?;
+                    let kind = if file_type.is_dir() {
+                        FileKind::Dir
+                    } else if file_type.is_symlink() {
+                        FileKind::Symlink
+                    } else {
+                        FileKind::File
+                    };
+                    let len = match kind {
+                        FileKind::File => entry.metadata().map_or(0, |m| m.len()),
+                        _ => 0,
+                    };
+                    let child = omp_vfs::child_path(path, &name);
+                    entries.push(Ok(DirEntry::new(
+                        child,
+                        name,
+                        Some(omp_vfs::FileType::from_kind(kind)),
+                    )
+                    .with_metadata(virtual_metadata(kind, len, 0o644))));
+                }
+                Ok(ReadDir::from_entries(entries))
+            }
+            UrlNode::Directory => {
+                let scheme = omp_vfs::url_scheme(path).unwrap_or_default();
+                let Some(provider) = self.registry.get(scheme) else {
+                    return Err(omp_vfs::unsupported("directory listing"));
+                };
+                let entries = provider
+                    .complete("", &self.ctx)
+                    .into_iter()
+                    .map(|candidate| {
+                        let name = std::ffi::OsString::from(&candidate.label);
+                        let child = omp_vfs::child_path(path, &name);
+                        Ok(DirEntry::new(
+                            child,
+                            name,
+                            Some(omp_vfs::FileType::from_kind(FileKind::File)),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ReadDir::from_entries(entries))
+            }
+            UrlNode::Bytes(_) => Err(omp_vfs::not_a_directory()),
+        }
+    }
+}
+
+/// Every regular file below `root`, in path order: hidden entries, `.git`,
+/// and `node_modules` pruned, `.ignore`/`.gitignore` honoured.
+async fn walk_files(fs: &Fs, root: &Path) -> Result<Vec<PathBuf>> {
+    let options = Options {
+        hidden: false,
+        gitignore: true,
+        skip_git: true,
+        skip_node_modules: true,
+        ..Options::default()
+    };
+    let found = walk::collect(fs, root, &options, true, |_, entry| {
+        if entry.file_type == FileType::File {
+            Action::Continue
+        } else {
+            Action::Skip
+        }
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(found
         .iter()
-        .map(|e| e.absolute_path(root))
+        .map(|entry| fs.join(root, entry.path))
         .collect())
 }
 
@@ -87,21 +322,22 @@ fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
 /// counters are zero when the file is skipped (too large, binary, unreadable)
 /// or cancelled mid-scan.
 fn judge_file(
+    fs: &BlockingFs,
     file: &Path,
     keywords: &[String],
-    env: &Env,
-    cancel: &CancelFlag,
+    cwd: &Path,
+    cancel: &CancellationToken,
 ) -> (Option<Hit>, usize, usize) {
-    if cancelled(cancel) {
+    if cancel.is_cancelled() {
         return (None, 0, 0);
     }
-    let Ok(m) = std::fs::metadata(file) else {
+    let Ok(meta) = fs.metadata(file) else {
         return (None, 0, 0);
     };
-    if m.len() > MAX_FILE_BYTES {
+    if meta.len() > MAX_FILE_BYTES {
         return (None, 0, 0);
     }
-    let Ok(bytes) = std::fs::read(file) else {
+    let Ok(bytes) = fs.read(file) else {
         return (None, 0, 0);
     };
     if bytes.contains(&0) {
@@ -139,7 +375,7 @@ fn judge_file(
     }
     ranges.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
     let mut hit_ranges = Vec::new();
-    for (start, end, n) in ranges.into_iter().take(RANGES_SHOWN) {
+    for (start, end, _) in ranges.into_iter().take(RANGES_SHOWN) {
         let snippet = matched_lines
             .iter()
             .find(|(ln, _)| *ln == start)
@@ -148,11 +384,10 @@ fn judge_file(
             .take(SNIPPET_CHARS)
             .collect::<String>();
         hit_ranges.push((start, end, snippet));
-        let _ = n;
     }
     (
         Some(Hit {
-            rel: format_path_relative_to_cwd(file, &env.cwd, false),
+            rel: display_path(file, cwd, false),
             score: file_score,
             lines_seen: text.lines().count(),
             ranges: hit_ranges,
@@ -162,32 +397,59 @@ fn judge_file(
     )
 }
 
-#[cfg(test)]
-/// Run the `find` tool (lexical stage of omp's cascade).
+/// Run the `find` tool: the lexical stage of omp's judge cascade.
+///
+/// Cancellation is immediate on both edges: the `select!` below abandons the
+/// search future on abort (dropping the [`omp_xfs::walk`] future cancels the
+/// walk) while the watcher fires the token the per-file judges poll, so at
+/// most the files already being read finish.
 ///
 /// # Errors
-/// Empty query or an unresolvable scope path.
-pub fn find(env: &Env, args: &serde_json::Value) -> Result<AgentToolResult> {
-    find_with_cancel(env, args, &CancelFlag::default())
+/// Empty query, an unresolvable scope path, or an aborted call.
+pub async fn find(
+    env: Arc<Env>,
+    args: serde_json::Value,
+    signal: AbortSignal,
+) -> Result<AgentToolResult> {
+    throw_if_aborted(&signal)?;
+    let cancel = CancellationToken::new();
+    let watcher = {
+        let cancel = cancel.clone();
+        let signal = signal.clone();
+        tokio::spawn(async move {
+            signal.aborted().await;
+            cancel.cancel();
+        })
+    };
+    let outcome = tokio::select! {
+        biased;
+        () = signal.aborted() => Err(aborted_error()),
+        result = search(env, args, cancel.clone()) => result,
+    };
+    watcher.abort();
+    cancel.cancel();
+    if signal.is_aborted() {
+        return Err(aborted_error());
+    }
+    outcome
 }
 
-/// [`find`] with a cooperative cancel flag: the registry adapter flips it on
-/// abort; the per-file scoring loop stops early instead of reading the rest
-/// of the tree.
+/// [`find`]'s body, over a cancel token the caller fires when the call aborts.
 ///
-/// Per-file work (read + keyword scan) runs on the `rayon` pool inside the
-/// registry's `spawn_blocking` section; hits are collected in input order and
-/// sorted afterwards exactly as before, so output stays byte-identical.
+/// Per-file work (read + keyword scan) is CPU-bound, so it runs on the
+/// blocking pool, `workers` files at a time; hits are collected in input order
+/// and sorted afterwards, so the report depends only on the multiset of
+/// judgments, never on scheduling.
 ///
 /// # Errors
 /// Empty query or an unresolvable scope path.
 #[allow(clippy::too_many_lines)]
-pub fn find_with_cancel(
-    env: &Env,
-    args: &serde_json::Value,
-    cancel: &CancelFlag,
+async fn search(
+    env: Arc<Env>,
+    args: serde_json::Value,
+    cancel: CancellationToken,
 ) -> Result<AgentToolResult> {
-    let query = str_arg(args, "query")?.trim().to_string();
+    let query = str_arg(&args, "query")?.trim().to_string();
     if query.is_empty() {
         bail!("`query` must be a non-empty description");
     }
@@ -200,7 +462,7 @@ pub fn find_with_cancel(
                 .map(str::to_string)
                 .collect()
         });
-    let keywords = keywords(&query, &extra);
+    let keywords: Arc<[String]> = Arc::from(keywords(&query, &extra));
     if keywords.is_empty() {
         bail!("`grep_keywords` must contain at least one term");
     }
@@ -209,38 +471,67 @@ pub fn find_with_cancel(
         .get("path")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let root = if scope_input.is_empty() {
-        env.cwd.clone()
+    // omp `resolveSearchBase`: a registered internal URL is searched as spelled
+    // (single-slash alias normalized) through the URL filesystem; anything else
+    // resolves against the cwd as a host path.
+    let registry = super::read::url_registry();
+    let normalized = registry.normalize(scope_input.trim());
+    let (root, vfs) = if scope_input.is_empty() {
+        (env.cwd.clone(), omp_vfs::Fs::native())
+    } else if registry.can_handle(&normalized) {
+        (
+            PathBuf::from(&normalized),
+            omp_vfs::Fs::new(Arc::new(UrlFs {
+                registry,
+                ctx: super::read::url_ctx(&env),
+            })),
+        )
     } else {
-        resolve_to_cwd(scope_input, &env.cwd)
+        (resolve_to_cwd(scope_input, &env.cwd), omp_vfs::Fs::native())
     };
-    let meta =
-        std::fs::metadata(&root).map_err(|_| anyhow::anyhow!("Path not found: {scope_input}"))?;
+    let meta = vfs
+        .metadata(&root)
+        .await
+        .map_err(|_| anyhow::anyhow!("Path not found: {scope_input}"))?;
     let scope_path = if root == env.cwd {
         None
     } else {
-        Some(format_path_relative_to_cwd(&root, &env.cwd, meta.is_dir()))
+        Some(display_path(&root, &env.cwd, meta.is_dir()))
     };
 
     let started = std::time::Instant::now();
-    let mut hits: Vec<Hit> = Vec::new();
-    let mut files_read = 0usize;
-    let mut file_bytes = 0usize;
+    let fs = Fs::new(&vfs, &root);
     let files: Vec<PathBuf> = if meta.is_file() {
         vec![root]
     } else {
-        walk_files(&root)?
+        walk_files(&fs, &root).await?
     };
     let listed = files.len();
 
-    // Rayon judges files in parallel (read + keyword scan is CPU-bound);
-    // results are collected in input order, and the sort below (score desc,
-    // path asc) plus the summed counters depend only on the multiset, so the
-    // report matches a serial scan byte for byte.
-    let judged: Vec<(Option<Hit>, usize, usize)> = files
-        .par_iter()
-        .map(|file| judge_file(file, &keywords, env, cancel))
-        .collect();
+    // Spawned blocking judges run off the runtime's workers; `buffered` bounds
+    // how many are in flight, and `collect` keeps them in input order.
+    let blocking = vfs.blocking();
+    let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let judged: Vec<(Option<Hit>, usize, usize)> = stream::iter(files)
+        .map(|file| {
+            let fs = blocking.clone();
+            let keywords = Arc::clone(&keywords);
+            let cwd = env.cwd.clone();
+            let cancel = cancel.clone();
+            tokio::task::spawn_blocking(move || {
+                judge_file(&fs, &file, &keywords[..], &cwd, &cancel)
+            })
+        })
+        .buffered(workers)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|joined| joined.map_err(|e| anyhow::anyhow!("find worker failed: {e}")))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut files_read = 0usize;
+    let mut file_bytes = 0usize;
     for (hit, read, bytes) in judged {
         files_read += read;
         file_bytes += bytes;
@@ -307,7 +598,7 @@ pub fn find_with_cancel(
         .collect();
     let mut details = serde_json::json!({
         "query": query,
-        "keywords": keywords,
+        "keywords": &keywords[..],
         "threshold": THRESHOLD,
         "cwd": env.cwd.display().to_string(),
         "elapsedMs": elapsed_ms,
@@ -332,7 +623,7 @@ pub fn find_with_cancel(
 mod tests {
     use super::*;
 
-    fn fixture() -> (tempfile::TempDir, Env) {
+    fn fixture() -> (tempfile::TempDir, Arc<Env>) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(
@@ -346,17 +637,19 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("README.md"), "# demo\nnothing here\n").unwrap();
-        let env = Env::new(dir.path(), false);
+        let env = Arc::new(Env::new(dir.path(), false));
         (dir, env)
     }
 
-    #[test]
-    fn ranks_files_by_keyword_hits_in_omp_format() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ranks_files_by_keyword_hits_in_omp_format() {
         let (_dir, env) = fixture();
         let r = find(
-            &env,
-            &serde_json::json!({"query": "user login session", "grep_keywords": ["session"]}),
+            env,
+            serde_json::json!({"query": "user login session", "grep_keywords": ["session"]}),
+            AbortSignal::never(),
         )
+        .await
         .unwrap();
         let text = match &r.content[0] {
             pa_agent::types::ToolResultContent::Text(t) => t.text.clone(),
@@ -384,13 +677,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scoped_search_reports_no_hits() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scoped_search_reports_no_hits() {
         let (_dir, env) = fixture();
         let r = find(
-            &env,
-            &serde_json::json!({"query": "zzz absent topic", "grep_keywords": ["zznotthere"], "path": "src"}),
+            env,
+            serde_json::json!({"query": "zzz absent topic", "grep_keywords": ["zznotthere"], "path": "src"}),
+            AbortSignal::never(),
         )
+        .await
         .unwrap();
         let text = match &r.content[0] {
             pa_agent::types::ToolResultContent::Text(t) => t.text.clone(),
@@ -404,19 +699,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_empty_query_and_scope() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_empty_query_and_scope() {
         let (_dir, env) = fixture();
         let e = find(
-            &env,
-            &serde_json::json!({"query": "  ", "grep_keywords": ["x"]}),
+            Arc::clone(&env),
+            serde_json::json!({"query": "  ", "grep_keywords": ["x"]}),
+            AbortSignal::never(),
         )
+        .await
         .unwrap_err();
         assert_eq!(e.to_string(), "`query` must be a non-empty description");
         let e = find(
-            &env,
-            &serde_json::json!({"query": "x", "grep_keywords": ["x"], "path": "nope"}),
+            env,
+            serde_json::json!({"query": "x", "grep_keywords": ["x"], "path": "nope"}),
+            AbortSignal::never(),
         )
+        .await
         .unwrap_err();
         assert_eq!(e.to_string(), "Path not found: nope");
     }

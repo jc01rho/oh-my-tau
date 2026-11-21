@@ -27,45 +27,51 @@ license-file = "vendor/LICENSE-oh-my-pi"
 
 [crates.pi-ast]
 path = "vendor/pi-ast"
-version = "18.9.1"
+version = "19.0.1"
 source = "can1357/oh-my-pi (main, crates/ast)"
-import-commit = "unrecorded (v18.9.1)"
+import-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
+modifications = "manifest keeps crate name pi-ast, omits default wasm feature/wasmtime edge (wasm = [\"dep:semver\"]), gates two upstream grammar tests requiring unvendored tree-sitter-go patch / tree-sitter-md 0.5.4 / extra dev grammars behind opt-in features (`patched-tree-sitter-go`, `test-grammars`), drops `[lints] workspace = true`, and formats with workspace default rustfmt"
 
 [crates.pi-diff]
 path = "vendor/pi-diff"
-version = "18.9.1"
+version = "19.0.1"
 source = "can1357/oh-my-pi (main, crates/diff)"
-import-commit = "unrecorded (v18.9.1)"
+import-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
+modifications = "manifest keeps crate name pi-diff, links path xutf shim, omits `[lints] workspace = true`, and formats with workspace default rustfmt"
 
 [crates.pi-edit]
 path = "vendor/pi-edit"
-version = "18.9.1"
+version = "19.0.1"
 source = "can1357/oh-my-pi (main, crates/edit)"
-import-commit = "unrecorded (v18.9.1)"
+import-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
+modifications = "manifest keeps crate name pi-edit with package aliases omp-ast/omp-diff -> pi-ast/pi-diff, omits `[lints] workspace = true`, adds `#[allow(clippy::too_many_arguments)]` on 6 upstream internal helpers, skips the single `.lua` fixture case in `tests/hashline_parity.rs` requiring unvendored `tree-sitter-lua`, and formats with workspace default rustfmt"
 
 [crates.pi-vfs]
 path = "vendor/pi-vfs"
-version = "18.9.1"
+version = "19.0.1"
 source = "can1357/oh-my-pi (main, crates/vfs)"
-import-commit = "unrecorded (v18.9.1)"
+import-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
+modifications = "manifest keeps crate name pi-vfs, omits `[lints] workspace = true` (46 unsafe blocks incompatible with workspace unsafe_code=forbid), and formats with workspace default rustfmt"
 
-[crates.pi-walker]
-path = "vendor/pi-walker"
-version = "18.9.1"
-source = "can1357/oh-my-pi (main, crates/walker, retired into crates/xfs::walk)"
-import-commit = "unrecorded (v18.9.1)"
+[crates.omp-xfs]
+path = "vendor/omp-xfs"
+version = "19.0.1"
+source = "can1357/oh-my-pi (main, crates/xfs)"
+import-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
+modifications = "replaces retired pi-walker; manifest uses flume 0.11, omp-vfs -> pi-vfs package alias, bare `[lints]` (unsafe blocks), `grep/render.rs` uses `.chars().count()` for UTF-32 column count, watch doc example tabs converted to spaces, and formatted with workspace default rustfmt"
 
 [crates.pi-predict]
 path = "vendor/pi-predict"
-version = "18.6.1"
+version = "19.0.1"
 source = "can1357/oh-my-pi (main, crates/predict, ngram only)"
-import-commit = "unrecorded (v18.6.1)"
+import-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
+modifications = "ngram-only subset (no src/smollm, src/apple, or macOS candle/objc2 deps; `Method::{SmolLm,Apple}` return explicit fallback errors), keeps zstd 0.13 and `[lints.cargo] unused_dependencies = \"allow\"`, uses std `encode_utf16`/`split_inclusive` in `prose.rs`/`ngram/web.rs`, and formats with workspace default rustfmt"
 
 # ── omp2 shell stack ──────────────────────────────────────────────────────────
 # Vendored verbatim from can1357/oh-my-pi ref `omp2`. The upstream workspace
@@ -134,7 +140,7 @@ version = "0.1.0"
 source = "first-party shim (not vendored): stable-Rust replacement for crates.io xutf"
 reference-commit = "n/a"
 license = "MIT"
-modifications = "replaces xutf 1.6.0, which requires nightly (core::simd) and a generated Unicode property trie. Only the surface the omp2 shell stack consumes is present: strict BufRead char decoding (BufReadCharsExt/Chars/CharsRaw/ReadCharError) and width_char/width_str/width_ansi_str over unicode-width 0.2 + unicode-segmentation 1 (both already in Cargo.lock). Chars still yields io::Result<char>, matching upstream, with ReadCharError kept as the io::Error payload"
+modifications = "replaces xutf 2.3.0 (and earlier 1.6.0), which requires nightly (core::simd) and a generated Unicode property trie. Covers the surface consumed by the omp2 shell stack (BufReadCharsExt/Chars/CharsRaw/ReadCharError, strip_ansi, width_char/width_str/width_ansi_str) and the Phase 2.5 19.0.1 stack (Encoding/Unit/Utf8/Utf16, Text::transcoded_len/unit_offset, LineEnds/lines/lines_str/Line::with_end, UnitSet, find_iter, IntoUnicodeNormalized::into_nfc via unicode-normalization)"
 
 # Local shims, not upstream code. Recorded here because they occupy the omp-*
 # crate names the rest of the tree imports.

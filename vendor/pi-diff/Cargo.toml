@@ -1,8 +1,10 @@
 [package]
 name = "pi-diff"
-version = "18.9.1"
+version = "19.0.1"
 edition = "2024"
 license = "MIT"
 authors = ["Stencil Labs, Inc."]
 description = "Vendored from can1357/oh-my-pi (MIT), see ../LICENSE-oh-my-pi."
 
+[dependencies]
+xutf = { path = "../xutf" }

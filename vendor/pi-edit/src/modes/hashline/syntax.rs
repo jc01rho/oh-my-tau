@@ -2,15 +2,18 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    path::Path,
     sync::{LazyLock, Mutex},
 };
 
-use pi_ast::{
+use omp_ast::{
+    SupportLang,
     block::{
         BlockRangeOptions, EnclosingBoundaryOptions, LineRange, NodeSpan,
         enclosing_block_boundaries, node_chain_at,
     },
-    summary::{SummaryOptions, summarize_code},
+    parse_cache::parse_cached,
+    summary::parse_code_status,
 };
 use xxhash_rust::xxh64::xxh64;
 
@@ -112,23 +115,16 @@ pub fn enclosing_boundaries(lines: &[&str], path: &str, start: u32, end: u32) ->
 
 /// Whether text parses cleanly for the supplied path language.
 pub fn parses_cleanly(path: Option<&str>, text: &str) -> bool {
-    let Some(path) = path else { return false };
+    let Some(path) = path.filter(|path| has_syntax_oracle(path)) else {
+        return false;
+    };
     let cache_key = key(text, path, 0, 0);
     if let Ok(cache) = CACHE.lock()
         && let Some(cached) = cache.parses.get(&cache_key)
     {
         return *cached;
     }
-    let parsed = summarize_code(SummaryOptions {
-        code: text.to_owned(),
-        lang: None,
-        path: Some(path.to_owned()),
-        min_body_lines: None,
-        min_comment_lines: None,
-        unfold_until_lines: None,
-        unfold_limit_lines: None,
-    })
-    .is_ok_and(|summary| summary.parsed);
+    let parsed = parse_code_status(text, None, Some(path)).is_ok_and(|language| language.is_some());
     if let Ok(mut cache) = CACHE.lock() {
         let SyntaxCache {
             parses,
@@ -138,4 +134,73 @@ pub fn parses_cleanly(path: Option<&str>, text: &str) -> bool {
         insert_fifo(parses, parse_order, cache_key, parsed);
     }
     parsed
+}
+
+/// 1-indexed line spans of the syntax errors (`ERROR` and `MISSING` nodes) in
+/// `text`, in document order. Empty when the text parses cleanly or `path` has
+/// no syntax oracle.
+pub fn syntax_error_spans(path: Option<&str>, text: &str) -> Vec<(u32, u32)> {
+    let Some(path) = path.filter(|path| has_syntax_oracle(path)) else {
+        return Vec::new();
+    };
+    let Some(language) = SupportLang::from_path(Path::new(path)) else {
+        return Vec::new();
+    };
+    let Ok(Some(tree)) = parse_cached(text, language, Some(path)) else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            spans.push((
+                node.start_position().row as u32 + 1,
+                node.end_position().row as u32 + 1,
+            ));
+            continue;
+        }
+        if !node.has_error() {
+            continue;
+        }
+        let mut cursor = node.walk();
+        let start = stack.len();
+        stack.extend(node.children(&mut cursor));
+        stack[start..].reverse();
+    }
+    spans
+}
+
+/// Whether a parse of `path` says anything about the file being valid.
+///
+/// Not for grammars whose `ERROR` nodes are mostly gaps rather than broken
+/// files, as reported against real compilers and parsers:
+/// - Markdown: every character sequence is a CommonMark document (a GFM table
+///   row with an empty `||` cell is an `ERROR`).
+/// - SQL and PowerShell: dialect and cmdlet syntax the grammars lack.
+/// - Bash: heredocs and `case` patterns inside functions.
+/// - CSS (also `.scss`): `@container` queries and SCSS syntax.
+/// - HTML, Vue, Svelte, Astro: template syntax (Jinja, directives, blocks).
+/// - C, C++, Objective-C: preprocessor conditionals split constructs, and `.h`
+///   C++ headers parse with the C grammar.
+/// - Kotlin and Swift: newer language syntax.
+pub(crate) fn has_syntax_oracle(path: &str) -> bool {
+    !matches!(
+        SupportLang::from_path(Path::new(path)),
+        Some(
+            SupportLang::Markdown
+                | SupportLang::Sql
+                | SupportLang::Powershell
+                | SupportLang::Bash
+                | SupportLang::Css
+                | SupportLang::Html
+                | SupportLang::Vue
+                | SupportLang::Svelte
+                | SupportLang::Astro
+                | SupportLang::C
+                | SupportLang::Cpp
+                | SupportLang::ObjC
+                | SupportLang::Kotlin
+                | SupportLang::Swift
+        )
+    )
 }

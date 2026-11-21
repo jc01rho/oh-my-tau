@@ -35,7 +35,7 @@ macro_rules! grammar {
 /// bare parser, which cannot run wasm grammars.
 fn parse_doc<L: LanguageExt + LanguageGrammar>(src: &str, lang: L) -> Result<StrDoc<L>, String> {
     let language = lang.grammar().load().map_err(|err| err.to_string())?;
-    let tree = grammar::parse(&language, src)
+    let tree = grammar::parse(&language, src, None)
         .map_err(|err| err.to_string())?
         .ok_or("tree-sitter produced no tree")?;
     Ok(StrDoc {
@@ -492,6 +492,19 @@ impl SupportLang {
         from_extension(path)
     }
 
+    /// Whether a file whose name maps to `self` parses as `explicit` too, so
+    /// an explicit language keeps it: the same language, C under C++ or
+    /// Objective-C (`.h` is either), JavaScript under TypeScript, and either
+    /// under TSX.
+    pub fn parses_as(self, explicit: Self) -> bool {
+        use SupportLang::{C, Cpp, JavaScript, ObjC, Tsx, TypeScript};
+        self == explicit
+            || matches!(
+                (self, explicit),
+                (C, Cpp | ObjC) | (JavaScript, TypeScript | Tsx) | (TypeScript, Tsx)
+            )
+    }
+
     pub fn sorted_aliases() -> &'static [&'static str] {
         &SORTED_ALIASES
     }
@@ -509,6 +522,16 @@ impl SupportLang {
 impl fmt::Display for SupportLang {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
+    }
+}
+
+/// A rule file's `language:` field: any alias [`SupportLang::from_alias`]
+/// accepts (`TypeScript`, `ts`, `rust`, …).
+impl<'de> serde::Deserialize<'de> for SupportLang {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let alias = <Cow<'de, str>>::deserialize(deserializer)?;
+        Self::from_alias(&alias)
+            .ok_or_else(|| serde::de::Error::custom(format!("unsupported language `{alias}`")))
     }
 }
 
@@ -655,7 +678,7 @@ const fn extensions(lang: SupportLang) -> &'static [&'static str] {
         EmacsLisp => &["el"],
         Elixir => &["ex", "exs"],
         Erlang => &["erl", "hrl"],
-        Fortran => &["f90", "F90", "f95", "F95", "f03", "F03", "f08", "F08"],
+        Fortran => &["f90", "f95", "f03", "f08"],
         Go => &["go"],
         Graphql => &["graphql", "gql"],
         Haskell => &["hs"],
@@ -678,7 +701,7 @@ const fn extensions(lang: SupportLang) -> &'static [&'static str] {
         Php => &["php"],
         Powershell => &["ps1", "psm1"],
         Proto => &["proto"],
-        Python => &["py", "py3", "pyi", "bzl"],
+        Python => &["py", "py3", "pyi"],
         R => &["r"],
         Regex => &[],
         Ruby => &["rb", "rbw", "gemspec"],
@@ -752,10 +775,17 @@ fn from_extension(path: &Path) -> Option<SupportLang> {
     }
 
     let ext = path.extension()?.to_str()?;
-    SupportLang::all_langs()
-        .iter()
-        .copied()
-        .find(|&l| extensions(l).contains(&ext))
+    // GCC's convention: an uppercase `.C`/`.H` is C++, not C.
+    if ext == "C" || ext == "H" {
+        return Some(SupportLang::Cpp);
+    }
+    // Otherwise tables list lowercase extensions; `analysis.R` and `MAIN.PY` are
+    // the same languages.
+    SupportLang::all_langs().iter().copied().find(|&l| {
+        extensions(l)
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(ext))
+    })
 }
 
 static LANG_ALIASES: phf::Map<&'static str, SupportLang> = phf_map! {
@@ -918,3 +948,50 @@ static LANG_ALIASES: phf::Map<&'static str, SupportLang> = phf_map! {
 "yml"            => SupportLang::Yaml,
 "zig"            => SupportLang::Zig,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infers_cuda_sources_and_headers_as_cpp() {
+        assert_eq!(
+            SupportLang::from_path(Path::new("kernel.cu")),
+            Some(SupportLang::Cpp)
+        );
+        assert_eq!(
+            SupportLang::from_path(Path::new("kernel.cuh")),
+            Some(SupportLang::Cpp)
+        );
+    }
+
+    #[test]
+    fn infers_languages_from_extensions_in_any_case() {
+        assert_eq!(
+            SupportLang::from_path(Path::new("analysis.R")),
+            Some(SupportLang::R)
+        );
+        assert_eq!(
+            SupportLang::from_path(Path::new("solver.F90")),
+            Some(SupportLang::Fortran)
+        );
+        assert_eq!(
+            SupportLang::from_path(Path::new("MAIN.PY")),
+            Some(SupportLang::Python)
+        );
+        assert_eq!(
+            SupportLang::from_path(Path::new("kernel.C")),
+            Some(SupportLang::Cpp)
+        );
+        assert_eq!(
+            SupportLang::from_path(Path::new("kernel.c")),
+            Some(SupportLang::C)
+        );
+    }
+
+    #[test]
+    fn resolves_cuda_language_aliases_as_cpp() {
+        assert_eq!(SupportLang::from_alias("cu"), Some(SupportLang::Cpp));
+        assert_eq!(SupportLang::from_alias("cuh"), Some(SupportLang::Cpp));
+    }
+}

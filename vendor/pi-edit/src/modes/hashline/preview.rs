@@ -9,7 +9,7 @@ use super::{
     clipboard::resolve_clipboard_edits,
     input::{Patch, PatchSection, contains_recognizable_hashline_operations},
     parser::parse_patch_streaming,
-    patcher::{apply_with_recovery, recover_target},
+    patcher::{apply_with_recovery, mismatch, recover_target},
     types::{Cursor, Edit, FileOp},
 };
 use crate::{
@@ -77,14 +77,12 @@ fn streaming_diff(
     }
     let mut rows = Vec::new();
     let mut first = None;
-    let mut index = 0;
-    while index < resolved.len() {
-        let op_line = resolved[index].line_num();
+    for group in resolved.chunk_by(|a, b| a.line_num() == b.line_num()) {
         let mut deletes = Vec::new();
         let mut inserts = Vec::new();
         let mut insert_base = None;
-        while index < resolved.len() && resolved[index].line_num() == op_line {
-            match &resolved[index] {
+        for edit in group {
+            match edit {
                 Edit::Delete { anchor, .. } => deletes.push(anchor.line),
                 Edit::Insert { cursor, text, .. } => {
                     insert_base.get_or_insert_with(|| cursor_line(*cursor, file_lines.len()));
@@ -92,7 +90,6 @@ fn streaming_diff(
                 }
                 Edit::Cut { .. } | Edit::Paste { .. } | Edit::Block { .. } => {}
             }
-            index += 1;
         }
         deletes.sort_unstable();
         for line in &deletes {
@@ -134,7 +131,7 @@ fn preview_section(
     };
     let outcome = (|| {
         let initial = files.resolve(&section.path, false)?;
-        let recovered = recover_target(section, &initial, files, store);
+        let recovered = recover_target(section, &initial, files, store)?;
         let (target, resolved) = recovered
             .as_ref()
             .map_or((section, &initial), |(target, resolved)| (target, resolved));
@@ -182,23 +179,17 @@ fn preview_section(
         }
         let parsed = target.parse()?;
         if target.file_hash.is_none() {
-            return Err(crate::error::EditError::apply(
-                super::messages::missing_snapshot_tag_message(&target.path),
-            ));
+            return Err(mismatch(target, &read.canonical, &read.text, "", store));
         }
-        let edits = if matches!(parsed.file_op, Some(FileOp::Rem)) {
-            &[][..]
-        } else {
-            parsed.edits.as_slice()
-        };
+        // A `REM` section holds only bodyless `CUT`s, which still fill registers.
         let applied = apply_with_recovery(
             target,
             &read.canonical,
             &read.text,
-            edits,
+            &parsed.edits,
             clipboard,
             store,
-            false,
+            None,
         )?;
         result.op = Some(if matches!(parsed.file_op, Some(FileOp::Rem)) {
             EngineFileOp::Delete
@@ -209,7 +200,7 @@ fn preview_section(
             Some(FileOp::Move { dest }) => Some(dest.clone()),
             _ => None,
         };
-        if applied.text == read.text {
+        if applied.text == read.text || matches!(parsed.file_op, Some(FileOp::Rem)) {
             if parsed.file_op.is_some() {
                 result.diff = Some(String::new());
                 return Ok(());
@@ -265,4 +256,17 @@ pub fn preview_patch(
         previews.push(preview);
     }
     previews
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cursor_line;
+    use crate::modes::hashline::types::{Anchor, Cursor};
+
+    #[test]
+    fn cursor_lines_are_one_indexed() {
+        assert_eq!(cursor_line(Cursor::Bof, 3), 1);
+        assert_eq!(cursor_line(Cursor::Eof, 3), 4);
+        assert_eq!(cursor_line(Cursor::AfterAnchor(Anchor { line: 2 }), 3), 3);
+    }
 }

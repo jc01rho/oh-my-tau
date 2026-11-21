@@ -18,7 +18,7 @@ Copyright (c) 2026 Stencil Labs, Inc.).
 | Crate | Origin | License |
 | --- | --- | --- |
 | `pa-agent`, `pa-ai`, `pa-models`, `pa-types` | [PrimeIntellect-ai/prime-agent](https://github.com/PrimeIntellect-ai/prime-agent) — **modified** in this repo | MIT, see [`vendor/LICENSE-prime-agent`](vendor/LICENSE-prime-agent) |
-| `pi-ast`, `pi-diff`, `pi-edit`, `pi-predict`, `pi-vfs`, `pi-walker` | oh-my-pi (can1357/oh-my-pi), vendored verbatim per each crate's `Cargo.toml` | MIT, see [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi) |
+| `pi-ast`, `pi-diff`, `pi-edit`, `pi-predict`, `pi-vfs`, `omp-xfs` | oh-my-pi (`can1357/oh-my-pi`) ref `main` @ `b636e19d10b664950d600505d194337bbeef42f0` (`19.0.1`), adapted per `vendor-src.lock` (`pi-walker` retired into `omp-xfs`) | MIT, see [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi) and per-crate `LICENSE` (`omp-xfs`, `pi-ast`) |
 | `omp-core`, `omp-macros`, `omp-vocab`, `omp-walker`, `omp-shell`, `omp-shell-builtins` | **adapted from** oh-my-pi (can1357/oh-my-pi) ref `omp2` @ `2f92f3b5aa2035d21c9f016f9ff6350795e5685a`: vendored from that commit with manifests pinned to build outside the upstream workspace, but **adapted, not unmodified verbatim** — several crates carry further upstream lineage with retained notices (`omp-shell`: brush-core/brush-parser; `omp-shell-builtins`: uutils coreutils/findutils/sed and `pi-builtins`/`pi-shell`; `omp-walker`: `pi-walker`; `omp-core`: `serde_json`). See each crate's `LICENSE`/`NOTICE`, listed below | MIT, see [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi); per-crate files listed below |
 | `omp-tool`, `omp-proto`, `xutf` | **local shims**, not upstream code — see the note below the table | MIT (this project) |
 | `crossterm` | fork of [crossterm](https://github.com/crossterm-rs/crossterm) 0.28 | MIT, see [`vendor/crossterm/LICENSE`](vendor/crossterm/LICENSE) |
@@ -65,6 +65,8 @@ reusing or re-vendoring that code:
   findutils (Google Inc. 2017; Tavian Barnes 2017, 2022; Collabora, Ltd. 2021, 2022),
   uutils sed 0.1.1 (Copyright (c) 2025 Diomidis Spinellis), the `wc` UTF-8 decoder
   (Copyright (c) Simon Sapin and many others), and earlier `pi-shell` implementations.
+- [`vendor/omp-xfs/LICENSE`](vendor/omp-xfs/LICENSE) and
+  [`vendor/pi-ast/LICENSE`](vendor/pi-ast/LICENSE) — MIT (Stencil Labs, Inc.).
 
 Notes:
 
@@ -84,8 +86,10 @@ Notes:
     prost/protox build-script codegen. It declares its own `[workspace]`, so it
     enters the graph as a path dependency rather than a workspace member.
   - `vendor/xutf` is a stable-Rust shim replacing crates.io `xutf` (which
-    requires nightly `core::simd`) with only the UTF-8 char decoding and
-    display-width surface used by `omp-shell` and `omp-shell-builtins`.
+    requires nightly `core::simd`) for both the `omp2` shell stack (UTF-8 char
+    decoding and display width) and the `19.0.1` `pi-diff`/`pi-edit`/`pi-predict`/`pi-ast`
+    stack (`lines`, `lines_str`, `LineEnds`, `Text`, `UnitSet`, `find_iter`, and
+    `IntoUnicodeNormalized` via `unicode-normalization`).
   - Note for MPL hygiene: `omp-shell` and `omp-shell-builtins` depend on `im`
     15.1 (MPL-2.0), which brings `bitmaps` and `sized-chunks`. Those are
     unmodified crates.io dependencies, not vendored here, and are allowed

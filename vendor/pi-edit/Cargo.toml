@@ -1,6 +1,6 @@
 [package]
 name = "pi-edit"
-version = "18.9.1"
+version = "19.0.1"
 edition = "2024"
 license = "MIT"
 authors = ["Stencil Labs, Inc."]
@@ -8,13 +8,16 @@ description = "Vendored from can1357/oh-my-pi (MIT), see ../LICENSE-oh-my-pi."
 
 [dependencies]
 async-trait = "0.1"
+omp-ast = { package = "pi-ast", path = "../pi-ast" }
+omp-diff = { package = "pi-diff", path = "../pi-diff" }
+omp-xfs = { path = "../omp-xfs" }
 parking_lot = "0.12"
-pi-ast = { path = "../pi-ast" }
-pi-diff = { path = "../pi-diff" }
-pi-walker = { path = "../pi-walker" }
 regex = "1"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-unicode-normalization = "0.1"
+xutf = { path = "../xutf" }
 xxhash-rust = { version = "0.8", features = ["xxh64", "xxh32"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
