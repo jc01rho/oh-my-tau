@@ -150,9 +150,14 @@ pub fn build_agent(
     let agent_model: pa_agent::types::Model = json_round_trip(&selected.model)
         .context("model does not convert to the agent model shape")?;
     let settings = omp_settings::Settings::load(cwd);
-    let mut tools =
-        crate::tools::session_builtin_tools(cwd, edit_mode_for(&selected.model.id), &settings);
-    let session_jobs = crate::tools::take_last_jobs();
+    let (builtin_env, mut tools) = crate::tools::session_builtin_tools_with_env(
+        cwd,
+        edit_mode_for(&selected.model.id),
+        &settings,
+    );
+    // The session's `dyn` bridge and job registry both come from this build,
+    // before anything else builds a throwaway tool set.
+    let session_jobs = Some(builtin_env.jobs.clone()).or_else(crate::tools::take_last_jobs);
     tools.extend(crate::tools::mcp::mcp_tools(cwd));
     tools.extend(crate::tools::wasm::wasm_tools(cwd));
     // Hidden tools (TS `HIDDEN_TOOLS`): the active legs (think) are appended
@@ -218,6 +223,11 @@ pub fn build_agent(
         Some(gate) => gate.wrap_tools(tools),
         None => tools,
     };
+    // Publish the final surface (settings filter, hidden tools, extension tools
+    // and the context tool, gate included) to the in-process shell's `dyn`
+    // builtin, and keep the env reachable for later tool-list swaps.
+    builtin_env.set_dyn_tools(&tools);
+    crate::tools::set_session_env(&builtin_env);
     let target: Target = Arc::new(RwLock::new(Some(ProviderTarget {
         api_key: selected.api_key,
         model: selected.model,

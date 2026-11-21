@@ -2083,4 +2083,208 @@ mod tests {
             "host cwd untouched"
         );
     }
+    /// Whether `pid` no longer runs: already reaped, or a zombie whose parent
+    /// has not collected it yet. A killed grandchild is briefly either, so both
+    /// count as dead.
+    fn pid_is_dead(pid: i32) -> bool {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::kill;
+            use nix::unistd::Pid;
+            if kill(Pid::from_raw(pid), None).is_err() {
+                return true;
+            }
+            #[cfg(target_os = "linux")]
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                return stat
+                    .rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
+            }
+            false
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            true
+        }
+    }
+
+    /// Regression: the `cwd` parameter defines `$PWD` as well as the shell's
+    /// working directory. A `$PWD` inherited from the host process would make
+    /// `pwd` and `$PWD` disagree, so every relative path built from `$PWD`
+    /// would resolve against the host's directory instead of the workspace.
+    #[tokio::test]
+    async fn in_process_pwd_env_matches_cwd_parameter() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let env = std::sync::Arc::new(super::super::Env::new(dir.path(), false));
+        let r = bash(
+            env,
+            serde_json::json!({
+                "cwd": "sub",
+                "command": r#"printf '%s|%s\n' "$(pwd)" "$PWD""#,
+            }),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let out = text_of(&r);
+        let first = out.lines().next().unwrap_or_default();
+        let (builtin, var) = first.split_once('|').unwrap_or((first, ""));
+        assert_eq!(builtin, var, "`pwd` and `$PWD` disagree: {out}");
+        let want = std::fs::canonicalize(&sub).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(builtin).unwrap(),
+            want,
+            "`$PWD` follows the cwd parameter: {out}"
+        );
+        let host_pwd = std::env::var("PWD").unwrap_or_default();
+        assert_ne!(
+            var, host_pwd,
+            "the shell must not inherit the host process's PWD: {out}"
+        );
+    }
+
+    /// Regression (hung TUI menus): the `/dev/tty` denial holds for alias
+    /// spellings too. `/dev/../dev/tty` is the same device node under a
+    /// different `Path`, so a literal `path == "/dev/tty"` test admits it and
+    /// lets the command take over the host terminal.
+    #[tokio::test]
+    async fn in_process_tty_alias_is_denied() {
+        let policy =
+            super::super::shell_host::CliPathPolicy::new(std::path::Path::new("/tmp"), false);
+        for alias in ["/dev/../dev/tty", "/dev/tty"] {
+            assert!(
+                omp_shell::PathPolicy::check_read(&policy, std::path::Path::new(alias)).is_err(),
+                "the policy admits the controlling-tty path {alias}"
+            );
+        }
+
+        let r = bash(
+            test_env(),
+            serde_json::json!({
+                "command": ": </dev/../dev/tty; echo alias_rc=$?; : </dev/tty; echo plain_rc=$?",
+            }),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let out = text_of(&r);
+        assert!(
+            out.contains("sandbox denied read to /dev/../dev/tty"),
+            "the alias is refused by the sandbox, not opened: {out}"
+        );
+        assert!(out.contains("alias_rc=1"), "the alias fails: {out}");
+        assert!(out.contains("plain_rc=1"), "the plain path fails: {out}");
+    }
+
+    /// Regression: an abort tears down the whole process group, not just the
+    /// direct child. A grandchild forked into the background outlives the shell
+    /// and keeps running, so the teardown is asserted on the grandchild's pid.
+    ///
+    /// Synchronization is the `child.pid` file the command writes once the
+    /// grandchild exists: no fixed delay, and the abort is issued only after
+    /// that pid is readable.
+    #[tokio::test]
+    async fn in_process_timeout_kills_backgrounded_grandchild_via_pgid() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = pa_agent::abort::AbortController::new();
+        let env = std::sync::Arc::new(super::super::Env::new(dir.path(), false));
+        let running = tokio::spawn(bash(
+            env,
+            serde_json::json!({"command": "sh -c 'sleep 30 & echo $! > child.pid; wait'"}),
+            controller.signal(),
+        ));
+
+        let pid_file = dir.path().join("child.pid");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the grandchild pid never reached {}",
+                pid_file.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        controller.abort();
+        let err = running.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("[Command aborted]"), "{err}");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pid_is_dead(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "grandchild {pid} survived the pgid teardown"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Regression: the `dyn` catalog is the settings-gated session list. A tool
+    /// switched off by settings is neither advertised nor dispatchable through
+    /// the in-process `dyn` builtin.
+    #[tokio::test]
+    async fn session_dyn_bridge_respects_settings_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yml");
+        std::fs::write(
+            &cfg,
+            "find:\n  enabled: \"off\"\ncheckpoint:\n  enabled: false\n",
+        )
+        .unwrap();
+        let settings = omp_settings::Settings::load_from(Some(&cfg), dir.path());
+        let tools =
+            super::super::session_builtin_tools(dir.path(), pi_edit::EditMode::Replace, &settings);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"read"), "read stays advertised: {names:?}");
+        assert!(
+            !names.contains(&"find"),
+            "find.enabled off hides find: {names:?}"
+        );
+        assert!(
+            !names.contains(&"checkpoint"),
+            "checkpoint.enabled false hides checkpoint: {names:?}"
+        );
+        // Both are built-ins: the omissions are the settings gate, not a
+        // missing tool.
+        let ungated = super::super::builtin_tools(dir.path(), pi_edit::EditMode::Replace);
+        for gated in ["find", "checkpoint"] {
+            assert!(
+                ungated.iter().any(|t| t.name() == gated),
+                "{gated} is a built-in, only its setting hides it"
+            );
+        }
+
+        let bash_tool = tools
+            .iter()
+            .find(|t| t.name() == "bash")
+            .cloned()
+            .expect("bash is advertised");
+        let catalog = text_of(
+            &bash_tool
+                .execute(
+                    String::new(),
+                    serde_json::json!({"command": "dyn"}),
+                    sig(),
+                    std::sync::Arc::new(|_r: AgentToolResult| {}),
+                )
+                .await
+                .unwrap(),
+        );
+        let listed = |name: &str| {
+            catalog
+                .lines()
+                .any(|l| l.trim_start().starts_with(&format!("{name} —")))
+        };
+        assert!(listed("read"), "dyn lists read: {catalog}");
+        assert!(!listed("find"), "dyn must omit find: {catalog}");
+        assert!(!listed("checkpoint"), "dyn must omit checkpoint: {catalog}");
+    }
 }

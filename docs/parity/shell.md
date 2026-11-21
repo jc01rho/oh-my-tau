@@ -49,9 +49,9 @@ service path. See §1 and §9.
 | Parser / AST | `vendor/omp-shell/src/parser/` via the interpreter | `Parser::new(.., ParserOptions::default())` in `analyze_script` (`shell_host.rs:459-476`) | **PRESENT** |
 | Expansion | `expansion.rs`, `braceexpansion.rs`, `arithmetic.rs`, `patterns.rs`, `regex.rs`, `escape.rs` | same | **PRESENT** |
 | Static analysis | `analyze_script` → `omp_shell::analysis::analyze` → `ScriptIr` + `omp_proto::…::BashIr::from(&ir)` (`shell_host.rs:459-476`); called on every `execute_shell` run for IR telemetry (`commands`, `is_read_only`, `writes_outside`, `opaque_count`) and exercised by unit tests | same | **PRESENT** (runs on live path for IR inspection; pre-exec deny policy can layer on top) |
-| Env / cwd | `do_not_inherit_env(true)` then every `std::env::vars_os()` re-exported as `ShellVariable` (`shell_host.rs:508-518`); stdin is `openfiles::null()` | same | **PARITY** |
+| Env / cwd | `do_not_inherit_env(true)` then `std::env::vars_os()` re-exported as `ShellVariable` (`shell_host.rs:508-518`), but filtered to entries whose key **and** value are UTF-8 (`to_str()`), so non-UTF-8 pairs are dropped rather than re-exported; stdin is `openfiles::null()` | same | **PARITY** (env re-export is UTF-8-only) |
 | Cancellation | `AbortSignal` → `ExecutionParameters::set_cancel_token` + `SpawnBook::signal_groups(SIGKILL)` (`killpg`) on timeout/abort (`shell_host.rs:568-575`); pinned by `cancel_aborts_spawned_child_via_pgid` | same | **PARITY** |
-| Sandboxing | `CliPathPolicy` (in-process write root) + `CliSpawnWrapper` (external binaries still re-exec through `wrap_inner` → `omt __sandbox-exec`) | `PathPolicy` / `SpawnWrapper` | **PARITY** — pinned by `path_policy_enforces_workspace_write_root` and `sandbox_path_policy_blocks_in_process_redirection_outside_root` |
+| Sandboxing | `CliPathPolicy` (in-process writes limited to `cwd` plus `/dev/null`) + `CliSpawnWrapper` (external binaries still re-exec through `wrap_inner` → `omt __sandbox-exec`) | `PathPolicy` / `SpawnWrapper`; the external Landlock policy (`features/sandbox.rs`) additionally permits `/tmp` and the agent directory | **PRESENT-GAP** — in-process writes are narrower than the external Landlock policy (no `/tmp`, no agent dir), so sandboxing is not full parity; pinned by `path_policy_enforces_workspace_write_root` and `sandbox_path_policy_blocks_in_process_redirection_outside_root` |
 
 ### `execute_shell` shape (`shell_host.rs:547-706`)
 
@@ -74,11 +74,15 @@ service path. See §1 and §9.
 ### What `bash.rs` does per call
 
 1. `run` (`:345-354`) forwards to `run_with_dyn` with `dyn_tools: None`; `bash()` calls
-   `run_with_dyn` directly with `env.dyn_tools()` (`:746`). `run_with_dyn` (`:356-382`) builds
-   `exec 2>&1\n{command}` **only** to test the `/ssh` branch: if `features::ssh::remote_argv`
-   yields a target it hands off to `run_remote_ssh` (`:385-...`, external `ssh`); otherwise it
-   builds a `ShellExecRequest { cwd, command, timeout, signal, dyn_tools, retain_bytes:
-   RETAIN_BYTES, on_chunk, tap }` and awaits `execute_shell`.
+   `run_with_dyn` directly with `env.dyn_tools()` (`:746`). `run_with_dyn` (`:356-382`) first
+   builds `script = format!("exec 2>&1\n{command}")` and asks
+   `features::ssh::remote_argv(&script)` for a target. When `/ssh` is active, that `script`
+   string — the stderr-merge wrapper itself, not merely a probe — is POSIX-quoted and passed to
+   `run_remote_ssh` as `ssh <target> -- bash -lc <script>` (`:385-...`, external `ssh`). When no
+   target is set, `remote_argv` yields `None`, the wrapped `script` is discarded, and the
+   **unwrapped** `command` is what goes into the `ShellExecRequest { cwd, command, timeout,
+   signal, dyn_tools, retain_bytes: RETAIN_BYTES, on_chunk, tap }` awaited on `execute_shell`
+   (which merges stderr itself by duplicating the pipe write end onto fd 2).
 2. `on_chunk` is `notify`-driven: `Box<dyn FnMut(&str) + Send>` feeding `Notify::feed`, so
    `notify` regexes now match on live chunks from the interpreter instead of a reader loop.
 3. Bound the result: BM25 relevance view (`tools/relevance.rs`), else `sink_window` middle
@@ -169,7 +173,7 @@ Schema (from `crates/omp-cli/src/tools.rs` `bash()`):
 
 | Arg | Target behavior | Notes |
 |---|---|---|
-| `command` | required; currently passed verbatim to the external launcher | parsed by `analyze_script`/`omp-shell` once `run` calls `execute_shell` |
+| `command` | required; local finite and background commands run **in-process** through `execute_shell` (`omp-shell` interpreter) — only `/ssh` commands and `start_service` daemon supervision are external | parsed by `analyze_script`/`omp-shell` on the in-process path |
 | `timeout` | `f64`, clamped `1..=3600`, default `300`; `0` disables | `timeout_arg`; `details.requestedTimeoutSeconds` records overrides |
 | `cwd` | `resolve_to_cwd`, defaults to session cwd | also the `Shell` working dir and the `CliPathPolicy` write root |
 | `async` | registers `bg_N` in `JobRegistry`, returns `Backgrounded as job bg_N (deadline Ns)`, output via `proc://<id>` | `start_background` → `run` |
@@ -241,7 +245,9 @@ members consumed by `crates/omp-cli` as `omp-shell.workspace = true` / `omp-shel
 - `normalize_for_policy` canonicalizes the path, or its deepest existing ancestor with the
   remaining tail re-appended, so `..` and symlink escapes cannot slip past the prefix test.
 - Construction takes `(write_root, sandbox_enabled)`; `execute_shell` passes
-  `features::sandbox::enabled()`, so the policy is unrestricted when `/sandbox` is off.
+  `features::sandbox::enabled()`, so with `/sandbox` off the **workspace write** restriction is
+  lifted (writes are then allowed anywhere) — but `/dev/tty` is still rejected in
+  `check_read`, `check_write`, and `open`, so the policy is never fully unrestricted.
 - `check_read` denies `/dev/tty` and otherwise allows; `check_write` denies `/dev/tty`
   first, allows `/dev/null` unconditionally, and otherwise requires the normalized target to
   stay under `write_root`. `open` rejects `/dev/tty` for every access mode before applying the
@@ -254,6 +260,10 @@ members consumed by `crates/omp-cli` as `omp-shell.workspace = true` / `omp-shel
 `CliSpawnWrapper` (`shell_host.rs:222-257`) adapts `features::sandbox::wrap_inner(write_root, &[])`
 to `SpawnWrapper::launcher()`, so external binaries run from the in-process shell still
 re-exec through `omt __sandbox-exec` with Landlock/seccomp; `env_allowed` admits every key.
+Activation is conditional: `wrap_inner` returns a launcher only when `/sandbox` is enabled
+**and** the build targets Linux **and** the kernel reports Landlock available
+(`KernelStatus::Available`). Otherwise it returns `None`, `from_sandbox` stores no launcher,
+`launcher()` yields `None`, and those external binaries run unsandboxed.
 
 ---
 

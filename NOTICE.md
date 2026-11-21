@@ -19,7 +19,7 @@ Copyright (c) 2026 Stencil Labs, Inc.).
 | --- | --- | --- |
 | `pa-agent`, `pa-ai`, `pa-models`, `pa-types` | [PrimeIntellect-ai/prime-agent](https://github.com/PrimeIntellect-ai/prime-agent) — **modified** in this repo | MIT, see [`vendor/LICENSE-prime-agent`](vendor/LICENSE-prime-agent) |
 | `pi-ast`, `pi-diff`, `pi-edit`, `pi-predict`, `pi-vfs`, `pi-walker` | oh-my-pi (can1357/oh-my-pi), vendored verbatim per each crate's `Cargo.toml` | MIT, see [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi) |
-| `omp-core`, `omp-macros`, `omp-vocab`, `omp-walker`, `omp-shell`, `omp-shell-builtins` | oh-my-pi (can1357/oh-my-pi) ref `omp2` @ `2f92f3b5aa2035d21c9f016f9ff6350795e5685a`, vendored verbatim (manifests pinned to build outside the upstream workspace) | MIT, see [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi) |
+| `omp-core`, `omp-macros`, `omp-vocab`, `omp-walker`, `omp-shell`, `omp-shell-builtins` | **adapted from** oh-my-pi (can1357/oh-my-pi) ref `omp2` @ `2f92f3b5aa2035d21c9f016f9ff6350795e5685a`: vendored from that commit with manifests pinned to build outside the upstream workspace, but **adapted, not unmodified verbatim** — several crates carry further upstream lineage with retained notices (`omp-shell`: brush-core/brush-parser; `omp-shell-builtins`: uutils coreutils/findutils/sed and `pi-builtins`/`pi-shell`; `omp-walker`: `pi-walker`; `omp-core`: `serde_json`). See each crate's `LICENSE`/`NOTICE`, listed below | MIT, see [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi); per-crate files listed below |
 | `omp-tool`, `omp-proto`, `xutf` | **local shims**, not upstream code — see the note below the table | MIT (this project) |
 | `crossterm` | fork of [crossterm](https://github.com/crossterm-rs/crossterm) 0.28 | MIT, see [`vendor/crossterm/LICENSE`](vendor/crossterm/LICENSE) |
 | `laya-ort` | part of this project (ONNX Runtime inference for the Laya judge) | MIT, plus the `ort` / ONNX Runtime terms below |
@@ -32,6 +32,30 @@ Per-crate notices:
 - [`vendor/pa-types/NOTICE`](vendor/pa-types/NOTICE)
 
 Each file documents the PrimeIntellect-ai/prime-agent MIT lineage and enumerates the modifications made in this repository.
+
+Provenance files shipped with the adapted `omp-*` crates; read them before
+reusing or re-vendoring that code:
+
+- [`vendor/omp-core/LICENSE`](vendor/omp-core/LICENSE) and
+  [`vendor/omp-core/NOTICE`](vendor/omp-core/NOTICE) — MIT (Stencil Labs, Inc.);
+  the `slopjson` `json!` muncher is adapted from `serde_json`.
+- [`vendor/omp-macros/LICENSE`](vendor/omp-macros/LICENSE) — MIT (Stencil Labs, Inc.).
+- `omp-vocab` ships no per-crate license file; its terms are the oh-my-pi MIT text in
+  [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi).
+- [`vendor/omp-walker/LICENSE`](vendor/omp-walker/LICENSE) and
+  [`vendor/omp-walker/NOTICE`](vendor/omp-walker/NOTICE) — MIT; continues the earlier
+  `pi-walker` implementation (renamed, extended and modified; no separate `pi-walker`
+  copyright notice was present in the incorporated snapshot).
+- [`vendor/omp-shell/LICENSE`](vendor/omp-shell/LICENSE) and
+  [`vendor/omp-shell/README.md`](vendor/omp-shell/README.md) — incorporates and adapts
+  brush-core 0.5.0 and brush-parser 0.4.0 (MIT, Copyright (c) 2024 reuben olinsky),
+  compiled directly into the engine with local fixes and interactive-shell machinery removed.
+- [`vendor/omp-shell-builtins/LICENSE`](vendor/omp-shell-builtins/LICENSE) and
+  [`vendor/omp-shell-builtins/NOTICE`](vendor/omp-shell-builtins/NOTICE) — ported from
+  `pi-builtins`, retaining per-module notices for uutils coreutils 0.8.0, uutils
+  findutils (Google Inc. 2017; Tavian Barnes 2017, 2022; Collabora, Ltd. 2021, 2022),
+  uutils sed 0.1.1 (Copyright (c) 2025 Diomidis Spinellis), the `wc` UTF-8 decoder
+  (Copyright (c) Simon Sapin and many others), and earlier `pi-shell` implementations.
 
 Notes:
 

@@ -13,11 +13,20 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::{os::fd::OwnedFd, path::Component};
+
 use anyhow::{Context, Result};
+#[cfg(unix)]
+use nix::{
+    fcntl::{openat, readlinkat, OFlag, AT_FDCWD},
+    sys::stat::{fstat, mode_t, Mode, SFlag},
+    unistd::isatty,
+};
 use omp_core::Str;
 use omp_proto::omp::policy::v1::BashIr;
 use omp_shell::{
@@ -25,8 +34,9 @@ use omp_shell::{
     builtins::{self, Registration},
     openfiles::{OpenFile, OpenFiles},
     parser::{Parser, ParserOptions},
-    ExecutionParameters, PathAccess, PathDenied, PathPolicy, ProcessScope, ProfileLoadBehavior,
-    RcLoadBehavior, Shell, ShellVariable, SourceInfo, SpawnObserver, SpawnWrapper,
+    ExecutionParameters, OpenRequest, PathAccess, PathDenied, PathPolicy, ProcessGroupPolicy,
+    ProcessScope, ProfileLoadBehavior, RcLoadBehavior, Shell, ShellVariable, SourceInfo,
+    SpawnObserver, SpawnWrapper,
 };
 use omp_shell_builtins::{
     dyn_builtin, process_builtins, utility_builtins, DynCallOutput, DynDevice, DynFault, DynFuture,
@@ -96,19 +106,40 @@ fn normalize_for_policy(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Purely lexical `.`/`..` collapse. Never touches the filesystem.
+#[cfg(unix)]
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn is_null_device(path: &Path) -> bool {
     path == Path::new("/dev/null")
 }
 
-fn is_controlling_tty(path: &Path) -> bool {
-    path == Path::new("/dev/tty")
-}
-
 /// File access policy enforcing workspace write boundaries when sandboxing is
 /// active (`sandbox_enabled = true`).
+///
+/// Admission stays the lexical rule; enforcement is an `openat(2)` walk anchored
+/// on a pinned root descriptor, so re-pointing a component between admission and
+/// open cannot redirect the write outside the root.
 #[derive(Debug, Clone)]
 pub struct CliPathPolicy {
     write_root: PathBuf,
+    /// Descriptor pinning the resolved root. Every sandboxed write walks down
+    /// from here, so re-pointing any component after admission cannot redirect
+    /// the write.
+    #[cfg(unix)]
+    write_root_fd: Option<Arc<OwnedFd>>,
     sandbox_enabled: bool,
 }
 
@@ -117,9 +148,21 @@ impl CliPathPolicy {
     /// `sandbox_enabled` is true (or unrestricted when false).
     #[must_use]
     pub fn new(write_root: &Path, sandbox_enabled: bool) -> Self {
+        let write_root = normalize_for_policy(write_root);
+        #[cfg(unix)]
+        let write_root_fd = open_dir_anchor(&write_root);
         Self {
-            write_root: normalize_for_policy(write_root),
+            write_root,
+            #[cfg(unix)]
+            write_root_fd,
             sandbox_enabled,
+        }
+    }
+
+    fn deny(path: &Path, access: PathAccess) -> PathDenied {
+        PathDenied {
+            path: path.to_path_buf(),
+            access,
         }
     }
 
@@ -131,88 +174,306 @@ impl CliPathPolicy {
         }
     }
 
+    /// Returns whether `path` names the controlling terminal.
+    ///
+    /// Compares the resolved target, which closes the alias spellings a literal
+    /// `path == "/dev/tty"` test lets through (`/dev/../dev/tty`, a symlink into
+    /// the terminal, or a relative path that resolves there). Absolute paths go
+    /// through [`normalize_for_policy`]; relative ones are joined to the write
+    /// root first.
+    fn is_controlling_tty(&self, path: &Path) -> bool {
+        self.resolve_under_root(path) == Path::new("/dev/tty")
+    }
+
     fn write_allowed(&self, path: &Path) -> bool {
-        if !self.sandbox_enabled || is_null_device(path) {
+        if !self.sandbox_enabled || is_null_device(&normalize_for_policy(path)) {
             return true;
         }
-        let target = self.resolve_under_root(path);
-        target.starts_with(&self.write_root)
+        self.resolve_under_root(path).starts_with(&self.write_root)
     }
 }
 
 impl PathPolicy for CliPathPolicy {
     fn check_read(&self, path: &Path) -> std::result::Result<(), PathDenied> {
-        if is_controlling_tty(path) {
-            return Err(PathDenied {
-                path: path.to_path_buf(),
-                access: PathAccess::Read,
-            });
+        if self.is_controlling_tty(path) {
+            return Err(Self::deny(path, PathAccess::Read));
         }
         Ok(())
     }
 
     fn check_write(&self, path: &Path) -> std::result::Result<(), PathDenied> {
-        if is_controlling_tty(path) || !self.write_allowed(path) {
-            Err(PathDenied {
-                path: path.to_path_buf(),
-                access: PathAccess::Write,
-            })
+        if self.is_controlling_tty(path) || !self.write_allowed(path) {
+            Err(Self::deny(path, PathAccess::Write))
         } else {
             Ok(())
         }
     }
 
-    fn open(
-        &self,
-        path: &Path,
-        request: omp_shell::OpenRequest,
-    ) -> std::result::Result<fs::File, PathDenied> {
-        if is_controlling_tty(path) {
-            return Err(PathDenied {
-                path: path.to_path_buf(),
-                access: request.access,
-            });
-        }
-        let is_write = !matches!(request.access, PathAccess::Read);
-        if is_write && !self.write_allowed(path) {
-            return Err(PathDenied {
-                path: path.to_path_buf(),
-                access: request.access,
-            });
-        }
-        let mut opts = OpenOptions::new();
-        match request.access {
-            PathAccess::Read => {
-                opts.read(true);
-            }
-            PathAccess::CreateNew => {
-                opts.write(true).create_new(true);
-            }
-            PathAccess::Truncate => {
-                opts.write(true).create(true).truncate(true);
-            }
-            PathAccess::Append => {
-                opts.write(true).create(true).append(true);
-            }
-            PathAccess::ReadWrite => {
-                opts.read(true).write(true).create(true);
-            }
-            PathAccess::Write => {
-                opts.write(true).create(true);
-            }
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            if is_write && request.create_mode != 0 {
-                opts.mode(request.create_mode);
-            }
-        }
-        opts.open(path).map_err(|_| PathDenied {
-            path: path.to_path_buf(),
-            access: request.access,
-        })
+    fn open(&self, path: &Path, request: OpenRequest) -> std::result::Result<fs::File, PathDenied> {
+        open_authorized(self, path, request)
     }
+}
+
+/// Pins the resolved write root so a later rename cannot redirect the walk.
+#[cfg(unix)]
+fn open_dir_anchor(path: &Path) -> Option<Arc<OwnedFd>> {
+    openat(
+        AT_FDCWD,
+        path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()
+    .map(Arc::new)
+}
+
+#[cfg(unix)]
+const fn oflag_for(access: PathAccess) -> (OFlag, bool) {
+    match access {
+        PathAccess::Read => (OFlag::O_RDONLY, false),
+        PathAccess::CreateNew => (
+            OFlag::O_WRONLY.union(OFlag::O_CREAT).union(OFlag::O_EXCL),
+            true,
+        ),
+        PathAccess::Truncate => (
+            OFlag::O_WRONLY.union(OFlag::O_CREAT).union(OFlag::O_TRUNC),
+            true,
+        ),
+        PathAccess::Append => (
+            OFlag::O_WRONLY.union(OFlag::O_CREAT).union(OFlag::O_APPEND),
+            true,
+        ),
+        PathAccess::ReadWrite => (OFlag::O_RDWR.union(OFlag::O_CREAT), true),
+        PathAccess::Write => (OFlag::O_WRONLY.union(OFlag::O_CREAT), true),
+    }
+}
+
+#[cfg(unix)]
+fn file_kind(st_mode: mode_t) -> Option<SFlag> {
+    mode_t::try_from(st_mode)
+        .ok()
+        .map(SFlag::from_bits_truncate)
+}
+
+#[cfg(unix)]
+fn is_dir_fd(fd: &OwnedFd) -> bool {
+    fstat(fd).is_ok_and(|st| file_kind(st.st_mode).is_some_and(|k| k.contains(SFlag::S_IFDIR)))
+}
+
+/// Returns whether `fd` is any terminal: `/dev/tty`, a `pts` node, or an alias
+/// such as `/proc/self/fd/0`. Fails closed when the descriptor cannot be
+/// inspected.
+#[cfg(unix)]
+fn is_terminal_fd(fd: &OwnedFd) -> bool {
+    let Ok(st) = fstat(fd) else { return true };
+    if !file_kind(st.st_mode).is_some_and(|k| k.contains(SFlag::S_IFCHR)) {
+        return false;
+    }
+    isatty(fd).unwrap_or(true)
+}
+
+#[cfg(unix)]
+fn check_not_terminal(
+    fd: OwnedFd,
+    path: &Path,
+    access: PathAccess,
+) -> std::result::Result<fs::File, PathDenied> {
+    if is_terminal_fd(&fd) {
+        return Err(CliPathPolicy::deny(path, access));
+    }
+    Ok(fs::File::from(fd))
+}
+
+#[cfg(unix)]
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Opens `path` through an atomically authorized, descriptor-anchored walk.
+#[cfg(unix)]
+fn open_authorized(
+    policy: &CliPathPolicy,
+    path: &Path,
+    request: OpenRequest,
+) -> std::result::Result<fs::File, PathDenied> {
+    let access = request.access;
+    let deny = || CliPathPolicy::deny(path, access);
+    let (flags, creates) = oflag_for(access);
+    let mode = if creates && request.create_mode != 0 {
+        Mode::from_bits_truncate(request.create_mode as mode_t)
+    } else {
+        Mode::empty()
+    };
+    let base = flags.union(OFlag::O_CLOEXEC).union(OFlag::O_NOCTTY);
+
+    // Reads are unrestricted tree-wide, and `/dev/null` is the one device
+    // exemption: no containment walk, but still no terminal handed back.
+    if matches!(access, PathAccess::Read)
+        || !policy.sandbox_enabled
+        || is_null_device(&normalize_for_policy(path))
+    {
+        let fd = openat(AT_FDCWD, path, base, mode).map_err(|_| deny())?;
+        return check_not_terminal(fd, path, access);
+    }
+
+    // Admission is the unchanged lexical rule; the walk below is the enforcement.
+    if !policy.write_allowed(path) {
+        return Err(deny());
+    }
+    let Some(root_fd) = policy.write_root_fd.as_deref() else {
+        return Err(deny()); // fail closed when the root could not be pinned
+    };
+    let target = policy.resolve_under_root(path);
+    let Ok(relative) = target.strip_prefix(&policy.write_root) else {
+        return Err(deny());
+    };
+
+    // NOTE: no `O_DIRECTORY`. Combined with `O_NOFOLLOW` a symlink-to-dir would
+    // otherwise report `ENOTDIR` and hide the link; directory-ness is validated
+    // with `fstat` on the returned descriptor instead.
+    let dir_flags = OFlag::O_RDONLY
+        .union(OFlag::O_NOFOLLOW)
+        .union(OFlag::O_CLOEXEC);
+    let root_path = policy.write_root.clone();
+    let mut pending: Vec<OsString> = relative
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    if pending.is_empty() {
+        return Err(deny());
+    }
+
+    let mut hops = 0usize;
+    let mut depth = 0usize;
+    let mut dirfd = root_fd.try_clone().map_err(|_| deny())?;
+    loop {
+        let Some(name) = pending.get(depth).cloned() else {
+            return Err(deny());
+        };
+        let is_last = depth + 1 == pending.len();
+        let step_flags = if is_last {
+            base.union(OFlag::O_NOFOLLOW)
+        } else {
+            dir_flags
+        };
+        match openat(
+            &dirfd,
+            name.as_os_str(),
+            step_flags,
+            if is_last { mode } else { Mode::empty() },
+        ) {
+            Ok(fd) if is_last => return check_not_terminal(fd, path, access),
+            Ok(next) => {
+                if !is_dir_fd(&next) {
+                    return Err(deny());
+                }
+                dirfd = next;
+                depth += 1;
+            }
+            Err(nix::errno::Errno::ELOOP) => {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Err(deny());
+                }
+                let Ok(link) = readlinkat(&dirfd, name.as_os_str()) else {
+                    return Err(deny());
+                };
+                let link = PathBuf::from(link);
+                let mut base_dir = root_path.clone();
+                for done in &pending[..depth] {
+                    base_dir.push(done);
+                }
+                let joined = if link.is_absolute() {
+                    link
+                } else {
+                    base_dir.join(link)
+                };
+                // Normalize BEFORE the prefix test: `ws/d/../../secret` still
+                // lexically starts with `ws`, and collapsing after the test would
+                // silently retarget the write instead of refusing the escape.
+                let joined = normalize_lexical(&joined);
+                let Ok(next_rel) = joined.strip_prefix(&root_path) else {
+                    return Err(deny());
+                };
+                let mut rest: Vec<OsString> = next_rel
+                    .components()
+                    .filter_map(|c| match c {
+                        Component::Normal(n) => Some(n.to_os_string()),
+                        _ => None,
+                    })
+                    .collect();
+                rest.extend(pending[depth + 1..].iter().cloned());
+                if rest.is_empty() {
+                    return Err(deny());
+                }
+                pending = rest;
+                depth = 0;
+                dirfd = root_fd.try_clone().map_err(|_| deny())?;
+            }
+            Err(_) => return Err(deny()),
+        }
+    }
+}
+
+/// Portable fallback: lexical write-root enforcement with no `nix` dependency.
+///
+/// Compiled on every platform so it stays type-checked and tested on unix; only
+/// *called* where `nix` is unavailable.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "unix builds take open_authorized; tests exercise this fallback"
+    )
+)]
+fn open_portable(
+    policy: &CliPathPolicy,
+    path: &Path,
+    request: OpenRequest,
+) -> std::result::Result<fs::File, PathDenied> {
+    if !matches!(request.access, PathAccess::Read) && !policy.write_allowed(path) {
+        return Err(CliPathPolicy::deny(path, request.access));
+    }
+    let mut opts = OpenOptions::new();
+    match request.access {
+        PathAccess::Read => {
+            opts.read(true);
+        }
+        PathAccess::CreateNew => {
+            opts.write(true).create_new(true);
+        }
+        PathAccess::Truncate => {
+            opts.write(true).create(true).truncate(true);
+        }
+        PathAccess::Append => {
+            opts.write(true).create(true).append(true);
+        }
+        PathAccess::ReadWrite => {
+            opts.read(true).write(true).create(true);
+        }
+        PathAccess::Write => {
+            opts.write(true).create(true);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if request.create_mode != 0 {
+            opts.mode(request.create_mode);
+        }
+    }
+    opts.open(path)
+        .map_err(|_| CliPathPolicy::deny(path, request.access))
+}
+
+#[cfg(not(unix))]
+fn open_authorized(
+    policy: &CliPathPolicy,
+    path: &Path,
+    request: OpenRequest,
+) -> std::result::Result<fs::File, PathDenied> {
+    open_portable(policy, path, request)
 }
 
 /// External command spawn wrapper adapting [`crate::features::sandbox::wrap_inner`]
@@ -294,9 +555,6 @@ impl SpawnBook {
             }
         }
     }
-
-    #[cfg(not(unix))]
-    pub fn signal_groups_best_effort(&self) {}
 }
 
 impl SpawnObserver for SpawnBook {
@@ -342,7 +600,10 @@ impl ProcessScope for SpawnBook {
 
 /// Callback type stored on [`super::Env`] to expose host tools to the `dyn`
 /// shell builtin without creating recursive `bash`/`dyn` loops.
-pub type DynToolList = Arc<Vec<Arc<dyn AgentTool>>>;
+///
+/// Held weakly: the tool registry already owns these tools, and an owning list
+/// would keep the registry alive through the `dyn` builtin it owns.
+pub type DynToolList = Arc<Vec<Weak<dyn AgentTool>>>;
 
 /// Bridges registered host `AgentTool` instances to `omp-shell-builtins` `dyn`.
 pub struct CliDynHost {
@@ -357,14 +618,15 @@ impl CliDynHost {
         Self { tools }
     }
 
-    fn visible_tools(&self) -> impl Iterator<Item = &Arc<dyn AgentTool>> {
+    fn visible_tools(&self) -> impl Iterator<Item = Arc<dyn AgentTool>> + '_ {
         self.tools
             .iter()
+            .filter_map(Weak::upgrade)
             .filter(|t| !matches!(t.name(), "bash" | "dyn"))
     }
 
     fn find_tool(&self, name: &str) -> Option<Arc<dyn AgentTool>> {
-        self.visible_tools().find(|t| t.name() == name).cloned()
+        self.visible_tools().find(|t| t.name() == name)
     }
 }
 
@@ -509,10 +771,19 @@ pub async fn build_embedded_shell(
         let (Some(k), Some(v)) = (name.to_str(), value.to_str()) else {
             continue;
         };
+        // `PWD`/`OLDPWD` describe the embedding process, not this shell: a stale
+        // `PWD` makes relative paths resolve against the wrong directory. `PWD`
+        // is re-set from `cwd` below; `OLDPWD` stays unset.
+        if matches!(k, "PWD" | "OLDPWD") {
+            continue;
+        }
         let mut var = ShellVariable::new(v);
         var.export();
         builder = builder.var(k, var);
     }
+    let mut pwd = ShellVariable::new(cwd.to_string_lossy().into_owned());
+    pwd.export();
+    builder = builder.var("PWD", pwd);
     builder
         .build()
         .await
@@ -584,6 +855,10 @@ pub async fn execute_shell(mut req: ShellExecRequest<'_>) -> Result<ShellExecRes
     let cancel_token = CancellationToken::new();
 
     let mut params: ExecutionParameters = shell.default_exec_params();
+    // The embedded shell is non-interactive, so job control is off and the
+    // default keeps children in the agent's own process group. A new group per
+    // command is what makes `-pgid` teardown target only this command.
+    params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
     params.set_fd(OpenFiles::STDIN_FD, stdin_null);
     params.set_fd(OpenFiles::STDOUT_FD, OpenFile::from(pipe_write));
     params.set_fd(OpenFiles::STDERR_FD, OpenFile::from(stderr_write));
@@ -673,7 +948,7 @@ pub async fn execute_shell(mut req: ShellExecRequest<'_>) -> Result<ShellExecRes
                 match res {
                     Ok(er) => exit_code = Some(i32::from(u8::from(&er.exit_code))),
                     Err(err) => {
-                        let _ = write!(io::sink(), "{err}");
+                        drain_chunk(format!("{err}\n").as_bytes());
                         exit_code = Some(1);
                     }
                 }
@@ -769,12 +1044,11 @@ fn decode_utf8_chunk(bytes: &[u8], carry: &mut Vec<u8>) -> String {
     out
 }
 
-use std::io::Write as _;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write as _;
 
     struct EchoTool;
     impl AgentTool for EchoTool {
@@ -849,7 +1123,11 @@ mod tests {
     async fn execute_shell_runs_pipes_heredoc_and_dyn_host() {
         let tmp = tempfile::tempdir().unwrap();
         let sig = AbortSignal::never();
-        let tools: DynToolList = Arc::new(vec![Arc::new(EchoTool)]);
+        // The registry owns the tool; `DynToolList` only holds a weak handle, so
+        // `echo` must outlive every `execute_shell` call below.
+        let echo: Arc<dyn AgentTool> = Arc::new(EchoTool);
+        let weak: Weak<dyn AgentTool> = Arc::downgrade(&echo);
+        let tools: DynToolList = Arc::new(vec![weak]);
 
         let res = execute_shell(ShellExecRequest {
             cwd: tmp.path(),
@@ -921,6 +1199,52 @@ mod tests {
             dyn_json.output.contains("pong:hi"),
             "got: {}",
             dyn_json.output
+        );
+        drop(echo);
+    }
+
+    #[test]
+    fn dyn_host_hides_bash_and_dyn_and_drops_dead_tools() {
+        let echo: Arc<dyn AgentTool> = Arc::new(EchoTool);
+        let host = CliDynHost::new(Arc::new(vec![Arc::downgrade(&echo)]));
+        assert_eq!(host.visible_tools().count(), 1);
+        assert!(host.find_tool("echo_device").is_some());
+        drop(echo);
+        // Upgrading a dangling weak handle yields nothing rather than panicking.
+        assert_eq!(host.visible_tools().count(), 0);
+        assert!(host.find_tool("echo_device").is_none());
+    }
+
+    #[tokio::test]
+    async fn shell_pwd_reflects_cwd_not_the_embedding_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let host_pwd = std::env::current_dir().unwrap();
+        assert_ne!(
+            host_pwd.as_path(),
+            ws.as_path(),
+            "test needs a distinct cwd"
+        );
+
+        let sig = AbortSignal::never();
+        let res = execute_shell(ShellExecRequest {
+            cwd: &ws,
+            command: "printf '%s' \"$PWD\"",
+            timeout: Some(10.0),
+            signal: &sig,
+            dyn_tools: None,
+            retain_bytes: 65536,
+            on_chunk: None,
+            tap: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0));
+        assert_eq!(
+            res.output,
+            ws.to_string_lossy(),
+            "stale inherited PWD leaked in"
         );
     }
 
@@ -1017,6 +1341,391 @@ mod tests {
         assert!(book.may_signal(4242));
         assert!(book.may_observe(4243));
         assert!(!book.may_signal(9999));
+    }
+
+    fn write_req(access: PathAccess) -> OpenRequest {
+        OpenRequest {
+            access,
+            create_mode: 0o644,
+        }
+    }
+
+    #[cfg(unix)]
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// Best-effort variant for racing threads: a losing `symlink` is expected
+    /// (`EEXIST`) and must not abort the flip loop.
+    #[cfg(unix)]
+    fn try_symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+        let _ = std::os::unix::fs::symlink(target, link);
+    }
+
+    /// Returns whether this process has a controlling terminal to test against.
+    #[cfg(unix)]
+    fn have_tty() -> bool {
+        fs::File::open("/dev/tty").is_ok()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_denies_dangling_symlink_escaping_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        let victim = tmp.path().join("created_by_escape.txt");
+        symlink(&victim, root.join("innocent"));
+
+        let policy = CliPathPolicy::new(&root, true);
+        // Admission passes lexically (the dangling link canonicalizes to its
+        // parent), so only the descriptor walk can refuse it.
+        assert!(policy.write_allowed(&root.join("innocent")));
+        assert!(policy
+            .open(&root.join("innocent"), write_req(PathAccess::Write))
+            .is_err());
+        assert!(!victim.exists(), "must not create outside the root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_allows_in_root_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(root.join("d")).unwrap();
+        fs::write(root.join("target.txt"), b"").unwrap();
+        fs::write(root.join("d").join("real.txt"), b"").unwrap();
+        symlink("target.txt", root.join("link.txt"));
+        symlink("d/real.txt", root.join("l1"));
+        symlink("l1", root.join("l2"));
+        symlink("d", root.join("link_dir"));
+
+        let policy = CliPathPolicy::new(&root, true);
+        let mut f = policy
+            .open(&root.join("link.txt"), write_req(PathAccess::Append))
+            .expect("in-root symlink write must follow, like bash");
+        f.write_all(b"hi").unwrap();
+        drop(f);
+        assert_eq!(fs::read(root.join("target.txt")).unwrap(), b"hi");
+
+        assert!(policy
+            .open(&root.join("l2"), write_req(PathAccess::Append))
+            .is_ok());
+        assert!(policy
+            .open(
+                &root.join("link_dir").join("n.txt"),
+                write_req(PathAccess::Write)
+            )
+            .is_ok());
+        assert!(root.join("d").join("n.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_denies_escaping_and_looping_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(root.join("d")).unwrap();
+        let outside = tmp.path().join("secret.txt");
+        fs::write(&outside, b"orig").unwrap();
+        symlink(&outside, root.join("bad"));
+        symlink("../../secret.txt", root.join("d").join("rel"));
+        symlink("b", root.join("a"));
+        symlink("a", root.join("b"));
+
+        let policy = CliPathPolicy::new(&root, true);
+        for name in ["bad", "a"] {
+            assert!(
+                policy
+                    .open(&root.join(name), write_req(PathAccess::Truncate))
+                    .is_err(),
+                "{name} must be refused"
+            );
+        }
+        assert!(policy
+            .open(&root.join("d").join("rel"), write_req(PathAccess::Truncate))
+            .is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"orig");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_create_new_is_noclobber_over_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("exists"), b"").unwrap();
+        fs::write(root.join("t.txt"), b"").unwrap();
+        symlink("t.txt", root.join("l"));
+
+        let policy = CliPathPolicy::new(&root, true);
+        assert!(policy
+            .open(&root.join("exists"), write_req(PathAccess::CreateNew))
+            .is_err());
+        // `O_CREAT|O_EXCL|O_NOFOLLOW` reports EEXIST on a symlink: noclobber
+        // refuses every link, even one that points inside the root.
+        assert!(policy
+            .open(&root.join("l"), write_req(PathAccess::CreateNew))
+            .is_err());
+        let f = policy
+            .open(&root.join("fresh"), write_req(PathAccess::CreateNew))
+            .expect("new in-root file must be creatable");
+        drop(f);
+        assert!(root.join("fresh").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_denies_terminal_spellings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        let policy = CliPathPolicy::new(&root, true);
+
+        for spelling in ["/dev/tty", "/dev/../dev/tty", "/dev//tty"] {
+            let path = Path::new(spelling);
+            assert!(policy.check_read(path).is_err(), "{spelling} read");
+            assert!(policy.check_write(path).is_err(), "{spelling} write");
+            assert!(
+                policy.open(path, write_req(PathAccess::Read)).is_err(),
+                "{spelling} open"
+            );
+        }
+
+        // A symlink inside the root pointing at the terminal is refused on the
+        // descriptor, not just by spelling.
+        let link = root.join("tty-link");
+        symlink("/dev/tty", &link);
+        assert!(policy.open(&link, write_req(PathAccess::Read)).is_err());
+        assert!(policy.open(&link, write_req(PathAccess::Write)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_denies_terminal_aliases_when_a_tty_exists() {
+        if !have_tty() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        let policy = CliPathPolicy::new(&root, true);
+
+        for spelling in ["/proc/self/fd/0", "/dev/fd/0", "/dev/stdin"] {
+            let path = Path::new(spelling);
+            let Ok(probe) = fs::File::open(path) else {
+                continue;
+            };
+            let is_tty = isatty(&probe).unwrap_or(false);
+            drop(probe);
+            if !is_tty {
+                continue;
+            }
+            assert!(
+                policy.open(path, write_req(PathAccess::Read)).is_err(),
+                "{spelling} is a tty and must be refused"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_allows_dev_null_and_char_pipes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        let policy = CliPathPolicy::new(&root, true);
+        assert!(policy.check_write(Path::new("/dev/null")).is_ok());
+        assert!(policy
+            .open(Path::new("/dev/null"), write_req(PathAccess::Write))
+            .is_ok());
+        // `/dev/null` is S_IFCHR but not a tty, so the descriptor check lets it
+        // through while still catching the terminal.
+        assert!(policy
+            .open(Path::new("/dev/zero"), write_req(PathAccess::Read))
+            .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_root_swap_cannot_redirect_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        let evil = tmp.path().join("evil");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&evil).unwrap();
+        let policy = CliPathPolicy::new(&root, true);
+
+        // Replace the root with a symlink to the attacker directory *after* the
+        // anchor fd exists: the pinned descriptor keeps writes inside the
+        // original inode.
+        fs::rename(&root, tmp.path().join("ws.bak")).unwrap();
+        symlink(&evil, &root);
+        let _ = policy.open(&root.join("late.txt"), write_req(PathAccess::Write));
+        assert!(!evil.join("late.txt").exists(), "pinned anchor must win");
+    }
+
+    /// `-pgid` teardown can only work if the child's group is registered with the
+    /// observer, and that only happens under `NewProcessGroup`: under
+    /// `SameProcessGroup` the child stays in the agent's group and is never
+    /// recorded, so a cancel could not target it without hitting the agent too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_shell_registers_a_child_process_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut shell = build_embedded_shell(tmp.path(), None, true).await.unwrap();
+        let (out_read, out_write) = io::pipe().unwrap();
+        let err_write = out_write.try_clone().unwrap();
+        let mut params = shell.default_exec_params();
+        // Mirrors `execute_shell`'s own parameters.
+        params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
+        params.set_fd(OpenFiles::STDIN_FD, omp_shell::openfiles::null().unwrap());
+        params.set_fd(OpenFiles::STDOUT_FD, OpenFile::from(out_write));
+        params.set_fd(OpenFiles::STDERR_FD, OpenFile::from(err_write));
+        let book = Arc::new(SpawnBook::default());
+        params.set_spawn_observer(book.clone());
+
+        let er = shell
+            .run_string("sh -c true", &SourceInfo::from("-c"), &params)
+            .await
+            .unwrap();
+        drop(params);
+        drop(shell);
+        drop(out_read);
+
+        assert_eq!(u8::from(&er.exit_code), 0);
+        let groups = book.tracked_groups();
+        assert_eq!(groups.len(), 1, "child group not registered: {groups:?}");
+        assert!(groups[0] > 0);
+        assert!(book.may_signal(groups[0]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_symlink_flip_never_writes_outside_root() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        let inside = root.join("inside");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let link = root.join("swap");
+        symlink(&inside, &link);
+
+        let policy = Arc::new(CliPathPolicy::new(&root, true));
+        // Control: with no racing, an open through the in-root symlink works.
+        assert!(policy
+            .open(&link.join("control.txt"), write_req(PathAccess::Write))
+            .is_ok());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let stop = Arc::clone(&stop);
+            let (link, inside, outside) = (link.clone(), inside.clone(), outside.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = fs::remove_file(&link);
+                    try_symlink(&outside, &link);
+                    let _ = fs::remove_file(&link);
+                    try_symlink(&inside, &link);
+                }
+            })
+        };
+
+        let mut admitted = 0usize;
+        for _ in 0..20_000 {
+            if let Ok(mut f) = policy.open(&link.join("f.txt"), write_req(PathAccess::Write)) {
+                let _ = f.write_all(b"x");
+                admitted += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().unwrap();
+
+        assert!(
+            !outside.join("f.txt").exists(),
+            "write escaped the root under a concurrent symlink flip"
+        );
+        assert!(inside.join("f.txt").exists() || admitted == 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_final_component_flip_never_truncates_outside_file() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        let victim_in = root.join("victim_in.txt");
+        let victim_out = tmp.path().join("victim_out.txt");
+        fs::write(&victim_in, b"in").unwrap();
+        fs::write(&victim_out, b"out").unwrap();
+        let link = root.join("lnk");
+        symlink(&victim_in, &link);
+
+        let policy = Arc::new(CliPathPolicy::new(&root, true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let stop = Arc::clone(&stop);
+            let (link, victim_in, victim_out) = (link.clone(), victim_in, victim_out.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = fs::remove_file(&link);
+                    try_symlink(&victim_out, &link);
+                    let _ = fs::remove_file(&link);
+                    try_symlink(&victim_in, &link);
+                }
+            })
+        };
+
+        for _ in 0..20_000 {
+            let _ = policy.open(&link, write_req(PathAccess::Truncate));
+        }
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().unwrap();
+
+        assert_eq!(
+            fs::read(&victim_out).unwrap(),
+            b"out",
+            "outside file truncated"
+        );
+    }
+
+    #[test]
+    fn portable_fallback_enforces_write_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(tmp.path().join("outside.txt"), b"x").unwrap();
+
+        let sandboxed = CliPathPolicy::new(&root, true);
+        assert!(open_portable(
+            &sandboxed,
+            &root.join("ok.txt"),
+            write_req(PathAccess::Write)
+        )
+        .is_ok());
+        assert!(root.join("ok.txt").exists());
+
+        let escaped = tmp.path().join("bad.txt");
+        assert!(open_portable(&sandboxed, &escaped, write_req(PathAccess::Write)).is_err());
+        assert!(!escaped.exists());
+
+        // Reads stay unrestricted, matching the unix walk's read fast path.
+        assert!(open_portable(
+            &sandboxed,
+            &tmp.path().join("outside.txt"),
+            write_req(PathAccess::Read)
+        )
+        .is_ok());
+
+        let open_policy = CliPathPolicy::new(&root, false);
+        let free = tmp.path().join("free.txt");
+        assert!(open_portable(&open_policy, &free, write_req(PathAccess::Write)).is_ok());
+        assert!(free.exists());
     }
 
     #[tokio::test]
