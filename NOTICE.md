@@ -19,6 +19,8 @@ Copyright (c) 2026 Stencil Labs, Inc.).
 | --- | --- | --- |
 | `pa-agent`, `pa-ai`, `pa-models`, `pa-types` | [PrimeIntellect-ai/prime-agent](https://github.com/PrimeIntellect-ai/prime-agent) — **modified** in this repo | MIT, see [`vendor/LICENSE-prime-agent`](vendor/LICENSE-prime-agent) |
 | `pi-ast`, `pi-diff`, `pi-edit`, `pi-predict`, `pi-vfs`, `pi-walker` | oh-my-pi (can1357/oh-my-pi), vendored verbatim per each crate's `Cargo.toml` | MIT, see [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi) |
+| `omp-core`, `omp-macros`, `omp-vocab`, `omp-walker`, `omp-shell`, `omp-shell-builtins` | oh-my-pi (can1357/oh-my-pi) ref `omp2` @ `2f92f3b5aa2035d21c9f016f9ff6350795e5685a`, vendored verbatim (manifests pinned to build outside the upstream workspace) | MIT, see [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi) |
+| `omp-tool`, `omp-proto`, `xutf` | **local shims**, not upstream code — see the note below the table | MIT (this project) |
 | `crossterm` | fork of [crossterm](https://github.com/crossterm-rs/crossterm) 0.28 | MIT, see [`vendor/crossterm/LICENSE`](vendor/crossterm/LICENSE) |
 | `laya-ort` | part of this project (ONNX Runtime inference for the Laya judge) | MIT, plus the `ort` / ONNX Runtime terms below |
 
@@ -38,6 +40,24 @@ Notes:
   Agent TypeScript product, originally Copyright (c) 2025 Mario Zechner".
 - `pi-predict` vendors only the n-gram word-completion engine of oh-my-pi; the
   smollm and apple engines are not included.
+- `omp-tool`, `omp-proto` and `xutf` are **not** vendored from oh-my-pi (nor crates.io `xutf`). They keep the
+  upstream crate names so the shell stack resolves unchanged, but they are
+  first-party MIT code of this repository:
+  - `vendor/omp-tool` exposes only the `Diag` diagnostics payload that
+    `omp-shell-builtins` consumes, instead of upstream `crates/tool`, which
+    drags in `omp-ai`, `omp-catalog` and the proto/gRPC agent mesh.
+  - `vendor/omp-proto` is a dependency-free hand-written subset of the wire
+    shapes `omp-shell` reads, replacing upstream `crates/proto`'s
+    prost/protox build-script codegen. It declares its own `[workspace]`, so it
+    enters the graph as a path dependency rather than a workspace member.
+  - `vendor/xutf` is a stable-Rust shim replacing crates.io `xutf` (which
+    requires nightly `core::simd`) with only the UTF-8 char decoding and
+    display-width surface used by `omp-shell` and `omp-shell-builtins`.
+  - Note for MPL hygiene: `omp-shell` and `omp-shell-builtins` depend on `im`
+    15.1 (MPL-2.0), which brings `bitmaps` and `sized-chunks`. Those are
+    unmodified crates.io dependencies, not vendored here, and are allowed
+    package-scoped in [`deny.toml`](deny.toml). If those crates are ever forked
+    into `vendor/`, that changes their MPL obligations and must be re-reviewed.
 
 ## `laya-ort` and ONNX Runtime (`ort`)
 

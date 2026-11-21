@@ -22,6 +22,7 @@ pub(crate) mod relevance;
 pub(crate) mod rlm;
 pub(crate) mod rlm_combinators;
 mod search;
+pub mod shell_host;
 mod task;
 mod todo;
 pub mod wasm;
@@ -92,6 +93,9 @@ pub struct Env {
     /// text), set per call from [`relevance::take`]; ranks the inline view of
     /// spilled `bash`/`read` output.
     pub query: parking_lot::Mutex<String>,
+    /// Snapshot of registered host tools exposed to `omp-shell-builtins`' `dyn`
+    /// builtin without capturing a direct reference cycle at `FnTool` setup.
+    pub dyn_tools: parking_lot::RwLock<Option<shell_host::DynToolList>>,
 }
 
 impl Env {
@@ -104,7 +108,14 @@ impl Env {
             hashline: edit_mode == EditMode::Hashline,
             jobs: jobs::JobRegistry::default(),
             query: parking_lot::Mutex::default(),
+            dyn_tools: parking_lot::RwLock::default(),
         }
+    }
+
+    /// Snapshot of host tools available to the in-process `dyn` builtin.
+    #[must_use]
+    pub fn dyn_tools(&self) -> Option<shell_host::DynToolList> {
+        self.dyn_tools.read().clone()
     }
 
     /// The current call's request text (see [`Env::query`]).
@@ -261,7 +272,7 @@ pub fn builtin_tools(cwd: &Path, edit_mode: EditMode) -> Vec<Arc<dyn AgentTool>>
                 })
             })
         };
-    vec![
+    let tools = vec![
         mk(
             "read",
             READ_DESCRIPTION.to_string(),
@@ -350,7 +361,9 @@ pub fn builtin_tools(cwd: &Path, edit_mode: EditMode) -> Vec<Arc<dyn AgentTool>>
         lsp::tool(env.clone()),
         checkpoint::checkpoint_tool(),
         checkpoint::rewind_tool(),
-    ]
+    ];
+    *env.dyn_tools.write() = Some(Arc::new(tools.clone()));
+    tools
 }
 
 /// TS `isToolAllowed` setting gates for the plain built-ins: a tool whose

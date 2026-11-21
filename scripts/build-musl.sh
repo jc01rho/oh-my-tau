@@ -15,6 +15,7 @@ target="${arch}-unknown-linux-musl"
 zt="${arch}-linux-musl"
 wrap="$(mktemp -d)"
 trap 'rm -rf "$wrap"' EXIT
+export ZIG_GLOBAL_CACHE_DIR="$wrap/zig-cache"
 for tool in cc c++; do
   # cc-rs passes --target=<rust triple>, which zig does not understand: drop it.
   cat > "$wrap/zig-$tool" <<SH

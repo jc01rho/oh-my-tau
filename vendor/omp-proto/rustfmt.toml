@@ -1,0 +1,2 @@
+# House style: hard tabs, matching the surrounding omp crates.
+hard_tabs = true

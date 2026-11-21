@@ -1,17 +1,15 @@
-//! `bash`: one shell command (`bash -c`, stderr merged into stdout), omp's
-//! result text: output, `Wall time: N.NN seconds`, `Command exited with code N`.
-//! Non-persistent shell: omp embeds a brush-based shell, while omp-rs currently
-//! spawns an external `bash -c` (under util-linux `setsid`, see [`detached_bash`])
-//! pending the Phase 2 in-process shell port; the command semantics above match omp.
+//! `bash`: one shell command (stderr merged into stdout), omp's result text:
+//! output, `Wall time: N.NN seconds`, `Command exited with code N`.
+//! Local finite commands run in-process via `omp-shell` and `omp-shell-builtins`
+//! (`tools/shell_host.rs`, with `PathPolicy`, `SpawnWrapper`, `-pgid` teardown,
+//! and the `dyn` host bridge); `/ssh` commands execute remotely over external
+//! `ssh`.
 //!
 //! omp's `async: true` backgrounds the command in the session job manager and
 //! returns `formatBackgroundNotice`; the job is inspected via `read proc://`
-//! (`tools/jobs.rs`). Services (`name`/`ready`) are supervised in-process
-//! (omp's shared daemon broker folded into the session): the child is spawned
-//! piped, readiness is observed from a log regex and/or a TCP port probe with
-//! a timeout (default 30s), the captured log is inspectable via
-//! `read proc://<name>`, and the child is killed when the session's job
-//! registry is dropped (omp stops owned services at session end).
+//! (`tools/jobs.rs`). Long-lived services (`name`/`ready`) stay supervised
+//! with a dedicated external `Child` handle (`SUPERVISOR_TICK` + `start_kill`)
+//! killed when the session's job registry is dropped.
 
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -352,34 +350,51 @@ async fn run(
     notify: Option<&Notify>,
     tap: Option<Arc<Mutex<String>>>,
 ) -> Result<(String, Option<i32>, Duration, Option<&'static str>)> {
+    run_with_dyn(cwd, command, timeout, signal, notify, tap, None).await
+}
+
+async fn run_with_dyn(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Option<f64>,
+    signal: &AbortSignal,
+    notify: Option<&Notify>,
+    tap: Option<Arc<Mutex<String>>>,
+    dyn_tools: Option<super::shell_host::DynToolList>,
+) -> Result<(String, Option<i32>, Duration, Option<&'static str>)> {
     let script = format!("exec 2>&1\n{command}");
+    if let Some(argv) = crate::features::ssh::remote_argv(&script) {
+        return run_remote_ssh(cwd, &argv, timeout, signal, notify, tap).await;
+    }
+    let on_chunk: Option<super::shell_host::ChunkCallback<'_>> = notify
+        .map(|n| Box::new(move |text: &str| n.feed(text)) as super::shell_host::ChunkCallback<'_>);
+    let res = super::shell_host::execute_shell(super::shell_host::ShellExecRequest {
+        cwd,
+        command,
+        timeout,
+        signal,
+        dyn_tools,
+        retain_bytes: RETAIN_BYTES,
+        on_chunk,
+        tap,
+    })
+    .await?;
+    Ok((res.output, res.exit_code, res.elapsed, res.outcome))
+}
+
+async fn run_remote_ssh(
+    cwd: &std::path::Path,
+    argv: &[String],
+    timeout: Option<f64>,
+    signal: &AbortSignal,
+    notify: Option<&Notify>,
+    tap: Option<Arc<Mutex<String>>>,
+) -> Result<(String, Option<i32>, Duration, Option<&'static str>)> {
     let started = Instant::now();
-    // `/ssh <host>` (features/ssh.rs): run the script remotely via
-    // `ssh <target> -- bash -lc <script>` instead of a local bash. When
-    // running locally with the sandbox on (features/sandbox.rs), re-launch
-    // through `omt __sandbox-exec` (self-exec confinement helper) so the tool
-    // subprocess is Landlock/seccomp-confined (remote runs are left to the
-    // remote host).
-    let mut cmd = if let Some(argv) = crate::features::ssh::remote_argv(&script) {
-        let mut c = tokio::process::Command::new("ssh");
-        for arg in argv {
-            c.arg(arg);
-        }
-        c
-    } else {
-        match crate::features::sandbox::wrap_inner(cwd, &local_bash_argv(&script)) {
-            Some((launcher, argv)) => {
-                let mut c = tokio::process::Command::new(launcher);
-                c.args(argv);
-                c
-            }
-            None => {
-                let mut c = detached_bash();
-                c.arg("-c").arg(script);
-                c
-            }
-        }
-    };
+    let mut cmd = tokio::process::Command::new("ssh");
+    for arg in argv {
+        cmd.arg(arg);
+    }
     let mut child = cmd
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -723,11 +738,20 @@ pub async fn bash(
             spill,
             query,
             notify.as_ref(),
+            env.dyn_tools(),
             &signal,
         ));
     }
-    let (output, code, elapsed, outcome) =
-        run(&dir, &command, timeout, &signal, None, None).await?;
+    let (output, code, elapsed, outcome) = run_with_dyn(
+        &dir,
+        &command,
+        timeout,
+        &signal,
+        None,
+        None,
+        env.dyn_tools(),
+    )
+    .await?;
     let mut text = finished_text(&output, elapsed, outcome, timeout, code, &spill, &query);
     if !notices.is_empty() {
         text = format!("{}\n{text}", notices.join("\n"));
@@ -1022,6 +1046,7 @@ fn start_background(
     spill: SpillConfig,
     query: String,
     notify: Option<&Arc<Notify>>,
+    dyn_tools: Option<super::shell_host::DynToolList>,
     _signal: &AbortSignal,
 ) -> AgentToolResult {
     let output: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -1040,13 +1065,14 @@ fn start_background(
     let task_notify = notify.cloned();
     tokio::spawn(async move {
         let controller = pa_agent::abort::AbortController::new();
-        let raw = run(
+        let raw = run_with_dyn(
             &dir,
             &command,
             timeout,
             &controller.signal(),
             task_notify.as_deref(),
             Some(output),
+            dyn_tools,
         )
         .await;
         if let Some(notify) = &task_notify {
@@ -1122,14 +1148,28 @@ mod tests {
         std::sync::Arc::new(super::super::Env::new(&std::env::temp_dir(), false))
     }
 
-    /// Regression (hung TUI menus): a tool command must not reach the TUI's
-    /// controlling terminal — it runs in its own session, so `/dev/tty` is
-    /// unavailable and `stty`/interop programs cannot drop raw mode.
+    /// Regression (hung TUI menus): neither the in-process shell nor any
+    /// external command it spawns may reach the TUI's controlling terminal —
+    /// `CliPathPolicy` blocks `/dev/tty` redirections in-process, and external
+    /// commands run in their own `setsid()` session (`external_cmd_leads_session`).
     #[tokio::test]
     async fn commands_have_no_controlling_terminal() {
+        let in_proc = bash(
+            test_env(),
+            serde_json::json!({"command": "if (: </dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi"}),
+            sig(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            text_of(&in_proc).contains("NO_TTY"),
+            "{}",
+            text_of(&in_proc)
+        );
+
         let r = bash(
             test_env(),
-            serde_json::json!({"command": "if (: </dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi; ps -o sid= -p $$ | tr -d ' '; echo $$"}),
+            serde_json::json!({"command": "sh -c 'if (: </dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi; ps -o sid= -p $$ | tr -d \" \"; echo $$'"}),
             sig(),
         )
         .await
@@ -1141,7 +1181,7 @@ mod tests {
             lines.next().unwrap_or_default(),
             lines.next().unwrap_or_default(),
         );
-        assert_eq!(sid, pid, "bash is its own session leader: {t}");
+        assert_eq!(sid, pid, "spawned child is its own session leader: {t}");
     }
 
     #[tokio::test]
@@ -1904,6 +1944,143 @@ mod tests {
         assert!(
             notice.ends_with("Read artifact://4 for full output"),
             "{notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_process_pipeline_heredoc_redirect_and_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let sig = AbortSignal::never();
+        let (out, code, _, outcome) = run(
+            dir.path(),
+            "cat <<'EOF' | grep -n two > hit.txt\none\ntwo\nthree\nEOF\ncat hit.txt\nexit 7",
+            Some(10.0),
+            &sig,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, None);
+        assert_eq!(code, Some(7));
+        assert_eq!(out.trim(), "2:two");
+    }
+
+    #[tokio::test]
+    async fn in_process_timeout_cancels_sleeping_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let sig = AbortSignal::never();
+        let (_, code, elapsed, outcome) = run(dir.path(), "sleep 30", Some(0.15), &sig, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, Some("timeout"));
+        assert_eq!(code, None);
+        assert!(elapsed < Duration::from_secs(5), "elapsed: {elapsed:?}");
+    }
+
+    /// QA: the in-process `omp-shell-builtins` `jq`, `grep` and `wc` really run
+    /// end-to-end inside the `bash` tool (no external binaries involved).
+    #[tokio::test]
+    async fn in_process_builtins_grep_wc_and_jq_work_end_to_end() {
+        let r = bash(
+            test_env(),
+            serde_json::json!({"command": "printf '{\"k\":1}\\n{\"k\":2}\\n' | jq -c '.k' | grep -c '[12]'"}),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let out = text_of(&r);
+        assert_eq!(
+            out.lines().next().unwrap_or_default().trim(),
+            "2",
+            "jq|grep -c pipeline: {out}"
+        );
+
+        let r = bash(
+            test_env(),
+            serde_json::json!({"command": "printf 'a\\nb\\nc\\n' | wc -l"}),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let out = text_of(&r);
+        assert_eq!(
+            out.lines().next().unwrap_or_default().trim(),
+            "3",
+            "wc -l: {out}"
+        );
+    }
+
+    /// QA: the registered host tools reach the in-process `dyn` builtin through
+    /// the live `Env::dyn_tools` bridge and the real `AgentTool` interface, and
+    /// `bash` itself is not exposed (no unbounded shell recursion).
+    #[tokio::test]
+    async fn bash_tool_exposes_registered_tools_via_dyn_bridge() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = super::super::builtin_tools(dir.path(), pi_edit::EditMode::Replace);
+        assert!(tools.iter().any(|t| t.name() == "read"), "read registered");
+        let bash_tool = tools
+            .iter()
+            .find(|t| t.name() == "bash")
+            .cloned()
+            .expect("bash tool is registered");
+        let call = |command: &str| {
+            bash_tool.clone().execute(
+                String::new(),
+                serde_json::json!({"command": command}),
+                sig(),
+                Arc::new(|_r: AgentToolResult| {}),
+            )
+        };
+
+        let catalog = text_of(&call("dyn").await.unwrap());
+        assert!(catalog.contains("  read"), "catalog lists read: {catalog}");
+        assert!(
+            !catalog
+                .lines()
+                .any(|l| l.trim_start().starts_with("bash —")),
+            "bash must not be a dyn device (recursion): {catalog}"
+        );
+
+        let top = text_of(&call("dyn --help").await.unwrap());
+        assert!(
+            top.contains("dyn — discover and invoke live dynamic devices"),
+            "{top}"
+        );
+
+        let help = text_of(&call("dyn read --help").await.unwrap());
+        assert!(help.contains("dyn read"), "dyn read --help: {help}");
+        assert!(help.contains("<path>"), "read path is a positional: {help}");
+    }
+
+    /// QA: the `cwd` parameter scopes the in-process shell without touching the
+    /// host process's own working directory.
+    #[tokio::test]
+    async fn in_process_cwd_parameter_isolates_shell_working_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let before = std::env::current_dir().unwrap();
+        let env = std::sync::Arc::new(super::super::Env::new(dir.path(), false));
+        let r = bash(
+            env,
+            serde_json::json!({"cwd": "sub", "command": "pwd"}),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let out = text_of(&r);
+        let want = std::fs::canonicalize(&sub).unwrap();
+        let printed = out.lines().next().unwrap_or_default().trim();
+        assert_eq!(
+            std::fs::canonicalize(printed).unwrap(),
+            want,
+            "pwd is the cwd parameter: {out}"
+        );
+        assert_eq!(
+            std::env::current_dir().unwrap(),
+            before,
+            "host cwd untouched"
         );
     }
 }
