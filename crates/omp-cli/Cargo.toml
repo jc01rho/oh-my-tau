@@ -48,6 +48,12 @@ pi-edit = { path = "../../vendor/pi-edit" }
 pi-walker = { path = "../../vendor/pi-walker" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
+omp-core.workspace = true
+omp-shell.workspace = true
+omp-shell-builtins.workspace = true
+omp-tool.workspace = true
+omp-proto.workspace = true
+
 omp-settings = { path = "../omp-settings" }
 omp-tui = { path = "../omp-tui" }
 omp-stats = { path = "../omp-stats" }
@@ -71,6 +77,10 @@ onnx = ["omp-judge/onnx"]
 # Dedup kernel compiled from goose (`crates/omp-goose`, committed generated C).
 # Off by default: the existing pure-Rust dedup path is used unless enabled.
 goose = ["dep:omp-goose"]
+
+[target.'cfg(unix)'.dependencies]
+# Process-group signalling for in-process shell teardown (tools/shell_host.rs).
+nix.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Landlock + seccomp confinement for tool subprocesses (`/sandbox`,

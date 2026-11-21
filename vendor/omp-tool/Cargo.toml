@@ -1,0 +1,16 @@
+[package]
+name = "omp-tool"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Harness diagnostics (Diag) attached to omp tool calls"
+
+[dependencies]
+omp-core = { path = "../omp-core" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

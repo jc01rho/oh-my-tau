@@ -30,7 +30,25 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
-exceptions = []
+# File-level copyleft, kept package-scoped so each addition stays visible in
+# review instead of widening the allowlist above. `im` 15.1 (a dependency of
+# omp-shell and omp-shell-builtins) is MPL-2.0 and builds on bitmaps and
+# sized-chunks, both also MPL-2.0. All three are unmodified crates.io crates.
+#
+# `unused-license-exception = "deny"` makes every entry here load-bearing: one
+# that stops appearing in Cargo.lock is a hard failure, so this list must track
+# the resolved graph. The versions are the ones upstream omp2's policy pins; if
+# the lock resolves a different patch release, widen the entry rather than
+# adding a second one.
+#
+# Upstream omp2 also scopes option-ext@0.2.0 to MPL-2.0, but nothing in this
+# repo's graph depends on it (im does not), so listing it here would fail the
+# unused-exception check. Add it back the moment a resolved crate pulls it in.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "bitmaps@2.1.0" },
+    { allow = ["MPL-2.0"], crate = "im@15.1.0" },
+    { allow = ["MPL-2.0"], crate = "sized-chunks@0.6.5" },
+]
 
 # Vendored crates (vendor/*) are path dependencies published nowhere and
 # rewritten in-tree; their manifests carry the workspace MIT license.

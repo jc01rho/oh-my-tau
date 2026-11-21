@@ -22,6 +22,7 @@ pub(crate) mod relevance;
 pub(crate) mod rlm;
 pub(crate) mod rlm_combinators;
 mod search;
+pub mod shell_host;
 mod task;
 mod todo;
 pub mod wasm;
@@ -38,7 +39,7 @@ mod web_search;
 mod yield_tool;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::Result;
 use pa_agent::abort::AbortSignal;
@@ -51,6 +52,10 @@ use serde_json::{json, Value};
 static LAST_JOBS: std::sync::Mutex<Option<jobs::JobRegistry>> = std::sync::Mutex::new(None);
 /// The agent session's job registry (see [`set_session_jobs`]).
 static SESSION_JOBS: std::sync::Mutex<Option<jobs::JobRegistry>> = std::sync::Mutex::new(None);
+/// The session's tool [`Env`], held weakly: tools keep it alive through their own
+/// `Arc<Env>`, so a strong link here would trap the pair in a cycle (see
+/// [`set_session_env`]).
+static SESSION_ENV: std::sync::Mutex<Option<Weak<Env>>> = std::sync::Mutex::new(None);
 
 /// The registry of the tool set built last, for the caller that builds the session's tools to
 /// capture right after (before anything else builds a throwaway set).
@@ -78,6 +83,33 @@ pub fn session_jobs() -> Option<jobs::JobRegistry> {
         .clone()
 }
 
+/// Publish the tool [`Env`] of the agent session, so callers that rebuild the
+/// tool list can refresh its `dyn` snapshot (see [`republish_dyn_tools`]).
+pub fn set_session_env(env: &Arc<Env>) {
+    *SESSION_ENV
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(env));
+}
+
+/// The agent session's tool [`Env`], while the session's tools keep it alive.
+#[must_use]
+pub fn session_env() -> Option<Arc<Env>> {
+    SESSION_ENV
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(Weak::upgrade)
+}
+
+/// Refresh the session `Env`'s `dyn` snapshot after the tool list changed (model
+/// swap, `todo` rehydration, `clm-host` toggle, RPC `ask` swap): the in-process
+/// shell must dispatch to the list the agent actually holds, gate included.
+pub fn republish_dyn_tools(tools: &[Arc<dyn AgentTool>]) {
+    if let Some(env) = session_env() {
+        env.set_dyn_tools(tools);
+    }
+}
+
 /// Per-session state shared by the tools: working directory, the hashline
 /// snapshot store (`read` mints tags, `edit` validates them) and edit mode.
 pub struct Env {
@@ -92,19 +124,48 @@ pub struct Env {
     /// text), set per call from [`relevance::take`]; ranks the inline view of
     /// spilled `bash`/`read` output.
     pub query: parking_lot::Mutex<String>,
+    /// Weak snapshot of the registered host tools exposed to
+    /// `omp-shell-builtins`' `dyn` builtin. Weak on purpose: the tools hold this
+    /// `Env` strongly, so a strong list here would make the pair un-freeable.
+    pub dyn_tools: parking_lot::RwLock<Option<shell_host::DynToolList>>,
 }
 
 impl Env {
     #[must_use]
     pub fn with_mode(cwd: &Path, edit_mode: EditMode) -> Self {
+        Self::with_mode_and_jobs(cwd, edit_mode, jobs::JobRegistry::default())
+    }
+
+    /// [`Env::with_mode`] over an existing job registry: a tool-list rebuild
+    /// (model swap, edit-mode change) passes the session's registry so the
+    /// background jobs and services started before the rebuild stay visible in
+    /// `/jobs`, `asyncJobs` and `proc://`.
+    #[must_use]
+    pub fn with_mode_and_jobs(cwd: &Path, edit_mode: EditMode, jobs: jobs::JobRegistry) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             store: EditStore::new(),
             edit_mode,
             hashline: edit_mode == EditMode::Hashline,
-            jobs: jobs::JobRegistry::default(),
+            jobs,
             query: parking_lot::Mutex::default(),
+            dyn_tools: parking_lot::RwLock::default(),
         }
+    }
+
+    /// Snapshot of host tools available to the in-process `dyn` builtin.
+    /// Entries whose owner has since dropped are skipped by the host adapter.
+    #[must_use]
+    pub fn dyn_tools(&self) -> Option<shell_host::DynToolList> {
+        self.dyn_tools.read().clone()
+    }
+
+    /// Publish the tool list the `dyn` builtin dispatches to. Stored weakly, so
+    /// the list owning these tools decides their lifetime (an empty list
+    /// publishes nothing).
+    pub fn set_dyn_tools(&self, tools: &[Arc<dyn AgentTool>]) {
+        *self.dyn_tools.write() = (!tools.is_empty())
+            .then(|| Arc::new(tools.iter().map(Arc::downgrade).collect::<Vec<_>>()));
     }
 
     /// The current call's request text (see [`Env::query`]).
@@ -194,11 +255,33 @@ const GREP_DESCRIPTION: &str = "Regex: Rust, then PCRE2. `path`: `;`-separated f
 const WRITE_DESCRIPTION: &str = "SHOULD `edit` existing files; `write` for required new files or whole-file replacement. NEVER create docs or emojis unless requested.";
 const FIND_DESCRIPTION: &str = "Describe behavior, get implementing files and line ranges. MUST use first for unknown locations; known strings/regex/symbols → `grep`, names → `glob`.\n`query`: plain language, not regex; quoted phrases match whole. `grep_keywords`: likely verbatim terms, `[]` if unsure.\n`path`: one directory or file, host path or internal URL (`omp://`, `omp://<file>.md`, `skill://<name>`, `local://…`); omitted = workspace root. Scope known subsystem; batch related questions. Searches live files, no index; no `:start-end` selector (judges whole files).\nHits strongest first: `path:start-end score snippet` (workspace-relative, or URL under URL scope); read returned ranges. Scores: absolute comparable 0–1 probability; below ~0.4 = weak evidence, so widen query or use `grep` before concluding absence.";
 
-/// All built-in tools, rooted at `cwd`.
+/// All built-in tools, rooted at `cwd`, without exposing their [`Env`].
+#[must_use]
+pub fn builtin_tools(cwd: &Path, edit_mode: EditMode) -> Vec<Arc<dyn AgentTool>> {
+    builtin_tools_with_env(cwd, edit_mode).1
+}
+
+/// [`builtin_tools`] plus the [`Env`] they share, so the caller can publish the
+/// final tool list to it once settings, extensions and the approval gate have
+/// had their say (see [`Env::set_dyn_tools`]).
+#[must_use]
+pub fn builtin_tools_with_env(
+    cwd: &Path,
+    edit_mode: EditMode,
+) -> (Arc<Env>, Vec<Arc<dyn AgentTool>>) {
+    builtin_tools_with_env_and_jobs(cwd, edit_mode, jobs::JobRegistry::default())
+}
+
+/// [`builtin_tools_with_env`] over an existing job registry (see
+/// [`Env::with_mode_and_jobs`]).
 #[must_use]
 #[allow(clippy::too_many_lines)] // the tool registry table; order mirrors omp's builtinTools
-pub fn builtin_tools(cwd: &Path, edit_mode: EditMode) -> Vec<Arc<dyn AgentTool>> {
-    let env = Arc::new(Env::with_mode(cwd, edit_mode));
+pub fn builtin_tools_with_env_and_jobs(
+    cwd: &Path,
+    edit_mode: EditMode,
+    jobs: jobs::JobRegistry,
+) -> (Arc<Env>, Vec<Arc<dyn AgentTool>>) {
+    let env = Arc::new(Env::with_mode_and_jobs(cwd, edit_mode, jobs));
     *LAST_JOBS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(env.jobs.clone());
@@ -261,7 +344,7 @@ pub fn builtin_tools(cwd: &Path, edit_mode: EditMode) -> Vec<Arc<dyn AgentTool>>
                 })
             })
         };
-    vec![
+    let tools = vec![
         mk(
             "read",
             READ_DESCRIPTION.to_string(),
@@ -350,7 +433,9 @@ pub fn builtin_tools(cwd: &Path, edit_mode: EditMode) -> Vec<Arc<dyn AgentTool>>
         lsp::tool(env.clone()),
         checkpoint::checkpoint_tool(),
         checkpoint::rewind_tool(),
-    ]
+    ];
+    env.set_dyn_tools(&tools);
+    (env, tools)
 }
 
 /// TS `isToolAllowed` setting gates for the plain built-ins: a tool whose
@@ -386,9 +471,34 @@ pub fn session_builtin_tools(
     edit_mode: EditMode,
     settings: &omp_settings::Settings,
 ) -> Vec<Arc<dyn AgentTool>> {
-    let mut tools = builtin_tools(cwd, edit_mode);
+    session_builtin_tools_with_env(cwd, edit_mode, settings).1
+}
+
+/// [`session_builtin_tools`] plus their [`Env`], with the settings-filtered
+/// list already published to it.
+#[must_use]
+pub fn session_builtin_tools_with_env(
+    cwd: &Path,
+    edit_mode: EditMode,
+    settings: &omp_settings::Settings,
+) -> (Arc<Env>, Vec<Arc<dyn AgentTool>>) {
+    session_builtin_tools_with_env_and_jobs(cwd, edit_mode, settings, jobs::JobRegistry::default())
+}
+
+/// [`session_builtin_tools_with_env`] over an existing job registry, so a
+/// rebuild keeps the session's live background jobs and services (see
+/// [`Env::with_mode_and_jobs`]).
+#[must_use]
+pub fn session_builtin_tools_with_env_and_jobs(
+    cwd: &Path,
+    edit_mode: EditMode,
+    settings: &omp_settings::Settings,
+    jobs: jobs::JobRegistry,
+) -> (Arc<Env>, Vec<Arc<dyn AgentTool>>) {
+    let (env, mut tools) = builtin_tools_with_env_and_jobs(cwd, edit_mode, jobs);
     tools.retain(|t| enabled_by_settings(settings, t.name()));
-    tools
+    env.set_dyn_tools(&tools);
+    (env, tools)
 }
 
 /// Active hidden tools for a session (TS `resolveBuiltinToolPlan`'s
@@ -437,6 +547,114 @@ pub use ask::{tool_with_ui, AskUi, SelectOption};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_is_freeable_once_the_tool_list_drops() {
+        // The tools hold the `Env` strongly and the `Env` holds them weakly, so
+        // the pair must free with the tool list; a strong `dyn_tools` snapshot
+        // here would trap both in a reference cycle.
+        let (env, tools) = builtin_tools_with_env(Path::new("/tmp"), EditMode::Hashline);
+        let weak_env = Arc::downgrade(&env);
+        assert!(env.dyn_tools().is_some_and(|t| !t.is_empty()));
+        drop(env);
+        assert!(weak_env.upgrade().is_some(), "the tool list owns the env");
+        drop(tools);
+        assert!(
+            weak_env.upgrade().is_none(),
+            "env outlives the tool list that owns it"
+        );
+    }
+
+    #[test]
+    fn rebuild_keeps_the_session_job_registry() {
+        // A model swap (or an edit-mode change) rebuilds the tool list; the
+        // rebuild runs on the session's own registry, so a job backgrounded
+        // before the swap is still listed by `asyncJobs` and `proc://` after.
+        let dir = tempfile::tempdir().unwrap();
+        let settings = omp_settings::Settings::load_from(None, dir.path());
+        let registry = jobs::JobRegistry::default();
+        let job_id = registry.insert(jobs::Job {
+            command: "sleep 30".to_string(),
+            started: std::time::Instant::now(),
+            status: jobs::JobStatus::Running,
+            output: Arc::new(std::sync::Mutex::new(String::new())),
+            result: None,
+            error: None,
+            ended: None,
+        });
+        let (before, tools) = session_builtin_tools_with_env_and_jobs(
+            dir.path(),
+            EditMode::Hashline,
+            &settings,
+            registry.clone(),
+        );
+        drop(tools);
+        // The rebuild passes the registry the session published before it.
+        let (after, tools) = session_builtin_tools_with_env_and_jobs(
+            dir.path(),
+            EditMode::Replace,
+            &settings,
+            registry,
+        );
+        assert!(
+            Arc::ptr_eq(&before.jobs.inner, &after.jobs.inner),
+            "the rebuild runs on the session's registry instance"
+        );
+        assert!(
+            after.jobs.get(&job_id).is_some(),
+            "the rebuilt env still sees the job backgrounded before it"
+        );
+        let proc_listing = jobs::read_proc(&after, "").unwrap();
+        let listing: String = proc_listing
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                pa_agent::types::ToolResultContent::Text(t) => Some(t.text.clone()),
+                pa_agent::types::ToolResultContent::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            listing.contains(&format!("{job_id} [bash] running up ")),
+            "proc:// lists the job after the rebuild: {listing}"
+        );
+        assert!(
+            after.dyn_tools().is_some_and(|t| !t.is_empty()),
+            "the rebuilt env publishes its tools"
+        );
+        drop(tools);
+    }
+
+    #[test]
+    fn dyn_tools_follow_the_settings_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yml");
+        // `checkpoint`/`rewind` default off; `find.enabled: off` hides `find`.
+        std::fs::write(&cfg, "find:\n  enabled: \"off\"\n").unwrap();
+        let settings = omp_settings::Settings::load_from(Some(&cfg), dir.path());
+        let (env, tools) =
+            session_builtin_tools_with_env(dir.path(), EditMode::Hashline, &settings);
+        let published: Vec<String> = env
+            .dyn_tools()
+            .expect("session env publishes its tools")
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|t| t.name().to_string())
+            .collect();
+        assert_eq!(
+            published,
+            tools
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect::<Vec<_>>()
+        );
+        for off in ["find", "checkpoint", "rewind"] {
+            assert!(
+                !published.iter().any(|n| n == off),
+                "{off} published despite its setting"
+            );
+        }
+    }
 
     #[test]
     fn edit_mode_follows_omp_model_rule() {

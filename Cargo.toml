@@ -11,11 +11,28 @@ members = [
     "vendor/pi-walker",
     "vendor/pi-vfs",
     "vendor/pi-predict",
+    # oh-my-pi (omp2) shell stack, vendored verbatim from the pinned omp2 commit
+    # (see vendor-src.lock). vendor/omp-proto is deliberately absent: it ships its
+    # own `[workspace]` table and reaches the graph as a path dependency instead,
+    # because a member that is also a workspace root is a hard cargo error.
+    "vendor/omp-core",
+    "vendor/omp-macros",
+    "vendor/omp-vocab",
+    "vendor/omp-walker",
+    "vendor/omp-tool",
+    "vendor/omp-shell",
+    "vendor/omp-shell-builtins",
     "vendor/laya-ort",
+    "vendor/xutf",
     "crates/*",
 ]
 # ws_ckpt checkpoint stores (not crates).
-exclude = ["crates/.wsckpt"]
+#
+# vendor/omp-proto keeps its upstream `[workspace]` table (it is a shim that must
+# stay standalone), and cargo hard-errors with "multiple workspace roots found"
+# unless the enclosing workspace excludes it. Verified with a minimal repro.
+# So it is a plain path dependency via [workspace.dependencies], never a member.
+exclude = ["crates/.wsckpt", "vendor/omp-proto"]
 
 [workspace.package]
 version = "0.12.0"
@@ -23,7 +40,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 # preserve_order: serde_json::Map keeps insertion order (IndexMap) so every
 # wire/durable JSON surface serializes in construction order — the JS object
 # model the TS daemon and session files byte-emit. Without it the Map is a
@@ -39,6 +56,102 @@ pa-ai = { path = "vendor/pa-ai" }
 pa-agent = { path = "vendor/pa-agent" }
 thiserror = "2"
 futures = "0.3"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Vendored oh-my-pi (omp2) shell stack
+#
+# Versions and feature unions are copied verbatim from the upstream omp2
+# workspace manifest at commit 2f92f3b5aa2035d21c9f016f9ff6350795e5685a
+# (vendor-src.lock), because the vendored manifests only ever say
+# `dep.workspace = true`. Path crates carry no version requirement, matching
+# this workspace's existing vendor/* style (deny.toml allow-wildcard-paths).
+# ──────────────────────────────────────────────────────────────────────────────
+omp-core = { path = "vendor/omp-core", features = ["schemars"] }
+omp-macros = { path = "vendor/omp-macros" }
+omp-vocab = { path = "vendor/omp-vocab" }
+omp-walker = { path = "vendor/omp-walker" }
+omp-tool = { path = "vendor/omp-tool" }
+omp-proto = { path = "vendor/omp-proto" }
+omp-shell = { path = "vendor/omp-shell" }
+omp-shell-builtins = { path = "vendor/omp-shell-builtins" }
+
+argmax = "0.3"
+async-recursion = "1.1"
+bigdecimal = "0.4"
+blake2 = "0.10"
+blake3 = { version = "1.8" }
+bon = "3"
+bstr = "1"
+bytecount = { version = "0.6", features = ["runtime-dispatch-simd"] }
+bytes = { version = "1.12.1", features = ["serde"] }
+bytes-utils = { version = "0.1.4", features = ["serde"] }
+cfg-if = "1"
+chrono = "0.4.45"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+codesnake = "0.2"
+command-fds = "0.3"
+crc32fast = "1.5"
+dashmap = "6"
+digest = "0.10"
+fancy-regex = "0.17"
+flume = "0.11"
+foldhash = "0.2"
+futures-core = "0.3"
+globset = "0.4"
+grep-cli = "0.1"
+grep-matcher = "0.1"
+grep-pcre2 = "0.1"
+grep-printer = "0.3"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+heapless = { version = "0.9.3", features = ["serde"] }
+hifijson = "0.2"
+ignore = "0.4"
+im = { version = "15.1", features = ["serde"] }
+indicatif = "0.18"
+insta = { version = "1.47", features = ["glob", "ron", "redactions"] }
+itertools = "0.14"
+jaq-core = "2.1"
+jaq-json = "1.1"
+jaq-std = "2.1"
+jiff = { version = "0.2", features = ["tzdb-bundle-platform"] }
+libc = "0.2"
+lscolors = { version = "0.21", default-features = false, features = ["gnu_legacy"] }
+md-5 = "0.10"
+memchr = "2"
+memmap2 = "0.9"
+nix = { version = "0.31", features = ["feature", "fs", "hostname", "poll", "process", "resource", "signal", "term", "user"] }
+notify = { version = "=8.2.0", features = ["macos_kqueue"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+parking_lot = "0.12"
+parking_lot_core = "0.9.12"
+parse_datetime = "0.14"
+peg = "0.8"
+postcard = { version = "1.1.3", features = ["alloc"] }
+pretty_assertions = { version = "1", features = ["unstable"] }
+proc-macro2 = "1"
+proptest = "1.11.0"
+quote = "1"
+rand = { version = "0.10", features = ["std_rng"] }
+rayon = "1.10"
+regex = "1.11"
+rustix = { version = "1.1", features = ["fs", "pipe", "process", "time"] }
+schemars = "1.2.2"
+self_cell = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+sha3 = { version = "0.10", features = ["asm"] }
+similar = "3"
+smallvec = { version = "2.0.0-alpha.12", features = ["serde"] }
+smol_bitmap = { version = "0.3.2", features = ["serde"] }
+strum = { version = "0.28", features = ["derive"] }
+syn = { version = "2", features = ["full"] }
+tempfile = "3"
+url = "2.5"
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Media_Multimedia", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+xutf = { path = "vendor/xutf" }
+zeroize = { version = "1.9", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

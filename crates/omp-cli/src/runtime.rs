@@ -2206,6 +2206,7 @@ impl Runtime {
         let mut tools = self.agent.tools().await;
         if let Some(slot) = tools.iter().position(|t| t.name() == "todo") {
             tools[slot] = todo;
+            crate::tools::republish_dyn_tools(&tools);
             self.agent.set_tools(tools).await;
         }
     }
@@ -3423,7 +3424,16 @@ impl Runtime {
         if rebuild {
             {
                 let settings = omp_settings::Settings::load(&self.cwd);
-                let mut tools = crate::tools::session_builtin_tools(&self.cwd, mode, &settings);
+                // The rebuild replaces the whole tool list, but the session's
+                // background jobs and services must outlive it: build on the
+                // registry the session already published (`/jobs`, `asyncJobs`
+                // and `proc://` keep seeing pre-swap work).
+                let (env, mut tools) = crate::tools::session_builtin_tools_with_env_and_jobs(
+                    &self.cwd,
+                    mode,
+                    &settings,
+                    crate::tools::session_jobs().unwrap_or_default(),
+                );
                 tools.extend(crate::tools::mcp::mcp_tools(&self.cwd));
                 tools.extend(crate::tools::wasm::wasm_tools(&self.cwd));
                 // TS `reconcileThinkTool`: model swaps re-evaluate the hidden
@@ -3431,14 +3441,23 @@ impl Runtime {
                 let hidden =
                     crate::tools::hidden_tools(&settings, Some(&resolved.model), false, false);
                 tools.extend(hidden);
-                // The live context strategy keeps its `context_edit` tool.
+                // The live context strategy keeps its `context_edit` tool; the
+                // whole vec is gated below, so it is not gated here.
                 if let Some(shared) = crate::context::live() {
-                    let tool = crate::context::tool(shared);
-                    tools.extend(match crate::approval::Gate::get() {
-                        Some(gate) => gate.wrap_tools(vec![tool]),
-                        None => vec![tool],
-                    });
+                    tools.push(crate::context::tool(shared));
                 }
+                let tools = match crate::approval::Gate::get() {
+                    Some(gate) => gate.wrap_tools(tools),
+                    None => tools,
+                };
+                // The rebuilt list is the one the shell's `dyn` builtin, the eval
+                // bridge and the session job registry must all dispatch to.
+                env.set_dyn_tools(&tools);
+                crate::tools::set_session_env(&env);
+                // Same registry instance, republished: `set_session_jobs` stays
+                // a no-op for callers that already hold it.
+                crate::tools::set_session_jobs(Some(env.jobs.clone()));
+                crate::tools::eval_bridge::set_session_tools(tools.clone());
                 self.agent.set_tools(tools).await;
             }
         }
@@ -3588,6 +3607,7 @@ impl Runtime {
         } else {
             crate::context::set_live(None, false);
         }
+        crate::tools::republish_dyn_tools(&tools);
         self.agent.set_tools(tools).await;
         let message = if want {
             format!(

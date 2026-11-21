@@ -67,6 +67,93 @@ source = "can1357/oh-my-pi (main, crates/predict, ngram only)"
 import-commit = "unrecorded (v18.6.1)"
 reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 
+# ── omp2 shell stack ──────────────────────────────────────────────────────────
+# Vendored verbatim from can1357/oh-my-pi ref `omp2`. The upstream workspace
+# manifest supplies the dependency versions these crates only reference as
+# `dep.workspace = true`; they are mirrored into this repo's
+# [workspace.dependencies] (see the "Vendored oh-my-pi (omp2) shell stack"
+# block in Cargo.toml). Keep the two in step when re-pinning.
+
+[crates.omp-core]
+path = "vendor/omp-core"
+version = "0.1.0"
+source = "can1357/oh-my-pi (omp2, crates/core)"
+reference-commit = "2f92f3b5aa2035d21c9f016f9ff6350795e5685a"
+license = "MIT"
+license-file = "vendor/LICENSE-oh-my-pi"
+modifications = "manifest only, both required to build outside the upstream workspace: edition pinned to 2024 (upstream inherits it; the crate uses let-chains, which are 2024-only, while this workspace stays on edition 2021) and upstream's `[lints] workspace = true` dropped (it would import this workspace's `unsafe_code = forbid`, but omp-core contains real unsafe blocks). Source is verbatim."
+
+[crates.omp-macros]
+path = "vendor/omp-macros"
+version = "0.1.0"
+source = "can1357/oh-my-pi (omp2, crates/macros)"
+reference-commit = "2f92f3b5aa2035d21c9f016f9ff6350795e5685a"
+license = "MIT"
+license-file = "vendor/LICENSE-oh-my-pi"
+modifications = "manifest: version/edition/license/authors pinned literally so the crate builds outside the upstream workspace"
+
+[crates.omp-vocab]
+path = "vendor/omp-vocab"
+version = "0.1.0"
+source = "can1357/oh-my-pi (omp2, crates/vocab)"
+reference-commit = "2f92f3b5aa2035d21c9f016f9ff6350795e5685a"
+license = "MIT"
+license-file = "vendor/LICENSE-oh-my-pi"
+modifications = "manifest: version/edition/license/authors pinned literally"
+
+[crates.omp-walker]
+path = "vendor/omp-walker"
+version = "0.1.0"
+source = "can1357/oh-my-pi (omp2, crates/walker)"
+reference-commit = "2f92f3b5aa2035d21c9f016f9ff6350795e5685a"
+license = "MIT"
+license-file = "vendor/LICENSE-oh-my-pi"
+modifications = "manifest: version/edition/license/authors pinned literally"
+
+[crates.omp-shell]
+path = "vendor/omp-shell"
+version = "0.1.0"
+source = "can1357/oh-my-pi (omp2, crates/shell)"
+reference-commit = "2f92f3b5aa2035d21c9f016f9ff6350795e5685a"
+license = "MIT"
+license-file = "vendor/LICENSE-oh-my-pi"
+modifications = "manifest: version/edition/license/authors pinned literally; src/sys/hostname.rs moves GetComputerNameW import from SystemInformation to WindowsProgramming for windows-sys 0.61 compatibility"
+
+[crates.omp-shell-builtins]
+path = "vendor/omp-shell-builtins"
+version = "0.1.0"
+source = "can1357/oh-my-pi (omp2, crates/shell-builtins)"
+reference-commit = "2f92f3b5aa2035d21c9f016f9ff6350795e5685a"
+license = "MIT"
+license-file = "vendor/LICENSE-oh-my-pi"
+modifications = "manifest: version/edition/license/authors pinned literally; src/{hostname,ls,uname}.rs move GetComputerNameW import from SystemInformation to WindowsProgramming for windows-sys 0.61 compatibility"
+
+[crates.xutf]
+path = "vendor/xutf"
+version = "0.1.0"
+source = "first-party shim (not vendored): stable-Rust replacement for crates.io xutf"
+reference-commit = "n/a"
+license = "MIT"
+modifications = "replaces xutf 1.6.0, which requires nightly (core::simd) and a generated Unicode property trie. Only the surface the omp2 shell stack consumes is present: strict BufRead char decoding (BufReadCharsExt/Chars/CharsRaw/ReadCharError) and width_char/width_str/width_ansi_str over unicode-width 0.2 + unicode-segmentation 1 (both already in Cargo.lock). Chars still yields io::Result<char>, matching upstream, with ReadCharError kept as the io::Error payload"
+
+# Local shims, not upstream code. Recorded here because they occupy the omp-*
+# crate names the rest of the tree imports.
+[crates.omp-tool]
+path = "vendor/omp-tool"
+version = "0.1.0"
+source = "first-party shim (not vendored): harness diagnostics only"
+reference-commit = "n/a"
+license = "MIT"
+modifications = "replaces upstream crates/tool, which pulls omp-ai/omp-catalog/omp-proto gRPC and the whole agent mesh; only the Diag surface omp-shell-builtins consumes is present"
+
+[crates.omp-proto]
+path = "vendor/omp-proto"
+version = "0.1.0"
+source = "first-party shim (not vendored): hand-written wire shapes"
+reference-commit = "n/a"
+license = "MIT"
+modifications = "replaces upstream crates/proto (prost/protox build-script gRPC codegen) with dependency-free Rust types; declares its own [workspace] so it is a path dependency, not a member"
+
 [deps.crossterm]
 # Patched crossterm vendored under vendor/crossterm (upstream crate version 0.28.1).
 path = "vendor/crossterm"

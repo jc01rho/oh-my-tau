@@ -1392,6 +1392,7 @@ pub async fn run_with(
         let mut tools = rt.agent.tools().await;
         if let Some(slot) = tools.iter_mut().find(|t| t.name() == "ask") {
             *slot = crate::tools::tool_with_ui(Arc::new(RpcAskUi));
+            crate::tools::republish_dyn_tools(&tools);
             rt.agent.set_tools(tools).await;
         }
     }

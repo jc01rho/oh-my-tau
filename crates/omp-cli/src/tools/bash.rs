@@ -1,17 +1,15 @@
-//! `bash`: one shell command (`bash -c`, stderr merged into stdout), omp's
-//! result text: output, `Wall time: N.NN seconds`, `Command exited with code N`.
-//! Non-persistent shell: omp embeds a brush-based shell, while omp-rs currently
-//! spawns an external `bash -c` (under util-linux `setsid`, see [`detached_bash`])
-//! pending the Phase 2 in-process shell port; the command semantics above match omp.
+//! `bash`: one shell command (stderr merged into stdout), omp's result text:
+//! output, `Wall time: N.NN seconds`, `Command exited with code N`.
+//! Local finite commands run in-process via `omp-shell` and `omp-shell-builtins`
+//! (`tools/shell_host.rs`, with `PathPolicy`, `SpawnWrapper`, `-pgid` teardown,
+//! and the `dyn` host bridge); `/ssh` commands execute remotely over external
+//! `ssh`.
 //!
 //! omp's `async: true` backgrounds the command in the session job manager and
 //! returns `formatBackgroundNotice`; the job is inspected via `read proc://`
-//! (`tools/jobs.rs`). Services (`name`/`ready`) are supervised in-process
-//! (omp's shared daemon broker folded into the session): the child is spawned
-//! piped, readiness is observed from a log regex and/or a TCP port probe with
-//! a timeout (default 30s), the captured log is inspectable via
-//! `read proc://<name>`, and the child is killed when the session's job
-//! registry is dropped (omp stops owned services at session end).
+//! (`tools/jobs.rs`). Long-lived services (`name`/`ready`) stay supervised
+//! with a dedicated external `Child` handle (`SUPERVISOR_TICK` + `start_kill`)
+//! killed when the session's job registry is dropped.
 
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -19,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use pa_agent::abort::AbortSignal;
-use pa_agent::types::AgentToolResult;
+use pa_agent::types::{AgentTool, AgentToolResult};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -352,34 +350,51 @@ async fn run(
     notify: Option<&Notify>,
     tap: Option<Arc<Mutex<String>>>,
 ) -> Result<(String, Option<i32>, Duration, Option<&'static str>)> {
+    run_with_dyn(cwd, command, timeout, signal, notify, tap, None).await
+}
+
+async fn run_with_dyn(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Option<f64>,
+    signal: &AbortSignal,
+    notify: Option<&Notify>,
+    tap: Option<Arc<Mutex<String>>>,
+    dyn_tools: Option<super::shell_host::DynToolList>,
+) -> Result<(String, Option<i32>, Duration, Option<&'static str>)> {
     let script = format!("exec 2>&1\n{command}");
+    if let Some(argv) = crate::features::ssh::remote_argv(&script) {
+        return run_remote_ssh(cwd, &argv, timeout, signal, notify, tap).await;
+    }
+    let on_chunk: Option<super::shell_host::ChunkCallback<'_>> = notify
+        .map(|n| Box::new(move |text: &str| n.feed(text)) as super::shell_host::ChunkCallback<'_>);
+    let res = super::shell_host::execute_shell(super::shell_host::ShellExecRequest {
+        cwd,
+        command,
+        timeout,
+        signal,
+        dyn_tools,
+        retain_bytes: RETAIN_BYTES,
+        on_chunk,
+        tap,
+    })
+    .await?;
+    Ok((res.output, res.exit_code, res.elapsed, res.outcome))
+}
+
+async fn run_remote_ssh(
+    cwd: &std::path::Path,
+    argv: &[String],
+    timeout: Option<f64>,
+    signal: &AbortSignal,
+    notify: Option<&Notify>,
+    tap: Option<Arc<Mutex<String>>>,
+) -> Result<(String, Option<i32>, Duration, Option<&'static str>)> {
     let started = Instant::now();
-    // `/ssh <host>` (features/ssh.rs): run the script remotely via
-    // `ssh <target> -- bash -lc <script>` instead of a local bash. When
-    // running locally with the sandbox on (features/sandbox.rs), re-launch
-    // through `omt __sandbox-exec` (self-exec confinement helper) so the tool
-    // subprocess is Landlock/seccomp-confined (remote runs are left to the
-    // remote host).
-    let mut cmd = if let Some(argv) = crate::features::ssh::remote_argv(&script) {
-        let mut c = tokio::process::Command::new("ssh");
-        for arg in argv {
-            c.arg(arg);
-        }
-        c
-    } else {
-        match crate::features::sandbox::wrap_inner(cwd, &local_bash_argv(&script)) {
-            Some((launcher, argv)) => {
-                let mut c = tokio::process::Command::new(launcher);
-                c.args(argv);
-                c
-            }
-            None => {
-                let mut c = detached_bash();
-                c.arg("-c").arg(script);
-                c
-            }
-        }
-    };
+    let mut cmd = tokio::process::Command::new("ssh");
+    for arg in argv {
+        cmd.arg(arg);
+    }
     let mut child = cmd
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -723,11 +738,20 @@ pub async fn bash(
             spill,
             query,
             notify.as_ref(),
+            env.dyn_tools(),
             &signal,
         ));
     }
-    let (output, code, elapsed, outcome) =
-        run(&dir, &command, timeout, &signal, None, None).await?;
+    let (output, code, elapsed, outcome) = run_with_dyn(
+        &dir,
+        &command,
+        timeout,
+        &signal,
+        None,
+        None,
+        env.dyn_tools(),
+    )
+    .await?;
     let mut text = finished_text(&output, elapsed, outcome, timeout, code, &spill, &query);
     if !notices.is_empty() {
         text = format!("{}\n{text}", notices.join("\n"));
@@ -1022,6 +1046,7 @@ fn start_background(
     spill: SpillConfig,
     query: String,
     notify: Option<&Arc<Notify>>,
+    dyn_tools: Option<super::shell_host::DynToolList>,
     _signal: &AbortSignal,
 ) -> AgentToolResult {
     let output: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -1038,15 +1063,26 @@ fn start_background(
     let registry = registry.clone();
     let task_job_id = job_id.clone();
     let task_notify = notify.cloned();
+    // A background job outlives the tool list that started it, and the `dyn`
+    // bridge only holds weak handles, so the job's `dyn` devices would vanish
+    // as soon as the caller rebuilt or dropped its list. Pin the live tools for
+    // the job's lifetime only: they are dropped with the job task, so `Env`
+    // never gains a strong link back to the tools that own it.
+    let keep_alive: Vec<Arc<dyn AgentTool>> = dyn_tools.as_ref().map_or_else(Vec::new, |list| {
+        list.iter().filter_map(std::sync::Weak::upgrade).collect()
+    });
     tokio::spawn(async move {
+        // Held for the whole job; released when this task ends.
+        let _keep = keep_alive;
         let controller = pa_agent::abort::AbortController::new();
-        let raw = run(
+        let raw = run_with_dyn(
             &dir,
             &command,
             timeout,
             &controller.signal(),
             task_notify.as_deref(),
             Some(output),
+            dyn_tools,
         )
         .await;
         if let Some(notify) = &task_notify {
@@ -1122,14 +1158,41 @@ mod tests {
         std::sync::Arc::new(super::super::Env::new(&std::env::temp_dir(), false))
     }
 
-    /// Regression (hung TUI menus): a tool command must not reach the TUI's
-    /// controlling terminal — it runs in its own session, so `/dev/tty` is
-    /// unavailable and `stty`/interop programs cannot drop raw mode.
+    /// Wait (bounded) until job `id` leaves the running state.
+    async fn settled_job(env: &super::super::Env, id: &str) -> jobs::Job {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let job = env.jobs.get(id).expect("job registered");
+            if job.status != JobStatus::Running {
+                return job;
+            }
+            assert!(Instant::now() < deadline, "job {id} never settled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Regression (hung TUI menus): neither the in-process shell nor any
+    /// external command it spawns may reach the TUI's controlling terminal —
+    /// `CliPathPolicy` blocks `/dev/tty` redirections in-process, and external
+    /// commands run in their own `setsid()` session (`external_cmd_leads_session`).
     #[tokio::test]
     async fn commands_have_no_controlling_terminal() {
+        let in_proc = bash(
+            test_env(),
+            serde_json::json!({"command": "if (: </dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi"}),
+            sig(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            text_of(&in_proc).contains("NO_TTY"),
+            "{}",
+            text_of(&in_proc)
+        );
+
         let r = bash(
             test_env(),
-            serde_json::json!({"command": "if (: </dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi; ps -o sid= -p $$ | tr -d ' '; echo $$"}),
+            serde_json::json!({"command": "sh -c 'if (: </dev/tty) 2>/dev/null; then echo HAS_TTY; else echo NO_TTY; fi; ps -o sid= -p $$ | tr -d \" \"; echo $$'"}),
             sig(),
         )
         .await
@@ -1141,7 +1204,7 @@ mod tests {
             lines.next().unwrap_or_default(),
             lines.next().unwrap_or_default(),
         );
-        assert_eq!(sid, pid, "bash is its own session leader: {t}");
+        assert_eq!(sid, pid, "spawned child is its own session leader: {t}");
     }
 
     #[tokio::test]
@@ -1260,6 +1323,121 @@ mod tests {
             "{}",
             text_of(&after)
         );
+    }
+
+    /// Regression: a background job outlives the tool list that started it,
+    /// and the `dyn` bridge holds its tools weakly, so without a job-scoped
+    /// strong hold a `dyn` call inside a still-running job would find no
+    /// device once the caller rebuilt or dropped its list.
+    #[tokio::test]
+    async fn background_job_keeps_dyn_tools_alive_after_the_list_drops() {
+        /// A `dyn` device; the gated one parks until the test releases it, so the
+        /// caller can drop its tool list at a known point in the command.
+        struct TestTool {
+            name: &'static str,
+            gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        }
+        impl pa_agent::types::AgentTool for TestTool {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn description(&self) -> &'static str {
+                "test device"
+            }
+            fn parameters(&self) -> &Value {
+                static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+                SCHEMA.get_or_init(|| {
+                    serde_json::json!(
+                        {"type":"object","properties":{"msg":{"type":"string"}}}
+                    )
+                })
+            }
+            fn execute(
+                self: Arc<Self>,
+                _id: String,
+                params: Value,
+                _signal: AbortSignal,
+                _on_update: pa_agent::types::AgentToolUpdateCallback,
+            ) -> pa_agent::BoxFut<'static, Result<AgentToolResult>> {
+                Box::pin(async move {
+                    if let Some((entered, release)) = &self.gate {
+                        let release = release.notified();
+                        entered.notify_one();
+                        release.await;
+                    }
+                    let msg = params["msg"].as_str().unwrap_or_default();
+                    Ok(AgentToolResult::text(format!("ran {}:{msg}", self.name)))
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let env = std::sync::Arc::new(super::super::Env::new(dir.path(), false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gated: Arc<dyn pa_agent::types::AgentTool> = Arc::new(TestTool {
+            name: "gate_device",
+            gate: Some((entered.clone(), release.clone())),
+        });
+        let target: Arc<dyn pa_agent::types::AgentTool> = Arc::new(TestTool {
+            name: "target_device",
+            gate: None,
+        });
+        let weak_target = Arc::downgrade(&target);
+        let tools = vec![gated, target];
+        env.set_dyn_tools(&tools);
+
+        // The gated device runs first; the target device runs only after the
+        // caller has dropped the list, so its lookup cannot ride on the caller.
+        let notice = start_background(
+            &env.jobs,
+            dir.path().to_path_buf(),
+            "dyn gate_device --msg go; dyn target_device --msg hi".to_string(),
+            Some(60.0),
+            Vec::new(),
+            SpillConfig::load(dir.path()),
+            String::new(),
+            None,
+            env.dyn_tools(),
+            &sig(),
+        );
+        let text = text_of(&notice);
+        assert!(text.starts_with("Backgrounded as job bg_1"), "{text}");
+
+        tokio::time::timeout(Duration::from_secs(60), entered.notified())
+            .await
+            .expect("the background job never reached the gated dyn device");
+
+        // The caller drops the list it built. The env's snapshot is weak, so the
+        // tools survive only because the running job holds them.
+        drop(tools);
+        assert!(
+            weak_target.upgrade().is_some(),
+            "the running job keeps its dyn tools alive after the list drops"
+        );
+        release.notify_one();
+        let job = settled_job(&env, "bg_1").await;
+        let result = job.result.unwrap_or_default();
+        assert!(
+            job.status == JobStatus::Completed,
+            "the post-drop dyn call failed: {:?}\n{result}",
+            job.error
+        );
+        assert!(
+            result.contains("ran target_device:hi"),
+            "the dyn call made after the list dropped ran: {result}"
+        );
+
+        // The hold is job-scoped: settling the job drops it, so the tool frees
+        // instead of being pinned for the session's lifetime.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while weak_target.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the finished job still pins its dyn tools"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -1905,5 +2083,342 @@ mod tests {
             notice.ends_with("Read artifact://4 for full output"),
             "{notice}"
         );
+    }
+
+    #[tokio::test]
+    async fn in_process_pipeline_heredoc_redirect_and_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let sig = AbortSignal::never();
+        let (out, code, _, outcome) = run(
+            dir.path(),
+            "cat <<'EOF' | grep -n two > hit.txt\none\ntwo\nthree\nEOF\ncat hit.txt\nexit 7",
+            Some(10.0),
+            &sig,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, None);
+        assert_eq!(code, Some(7));
+        assert_eq!(out.trim(), "2:two");
+    }
+
+    #[tokio::test]
+    async fn in_process_timeout_cancels_sleeping_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let sig = AbortSignal::never();
+        let (_, code, elapsed, outcome) = run(dir.path(), "sleep 30", Some(0.15), &sig, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, Some("timeout"));
+        assert_eq!(code, None);
+        assert!(elapsed < Duration::from_secs(5), "elapsed: {elapsed:?}");
+    }
+
+    /// QA: the in-process `omp-shell-builtins` `jq`, `grep` and `wc` really run
+    /// end-to-end inside the `bash` tool (no external binaries involved).
+    #[tokio::test]
+    async fn in_process_builtins_grep_wc_and_jq_work_end_to_end() {
+        let r = bash(
+            test_env(),
+            serde_json::json!({"command": "printf '{\"k\":1}\\n{\"k\":2}\\n' | jq -c '.k' | grep -c '[12]'"}),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let out = text_of(&r);
+        assert_eq!(
+            out.lines().next().unwrap_or_default().trim(),
+            "2",
+            "jq|grep -c pipeline: {out}"
+        );
+
+        let r = bash(
+            test_env(),
+            serde_json::json!({"command": "printf 'a\\nb\\nc\\n' | wc -l"}),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let out = text_of(&r);
+        assert_eq!(
+            out.lines().next().unwrap_or_default().trim(),
+            "3",
+            "wc -l: {out}"
+        );
+    }
+
+    /// QA: the registered host tools reach the in-process `dyn` builtin through
+    /// the live `Env::dyn_tools` bridge and the real `AgentTool` interface, and
+    /// `bash` itself is not exposed (no unbounded shell recursion).
+    #[tokio::test]
+    async fn bash_tool_exposes_registered_tools_via_dyn_bridge() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = super::super::builtin_tools(dir.path(), pi_edit::EditMode::Replace);
+        assert!(tools.iter().any(|t| t.name() == "read"), "read registered");
+        let bash_tool = tools
+            .iter()
+            .find(|t| t.name() == "bash")
+            .cloned()
+            .expect("bash tool is registered");
+        let call = |command: &str| {
+            bash_tool.clone().execute(
+                String::new(),
+                serde_json::json!({"command": command}),
+                sig(),
+                Arc::new(|_r: AgentToolResult| {}),
+            )
+        };
+
+        let catalog = text_of(&call("dyn").await.unwrap());
+        assert!(catalog.contains("  read"), "catalog lists read: {catalog}");
+        assert!(
+            !catalog
+                .lines()
+                .any(|l| l.trim_start().starts_with("bash —")),
+            "bash must not be a dyn device (recursion): {catalog}"
+        );
+
+        let top = text_of(&call("dyn --help").await.unwrap());
+        assert!(
+            top.contains("dyn — discover and invoke live dynamic devices"),
+            "{top}"
+        );
+
+        let help = text_of(&call("dyn read --help").await.unwrap());
+        assert!(help.contains("dyn read"), "dyn read --help: {help}");
+        assert!(help.contains("<path>"), "read path is a positional: {help}");
+    }
+
+    /// QA: the `cwd` parameter scopes the in-process shell without touching the
+    /// host process's own working directory.
+    #[tokio::test]
+    async fn in_process_cwd_parameter_isolates_shell_working_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let before = std::env::current_dir().unwrap();
+        let env = std::sync::Arc::new(super::super::Env::new(dir.path(), false));
+        let r = bash(
+            env,
+            serde_json::json!({"cwd": "sub", "command": "pwd"}),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let out = text_of(&r);
+        let want = std::fs::canonicalize(&sub).unwrap();
+        let printed = out.lines().next().unwrap_or_default().trim();
+        assert_eq!(
+            std::fs::canonicalize(printed).unwrap(),
+            want,
+            "pwd is the cwd parameter: {out}"
+        );
+        assert_eq!(
+            std::env::current_dir().unwrap(),
+            before,
+            "host cwd untouched"
+        );
+    }
+    /// Whether `pid` no longer runs: already reaped, or a zombie whose parent
+    /// has not collected it yet. A killed grandchild is briefly either, so both
+    /// count as dead. Only the pgid teardown test probes pids, and that test is
+    /// unix-only.
+    #[cfg(unix)]
+    fn pid_is_dead(pid: i32) -> bool {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        if kill(Pid::from_raw(pid), None).is_err() {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            return stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
+        }
+        false
+    }
+
+    /// Regression: the `cwd` parameter defines `$PWD` as well as the shell's
+    /// working directory. A `$PWD` inherited from the host process would make
+    /// `pwd` and `$PWD` disagree, so every relative path built from `$PWD`
+    /// would resolve against the host's directory instead of the workspace.
+    #[tokio::test]
+    async fn in_process_pwd_env_matches_cwd_parameter() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let env = std::sync::Arc::new(super::super::Env::new(dir.path(), false));
+        let r = bash(
+            env,
+            serde_json::json!({
+                "cwd": "sub",
+                "command": r#"printf '%s|%s\n' "$(pwd)" "$PWD""#,
+            }),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let out = text_of(&r);
+        let first = out.lines().next().unwrap_or_default();
+        let (builtin, var) = first.split_once('|').unwrap_or((first, ""));
+        assert_eq!(builtin, var, "`pwd` and `$PWD` disagree: {out}");
+        let want = std::fs::canonicalize(&sub).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(builtin).unwrap(),
+            want,
+            "`$PWD` follows the cwd parameter: {out}"
+        );
+        let host_pwd = std::env::var("PWD").unwrap_or_default();
+        assert_ne!(
+            var, host_pwd,
+            "the shell must not inherit the host process's PWD: {out}"
+        );
+    }
+
+    /// Regression (hung TUI menus): the `/dev/tty` denial holds for alias
+    /// spellings too. `/dev/../dev/tty` is the same device node under a
+    /// different `Path`, so a literal `path == "/dev/tty"` test admits it and
+    /// lets the command take over the host terminal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_process_tty_alias_is_denied() {
+        let policy =
+            super::super::shell_host::CliPathPolicy::new(std::path::Path::new("/tmp"), false);
+        for alias in ["/dev/../dev/tty", "/dev/tty"] {
+            assert!(
+                omp_shell::PathPolicy::check_read(&policy, std::path::Path::new(alias)).is_err(),
+                "the policy admits the controlling-tty path {alias}"
+            );
+        }
+
+        let r = bash(
+            test_env(),
+            serde_json::json!({
+                "command": ": </dev/../dev/tty; echo alias_rc=$?; : </dev/tty; echo plain_rc=$?",
+            }),
+            sig(),
+        )
+        .await
+        .unwrap();
+        let out = text_of(&r);
+        assert!(
+            out.contains("sandbox denied read to /dev/../dev/tty"),
+            "the alias is refused by the sandbox, not opened: {out}"
+        );
+        assert!(out.contains("alias_rc=1"), "the alias fails: {out}");
+        assert!(out.contains("plain_rc=1"), "the plain path fails: {out}");
+    }
+
+    /// Regression: an abort tears down the whole process group, not just the
+    /// direct child. A grandchild forked into the background outlives the shell
+    /// and keeps running, so the teardown is asserted on the grandchild's pid.
+    ///
+    /// Synchronization is the `child.pid` file the command writes once the
+    /// grandchild exists: no fixed delay, and the abort is issued only after
+    /// that pid is readable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_process_timeout_kills_backgrounded_grandchild_via_pgid() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = pa_agent::abort::AbortController::new();
+        let env = std::sync::Arc::new(super::super::Env::new(dir.path(), false));
+        let running = tokio::spawn(bash(
+            env,
+            serde_json::json!({"command": "sh -c 'sleep 30 & echo $! > child.pid; wait'"}),
+            controller.signal(),
+        ));
+
+        let pid_file = dir.path().join("child.pid");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the grandchild pid never reached {}",
+                pid_file.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        controller.abort();
+        let err = running.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("[Command aborted]"), "{err}");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pid_is_dead(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "grandchild {pid} survived the pgid teardown"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Regression: the `dyn` catalog is the settings-gated session list. A tool
+    /// switched off by settings is neither advertised nor dispatchable through
+    /// the in-process `dyn` builtin.
+    #[tokio::test]
+    async fn session_dyn_bridge_respects_settings_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yml");
+        std::fs::write(
+            &cfg,
+            "find:\n  enabled: \"off\"\ncheckpoint:\n  enabled: false\n",
+        )
+        .unwrap();
+        let settings = omp_settings::Settings::load_from(Some(&cfg), dir.path());
+        let tools =
+            super::super::session_builtin_tools(dir.path(), pi_edit::EditMode::Replace, &settings);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"read"), "read stays advertised: {names:?}");
+        assert!(
+            !names.contains(&"find"),
+            "find.enabled off hides find: {names:?}"
+        );
+        assert!(
+            !names.contains(&"checkpoint"),
+            "checkpoint.enabled false hides checkpoint: {names:?}"
+        );
+        // Both are built-ins: the omissions are the settings gate, not a
+        // missing tool.
+        let ungated = super::super::builtin_tools(dir.path(), pi_edit::EditMode::Replace);
+        for gated in ["find", "checkpoint"] {
+            assert!(
+                ungated.iter().any(|t| t.name() == gated),
+                "{gated} is a built-in, only its setting hides it"
+            );
+        }
+
+        let bash_tool = tools
+            .iter()
+            .find(|t| t.name() == "bash")
+            .cloned()
+            .expect("bash is advertised");
+        let catalog = text_of(
+            &bash_tool
+                .execute(
+                    String::new(),
+                    serde_json::json!({"command": "dyn"}),
+                    sig(),
+                    std::sync::Arc::new(|_r: AgentToolResult| {}),
+                )
+                .await
+                .unwrap(),
+        );
+        let listed = |name: &str| {
+            catalog
+                .lines()
+                .any(|l| l.trim_start().starts_with(&format!("{name} —")))
+        };
+        assert!(listed("read"), "dyn lists read: {catalog}");
+        assert!(!listed("find"), "dyn must omit find: {catalog}");
+        assert!(!listed("checkpoint"), "dyn must omit checkpoint: {catalog}");
     }
 }
