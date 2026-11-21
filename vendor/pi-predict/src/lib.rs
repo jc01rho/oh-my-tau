@@ -14,6 +14,13 @@
 //!                                                  ├─ ngram::open   (`auto`)
 //! ```
 //!
+//! # Vendored subset
+//! Only the `ngram` engine is vendored: the upstream `smollm` and `apple`
+//! engines need model weights / AppKit and ML dependencies this crate does not
+//! ship. [`Method::parse`] still accepts their wire names so callers keep
+//! upstream's vocabulary, and [`open`] reports them as unavailable instead of
+//! silently substituting another engine.
+//!
 //! # Example
 //! ```ignore
 //! let mut engine = pi_predict::open(Method::Ngram, &config)?;
@@ -81,22 +88,30 @@ pub trait Predictor: Send {
 }
 
 /// Engines implemented in this crate. Upstream also has `smollm` and `apple`;
-/// they are not vendored (model weights / AppKit), so [`Method::parse`] maps
-/// those names to [`Method::Ngram`].
+/// they are not vendored (model weights / AppKit), so [`open`] refuses them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
     /// Personal word n-gram + web prior; serves `auto`.
     Ngram,
+    /// SmolLM2-135M base model with token-healed, prefix-constrained decoding.
+    /// Not vendored: [`open`] returns an error.
+    SmolLm,
+    /// macOS `NSSpellChecker` dictionary completion (errors elsewhere).
+    /// Not vendored: [`open`] returns an error.
+    Apple,
 }
 
 impl Method {
-    /// Parse a wire name. `smollm` and `apple` fall back to the n-gram engine.
+    /// Parse a wire name (`ngram`, `smollm`, `apple`), as used by settings,
+    /// the daemon protocol, and `TextPredictor`.
     ///
     /// # Errors
     /// Returns an error for any other name.
     pub fn parse(name: &str) -> anyhow::Result<Self> {
         match name {
-            "ngram" | "smollm" | "apple" => Ok(Self::Ngram),
+            "ngram" => Ok(Self::Ngram),
+            "smollm" => Ok(Self::SmolLm),
+            "apple" => Ok(Self::Apple),
             other => anyhow::bail!("unknown text prediction method {other:?}"),
         }
     }
@@ -113,9 +128,16 @@ impl FromStr for Method {
 /// Open (or restore from [`Config::state_dir`]) the engine for `method`.
 ///
 /// # Errors
-/// Returns an error when persisted state cannot be loaded.
+/// Returns an error when persisted state cannot be loaded, and for the engines
+/// this vendored subset does not ship ([`Method::SmolLm`], [`Method::Apple`]).
 pub fn open(method: Method, config: &Config) -> anyhow::Result<Box<dyn Predictor>> {
     match method {
         Method::Ngram => ngram::open(config),
+        Method::SmolLm => anyhow::bail!(
+            "the smollm text prediction engine is not vendored in pi-predict; use \"ngram\""
+        ),
+        Method::Apple => anyhow::bail!(
+            "the apple text prediction engine is not vendored in pi-predict; use \"ngram\""
+        ),
     }
 }

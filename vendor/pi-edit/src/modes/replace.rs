@@ -9,7 +9,7 @@
 use crate::{
     diff_string::{BlockContextSource, generate_diff_string},
     engine::{EditMode, FileOp, Inspection, ModeEngine, PreviewFile, StagedFile},
-    error::EditError,
+    error::{EditError, Rejection},
     files::FileSource,
     fuzzy::{
         ReplaceOutcome, ReplaceResult, format_match_error, format_occurrence_error, replace_text,
@@ -217,9 +217,10 @@ impl ModeEngine for ReplaceEngine {
         }
         let after = after.unwrap_or_else(|| read.text.clone());
         if read.text == after {
-            return Err(EditError::apply(format!(
-                "Edits to {display} resulted in no changes being made."
-            )));
+            return Err(EditError::rejected(
+                Rejection::NoChange,
+                format!("Edits to {display} resulted in no changes being made."),
+            ));
         }
 
         let persisted = read.persist(&after)?;
@@ -252,10 +253,40 @@ impl ModeEngine for ReplaceEngine {
             entries: args
                 .new_string
                 .as_ref()
-                .map_or_else(Vec::new, |new_string| {
-                    vec![(path.clone(), new_string.clone())]
-                }),
+                .map_or_default(|new_string| vec![(path.clone(), new_string.clone())]),
             file_ops: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine() -> ReplaceEngine {
+        ReplaceEngine {
+            allow_fuzzy: true,
+            fuzzy_threshold: 0.95,
+        }
+    }
+
+    #[test]
+    fn reports_path_qualified_occurrences() {
+        let error = engine()
+            .replace("one\none\n", "one", "two", false, "a.txt")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("Found 2 occurrences in a.txt")
+        );
+    }
+
+    #[test]
+    fn reports_path_qualified_match_error() {
+        let error = engine()
+            .replace("alpha\n", "omega", "two", false, "a.txt")
+            .unwrap_err();
+        assert!(error.to_string().contains("match in a.txt"));
     }
 }

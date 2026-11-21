@@ -1,18 +1,53 @@
 [package]
 name = "pi-ast"
-version = "18.9.1"
+version = "19.0.1"
 edition = "2024"
 license = "MIT"
 authors = ["Stencil Labs, Inc."]
 description = "Vendored from can1357/oh-my-pi (MIT), see ../LICENSE-oh-my-pi."
 
+[features]
+default = []
+# Grammars outside the linked set load as WebAssembly (src/language/grammar.rs).
+# Off, such grammars report `GrammarError::Invalid` and the linked grammars work
+# unchanged. Deliberately NOT in `default`.
+#
+# Upstream declares `wasm = ["tree-sitter/wasm", "dep:semver"]`. The
+# `tree-sitter/wasm` edge is omitted here on purpose: cargo records a
+# dependency's optional dependencies in Cargo.lock whether or not the feature
+# is enabled, so declaring it pulls `wasmtime-c-api` -> `wasmtime-c-api-impl`
+# into the lock graph (and cranelift + cmake at build time) even for a default
+# `cargo build`. This workspace's lock has no wasmtime entry and must not grow
+# one. Re-adding the edge is required to actually enable the feature, together
+# with a Cargo.lock update.
+wasm = ["dep:semver"]
+# Upstream gates some parser tests on grammar crates this workspace does not
+# lock (emacs-lisp, fortran, ruby, swift) or on a newer grammar revision than
+# the locked one (tree-sitter-md 0.5.3 vs the fixed 0.5.4). Those tests are
+# gated on this feature so `cargo test` stays green without pulling new
+# crates or rewriting Cargo.lock. Enabling it means adding
+# tree-sitter-{elisp,fortran,ruby,swift} dev-dependencies and bumping
+# tree-sitter-md to 0.5.4.
+test-grammars = []
+# Upstream's `summary::tests::parses_go_new_with_expression_operand` needs the
+# vendored `tree-sitter-go` (Go 1.26 `new(expr)` fix, upstream PR #193) that the
+# upstream root manifest wires in through [patch.crates-io]. This workspace locks
+# the unpatched crates.io 0.25.0, which rejects `new(expr)`, so the test is gated
+# here. Enable after adding the same patch entry to the root Cargo.toml.
+patched-tree-sitter-go = []
+
 [dependencies]
 anyhow = "1"
 ast-grep-core = { version = "0.39", default-features = false, features = ["tree-sitter"] }
-globset = "0.4"
-ignore = "0.4"
+futures = "0.3"
 phf = { version = "0.14", features = ["macros"] }
+omp-xfs = { path = "../omp-xfs" }
+omp-vfs = { package = "pi-vfs", path = "../pi-vfs" }
 serde = { version = "1", features = ["derive"] }
+# Match the host semver features used by wasmtime's build dependencies.
+semver = { version = "1", optional = true }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
 tree-sitter = "0.25"
 tree-sitter-bash = "0.25"
 tree-sitter-c = "0.24"
@@ -31,4 +66,12 @@ tree-sitter-rust = "0.24"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-typescript = "0.23"
 tree-sitter-yaml = "0.7"
+xutf = { path = "../xutf" }
 xxhash-rust = { version = "0.8", features = ["xxh64", "xxh32"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+parking_lot = "0.12"
+tempfile = "3"
+
+[lints]

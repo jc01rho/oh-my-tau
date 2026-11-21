@@ -67,7 +67,7 @@ const fn is_mark(c: char) -> bool {
     )
 }
 
-pub fn utf16_len(text: &str) -> usize {
+fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
 
@@ -196,7 +196,7 @@ fn mask_tag_at(text: &[u8], i: usize, masked: &mut [bool]) -> usize {
     let n = text.len();
     if text[i..].starts_with(b"<!--") {
         let stop = text[i + 4..]
-            .windows(3)
+            .array_windows()
             .position(|w| w == b"-->")
             .map_or(n, |at| i + 4 + at + 3);
         masked[i..stop].fill(true);
@@ -307,10 +307,7 @@ pub fn mask_non_prose(text: &str) -> Cow<'_, str> {
     }
     // Masked regions start and end at ASCII delimiters, so every multi-byte
     // character is replaced whole and the result stays UTF-8.
-    Cow::Owned(
-        String::from_utf8(out)
-            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
-    )
+    Cow::Owned(String::from_utf8_lossy_owned(out))
 }
 
 /// Share of non-whitespace characters (UTF-16 weighted) that survive
@@ -410,7 +407,7 @@ fn word_spans(line: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
 /// Line-level `isProseWord`: the word survives the mask, its
 /// whitespace-delimited token has no code characters, digits or camelCase,
 /// and the line is not a slash command or an arrow.
-pub fn is_prose_word(line: &str, masked_line: &str, start: usize, end: usize) -> bool {
+fn is_prose_word(line: &str, masked_line: &str, start: usize, end: usize) -> bool {
     if is_blank(&masked_line[start..end]) {
         return false;
     }

@@ -8,9 +8,9 @@ members = [
     "vendor/pi-edit",
     "vendor/pi-ast",
     "vendor/pi-diff",
-    "vendor/pi-walker",
     "vendor/pi-vfs",
     "vendor/pi-predict",
+    "vendor/omp-xfs",
     # oh-my-pi (omp2) shell stack, vendored verbatim from the pinned omp2 commit
     # (see vendor-src.lock). vendor/omp-proto is deliberately absent: it ships its
     # own `[workspace]` table and reaches the graph as a path dependency instead,
@@ -70,6 +70,7 @@ omp-core = { path = "vendor/omp-core", features = ["schemars"] }
 omp-macros = { path = "vendor/omp-macros" }
 omp-vocab = { path = "vendor/omp-vocab" }
 omp-walker = { path = "vendor/omp-walker" }
+omp-xfs = { path = "vendor/omp-xfs" }
 omp-tool = { path = "vendor/omp-tool" }
 omp-proto = { path = "vendor/omp-proto" }
 omp-shell = { path = "vendor/omp-shell" }
@@ -149,7 +150,7 @@ strum = { version = "0.28", features = ["derive"] }
 syn = { version = "2", features = ["full"] }
 tempfile = "3"
 url = "2.5"
-windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Media_Multimedia", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Media_Multimedia", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Kernel", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 xutf = { path = "vendor/xutf" }
 zeroize = { version = "1.9", features = ["derive"] }
 

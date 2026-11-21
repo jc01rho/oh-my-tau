@@ -1508,6 +1508,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hashlink"
@@ -2737,13 +2742,14 @@ dependencies = [
  "omp-tui",
  "omp-urls",
  "omp-wasm",
+ "omp-xfs",
  "pa-agent",
  "pa-ai",
  "pa-types",
  "parking_lot",
  "pi-ast",
  "pi-edit",
- "pi-walker",
+ "pi-vfs",
  "rand 0.8.8",
  "rayon",
  "regex",
@@ -3205,6 +3211,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "omp-xfs"
+version = "19.0.1"
+dependencies = [
+ "async-trait",
+ "flume",
+ "futures",
+ "globset",
+ "grep-matcher",
+ "grep-pcre2",
+ "grep-regex",
+ "grep-searcher",
+ "hashbrown 0.17.1",
+ "ignore",
+ "libc",
+ "memchr",
+ "parking_lot",
+ "pi-vfs",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3603,14 +3635,21 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "18.9.1"
+version = "19.0.1"
 dependencies = [
  "anyhow",
  "ast-grep-core",
- "globset",
- "ignore",
+ "async-trait",
+ "futures",
+ "omp-xfs",
+ "parking_lot",
  "phf",
+ "pi-vfs",
+ "semver",
  "serde",
+ "tempfile",
+ "tokio",
+ "tokio-util",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -3629,66 +3668,59 @@ dependencies = [
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+ "xutf",
  "xxhash-rust",
 ]
 
 [[package]]
 name = "pi-diff"
-version = "18.9.1"
+version = "19.0.1"
+dependencies = [
+ "xutf",
+]
 
 [[package]]
 name = "pi-edit"
-version = "18.9.1"
+version = "19.0.1"
 dependencies = [
  "async-trait",
+ "omp-xfs",
  "parking_lot",
  "pi-ast",
  "pi-diff",
- "pi-walker",
  "regex",
- "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
- "unicode-normalization",
+ "tokio",
+ "xutf",
  "xxhash-rust",
 ]
 
 [[package]]
 name = "pi-predict"
-version = "18.6.1"
+version = "19.0.1"
 dependencies = [
  "anyhow",
  "rayon",
  "regex",
  "serde",
  "serde_json",
+ "xutf",
  "zstd",
 ]
 
 [[package]]
 name = "pi-vfs"
-version = "18.9.1"
+version = "19.0.1"
 dependencies = [
  "async-trait",
  "libc",
  "parking_lot",
  "tokio",
  "tokio-util",
- "windows-sys 0.59.0",
- "xattr",
-]
-
-[[package]]
-name = "pi-walker"
-version = "18.9.1"
-dependencies = [
- "globset",
- "ignore",
- "libc",
- "parking_lot",
- "pi-vfs",
- "rayon",
  "windows-sys 0.61.2",
+ "xattr",
 ]
 
 [[package]]
@@ -5083,10 +5115,13 @@ checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "futures-util",
+ "hashbrown 0.15.5",
  "libc",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 
@@ -6192,6 +6227,7 @@ dependencies = [
 name = "xutf"
 version = "0.1.0"
 dependencies = [
+ "unicode-normalization",
  "unicode-segmentation",
  "unicode-width 0.2.0",
 ]

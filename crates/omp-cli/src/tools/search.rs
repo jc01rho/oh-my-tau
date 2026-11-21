@@ -1,30 +1,30 @@
-//! `grep` (ripgrep engine crates over the `pi-walker` file walk) and `glob`
-//! (`pi-walker`, mtime-ranked), with omp's result formats and notices.
+//! `grep` (ripgrep engine crates over the `omp-xfs` parallel walk) and `glob`
+//! (`omp-xfs`, mtime-ranked), with omp's result formats and notices.
 
 use std::collections::{BTreeSet, HashMap};
-use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
+use futures::{stream, StreamExt};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{
     BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
 };
+use omp_xfs::glob::{glob as glob_walk, GlobOptions, Selector};
+use omp_xfs::walk::{self, Action};
+use omp_xfs::{FileType, Fs};
+use pa_agent::abort::AbortSignal;
 use pa_agent::types::AgentToolResult;
 use pi_edit::path_policy::canonical_key;
 use pi_edit::store::seen_lines_from_body;
-use pi_walker::{
-    CompiledWalkGlob, DirectoryErrorMode, EmptyRecheck, FollowLinks, WalkDetail, WalkFilter,
-    WalkOrder, WalkRank, WalkRequest,
-};
 
-use super::read::{parse_sel, LineRange, Selector};
+use super::read::{parse_sel, LineRange, Selector as ReadSelector};
 use super::tree::{events, format_grouped_paths, Kind};
 use super::util::{
-    cancelled, cut_bytes, format_bytes, format_path_relative_to_cwd, path_list, resolve_to_cwd,
-    truncate_head, CancelFlag, DEFAULT_MAX_BYTES,
+    cut_bytes, format_bytes, format_path_relative_to_cwd, path_list, resolve_to_cwd, truncate_head,
+    DEFAULT_MAX_BYTES,
 };
 use super::Env;
 
@@ -36,10 +36,10 @@ const MAX_COLUMN: usize = 512;
 const CONTEXT_BEFORE: usize = 1;
 const CONTEXT_AFTER: usize = 3;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
-/// Files searched per parallel batch: bounds wasted work past
-/// `INTERNAL_TOTAL_CAP` while staying above the walker pool's parallel
-/// threshold (256 files).
-const SEARCH_CHUNK_FILES: usize = 512;
+/// Files read and searched at once (one `Searcher` each, since a `Searcher` is
+/// neither `Sync` nor `Send`). Results are folded back in path order, so this
+/// bounds memory and in-flight I/O without ever changing the output.
+const SEARCH_CONCURRENCY: usize = 8;
 const GLOB_DEFAULT_LIMIT: usize = 200;
 const GLOB_MAX_LIMIT: usize = 200;
 
@@ -86,52 +86,11 @@ pub fn parse_find_pattern(pattern: &str) -> FindPattern {
     }
 }
 
-fn fix_unclosed_braces(mut p: String) -> String {
-    let opens = p.matches('{').count();
-    let closes = p.matches('}').count();
-    for _ in closes..opens {
-        p.push('}');
-    }
-    p
-}
-
-fn walk_depth_bound(pattern: &str) -> usize {
-    if pattern.contains("**") || pattern.contains('{') {
-        return usize::MAX;
-    }
-    pattern.split('/').filter(|s| !s.is_empty()).count().max(1)
-}
-
-fn build_walk_request(
-    root: &Path,
-    glob: &str,
-    hidden: bool,
-    gitignore: bool,
-    detail: WalkDetail,
-) -> Result<WalkRequest> {
-    let pattern = fix_unclosed_braces(glob.replace('\\', "/"));
-    let depth = walk_depth_bound(&pattern);
-    let compiled = CompiledWalkGlob::new([pattern.clone()])
-        .map_err(|e| anyhow::anyhow!("Invalid glob pattern: {e}"))?;
-    let mentions_node_modules = pattern.contains("node_modules");
-    Ok(WalkRequest::new(root.to_path_buf())
-        .hidden(hidden)
-        .gitignore(gitignore)
-        .skip_git(true)
-        .skip_node_modules(!mentions_node_modules)
-        .follow_links(FollowLinks::Never)
-        .detail(detail)
-        .order(WalkOrder::Path)
-        .emit_root(false)
-        .depth(1, depth)
-        .directory_errors(DirectoryErrorMode::SkipSkippable)
-        .cache(false)
-        .empty_recheck(EmptyRecheck::Configured)
-        .filter(
-            WalkFilter::all()
-                .glob(compiled)
-                .node_modules_unless_mentioned(mentions_node_modules),
-        ))
+/// Nanoseconds (the `omp-xfs` walker's unit) to the milliseconds `glob` ranks
+/// by.
+#[allow(clippy::cast_precision_loss)] // mtimes are far below f64's exact range
+fn millis(nanos: i64) -> f64 {
+    nanos as f64 / 1_000_000.0
 }
 
 // ------------------------------------------------------------------ glob
@@ -140,26 +99,35 @@ fn bool_arg(args: &serde_json::Value, key: &str) -> Option<bool> {
     args.get(key).and_then(serde_json::Value::as_bool)
 }
 
-/// Run the `glob` tool.
-///
-/// # Errors
-/// Missing paths, invalid glob or limit.
-// Layout mirrors omp's `glob` flow top-to-bottom; splitting it would obscure that parity.
-// The limit casts below are lossless: both limits are small fixed constants (200).
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn with_details(text: String, details: serde_json::Value) -> AgentToolResult {
     let mut result = AgentToolResult::text(text);
     result.details = details;
     result
 }
 
-pub fn glob(env: &Env, args: &serde_json::Value) -> Result<AgentToolResult> {
+/// Run the `glob` tool.
+///
+/// # Errors
+/// Missing paths, invalid glob or limit.
+// Layout mirrors omp's `glob` flow top-to-bottom; splitting it would obscure that parity.
+// The limit casts below are lossless: both limits are small fixed constants (200).
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+pub async fn glob(
+    env: Arc<Env>,
+    args: serde_json::Value,
+    signal: AbortSignal,
+) -> Result<AgentToolResult> {
+    let fs = Fs::native();
     let mut patterns = path_list(args.get("path").and_then(serde_json::Value::as_str));
     if patterns.is_empty() {
         patterns.push(".".into());
     }
-    let hidden = bool_arg(args, "hidden").unwrap_or(true);
-    let gitignore = bool_arg(args, "gitignore").unwrap_or(true);
+    let hidden = bool_arg(&args, "hidden").unwrap_or(true);
+    let gitignore = bool_arg(&args, "gitignore").unwrap_or(true);
     let requested = args
         .get("limit")
         .and_then(serde_json::Value::as_f64)
@@ -167,7 +135,7 @@ pub fn glob(env: &Env, args: &serde_json::Value) -> Result<AgentToolResult> {
     if !requested.is_finite() || requested <= 0.0 {
         bail!("Limit must be a positive number");
     }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(clippy::cast_possible_truncation)]
     let limit = (requested.floor() as usize).clamp(1, GLOB_MAX_LIMIT);
     let clamp_notice = (requested > GLOB_MAX_LIMIT as f64)
         .then(|| format!("Requested limit {requested} clamped to the max of {GLOB_MAX_LIMIT}"));
@@ -177,6 +145,7 @@ pub fn glob(env: &Env, args: &serde_json::Value) -> Result<AgentToolResult> {
     let mut merged: Vec<(String, f64)> = Vec::new();
     let mut scope = String::new();
     for pat in &patterns {
+        pa_agent::abort::throw_if_aborted(&signal)?;
         let parsed = parse_find_pattern(pat.trim().trim_matches('"'));
         let base = resolve_to_cwd(&parsed.base, &env.cwd);
         if base == Path::new("/") {
@@ -185,36 +154,51 @@ pub fn glob(env: &Env, args: &serde_json::Value) -> Result<AgentToolResult> {
         if scope.is_empty() {
             scope = format_path_relative_to_cwd(&base, &env.cwd, false);
         }
-        let Ok(meta) = std::fs::metadata(&base) else {
+        let Ok(info) = fs.session().stat(&base, true).await else {
             if single {
                 bail!("Path not found: {scope}");
             }
             missing.push(pat.clone());
             continue;
         };
-        if !parsed.has_glob && meta.is_file() {
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0.0, |d| d.as_secs_f64() * 1000.0);
-            merged.push((format_path_relative_to_cwd(&base, &env.cwd, false), mtime));
+        if !parsed.has_glob && info.file_type == Some(FileType::File) {
+            merged.push((
+                format_path_relative_to_cwd(&base, &env.cwd, false),
+                millis(info.stamp.mtime),
+            ));
             continue;
         }
-        if !meta.is_dir() {
+        if info.file_type != Some(FileType::Dir) {
             if single {
                 bail!("Path is not a directory: {}", base.display());
             }
             continue;
         }
-        let request = build_walk_request(&base, &parsed.glob, hidden, gitignore, WalkDetail::Full)?;
-        let outcome = request
-            .collect_ranked(WalkRank::MtimeDescPathAsc, limit)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        for entry in outcome.entries {
-            let abs = entry.absolute_path(&base);
-            let shown = format_path_relative_to_cwd(&abs, &env.cwd, entry.is_dir());
-            merged.push((shown, entry.mtime.unwrap_or(0.0)));
+        // `parse_find_pattern` already made a bare glob recursive (`**/*.ts`),
+        // so the remaining glob keeps the depth its own segments spell out.
+        let opts = GlobOptions {
+            pattern: parsed.glob.clone(),
+            recursive: false,
+            max_results: Some(limit),
+            sort_by_mtime: true,
+            walk: walk::Options {
+                hidden,
+                gitignore,
+                ..walk::Options::default()
+            },
+            ..GlobOptions::default()
+        };
+        let found = tokio::select! {
+            () = signal.aborted() => return Err(pa_agent::abort::aborted_error()),
+            found = glob_walk(&fs, &base, &opts) => {
+                found.map_err(|e| anyhow::anyhow!("{e}"))?
+            }
+        };
+        for entry in found {
+            let abs = fs.join(&base, entry.path.as_bytes());
+            let is_dir = entry.file_type == FileType::Dir;
+            let shown = format_path_relative_to_cwd(&abs, &env.cwd, is_dir);
+            merged.push((shown, entry.mtime.map_or(0.0, millis)));
         }
     }
     if patterns.len() > 1 && merged.is_empty() && missing.len() == patterns.len() {
@@ -414,6 +398,8 @@ struct Target {
     base: PathBuf,
     glob: Option<String>,
     ranges: Option<Vec<LineRange>>,
+    /// The base is a regular file, not a directory to walk.
+    file: bool,
 }
 
 struct FileHits {
@@ -430,26 +416,27 @@ fn in_ranges(line: u64, ranges: &[LineRange]) -> bool {
         .any(|r| line >= r.start && r.end.is_none_or(|e| line <= e))
 }
 
-fn search_file(
+/// Reads `path` through `fs` (never past [`MAX_FILE_BYTES`]) and searches the
+/// bytes with the caller's `Searcher`, so file I/O stays on the filesystem
+/// layer while the scan keeps grep-searcher's exact row semantics.
+async fn search_file(
+    fs: &Fs,
     searcher: &mut Searcher,
     matcher: &RegexMatcher,
     path: &Path,
     per_file_cap: usize,
     ranges: Option<&[LineRange]>,
 ) -> Option<(Vec<Match>, usize, bool)> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
+    let (mut file, _) = fs.session().open_file(path).await.ok()?;
+    let mut bytes = Vec::new();
+    file.read_into(&mut bytes, MAX_FILE_BYTES).await.ok()?;
     let mut sink = Collector {
         rows: Vec::new(),
         matches: 0,
         cap: per_file_cap,
         truncated_lines: false,
     };
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::Read::take(file, MAX_FILE_BYTES);
-    searcher.search_reader(matcher, reader, &mut sink).ok()?;
+    searcher.search_slice(matcher, &bytes, &mut sink).ok()?;
     let mut rows = sink.rows;
     let mut count = sink.matches;
     if let Some(r) = ranges {
@@ -462,18 +449,27 @@ fn search_file(
     Some((rows, count.min(per_file_cap + 1), sink.truncated_lines))
 }
 
-fn split_targets(env: &Env, entries: &[String]) -> (Vec<Target>, Vec<String>) {
+async fn split_targets(env: &Env, entries: &[String], fs: &Fs) -> (Vec<Target>, Vec<String>) {
     let mut targets = Vec::new();
     let mut missing = Vec::new();
+    let mut session = fs.session();
     for entry in entries {
         let entry = entry.trim().trim_matches('"').to_string();
         // line-range selector on an existing file: `src/foo.ts:50-100`
         let mut ranges = None;
         let mut path_part = entry.clone();
-        if !resolve_to_cwd(&entry, &env.cwd).exists() {
+        if session
+            .stat(&resolve_to_cwd(&entry, &env.cwd), true)
+            .await
+            .is_err()
+        {
             if let Some((p, sel)) = entry.rsplit_once(':') {
-                if let Ok(Selector::Lines { ranges: r, .. }) = parse_sel(sel) {
-                    if resolve_to_cwd(p, &env.cwd).is_file() {
+                if let Ok(ReadSelector::Lines { ranges: r, .. }) = parse_sel(sel) {
+                    if session
+                        .stat(&resolve_to_cwd(p, &env.cwd), true)
+                        .await
+                        .is_ok_and(|info| info.file_type == Some(FileType::File))
+                    {
                         ranges = Some(r);
                         path_part = p.to_string();
                     }
@@ -481,11 +477,12 @@ fn split_targets(env: &Env, entries: &[String]) -> (Vec<Target>, Vec<String>) {
             }
         }
         let literal = resolve_to_cwd(&path_part, &env.cwd);
-        if literal.exists() {
+        if let Ok(info) = session.stat(&literal, true).await {
             targets.push(Target {
                 base: literal,
                 glob: None,
                 ranges,
+                file: info.file_type == Some(FileType::File),
             });
             continue;
         }
@@ -499,11 +496,16 @@ fn split_targets(env: &Env, entries: &[String]) -> (Vec<Target>, Vec<String>) {
                 parsed.glob
             };
             let dir = resolve_to_cwd(&parsed.base, &env.cwd);
-            if dir.is_dir() {
+            if session
+                .stat(&dir, true)
+                .await
+                .is_ok_and(|info| info.file_type == Some(FileType::Dir))
+            {
                 targets.push(Target {
                     base: dir,
                     glob: Some(glob),
                     ranges: None,
+                    file: false,
                 });
                 continue;
             }
@@ -513,27 +515,54 @@ fn split_targets(env: &Env, entries: &[String]) -> (Vec<Target>, Vec<String>) {
     (targets, missing)
 }
 
-#[cfg(test)]
+/// The files below `target` to search, in path order.
+async fn target_files(fs: &Fs, target: &Target, gitignore: bool) -> Result<Vec<PathBuf>> {
+    if target.file {
+        return Ok(vec![target.base.clone()]);
+    }
+    let pattern = target.glob.clone().unwrap_or_else(|| "**/*".to_string());
+    // Not recursive: `parse_find_pattern` already split off the base directory
+    // and prefixed a bare glob with `**/`, so the remaining glob is relative to
+    // `target.base` and `dir/*.ts` must stay inside `dir`.
+    let selector =
+        Selector::new(&pattern, false).map_err(|e| anyhow::anyhow!("Invalid glob pattern: {e}"))?;
+    let opts = walk::Options {
+        hidden: true,
+        gitignore,
+        skip_git: !selector.mentions_git(),
+        skip_node_modules: !selector.mentions_node_modules(),
+        ..walk::Options::default()
+    };
+    let found = walk::collect(fs, &target.base, &opts, true, move |_, entry| {
+        if entry.file_type == FileType::File && selector.matches(entry.path) {
+            return Action::Continue;
+        }
+        if entry.file_type == FileType::Dir && selector.prunes(entry.path) {
+            Action::SkipDir
+        } else {
+            Action::Skip
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(found
+        .iter()
+        .map(|entry| fs.join(&target.base, entry.path))
+        .collect())
+}
+
 /// Run the `grep` tool.
 ///
 /// # Errors
 /// Empty pattern, bad `skip`, or no path resolving.
-pub fn grep(env: &Env, args: &serde_json::Value) -> Result<AgentToolResult> {
-    grep_with_cancel(env, args, &CancelFlag::default())
-}
-
-/// [`grep`] with a cooperative cancel flag: the registry adapter flips it on
-/// abort, and the walker chunk loop bails out instead of finishing the scan.
-///
-/// # Errors
-/// Empty pattern, bad `skip`, or no path resolving.
 #[allow(clippy::too_many_lines)]
-pub fn grep_with_cancel(
-    env: &Env,
-    args: &serde_json::Value,
-    cancel: &CancelFlag,
+pub async fn grep(
+    env: Arc<Env>,
+    args: serde_json::Value,
+    signal: AbortSignal,
 ) -> Result<AgentToolResult> {
-    let pattern = super::util::str_arg(args, "pattern")?;
+    let fs = Fs::native();
+    let pattern = super::util::str_arg(&args, "pattern")?;
     if pattern.trim().is_empty() {
         bail!("Pattern must not be empty");
     }
@@ -549,11 +578,11 @@ pub fn grep_with_cancel(
     if entries.is_empty() {
         entries.push(".".into());
     }
-    let ignore_case = !bool_arg(args, "case").unwrap_or(true);
-    let gitignore = bool_arg(args, "gitignore").unwrap_or(true);
+    let ignore_case = !bool_arg(&args, "case").unwrap_or(true);
+    let gitignore = bool_arg(&args, "gitignore").unwrap_or(true);
     let multiline = pattern.contains('\n') || pattern.contains("\\n");
 
-    let (targets, missing) = split_targets(env, &entries);
+    let (targets, missing) = split_targets(&env, &entries, &fs).await;
     if targets.is_empty() {
         bail!(
             "Path not found: {}; list each target in the semicolon-delimited `path`",
@@ -567,8 +596,7 @@ pub fn grep_with_cancel(
         .join(", ");
     let search_path = targets[0].base.display().to_string();
     let matcher = build_matcher(pattern, ignore_case, multiline)?;
-    // One `Searcher` per walker-pool worker (a `Searcher` is not `Sync`).
-    let new_searcher = move || {
+    let new_searcher = || {
         SearcherBuilder::new()
             .binary_detection(BinaryDetection::quit(0))
             .line_number(true)
@@ -578,7 +606,7 @@ pub fn grep_with_cancel(
             .build()
     };
 
-    let single_file = targets.len() == 1 && targets[0].glob.is_none() && targets[0].base.is_file();
+    let single_file = targets.len() == 1 && targets[0].glob.is_none() && targets[0].file;
     let is_multi_scope = !single_file;
     let per_file_cap = if is_multi_scope {
         MULTI_FILE_PER_FILE_MATCHES
@@ -593,81 +621,63 @@ pub fn grep_with_cancel(
     let mut lines_truncated = false;
     let mut oversized: Vec<String> = Vec::new();
     for target in &targets {
-        if cancelled(cancel) {
+        if signal.is_aborted() {
             return Err(pa_agent::abort::aborted_error());
         }
-        let files: Vec<PathBuf> = if target.base.is_file() {
-            vec![target.base.clone()]
-        } else {
-            let glob = target.glob.clone().unwrap_or_else(|| "**/*".to_string());
-            let request =
-                build_walk_request(&target.base, &glob, true, gitignore, WalkDetail::Minimal)?;
-            let mut files: Vec<PathBuf> = request
-                .collect_files()
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-                .iter()
-                .map(|e| e.absolute_path(&target.base))
-                .collect();
-            files.sort();
-            files
-        };
-        if target.base.is_file() {
-            if let Ok(m) = std::fs::metadata(&target.base) {
-                if m.len() > MAX_FILE_BYTES {
+        if target.file {
+            if let Ok(info) = fs.session().stat(&target.base, true).await {
+                if info.size > MAX_FILE_BYTES {
                     oversized.push(format_path_relative_to_cwd(&target.base, &env.cwd, false));
                 }
             }
         }
-        let files: Vec<PathBuf> = files
+        let files: Vec<PathBuf> = target_files(&fs, target, gitignore)
+            .await?
             .into_iter()
             .filter(|f| seen_files.insert(f.clone()))
             .collect();
-        // Search each chunk on the walker pool (cold page cache makes this
-        // per-file I/O latency bound), then fold results in path order so
+        // Files are searched concurrently but folded back in path order, so
         // output and the total-match cap stay identical to a serial scan.
-        for chunk in files.chunks(SEARCH_CHUNK_FILES) {
-            if cancelled(cancel) {
-                return Err(pa_agent::abort::aborted_error());
-            }
-            type FileSlot = OnceLock<Option<(Vec<Match>, usize, bool)>>;
-            let slots: Vec<FileSlot> = std::iter::repeat_with(OnceLock::new)
-                .take(chunk.len())
-                .collect();
-            let indices: Vec<usize> = (0..chunk.len()).collect();
-            let searched = pi_walker::parallel_for_each_init(
-                &indices,
-                new_searcher,
-                |searcher, &i| -> std::result::Result<(), Infallible> {
+        let mut searched = stream::iter(files)
+            .map(|file| {
+                // `Fs` is a cheap handle (native: a unit variant) and a
+                // `RegexMatcher` clone shares its compiled `Regex`.
+                let fs = fs.clone();
+                let matcher = matcher.clone();
+                async move {
+                    let mut searcher = new_searcher();
                     let found = search_file(
-                        searcher,
+                        &fs,
+                        &mut searcher,
                         &matcher,
-                        &chunk[i],
+                        &file,
                         per_file_cap,
                         target.ranges.as_deref(),
-                    );
-                    let _ = slots[i].set(found);
-                    Ok(())
-                },
-            );
-            let Ok(()) = searched;
-            for (file, slot) in chunk.iter().zip(slots) {
-                let Some((rows, count, truncated)) = slot.into_inner().flatten() else {
-                    continue;
-                };
-                lines_truncated |= truncated;
-                total_matches += count;
-                hits.push(FileHits {
-                    shown: format_path_relative_to_cwd(file, &env.cwd, false),
-                    absolute: file.clone(),
-                    matches: rows,
-                    match_count: count,
-                });
-                if total_matches >= INTERNAL_TOTAL_CAP {
-                    limit_reached = true;
-                    break;
+                    )
+                    .await;
+                    (file, found)
                 }
-            }
-            if limit_reached {
+            })
+            .buffered(SEARCH_CONCURRENCY);
+        loop {
+            let next = tokio::select! {
+                () = signal.aborted() => return Err(pa_agent::abort::aborted_error()),
+                next = searched.next() => next,
+            };
+            let Some((file, found)) = next else { break };
+            let Some((rows, count, truncated)) = found else {
+                continue;
+            };
+            lines_truncated |= truncated;
+            total_matches += count;
+            hits.push(FileHits {
+                shown: format_path_relative_to_cwd(&file, &env.cwd, false),
+                absolute: file,
+                matches: rows,
+                match_count: count,
+            });
+            if total_matches >= INTERNAL_TOTAL_CAP {
+                limit_reached = true;
                 break;
             }
         }
@@ -958,6 +968,14 @@ mod tests {
             .join("\n")
     }
 
+    async fn run_glob(env: &Arc<Env>, args: serde_json::Value) -> Result<AgentToolResult> {
+        glob(env.clone(), args, AbortSignal::never()).await
+    }
+
+    async fn run_grep(env: &Arc<Env>, args: serde_json::Value) -> Result<AgentToolResult> {
+        grep(env.clone(), args, AbortSignal::never()).await
+    }
+
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
@@ -970,6 +988,10 @@ mod tests {
         std::fs::write(p.join("ignored/c.rs"), "fn beta_ignored() {}\n").unwrap();
         std::fs::write(p.join("notes.md"), "beta in notes\n").unwrap();
         dir
+    }
+
+    fn env_of(dir: &tempfile::TempDir) -> Arc<Env> {
+        Arc::new(Env::new(dir.path(), true))
     }
 
     #[test]
@@ -990,59 +1012,82 @@ mod tests {
         );
     }
 
-    #[test]
-    fn glob_lists_grouped_respecting_gitignore() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn glob_lists_grouped_respecting_gitignore() {
         let dir = fixture();
-        let env = Env::new(dir.path(), true);
-        let out = text_of(&glob(&env, &serde_json::json!({"path": "**/*.rs"})).unwrap());
+        let env = env_of(&dir);
+        let out = text_of(
+            &run_glob(&env, serde_json::json!({"path": "**/*.rs"}))
+                .await
+                .unwrap(),
+        );
         assert!(out.contains("a.rs") && out.contains("b.rs"), "{out}");
         assert!(!out.contains("c.rs"), "gitignored file leaked: {out}");
         assert!(out.contains("# src/"), "{out}");
-        let none = text_of(&glob(&env, &serde_json::json!({"path": "*.zzz"})).unwrap());
+        let none = text_of(
+            &run_glob(&env, serde_json::json!({"path": "*.zzz"}))
+                .await
+                .unwrap(),
+        );
         assert_eq!(none, "No files found matching pattern");
-        let err = glob(&env, &serde_json::json!({"path": "missing/dir"}))
+        let err = run_glob(&env, serde_json::json!({"path": "missing/dir"}))
+            .await
             .unwrap_err()
             .to_string();
         assert_eq!(err, "Path not found: missing/dir");
     }
 
-    #[test]
-    fn glob_and_grep_emit_card_details() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn glob_and_grep_emit_card_details() {
         let dir = fixture();
-        let env = Env::new(dir.path(), true);
-        let g = glob(&env, &serde_json::json!({"path": "**/*.rs"})).unwrap();
+        let env = env_of(&dir);
+        let g = run_glob(&env, serde_json::json!({"path": "**/*.rs"}))
+            .await
+            .unwrap();
         assert_eq!(g.details["fileCount"], 2, "{:?}", g.details);
         assert_eq!(g.details["scopePath"], ".");
         assert_eq!(g.details["files"].as_array().unwrap().len(), 2);
-        let r = grep(&env, &serde_json::json!({"pattern": "beta", "path": "."})).unwrap();
+        let r = run_grep(&env, serde_json::json!({"pattern": "beta", "path": "."}))
+            .await
+            .unwrap();
         assert_eq!(r.details["matchCount"], 3, "{:?}", r.details);
         assert_eq!(r.details["fileCount"], 3);
         let display = r.details["displayContent"].as_str().unwrap();
         assert!(display.contains("*2\u{2502}fn beta() {}"), "{display}");
         assert!(display.starts_with("# "), "{display}");
-        let none = grep(&env, &serde_json::json!({"pattern": "zzzz", "path": "."})).unwrap();
+        let none = run_grep(&env, serde_json::json!({"pattern": "zzzz", "path": "."}))
+            .await
+            .unwrap();
         assert_eq!(none.details["matchCount"], 0);
     }
 
-    #[test]
-    fn glob_limit_notice() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn glob_limit_notice() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..5 {
             std::fs::write(dir.path().join(format!("f{i}.txt")), "x").unwrap();
         }
-        let env = Env::new(dir.path(), true);
-        let out = text_of(&glob(&env, &serde_json::json!({"path": "*.txt", "limit": 3})).unwrap());
+        let env = env_of(&dir);
+        let out = text_of(
+            &run_glob(&env, serde_json::json!({"path": "*.txt", "limit": 3}))
+                .await
+                .unwrap(),
+        );
         assert!(
             out.ends_with("[3 results limit reached. Use limit=6 for more]"),
             "{out}"
         );
     }
 
-    #[test]
-    fn grep_directory_scope_groups_files_with_tags_and_context() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grep_directory_scope_groups_files_with_tags_and_context() {
         let dir = fixture();
-        let env = Env::new(dir.path(), true);
-        let out = text_of(&grep(&env, &serde_json::json!({"pattern": "beta"})).unwrap());
+        let env = env_of(&dir);
+        let out = text_of(
+            &run_grep(&env, serde_json::json!({"pattern": "beta"}))
+                .await
+                .unwrap(),
+        );
         assert!(
             out.contains("## a.rs#") || out.contains("# a.rs#") || out.contains("a.rs#"),
             "{out}"
@@ -1057,79 +1102,87 @@ mod tests {
         assert!(out.contains("notes.md"), "{out}");
     }
 
-    #[test]
-    fn grep_single_file_scope_flat_with_header() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grep_single_file_scope_flat_with_header() {
         let dir = fixture();
-        let env = Env::new(dir.path(), true);
+        let env = env_of(&dir);
         let out = text_of(
-            &grep(
+            &run_grep(
                 &env,
-                &serde_json::json!({"pattern": "alpha", "path": "src/a.rs"}),
+                serde_json::json!({"pattern": "alpha", "path": "src/a.rs"}),
             )
+            .await
             .unwrap(),
         );
         assert!(out.starts_with("[src/a.rs#"), "{out}");
         assert!(out.contains("*1:fn alpha() {}"), "{out}");
     }
 
-    #[test]
-    fn grep_case_flag_no_match_and_invalid_input() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grep_case_flag_no_match_and_invalid_input() {
         let dir = fixture();
-        let env = Env::new(dir.path(), true);
-        let none = text_of(&grep(&env, &serde_json::json!({"pattern": "ALPHA"})).unwrap());
+        let env = env_of(&dir);
+        let none = text_of(
+            &run_grep(&env, serde_json::json!({"pattern": "ALPHA"}))
+                .await
+                .unwrap(),
+        );
         assert_eq!(none, "No matches found");
         let some = text_of(
-            &grep(
-                &env,
-                &serde_json::json!({"pattern": "ALPHA", "case": false}),
-            )
-            .unwrap(),
+            &run_grep(&env, serde_json::json!({"pattern": "ALPHA", "case": false}))
+                .await
+                .unwrap(),
         );
         assert!(some.contains("alpha"), "{some}");
         assert_eq!(
-            grep(&env, &serde_json::json!({"pattern": "  "}))
+            run_grep(&env, serde_json::json!({"pattern": "  "}))
+                .await
                 .unwrap_err()
                 .to_string(),
             "Pattern must not be empty"
         );
         // unbalanced paren is escaped instead of failing
-        let paren = text_of(&grep(&env, &serde_json::json!({"pattern": "alpha("})).unwrap());
+        let paren = text_of(
+            &run_grep(&env, serde_json::json!({"pattern": "alpha("}))
+                .await
+                .unwrap(),
+        );
         assert!(paren.contains("No matches found") || paren.contains("alpha"));
     }
 
-    #[test]
-    fn grep_line_range_selector_filters_matches() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grep_line_range_selector_filters_matches() {
         let dir = fixture();
-        let env = Env::new(dir.path(), true);
+        let env = env_of(&dir);
         let out = text_of(
-            &grep(
+            &run_grep(
                 &env,
-                &serde_json::json!({"pattern": "fn", "path": "src/a.rs:2-2"}),
+                serde_json::json!({"pattern": "fn", "path": "src/a.rs:2-2"}),
             )
+            .await
             .unwrap(),
         );
         assert!(out.contains("*2:fn beta() {}"), "{out}");
         assert!(!out.contains("*1:fn alpha"), "{out}");
     }
 
-    #[test]
-    fn grep_glob_scope_and_bare_glob_any_depth() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grep_glob_scope_and_bare_glob_any_depth() {
         let dir = fixture();
-        let env = Env::new(dir.path(), true);
+        let env = env_of(&dir);
         let out = text_of(
-            &grep(
-                &env,
-                &serde_json::json!({"pattern": "beta", "path": "*.rs"}),
-            )
-            .unwrap(),
+            &run_grep(&env, serde_json::json!({"pattern": "beta", "path": "*.rs"}))
+                .await
+                .unwrap(),
         );
         assert!(out.contains("a.rs") && out.contains("b.rs"), "{out}");
         assert!(!out.contains("notes.md"), "{out}");
         let direct = text_of(
-            &grep(
+            &run_grep(
                 &env,
-                &serde_json::json!({"pattern": "beta", "path": "src/*.rs"}),
+                serde_json::json!({"pattern": "beta", "path": "src/*.rs"}),
             )
+            .await
             .unwrap(),
         );
         assert!(

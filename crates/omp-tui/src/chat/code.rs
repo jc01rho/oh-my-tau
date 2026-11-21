@@ -601,7 +601,7 @@ const OP_CHARS: &[char] = &[
 fn parse_tree(code: &str, lang: Option<&str>) -> Option<tree_sitter::Tree> {
     let sl = resolve_lang(lang?)?;
     let ts = sl.grammar().load().ok()?;
-    grammar::parse(&ts, code).ok()?
+    grammar::parse(&ts, code, None).ok()?
 }
 
 /// Pre-order walk producing `(start, end, category)` spans over `code`.

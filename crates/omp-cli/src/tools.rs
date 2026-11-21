@@ -2,7 +2,7 @@
 //! `read`, `edit`, `write`, `grep`, `glob`, `bash`.
 //!
 //! The edit engine is the vendored `pi-edit` crate (omp's native edit
-//! sessions, hashline mode included) and the file walks are `pi-walker`.
+//! sessions, hashline mode included) and the file walks are `omp-xfs` over `pi-vfs`.
 //! Failures are returned as `Err` so the agent loop reports `isError: true`.
 
 pub mod ask;
@@ -318,32 +318,6 @@ pub fn builtin_tools_with_env_and_jobs(
             })
         })
     };
-    // Same contract as `blocking`, plus a cooperative `CancelFlag` the tool
-    // body polls inside long loops (walker chunks, per-file scoring) so an
-    // aborted call stops burning CPU on the blocking pool promptly.
-    let blocking_cancel =
-        |f: fn(&Env, &Value, &util::CancelFlag) -> Result<AgentToolResult>| -> Handler {
-            Arc::new(move |env, args, signal| {
-                Box::pin(async move {
-                    pa_agent::abort::throw_if_aborted(&signal)?;
-                    let cancel = util::CancelFlag::default();
-                    let flag = cancel.clone();
-                    let watch_signal = signal.clone();
-                    let watcher = tokio::spawn(async move {
-                        watch_signal.aborted().await;
-                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                    });
-                    let result = tokio::task::spawn_blocking(move || f(&env, &args, &cancel))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("tool task failed: {e}"))?;
-                    watcher.abort();
-                    if signal.is_aborted() {
-                        return Err(pa_agent::abort::aborted_error());
-                    }
-                    result
-                })
-            })
-        };
     let tools = vec![
         mk(
             "read",
@@ -381,13 +355,13 @@ pub fn builtin_tools_with_env_and_jobs(
             "glob",
             GLOB_DESCRIPTION.to_string(),
             json!({"type":"object","properties":{"path":{"type":"string"},"hidden":{"type":"boolean"},"gitignore":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200}},"additionalProperties":false}),
-            blocking(search::glob),
+            Arc::new(|env, args, signal| Box::pin(search::glob(env, args, signal))),
         ),
         mk(
             "grep",
             GREP_DESCRIPTION.to_string(),
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"case":{"type":"boolean"},"gitignore":{"type":"boolean"},"skip":{"anyOf":[{"type":"number"},{"type":"null"}]}},"required":["pattern"],"additionalProperties":false}),
-            blocking_cancel(search::grep_with_cancel),
+            Arc::new(|env, args, signal| Box::pin(search::grep(env, args, signal))),
         ),
         mk(
             "write",
@@ -403,7 +377,7 @@ pub fn builtin_tools_with_env_and_jobs(
                 "grep_keywords":{"type":"array","items":{"type":"string"}},
                 "path":{"type":"string"}
             },"required":["query","grep_keywords"],"additionalProperties":false}),
-            blocking_cancel(find::find_with_cancel),
+            Arc::new(|env, args, signal| Box::pin(find::find(env, args, signal))),
         ),
         mk(
             "task",
@@ -419,13 +393,13 @@ pub fn builtin_tools_with_env_and_jobs(
             "ast_grep",
             ast::AST_GREP_DESCRIPTION.to_string(),
             ast::schema_ast_grep(),
-            blocking_cancel(ast::ast_grep_with_cancel),
+            Arc::new(|env, args, signal| Box::pin(ast::ast_grep(env, args, signal))),
         ),
         mk(
             "ast_edit",
             ast::AST_EDIT_DESCRIPTION.to_string(),
             ast::schema_ast_edit(),
-            blocking_cancel(ast::ast_edit_with_cancel),
+            Arc::new(|env, args, signal| Box::pin(ast::ast_edit(env, args, signal))),
         ),
         ask::tool(),
         todo::tool(),

@@ -36,6 +36,8 @@ use crate::{
 
 pub struct HashlineEngine {
     pub enforce_seen_lines: bool,
+    /// See [`crate::session::SessionConfig::max_columns`].
+    pub max_columns: usize,
 }
 
 impl ModeEngine for HashlineEngine {
@@ -89,9 +91,26 @@ impl ModeEngine for HashlineEngine {
             },
         )?;
         if patch.sections.is_empty() {
-            return Err(EditError::apply("No hashline sections found in input."));
+            let path = input::first_header_path(
+                input,
+                &SplitOptions {
+                    cwd: Some(&files.policy().cwd),
+                    path: None,
+                },
+            );
+            return Err(match path {
+                Some(path) => patcher::header_only_error(&path, files),
+                None => EditError::parse("No hashline sections found in input."),
+            });
         }
-        patcher::stage_patch(&patch, input, self.enforce_seen_lines, files, store)
+        patcher::stage_patch(
+            &patch,
+            input,
+            self.enforce_seen_lines,
+            self.max_columns,
+            files,
+            store,
+        )
     }
 
     fn inspect(&self, args: &ArgSnapshot) -> Inspection {
@@ -176,5 +195,19 @@ fn inspect_input(input: &str) -> Inspection {
         paths,
         entries,
         file_ops,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inspect_input;
+
+    #[test]
+    fn inspect_extracts_paths_and_added_lines_from_partial_input() {
+        let inspected = inspect_input(
+            "[*** Update File: src/a.ts#ABCD]\nPUT 1.=1:\n+new\n[src/b.ts]\nCUT 2.=2",
+        );
+        assert_eq!(inspected.paths, ["src/a.ts", "src/b.ts"]);
+        assert_eq!(inspected.entries, [("src/a.ts".into(), "new".into())]);
     }
 }

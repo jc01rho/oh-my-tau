@@ -10,20 +10,18 @@ Reference upstreams for this repository (all MIT):
 
 | Track | Repository | Branch | Import commit | Reference commit |
 | --- | --- | --- | --- | --- |
-| `main` | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) | `main` | unrecorded (`18.9.1` / `18.6.1` import) | `b636e19d10b664950d600505d194337bbeef42f0` (`v19.0.1+126`; short form `b636e19d10`) |
-| `omp2` | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) | `omp2` | none — no crate imported from this track | `2f92f3b5aa2035d21c9f016f9ff6350795e5685a` (short form `2f92f3b`) |
+| `main` | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) | `main` | `b636e19d10b664950d600505d194337bbeef42f0` (`19.0.1`) | `b636e19d10b664950d600505d194337bbeef42f0` (`v19.0.1+126`; short form `b636e19d10`) |
+| `omp2` | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) | `omp2` | `2f92f3b5aa2035d21c9f016f9ff6350795e5685a` (`omp-*` shell stack in Phase 2) | `2f92f3b5aa2035d21c9f016f9ff6350795e5685a` (short form `2f92f3b`) |
 | crossterm | [crossterm-rs/crossterm](https://github.com/crossterm-rs/crossterm) | `master` | n/a — registry crate | `492b764f` (`492b764f9f132d302903ff6f2f55e96c1b8cd0ec`, crate `0.28.1`) |
 | prime-agent fork base | [PrimeIntellect-ai/prime-agent](https://github.com/PrimeIntellect-ai/prime-agent) | default | not recorded yet — see "Known gaps" | not recorded yet — see "Known gaps" |
 
 **`import-commit` vs `reference-commit`.** These are different claims and must not be
 conflated. `import-commit` is the revision the files under `vendor/` were actually copied
-from; for every `pi-*` crate it is **unrecorded** (the initial import was taken at crate
-versions `18.9.1` / `pi-predict` `18.6.1` and the SHA was never captured). `reference-commit`
-is the revision the vendored tree is measured against and meant to be updated toward — `main`
-`b636e19d10b664950d600505d194337bbeef42f0` for the `pi-*` crates, and `omp2`
-`2f92f3b5aa2035d21c9f016f9ff6350795e5685a` as the `omp2` reference track (which supplies no
-vendored crate). `vendor-src.lock` carries both fields per crate; this document mirrors them
-1:1.
+from (updated to `b636e19d10b664950d600505d194337bbeef42f0` for the Phase 2.5 `pi-*` /
+`omp-xfs` crates, and `2f92f3b5aa2035d21c9f016f9ff6350795e5685a` for the Phase 2 `omp-*`
+shell stack). `reference-commit` is the revision each track is measured against (`main`
+`b636e19d10b664950d600505d194337bbeef42f0` and `omp2` `2f92f3b5aa2035d21c9f016f9ff6350795e5685a`).
+`vendor-src.lock` carries both fields per crate; this document mirrors them 1:1.
 
 The machine-readable form of these pins is [`vendor-src.lock`](../vendor-src.lock) at the
 repository root. It is a **pin ledger**: the durable provenance record for the vendored trees,
@@ -36,40 +34,34 @@ tooling will catch it for you.
 
 ## workspace members from `vendor/`
 
-`Cargo.toml` lists `vendor/pa-{types,ai,models,agent}`, `vendor/pi-{edit,ast,diff,walker,vfs,predict}`
-and `vendor/laya-ort` as workspace members. `vendor/crossterm` is not a member: it enters the
-graph through `[patch.crates-io] crossterm = { path = "vendor/crossterm" }`.
+`Cargo.toml` lists `vendor/pa-{types,ai,models,agent}`, `vendor/pi-{edit,ast,diff,vfs,predict}`,
+`vendor/omp-xfs`, the Phase 2 `vendor/omp-*` shell stack (`omp-{core,macros,vocab,walker,tool,shell,shell-builtins}`),
+`vendor/xutf`, and `vendor/laya-ort` as workspace members. `vendor/crossterm` and `vendor/omp-proto` are not members (`crossterm` enters via `[patch.crates-io]`, `omp-proto` as a standalone path dependency).
 
-## 1. `pi-*` — vendored verbatim from oh-my-pi
+## 1. `pi-*` and `omp-xfs` — synced from oh-my-pi (`main` @ `b636e19d10`)
 
-Origin: `can1357/oh-my-pi`, `main` track. Authors `Stencil Labs, Inc.`, MIT.
+Origin: `can1357/oh-my-pi`, `main` track (`19.0.1`). Authors `Stencil Labs, Inc.`, MIT.
 License text: [`vendor/LICENSE-oh-my-pi`](../vendor/LICENSE-oh-my-pi).
 Each manifest carries the provenance line `Vendored from can1357/oh-my-pi (MIT), see ../LICENSE-oh-my-pi.`
 
 | Crate | Vendored version | Upstream source | Import commit | Reference commit | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `pi-ast` | `18.9.1` | `can1357/oh-my-pi` (`main`, `crates/ast`) | unrecorded (`18.9.1`) | `b636e19d10` (`main`) | edition 2024; tree-sitter grammar set pinned per-crate in the manifest |
-| `pi-diff` | `18.9.1` | `can1357/oh-my-pi` (`main`, `crates/diff`) | unrecorded (`18.9.1`) | `b636e19d10` (`main`) | dependency-free manifest |
-| `pi-edit` | `18.9.1` | `can1357/oh-my-pi` (`main`, `crates/edit`) | unrecorded (`18.9.1`) | `b636e19d10` (`main`) | depends on `pi-ast`, `pi-diff`, `pi-walker` by path |
-| `pi-vfs` | `18.9.1` | `can1357/oh-my-pi` (`main`, `crates/vfs`) | unrecorded (`18.9.1`) | `b636e19d10` (`main`) | |
-| `pi-walker` | `18.9.1` | `can1357/oh-my-pi` (`main`, `crates/walker` -> retired into `crates/xfs::walk`) | unrecorded (`18.9.1`) | `b636e19d10` (`main`) | deleted upstream and folded into `crates/xfs::walk`; see §4.2b |
-| `pi-predict` | `18.6.1` | `can1357/oh-my-pi` (`main`, `crates/predict`, n-gram only) | unrecorded (`18.6.1`) | `b636e19d10` (`main`) | n-gram engine only; the `smollm` and `apple` engines are not vendored |
+| `pi-ast` | `19.0.1` | `can1357/oh-my-pi` (`main`, `crates/ast`) | `b636e19d10` (`main`) | `b636e19d10` (`main`) | edition 2024; `wasm` feature omits `wasmtime` edge; `search`/`outline`/`debug` synced |
+| `pi-diff` | `19.0.1` | `can1357/oh-my-pi` (`main`, `crates/diff`) | `b636e19d10` (`main`) | `b636e19d10` (`main`) | `ComponentArena` + `myers_diff_within`; links `vendor/xutf` |
+| `pi-edit` | `19.0.1` | `can1357/oh-my-pi` (`main`, `crates/edit`) | `b636e19d10` (`main`) | `b636e19d10` (`main`) | depends on `pi-ast`, `pi-diff`, `omp-xfs`, `xutf`; `Rejection` + `max_columns` + 5 prompts |
+| `pi-vfs` | `19.0.1` | `can1357/oh-my-pi` (`main`, `crates/vfs`) | `b636e19d10` (`main`) | `b636e19d10` (`main`) | `read_until_cancelled` + `ScopedOpen` + `Fs::with_provider` |
+| `omp-xfs` | `19.0.1` | `can1357/oh-my-pi` (`main`, `crates/xfs`) | `b636e19d10` (`main`) | `b636e19d10` (`main`) | replaces retired `pi-walker`; async walk/tree/grep/glob over `pi-vfs` |
+| `pi-predict` | `19.0.1` | `can1357/oh-my-pi` (`main`, `crates/predict`, n-gram only) | `b636e19d10` (`main`) | `b636e19d10` (`main`) | n-gram engine only; `smollm`/`apple` return explicit fallback errors without pulling ML deps |
 
-All six `pi-*` crates come from the `main` track. `pi-predict` is **not** an `omp2` crate: its
-source is `can1357/oh-my-pi` `main`, `crates/predict`, restricted to the n-gram engine. The
-`omp2` track (`2f92f3b`) is a reference-only pin — it contributes no vendored crate.
+All five `pi-*` crates and `omp-xfs` come from the `main` track (`b636e19d10`). `pi-predict`
+is **not** an `omp2` crate: its source is `can1357/oh-my-pi` `main`, `crates/predict`,
+restricted to the n-gram engine. The `omp2` track (`2f92f3b`) supplies the Phase 2
+`omp-{core,macros,vocab,walker,tool,shell,shell-builtins}` shell stack (`vendor-src.lock`).
 
-**Version vs. pin.** The manifests still say `18.9.1` (`pi-predict` `18.6.1`) while the
-designated reference `main` head is `19.0.1+126`. This is expected and is *not* evidence that
-the `reference-commit` is wrong: the vendored trees were copied at the earlier crate
-versions, and that copy point (`import-commit`) was never recorded as a SHA — for every
-`pi-*` crate it reads `unrecorded (v18.9.1)` / `unrecorded (v18.6.1)` in `vendor-src.lock`.
-So read `import-commit` as "where these files actually came from (unknown SHA)", the crate
-version as "what the copied files say", and `reference-commit` as "the revision drift is
-measured against and updates target" (`b636e19d10`). The drift against that reference is
-exactly what §4.2b measures (`pi-walker` deleted, `pi-ast` API replaced by `ast::search`,
-`pi-edit` ~10.3k lines). Either way the rule stands: a `pi-*` update is an API migration,
-never a version bump.
+**Version vs. pin.** In Phase 2.5 these crates were synced to `main` `b636e19d10` (`19.0.1`),
+retiring `pi-walker` into `omp-xfs` and updating `pi-ast` (`ast::search`), `pi-edit`,
+`pi-diff`, `pi-vfs`, and `pi-predict` (n-gram). The rule remains: a `pi-*` update is an API
+migration, never a bare version bump.
 
 ## 2. `pa-*` — fork of prime-agent, modified in this repo
 
@@ -158,9 +150,8 @@ notes") and §5.2 #7 ("pin and delta for every `vendor/*`").
    (edit/walk/ast semantics, key decoding, provider wire format) lands only with the
    relevant golden/oracle suite green (`tests-golden/`, `tests-tools/`, `tests-e2e/`).
    Do not delete or weaken a test to accommodate an upstream change.
-8. **`pi-walker` is frozen.** Upstream deleted it in favour of `crates/xfs::walk`. Do not
-   modernize the vendored copy; the path forward is replacing it with an `xfs`-style
-   `Tree`/`Walk`/`Batch` implementation (§4.2b, Phase 3).
+8. **`pi-walker` is retired.** Phase 2.5 deleted `vendor/pi-walker` and replaced it with
+   `vendor/omp-xfs` (`Tree`/`Walk`/`glob`/`grep`). Do not re-introduce `pi-walker`.
 9. **Upstream source checkouts are not distributed.** `vendor-src/oh-my-pi/` is gitignored;
    pins here are the durable record, so this file must stay accurate without it.
 10. **Reviewer checklist for a vendor change:** SHA recorded here · `NOTICE.md`/license
@@ -169,10 +160,8 @@ notes") and §5.2 #7 ("pin and delta for every `vendor/*`").
 
 ## Known gaps (Phase 0.3 work)
 
-- Every `pi-*` crate has `reference-commit = b636e19d10` but an **unrecorded**
-  `import-commit` (`18.9.1`, `pi-predict` `18.6.1`) — this is why the crate versions do not
-  self-report `19.0.1`. Recover the import SHA from the original checkouts and record it in
-  both this file and `vendor-src.lock`, or keep the unrecorded marker deliberately.
+- `pi-*` and `omp-xfs` pins were brought up to `main` `b636e19d10` (`19.0.1`) in Phase 2.5,
+  closing the unrecorded-SHA gap for the `pi-*` family.
 - No SHA is recorded for the `pa-*` fork base; it must be recovered from the original
   checkout and added both here and to `vendor-src.lock`.
 - `NOTICE.md` states the `pa-*` crates are modified but does not list the modified files;

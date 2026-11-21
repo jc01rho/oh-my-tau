@@ -2,8 +2,8 @@
 
 use std::{collections::BTreeSet, sync::LazyLock};
 
-use pi_ast::block::{EnclosingBoundaryOptions, LineRange, enclosing_block_boundaries};
-use pi_diff::HunkLine;
+use omp_ast::block::{EnclosingBoundaryOptions, LineRange, enclosing_block_boundaries};
+use omp_diff::HunkLine;
 use regex::Regex;
 
 use crate::error::EditError;
@@ -37,8 +37,9 @@ const DIFF_METADATA_PREFIXES: [&str; 15] = [
 ];
 const PATCH_WRAPPER_PREFIXES: [&str; 2] = ["*** Begin Patch", "*** End Patch"];
 const DEFAULT_ADDED_RUN_CONTEXT_LINES: usize = 2;
+/// Marks rows a preview omits. Hunk gaps (blank diff rows) render as it too: a
+/// bare blank row would hide that the lines between hunks were skipped.
 const PREVIEW_ELISION_MARKER: &str = "…";
-const PREVIEW_GAP_ROW: &str = "";
 
 /// Rendered diff plus the 1-indexed first changed line in the new text.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -104,28 +105,30 @@ fn parse_source_row_line_number(row: &str) -> Option<u32> {
 }
 
 fn normalize_diff_gap_rows(rows: &mut Vec<String>) {
-    let mut kept = Vec::with_capacity(rows.len());
-    for (index, row) in rows.iter().enumerate() {
-        if row != DIFF_GAP_ROW {
-            kept.push(row.clone());
+    let mut write_idx = 0;
+    for read_idx in 0..rows.len() {
+        if rows[read_idx] != DIFF_GAP_ROW {
+            rows.swap(write_idx, read_idx);
+            write_idx += 1;
             continue;
         }
-        if kept.is_empty() || kept.last().is_some_and(String::is_empty) {
+        if write_idx == 0 || rows[write_idx - 1].is_empty() {
             continue;
         }
-        let before = kept
+        let before = rows[..write_idx]
             .iter()
             .rev()
             .find_map(|candidate| parse_source_row_line_number(candidate));
-        let after = rows[index + 1..]
+        let after = rows[read_idx + 1..]
             .iter()
             .filter(|candidate| !candidate.is_empty())
             .find_map(|candidate| parse_source_row_line_number(candidate));
         if matches!((before, after), (Some(left), Some(right)) if right > left + 1) {
-            kept.push(String::new());
+            rows[write_idx].clear();
+            write_idx += 1;
         }
     }
-    *rows = kept;
+    rows.truncate(write_idx);
 }
 
 fn adjusted_context_insert_index(rows: &[String], index: usize) -> usize {
@@ -253,15 +256,15 @@ pub struct LineDiff<'a> {
     new: &'a str,
     old_tokens: Vec<&'a str>,
     new_tokens: Vec<&'a str>,
-    runs: Vec<pi_diff::Run>,
+    runs: Vec<omp_diff::Run>,
 }
 
 impl<'a> LineDiff<'a> {
     /// Tokenize both texts and run Myers over their lines.
     pub fn new(old: &'a str, new: &'a str) -> Self {
-        let old_tokens = pi_diff::line_tokens_str(old);
-        let new_tokens = pi_diff::line_tokens_str(new);
-        let runs = pi_diff::diff_line_tokens(&old_tokens, &new_tokens);
+        let old_tokens = omp_diff::line_tokens_str(old);
+        let new_tokens = omp_diff::line_tokens_str(new);
+        let runs = omp_diff::diff_line_tokens(&old_tokens, &new_tokens);
         Self {
             old,
             new,
@@ -394,7 +397,7 @@ impl<'a> LineDiff<'a> {
         source: &BlockContextSource<'_>,
     ) -> DiffOutput {
         let context_lines = context_lines.unwrap_or(3);
-        let hunks = pi_diff::structured_patch_hunk_rows(
+        let hunks = omp_diff::structured_patch_hunk_rows(
             Some(u32::try_from(context_lines).unwrap_or(u32::MAX)),
             &self.old_tokens,
             &self.new_tokens,
@@ -680,18 +683,16 @@ pub struct CompactDiffOptions {
     pub max_unchanged_run: Option<usize>,
 }
 
-fn is_preview_separator(line: &str) -> bool {
-    line == PREVIEW_ELISION_MARKER || line == PREVIEW_GAP_ROW
-}
-
 fn append_preview_line(output: &mut Vec<String>, line: &str) {
-    let normalized = if matches!(line, "..." | PREVIEW_ELISION_MARKER | "+…") {
+    let normalized = if matches!(line, "" | "..." | PREVIEW_ELISION_MARKER | "+…") {
         PREVIEW_ELISION_MARKER
     } else {
         line
     };
-    if is_preview_separator(normalized)
-        && (output.is_empty() || output.last().is_some_and(|last| is_preview_separator(last)))
+    if normalized == PREVIEW_ELISION_MARKER
+        && output
+            .last()
+            .is_none_or(|last| last == PREVIEW_ELISION_MARKER)
     {
         return;
     }
@@ -812,7 +813,7 @@ pub fn build_compact_diff_preview(diff: &str, options: &CompactDiffOptions) -> C
     append_added_run(&mut formatted, &added_run, added_run_context);
     while formatted
         .last()
-        .is_some_and(|line| is_preview_separator(line))
+        .is_some_and(|line| line == PREVIEW_ELISION_MARKER)
     {
         formatted.pop();
     }
@@ -862,26 +863,17 @@ fn is_patch_wrapper_line(line: &str) -> bool {
 /// Strip wrapper/metadata lines and trailing blank rows from a diff body.
 pub fn normalize_diff(diff: &str) -> String {
     let mut lines = diff.split('\n').collect::<Vec<_>>();
-    while let Some(last_line) = lines.last().copied() {
-        if last_line.is_empty() || (last_line.trim().is_empty() && !is_diff_content_line(last_line))
-        {
-            lines.pop();
-        } else {
-            break;
-        }
-    }
+    while lines
+        .pop_if(|line| line.is_empty() || (line.trim().is_empty() && !is_diff_content_line(line)))
+        .is_some()
+    {}
     if lines
         .first()
         .is_some_and(|line| is_patch_wrapper_line(line.trim()))
     {
         lines.remove(0);
     }
-    if lines
-        .last()
-        .is_some_and(|line| is_patch_wrapper_line(line.trim()))
-    {
-        lines.pop();
-    }
+    lines.pop_if(|line| is_patch_wrapper_line(line.trim()));
     lines.retain(|line| {
         is_diff_content_line(line) || !matches_trimmed_prefix(line.trim(), &DIFF_METADATA_PREFIXES)
     });
@@ -976,8 +968,8 @@ fn strip_line_number_prefixes(hunk: &mut DiffHunk) {
         .filter_map(|captures| captures.get(1)?.as_str().parse::<u32>().ok())
         .collect::<Vec<_>>();
     let sequential = numbers
-        .windows(2)
-        .filter(|pair| pair[1] == pair[0] + 1)
+        .array_windows()
+        .filter(|&&[previous, next]| next == previous + 1)
         .count();
     if numbers.len() >= 3 && sequential < 1_usize.max(numbers.len() - 2) {
         return;
@@ -1001,6 +993,7 @@ fn parse_one_hunk(
     lines: &[&str],
     line_number: u32,
     allow_missing_context: bool,
+    recover_line_numbers: bool,
 ) -> Result<ParseHunkResult, EditError> {
     if lines.is_empty() {
         return Err(parse_error("Diff does not contain any lines", line_number));
@@ -1016,8 +1009,7 @@ fn parse_one_hunk(
         .then(|| parse_unified_hunk_header(header_trimmed))
         .flatten();
     let is_empty_context_marker = header_trimmed
-        .strip_prefix("@@")
-        .and_then(|rest| rest.strip_suffix("@@"))
+        .strip_circumfix("@@", "@@")
         .is_some_and(|middle| middle.trim().is_empty());
 
     if is_header_line && (header_trimmed == EMPTY_CHANGE_CONTEXT_MARKER || is_empty_context_marker)
@@ -1196,7 +1188,9 @@ fn parse_one_hunk(
             line_number + u32::try_from(start_index).unwrap_or(u32::MAX),
         ));
     }
-    strip_line_number_prefixes(&mut hunk);
+    if recover_line_numbers {
+        strip_line_number_prefixes(&mut hunk);
+    }
     Ok(ParseHunkResult {
         hunk,
         lines_consumed: parsed_lines + start_index,
@@ -1257,8 +1251,17 @@ fn is_unified_diff_metadata_line(line: &str) -> bool {
         .any(|prefix| line.starts_with(prefix))
 }
 
-/// Parse a diff body into hunks.
+/// Parse JSON patch hunks, recovering numbered read output when present.
 pub fn parse_diff_hunks(diff: &str) -> Result<Vec<DiffHunk>, EditError> {
+    parse_hunks(diff, true)
+}
+
+/// Codex `apply_patch` preserves numeric prefixes as literal content.
+pub(crate) fn parse_apply_patch_hunks(diff: &str) -> Result<Vec<DiffHunk>, EditError> {
+    parse_hunks(diff, false)
+}
+
+fn parse_hunks(diff: &str, recover_line_numbers: bool) -> Result<Vec<DiffHunk>, EditError> {
     let multi_file_count = count_multi_file_markers(diff);
     if multi_file_count > 1 {
         return Err(EditError::Apply(format!(
@@ -1290,9 +1293,446 @@ pub fn parse_diff_hunks(diff: &str) -> Result<Vec<DiffHunk>, EditError> {
             &lines[index..],
             u32::try_from(index + 1).unwrap_or(u32::MAX),
             true,
+            recover_line_numbers,
         )?;
         hunks.push(parsed.hunk);
         index += parsed.lines_consumed;
     }
     Ok(hunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(path: &str) -> BlockContextSource<'_> {
+        BlockContextSource {
+            path: Some(path),
+            lang: None,
+            streaming: false,
+        }
+    }
+
+    #[test]
+    fn collapses_unchanged_lines_between_distant_edits() {
+        let old_lines = (1..=20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>();
+        let mut new_lines = old_lines.clone();
+        new_lines[1] = "line 2 changed".to_owned();
+        new_lines[17] = "line 18 changed".to_owned();
+        let result = generate_diff_string(
+            &old_lines.join("\n"),
+            &new_lines.join("\n"),
+            Some(2),
+            &BlockContextSource::default(),
+        );
+        let lines = result.diff.split('\n').collect::<Vec<_>>();
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.ends_with("|...") || line.ends_with("|…"))
+        );
+        let line_four = lines.iter().position(|line| *line == " 4|line 4").unwrap();
+        assert_eq!(lines[line_four + 1], " 16|line 16");
+        assert!(lines.contains(&"-2|line 2"));
+        assert!(lines.contains(&"+2|line 2 changed"));
+        assert!(lines.contains(&"-18|line 18"));
+        assert!(lines.contains(&"+18|line 18 changed"));
+        assert!(!lines.contains(&" 8|line 8"));
+        assert!(!lines.contains(&" 12|line 12"));
+    }
+
+    #[test]
+    fn adds_matching_bracket_line_beyond_context() {
+        let old = [
+            "function outer() {",
+            "  const value = 1;",
+            "  const two = 2;",
+            "  const three = 3;",
+            "  const four = 4;",
+            "  return value + two + three + four;",
+            "}",
+        ];
+        let mut new = old;
+        new[0] = "function renamed() {";
+        let result = generate_diff_string(
+            &old.join("\n"),
+            &new.join("\n"),
+            Some(1),
+            &source("sample.ts"),
+        );
+        let lines = result.diff.split('\n').collect::<Vec<_>>();
+        assert!(lines.contains(&"-1|function outer() {"));
+        assert!(lines.contains(&"+1|function renamed() {"));
+        assert!(lines.contains(&""));
+        assert!(!lines.contains(&"..."));
+        assert!(lines.contains(&" 7|}"));
+        assert!(!lines.contains(&" 5|  const four = 4;"));
+        assert!(!lines.contains(&" 6|  return value + two + three + four;"));
+    }
+
+    #[test]
+    fn normalizes_gap_rows_around_block_context() {
+        let old = [
+            "function alpha() {",
+            "  const a1 = 1;",
+            "  const a2 = 2;",
+            "  const a3 = 3;",
+            "  const a4 = 4;",
+            "  return a1;",
+            "}",
+            "// spacer",
+            "function beta() {",
+            "  const b1 = 1;",
+            "  const b2 = 2;",
+            "  const b3 = 3;",
+            "  const b4 = 4;",
+            "  return b1;",
+            "}",
+        ];
+        let mut new = old;
+        new[1] = "  const a1 = 100;";
+        new[13] = "  return b1 + 1;";
+        let result = generate_diff_string(
+            &old.join("\n"),
+            &new.join("\n"),
+            Some(1),
+            &source("sample.ts"),
+        );
+        let lines = result.diff.split('\n').collect::<Vec<_>>();
+        let closer = lines.iter().position(|line| *line == " 7|}").unwrap();
+        let opener = lines
+            .iter()
+            .position(|line| *line == " 9|function beta() {")
+            .unwrap();
+        assert!(opener > closer);
+        assert_eq!(lines[closer - 1], "");
+        assert_eq!(lines[closer + 1], "");
+        assert_eq!(lines[opener - 1], "");
+        assert_eq!(lines[opener + 1], "");
+        assert!(!lines.windows(2).any(|pair| pair == ["", ""]));
+        assert_ne!(lines.first(), Some(&""));
+        assert_ne!(lines.last(), Some(&""));
+    }
+
+    #[test]
+    fn drops_gap_between_contiguous_boundaries() {
+        let old = [
+            "function alpha() {",
+            "  const a1 = 1;",
+            "  const a2 = 2;",
+            "  const a3 = 3;",
+            "  const a4 = 4;",
+            "  return a1;",
+            "}",
+            "function beta() {",
+            "  const b1 = 1;",
+            "  const b2 = 2;",
+            "  const b3 = 3;",
+            "  const b4 = 4;",
+            "  return b1;",
+            "}",
+        ];
+        let mut new = old;
+        new[1] = "  const a1 = 100;";
+        new[12] = "  return b1 + 1;";
+        let result = generate_diff_string(
+            &old.join("\n"),
+            &new.join("\n"),
+            Some(1),
+            &source("sample.ts"),
+        );
+        let lines = result.diff.split('\n').collect::<Vec<_>>();
+        let closer = lines.iter().position(|line| *line == " 7|}").unwrap();
+        let opener = lines
+            .iter()
+            .position(|line| *line == " 8|function beta() {")
+            .unwrap();
+        assert_eq!(opener, closer + 1);
+    }
+
+    #[test]
+    fn translates_new_block_context_to_old_line_numbers() {
+        let old = [
+            "function outer() {",
+            "  const a = 1;",
+            "  const keep = 2;",
+            "  const b = 3;",
+            "  return a + keep + b;",
+            "}",
+        ];
+        let new = [
+            "function outer() {",
+            "  const a = 10;",
+            "  const a2 = 11;",
+            "  const keep = 2;",
+            "  const b = 30;",
+            "  const b2 = 31;",
+            "  return a + keep + b;",
+            "}",
+        ];
+        let result = generate_diff_string(
+            &old.join("\n"),
+            &new.join("\n"),
+            Some(1),
+            &source("sample.ts"),
+        );
+        let lines = result.diff.split('\n').collect::<Vec<_>>();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.ends_with("|}"))
+                .copied()
+                .collect::<Vec<_>>(),
+            [" 6|}"]
+        );
+        let context_numbers = lines
+            .iter()
+            .filter(|line| line.starts_with(' '))
+            .map(|line| line[1..].split('|').next().unwrap().parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        let mut sorted = context_numbers.clone();
+        sorted.sort_unstable();
+        assert_eq!(context_numbers, sorted);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("|  const keep = 2;"))
+                .copied()
+                .collect::<Vec<_>>(),
+            [" 3|  const keep = 2;"]
+        );
+    }
+
+    #[test]
+    fn compact_preview_counts_and_renumbers() {
+        let diff = [" 1|alpha", "-2|beta", "+2|DELTA", "+3|EPSILON", " 3|gamma"].join("\n");
+        let preview = build_compact_diff_preview(&diff, &CompactDiffOptions::default());
+        assert_eq!(preview.preview, "1:alpha\n2:DELTA\n3:EPSILON\n4:gamma");
+        assert_eq!(preview.added_lines, 2);
+        assert_eq!(preview.removed_lines, 1);
+    }
+
+    #[test]
+    fn compact_preview_renumbers_after_range_expansion() {
+        let diff = [
+            " 1|a1", " 2|a2", "-3|a3", "-4|a4", "+3|X", "+4|Y", "+5|Z", " 5|a5", " 6|a6", " 7|a7",
+        ]
+        .join("\n");
+        let preview = build_compact_diff_preview(&diff, &CompactDiffOptions::default());
+        assert_eq!(
+            preview.preview.split('\n').collect::<Vec<_>>(),
+            ["1:a1", "2:a2", "3:X", "4:Y", "5:Z", "6:a5", "7:a6", "8:a7"]
+        );
+    }
+
+    #[test]
+    fn compact_preview_collapses_long_added_runs() {
+        let diff = (0..7)
+            .map(|index| format!("+{}|line {}", 10 + index, index + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = build_compact_diff_preview(&diff, &CompactDiffOptions::default());
+        assert_eq!(
+            preview.preview,
+            "10:line 1\n11:line 2\n…\n15:line 6\n16:line 7"
+        );
+        assert_eq!((preview.added_lines, preview.removed_lines), (7, 0));
+    }
+
+    #[test]
+    fn compact_preview_honors_added_run_options() {
+        let diff = (0..8)
+            .map(|index| format!("+{}|line {}", 1 + index, index + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let options = CompactDiffOptions {
+            max_added_run_context: Some(1),
+            max_unchanged_run: Some(3),
+        };
+        assert_eq!(
+            build_compact_diff_preview(&diff, &options).preview,
+            "1:line 1\n…\n8:line 8"
+        );
+        let alias = CompactDiffOptions {
+            max_added_run_context: None,
+            max_unchanged_run: Some(1),
+        };
+        assert_eq!(
+            build_compact_diff_preview(&diff, &alias).preview,
+            "1:line 1\n…\n8:line 8"
+        );
+    }
+
+    #[test]
+    fn compact_preview_normalizes_separators() {
+        let preview = build_compact_diff_preview(
+            " 1|alpha\n...\n...\n…\n 20|omega",
+            &CompactDiffOptions::default(),
+        );
+        assert_eq!(preview.preview, "1:alpha\n…\n20:omega");
+        let preview = build_compact_diff_preview(
+            "\n 1|alpha\n\n-5|beta\n\n 9|gamma\n\n-12|omitted",
+            &CompactDiffOptions::default(),
+        );
+        assert_eq!(preview.preview, "1:alpha\n…\n8:gamma");
+        assert_eq!(preview.removed_lines, 2);
+    }
+
+    #[test]
+    fn parses_simple_and_multiple_hunks() {
+        let hunks = parse_diff_hunks("@@ def f():\n-    pass\n+    return 123").unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].change_context.as_deref(), Some("def f():"));
+        assert_eq!(hunks[0].old_lines, ["    pass"]);
+        assert_eq!(hunks[0].new_lines, ["    return 123"]);
+        assert_eq!(
+            parse_diff_hunks("@@\n-bar\n+BAR\n@@\n-qux\n+QUX")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn parses_context_and_eof_markers() {
+        let hunks = parse_diff_hunks("@@\n foo\n-bar\n+baz\n qux").unwrap();
+        assert_eq!(hunks[0].old_lines, ["foo", "bar", "qux"]);
+        assert_eq!(hunks[0].new_lines, ["foo", "baz", "qux"]);
+        assert!(
+            parse_diff_hunks("@@\n+new line").unwrap()[0]
+                .change_context
+                .is_none()
+        );
+        assert!(parse_diff_hunks("@@\n+line\n*** End of File").unwrap()[0].is_end_of_file);
+    }
+
+    #[test]
+    fn parses_headers_hints_and_wrappers() {
+        let hunk = parse_diff_hunks(
+            "*** Begin Patch\n*** Update File: a.txt\n@@ -12,2 +13,3 @@ name\n-old\n+new\n*** End \
+			 Patch",
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            (hunk.old_start_line, hunk.new_start_line),
+            (Some(12), Some(13))
+        );
+        assert_eq!(hunk.change_context.as_deref(), Some("name"));
+        let hint = parse_diff_hunks("@@ lines 7-9\n-a\n+b").unwrap().remove(0);
+        assert_eq!(
+            (hint.old_start_line, hint.new_start_line),
+            (Some(7), Some(7))
+        );
+        let top = parse_diff_hunks("@@ top of file\n-a\n+b")
+            .unwrap()
+            .remove(0);
+        assert_eq!((top.old_start_line, top.new_start_line), (Some(1), Some(1)));
+    }
+
+    #[test]
+    fn normalizes_diff_and_create_content() {
+        assert_eq!(
+            normalize_diff("*** Begin Patch\n*** Update File: a\n@@\n-old\n+new\n*** End Patch\n"),
+            "@@\n-old\n+new"
+        );
+        assert_eq!(normalize_create_content("+ one\n+two\n"), "one\ntwo\n");
+        assert_eq!(normalize_create_content("one\n+two"), "one\n+two");
+    }
+
+    #[test]
+    fn rejects_multi_file_diff() {
+        let error =
+            parse_diff_hunks("diff --git a/a b/a\n@@\n-a\n+b\ndiff --git a/b b/b\n@@\n-c\n+d")
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Diff contains 2 file markers. Single-file patches cannot contain multi-file markers."
+        );
+    }
+
+    #[test]
+    fn generates_numbered_unified_diff() {
+        let result = LineDiff::new("a\nb\nc\n", "a\nB\nc\n")
+            .unified(Some(1), &BlockContextSource::default());
+        assert_eq!(result.diff, "@@ -1,3 +1,3 @@\n 1|a\n-2|b\n+2|B\n 3|c");
+        assert_eq!(result.first_changed_line, Some(2));
+    }
+
+    #[test]
+    fn unified_diff_omits_duplicate_and_boundary_gap_rows() {
+        let old = [
+            "function alpha() {",
+            "  const a1 = 1;",
+            "  const a2 = 2;",
+            "  const a3 = 3;",
+            "  const a4 = 4;",
+            "  return a1;",
+            "}",
+            "// spacer",
+            "function beta() {",
+            "  const b1 = 1;",
+            "  const b2 = 2;",
+            "  const b3 = 3;",
+            "  const b4 = 4;",
+            "  return b1;",
+            "}",
+        ];
+        let mut new = old;
+        new[1] = "  const a1 = 100;";
+        new[13] = "  return b1 + 1;";
+
+        let result =
+            LineDiff::new(&old.join("\n"), &new.join("\n")).unified(Some(1), &source("sample.ts"));
+        let lines = result.diff.split('\n').collect::<Vec<_>>();
+        let closer = lines.iter().position(|line| *line == " 7|}").unwrap();
+        let opener = lines
+            .iter()
+            .position(|line| *line == " 9|function beta() {")
+            .unwrap();
+        assert!(opener > closer);
+        assert_eq!(lines[closer - 1], "");
+        assert_eq!(lines[closer + 1], "");
+        assert_eq!(lines[opener - 1], "");
+        assert_eq!(lines[opener + 1], "");
+        assert!(!lines.windows(2).any(|pair| pair == ["", ""]));
+        assert_ne!(lines.first(), Some(&""));
+        assert_ne!(lines.last(), Some(&""));
+
+        let contiguous_old = [
+            "function alpha() {",
+            "  const a1 = 1;",
+            "  const a2 = 2;",
+            "  const a3 = 3;",
+            "  const a4 = 4;",
+            "  return a1;",
+            "}",
+            "function beta() {",
+            "  const b1 = 1;",
+            "  const b2 = 2;",
+            "  const b3 = 3;",
+            "  const b4 = 4;",
+            "  return b1;",
+            "}",
+        ];
+        let mut contiguous_new = contiguous_old;
+        contiguous_new[1] = "  const a1 = 100;";
+        contiguous_new[12] = "  return b1 + 1;";
+
+        let contiguous_result =
+            LineDiff::new(&contiguous_old.join("\n"), &contiguous_new.join("\n"))
+                .unified(Some(1), &source("sample.ts"));
+        let contiguous_lines = contiguous_result.diff.split('\n').collect::<Vec<_>>();
+        let contiguous_closer = contiguous_lines
+            .iter()
+            .position(|line| *line == " 7|}")
+            .unwrap();
+        let contiguous_opener = contiguous_lines
+            .iter()
+            .position(|line| *line == " 8|function beta() {")
+            .unwrap();
+        assert_eq!(contiguous_opener, contiguous_closer + 1);
+    }
 }

@@ -1,4 +1,6 @@
-Edit files via the `apply_patch` shell command: a stripped-down, file-oriented diff, easy to parse and safe to apply.
+Edit files: pass the patch as this tool's input. It is not a shell command; `bash` has no `apply_patch`.
+
+`apply_patch`: stripped-down, file-oriented diff; easy to parse, safe to apply.
 
 Envelope:
 ```
@@ -6,12 +8,24 @@ Envelope:
 [ one or more file sections ]
 *** End Patch
 ```
-Each file operation MUST start with an action header:
-`*** Add File: <path>`: create file; every following line MUST start with `+` (initial content).
-`*** Delete File: <path>`: remove existing file; nothing follows.
-`*** Update File: <path>`: patch in place; optional immediate `*** Move to: <new path>` renames; then one or more `@@` hunks (header optional). Hunk lines start with space, `-` or `+`.
+Contains file operations. Each MUST have an action header:
 
-Context: 3 unchanged lines before and after each change. For changes within 3 lines of each other, do NOT repeat the first change's after-context as the second's before-context. If 3 lines don't identify the code uniquely, add `@@ <class/function>`; if still ambiguous, stack several `@@` lines:
+`*** Add File: <path>`: create file; every following line `+` (initial contents).
+
+`*** Delete File: <path>`: remove existing file; nothing follows.
+
+`*** Update File: <path>`: patch existing file in place; optional immediate `*** Move to: <new path>` renames it; then one or more `@@` hunks (optional hunk header). Omit hunks only for a content-preserving move. Hunk lines start with space, `-`, or `+`.
+
+Old/context lines must match complete file lines, allowing only whitespace and Unicode punctuation normalization, not substrings or similar text.
+
+Context: default 3 code lines immediately before and after each change. Changes within 3 lines: do NOT duplicate first change's context-after lines as second change's context-before lines. If 3 lines do not uniquely identify code in the file, use `@@` with its class/function; if one `@@` plus 3 context lines still cannot uniquely identify repeated code in a class/function, use multiple `@@` lines to reach it:
+```
+@@ class BaseClass
+[3 lines of pre-context]
+- [old_code]
++ [new_code]
+[3 lines of post-context]
+```
 ```
 @@ class BaseClass
 @@ 	 def method():
@@ -35,7 +49,7 @@ Hunk := "@@" [ header ] NEWLINE { HunkLine } [ "*** End of File" NEWLINE ]
 HunkLine := (" " | "-" | "+") text NEWLINE
 ```
 
-Example combining operations:
+Full patches may combine operations:
 ```
 *** Begin Patch
 *** Add File: hello.txt
@@ -49,4 +63,4 @@ Example combining operations:
 *** End Patch
 ```
 
-Paths MUST be relative, NEVER absolute.
+MUST use Add/Delete/Update header; new-file lines MUST start `+`; relative paths resolve against the session cwd (a shell `cd` does not change it); use absolute paths for files outside it.
