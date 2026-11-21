@@ -10,7 +10,7 @@ Sources verified this pass:
 | Integration layer | `crates/omp-cli/src/tools/shell_host.rs` | `CliPathPolicy`, `CliSpawnWrapper`, `SpawnBook`, `split_utility_builtins`, `CliDynHost`, `analyze_script`, `build_embedded_shell`, `execute_shell` |
 | Target tool surface | `crates/omp-cli/src/tools/bash.rs` | `run`, `start_background`, `start_service`, `local_bash_argv`, `detached_bash` |
 | Target job plumbing | `crates/omp-cli/src/tools/jobs.rs` | `JobRegistry`, `bg_N`, `Service` |
-| Host tool snapshot | `crates/omp-cli/src/tools.rs` | `Env::dyn_tools` (`:98`, `:117-119`), populated at `:365` |
+| Host tool snapshot | `crates/omp-cli/src/tools.rs` | `Env::dyn_tools` (`:130`, `:159-161`), populated at `:437` |
 | Remote runs | `crates/omp-cli/src/features/ssh.rs` | `remote_argv` / `remote_argv_for` |
 | Sandbox | `crates/omp-sandbox/src/lib.rs` + `crates/omp-cli/src/features/sandbox.rs` | `wrap_inner`, Landlock/seccomp |
 | Vendored engine | `vendor/omp-shell` | omp2 `crates/shell` |
@@ -20,20 +20,20 @@ Sources verified this pass:
 | Related parity | `docs/parity/tools.md` §4 `bash`, §7 | schema deltas |
 
 **Bottom line: local finite `bash` execution is wired in-process — this is `PARITY`.**
-`crates/omp-cli/src/tools/bash.rs::run_with_dyn` (`:356-382`) calls
+`crates/omp-cli/src/tools/bash.rs::run_with_dyn` (`:356-383`) calls
 `super::shell_host::execute_shell` with a `ShellExecRequest`, so `run`, `bash()` and
 `execute()` all reach the embedded `omp_shell::Shell` rather than spawning `bash`. `bash()`
-threads `env.dyn_tools()` into both the foreground call (`:746`) and `start_background`
-(`:741`, `:1041`, `:1060-1067`), so the `dyn` bridge is live on the tool path. `CliPathPolicy`
+threads `env.dyn_tools()` into both the foreground call (`:752`) and `start_background`
+(`:741`, `:1040`, `:1078-1086`), so the `dyn` bridge is live on the tool path. `CliPathPolicy`
 gained a `/dev/tty` denial on top of the workspace write root, closing the controlling-terminal
-regression in-process (`shell_host.rs:103-105`, `:144-176`). `omp-shell`,
+regression in-process (`shell_host.rs:184-186`, `:196-215`). `omp-shell`,
 `omp-shell-builtins` and `nix` are declared in `crates/omp-cli/Cargo.toml`, and
-`Env::dyn_tools` feeds the registry snapshot from `tools.rs:365`.
+`Env::dyn_tools` feeds the registry snapshot from `tools.rs:437`.
 
 Two paths stay external **by design, not by omission**: `/ssh` commands keep
 external `ssh` (`run_with_dyn` branches to `run_remote_ssh` at `:366-368`), and long-lived
 services (`name`/`ready`) keep their own external `Child` supervisor for the `SUPERVISOR_TICK`
-daemon lifecycle (`start_service`, `:820-...`), because both need to own a process table the
+daemon lifecycle (`start_service`, `:828-...`), because both need to own a process table the
 in-process interpreter cannot. `detached_bash`/`local_bash_argv` survive only for that
 service path. See §1 and §9.
 
@@ -43,22 +43,22 @@ service path. See §1 and §9.
 
 | Dimension | Current target | Vendored / integration layer | Status |
 |---|---|---|---|
-| Local evaluation | **In-process.** `run_with_dyn` → `shell_host::execute_shell` → `Shell::run_string` (`bash.rs:356-382`, `shell_host.rs:547-706`). No local `bash` spawn | `execute_shell` + `Shell` | **PARITY** |
-| Persistence | `Shell` instance per call (fresh interpreter, no carry-over) | `Shell` holds env, variables, options, jobs, traps, callstack, history; `build_embedded_shell` pins `profile(Skip)`, `rc(Skip)`, `working_dir(cwd)`, `do_not_inherit_env(true)`, `external_cmd_leads_session(true)` (`shell_host.rs:478-521`) | **PRESENT** (per-call, matching omp's non-persistent `bash`) |
-| Session isolation | `CliPathPolicy` denies `/dev/tty` on read, write, and `open` (`shell_host.rs:103-105`, `:144-176`); external children get `external_cmd_leads_session(true)` → own `setsid` session | same | **PARITY** — pinned by `commands_have_no_controlling_terminal` (in-process `NO_TTY`, and the external child's `sid == pid`) |
-| Parser / AST | `vendor/omp-shell/src/parser/` via the interpreter | `Parser::new(.., ParserOptions::default())` in `analyze_script` (`shell_host.rs:459-476`) | **PRESENT** |
+| Local evaluation | **In-process.** `run_with_dyn` → `shell_host::execute_shell` → `Shell::run_string` (`bash.rs:356-383`, `shell_host.rs:848-1021`). No local `bash` spawn | `execute_shell` + `Shell` | **PARITY** |
+| Persistence | `Shell` instance per call (fresh interpreter, no carry-over) | `Shell` holds env, variables, options, jobs, traps, callstack, history; `build_embedded_shell` pins `profile(Skip)`, `rc(Skip)`, `working_dir(cwd)`, `do_not_inherit_env(true)`, `external_cmd_leads_session(true)` (`shell_host.rs:758-809`) | **PRESENT** (per-call, matching omp's non-persistent `bash`) |
+| Session isolation | `CliPathPolicy` denies `/dev/tty` on read, write, and `open` (`shell_host.rs:184-186`, `:196-215`); external children get `external_cmd_leads_session(true)` → own `setsid` session | same | **PARITY** — pinned by `commands_have_no_controlling_terminal` (in-process `NO_TTY`, and the external child's `sid == pid`) |
+| Parser / AST | `vendor/omp-shell/src/parser/` via the interpreter | `Parser::new(.., ParserOptions::default())` in `analyze_script` (`shell_host.rs:739-752`) | **PRESENT** |
 | Expansion | `expansion.rs`, `braceexpansion.rs`, `arithmetic.rs`, `patterns.rs`, `regex.rs`, `escape.rs` | same | **PRESENT** |
-| Static analysis | `analyze_script` → `omp_shell::analysis::analyze` → `ScriptIr` + `omp_proto::…::BashIr::from(&ir)` (`shell_host.rs:459-476`); called on every `execute_shell` run for IR telemetry (`commands`, `is_read_only`, `writes_outside`, `opaque_count`) and exercised by unit tests | same | **PRESENT** (runs on live path for IR inspection; pre-exec deny policy can layer on top) |
-| Env / cwd | `do_not_inherit_env(true)` then `std::env::vars_os()` re-exported as `ShellVariable` (`shell_host.rs:508-518`), but filtered to entries whose key **and** value are UTF-8 (`to_str()`), so non-UTF-8 pairs are dropped rather than re-exported; stdin is `openfiles::null()` | same | **PARITY** (env re-export is UTF-8-only) |
-| Cancellation | `AbortSignal` → `ExecutionParameters::set_cancel_token` + `SpawnBook::signal_groups(SIGKILL)` (`killpg`) on timeout/abort (`shell_host.rs:568-575`); pinned by `cancel_aborts_spawned_child_via_pgid` | same | **PARITY** |
+| Static analysis | `analyze_script` → `omp_shell::analysis::analyze` → `ScriptIr` + `omp_proto::…::BashIr::from(&ir)` (`shell_host.rs:739-752`); called on every `execute_shell` run for IR telemetry (`commands`, `is_read_only`, `writes_outside`, `opaque_count`) and exercised by unit tests | same | **PRESENT** (runs on live path for IR inspection; pre-exec deny policy can layer on top) |
+| Env / cwd | `do_not_inherit_env(true)` then `std::env::vars_os()` re-exported as `ShellVariable` (`shell_host.rs:788-804`), but filtered to entries whose key **and** value are UTF-8 (`to_str()`), so non-UTF-8 pairs are dropped rather than re-exported; inherited `PWD`/`OLDPWD` are skipped and `PWD` is re-set from `cwd`; stdin is `openfiles::null()` | same | **PARITY** (env re-export is UTF-8-only) |
+| Cancellation | `AbortSignal` → `ExecutionParameters::set_cancel_token` + `SpawnBook::signal_groups(SIGKILL)` (`killpg`) on timeout/abort (`shell_host.rs:887`, `:984`, `:991`); pinned by `cancel_aborts_spawned_child_via_pgid` | same | **PARITY** |
 | Sandboxing | `CliPathPolicy` (in-process writes limited to `cwd` plus `/dev/null`) + `CliSpawnWrapper` (external binaries still re-exec through `wrap_inner` → `omt __sandbox-exec`) | `PathPolicy` / `SpawnWrapper`; the external Landlock policy (`features/sandbox.rs`) additionally permits `/tmp` and the agent directory | **PRESENT-GAP** — in-process writes are narrower than the external Landlock policy (no `/tmp`, no agent dir), so sandboxing is not full parity; pinned by `path_policy_enforces_workspace_write_root` and `sandbox_path_policy_blocks_in_process_redirection_outside_root` |
 
-### `execute_shell` shape (`shell_host.rs:547-706`)
+### `execute_shell` shape (`shell_host.rs:848-1021`)
 
 1. `build_embedded_shell(cwd, dyn_tools, include_fs_mutations = true)`.
 2. `io::pipe()`; the write end is duplicated onto stderr so both streams share one reader;
    stdin is `omp_shell::openfiles::null()`.
-3. `ExecutionParameters` (`shell_host.rs:563-572`) gets `set_fd` for 0/1/2, plus
+3. `ExecutionParameters` (`shell_host.rs:875-887`) gets `set_fd` for 0/1/2, plus
    `set_path_policy(CliPathPolicy::new(cwd, features::sandbox::enabled()))`,
    `set_spawn_wrapper(CliSpawnWrapper::from_sandbox(cwd))`,
    `set_spawn_observer`/`set_process_scope` (the same `SpawnBook`), and `set_cancel_token`.
@@ -74,7 +74,7 @@ service path. See §1 and §9.
 ### What `bash.rs` does per call
 
 1. `run` (`:345-354`) forwards to `run_with_dyn` with `dyn_tools: None`; `bash()` calls
-   `run_with_dyn` directly with `env.dyn_tools()` (`:746`). `run_with_dyn` (`:356-382`) first
+   `run_with_dyn` directly with `env.dyn_tools()` (`:752`). `run_with_dyn` (`:356-383`) first
    builds `script = format!("exec 2>&1\n{command}")` and asks
    `features::ssh::remote_argv(&script)` for a target. When `/ssh` is active, that `script`
    string — the stderr-merge wrapper itself, not merely a probe — is POSIX-quoted and passed to
@@ -92,7 +92,7 @@ service path. See §1 and §9.
    attaches `details` (`wallTimeMs`, `timeoutSeconds` or `timeoutDisabled`,
    `requestedTimeoutSeconds`).
 
-`execute` (`:494-...`, the rpc `bash` surface) calls the same `run` with
+`execute` (`:494-515`, the rpc `bash` surface) calls the same `run` with
 `DEFAULT_TIMEOUT_SECS` and maps the tuple onto `Executed`, setting `cancelled` from
 `outcome == Some("aborted")` and `timed_out` from `Some("timeout")`.
 
@@ -102,15 +102,15 @@ filesystem or process table. `run_remote_ssh` retains the pre-port reader loop (
 `tokio::select!` over read/deadline/abort, head+tail retention, `kill_on_drop(true)`).
 
 `start_service` also keeps its external supervisor by design: it spawns a piped `Child`
-(`bash.rs:820-...`, via `wrap_inner`/`detached_bash` + `local_bash_argv`), keeps the `Child`
+(`bash.rs:828-...`, via `wrap_inner`/`detached_bash` + `local_bash_argv`), keeps the `Child`
 handle in the supervisor task, drains stdout into a 64 KiB readiness buffer plus the service
 log, probes readiness (log regex and/or TCP) and liveness on `SUPERVISOR_TICK = 100 ms`
-(`:804`), and kills on registry drop or `kill_requested`. That lifecycle is tied to a real
+(`:812`), and kills on registry drop or `kill_requested`. That lifecycle is tied to a real
 `Child` and a daemon that outlives the call, so it is not an `execute_shell` candidate —
 which is why `detached_bash`/`local_bash_argv`/`setsid_path` still exist.
 
-`start_background` (`bash.rs:1032-...`) registers a `bg_N` job, then spawns a task that calls
-`run_with_dyn` with the `env.dyn_tools()` snapshot it was handed (`:1060-1067`), passing the
+`start_background` (`bash.rs:1040-...`) registers a `bg_N` job, then spawns a task that calls
+`run_with_dyn` with the `env.dyn_tools()` snapshot it was handed (`:1078-1086`), passing the
 job's `Arc<Mutex<String>>` as `tap` so `proc://<id>` streams live in-process output.
 
 ---
@@ -122,14 +122,14 @@ plus the `dyn` bridge; `build_embedded_shell` installs all three.
 
 | Registry | Vendored contents | Wiring | Status |
 |---|---|---|---|
-| Shell builtins (57 modules, 60 registered names in `vendor/omp-shell/src/builtins/`) | `cd/pwd/pushd/popd/dirs`, `export/declare/typeset/local/readonly/set/unset/shopt`, `alias/unalias`, `read/mapfile/readarray`, `printf` (+`printf_engine`), `test`/`[`, `eval/dot/source/exec/command/type_/builtin_/enable/hash`, `getopts/shift/return_/break_/continue_/exit`, `jobs/fg/bg/disown/wait/suspend/kill`, `trap`, `history/fc`, `ulimit/umask`, `complete/compgen/compopt/bind`, `help`, `caller`, `times`, `echo/colon/true_/false_/let_` | `builtins::default_builtins()` (`shell_host.rs:490`) | **PRESENT** |
-| `utility_builtins()` — 59 names | text: `cat/head/tail/tac/tee/tr/cut/paste/comm/cmp/diff/sort/uniq/wc/sed/grep/rg/find/xargs/jq/seq/yes/sponge/ts/ifne/isutf8/combine`; fs: `ls/stat/fd/ln/mv/rm/mkdir/mktemp/touch/truncate/readlink/realpath/basename/dirname/which`; checksums: `cksum/b2sum/md5sum/sha1sum/sha224sum/sha256sum/sha384sum/sha512sum/base32/base64`; system: `date/hostname/uname/whoami/printenv/nproc/errno` (`errno` is `#[cfg(unix)]`) | `split_utility_builtins()` → safe tier always installed (`:491`); `rm`/`mv`/`ln` installed only when `include_fs_mutations` is true (`:497-505`, `execute_shell` passes `true`) | **PRESENT**, with `rm`/`mv`/`ln` behind their own gate |
-| `process_builtins()` — 8 names | `pgrep/pkill/pidwait/ps/top/sleep/timeout/nohup`; `nohup` is `transparent_background_wrapper()` so `$!` is the real child PID | installed at `:492-496` | **PRESENT** |
-| `dyn_builtin(host)` | `list` / `schema` / `call` against `Arc<dyn DynHost>`; registration is fixed so discovery never mutates the model-facing roster | `builder.builtin("dyn", dyn_builtin(host))` when `Env::dyn_tools()` is non-empty (`:504-507`) | **PRESENT** |
+| Shell builtins (57 modules, 60 registered names in `vendor/omp-shell/src/builtins/`) | `cd/pwd/pushd/popd/dirs`, `export/declare/typeset/local/readonly/set/unset/shopt`, `alias/unalias`, `read/mapfile/readarray`, `printf` (+`printf_engine`), `test`/`[`, `eval/dot/source/exec/command/type_/builtin_/enable/hash`, `getopts/shift/return_/break_/continue_/exit`, `jobs/fg/bg/disown/wait/suspend/kill`, `trap`, `history/fc`, `ulimit/umask`, `complete/compgen/compopt/bind`, `help`, `caller`, `times`, `echo/colon/true_/false_/let_` | `builtins::default_builtins()` (`shell_host.rs:770`) | **PRESENT** |
+| `utility_builtins()` — 59 names | text: `cat/head/tail/tac/tee/tr/cut/paste/comm/cmp/diff/sort/uniq/wc/sed/grep/rg/find/xargs/jq/seq/yes/sponge/ts/ifne/isutf8/combine`; fs: `ls/stat/fd/ln/mv/rm/mkdir/mktemp/touch/truncate/readlink/realpath/basename/dirname/which`; checksums: `cksum/b2sum/md5sum/sha1sum/sha224sum/sha256sum/sha384sum/sha512sum/base32/base64`; system: `date/hostname/uname/whoami/printenv/nproc/errno` (`errno` is `#[cfg(unix)]`) | `split_utility_builtins()` → safe tier always installed (`:771`); `rm`/`mv`/`ln` installed only when `include_fs_mutations` is true (`:777-783`, `execute_shell` passes `true`) | **PRESENT**, with `rm`/`mv`/`ln` behind their own gate |
+| `process_builtins()` — 8 names | `pgrep/pkill/pidwait/ps/top/sleep/timeout/nohup`; `nohup` is `transparent_background_wrapper()` so `$!` is the real child PID | installed at `:772-776` | **PRESENT** |
+| `dyn_builtin(host)` | `list` / `schema` / `call` against `Arc<dyn DynHost>`; registration is fixed so discovery never mutates the model-facing roster | `builder.builtin("dyn", dyn_builtin(host))` when `Env::dyn_tools()` is non-empty (`:784-786`) | **PRESENT** |
 
 `factory.rs` pushes 67 entries total: 59 utilities + 8 process builtins.
 
-`split_utility_builtins()` (`shell_host.rs:58-70`) is the destructive-command seam: it walks
+`split_utility_builtins()` (`shell_host.rs:68-79`) is the destructive-command seam: it walks
 `utility_builtins()` and returns `(safe, fs_mutation)` with exactly `rm`, `mv`, `ln` in the
 second vec, so mutation builtins can be audited, gated, or registered as an independent tier
 without touching the rest. The unit test `utility_split_separates_fs_mutations` pins the
@@ -147,10 +147,10 @@ Registry separation remains deliberate:
 
 ## 3. `CliDynHost`: the `dyn` bridge
 
-`CliDynHost` (`shell_host.rs:348-426`) implements `omp_shell_builtins::DynHost` over
-`DynToolList = Arc<Vec<Arc<dyn AgentTool>>>`, the snapshot `Env` holds (`tools.rs:98`) and
-fills at `tools.rs:365` from the registered tool list — a snapshot, not a reference, so
-`FnTool` setup creates no cycle.
+`CliDynHost` (`shell_host.rs:615-706`) implements `omp_shell_builtins::DynHost` over
+`DynToolList = Arc<Vec<Weak<dyn AgentTool>>>`, the snapshot `Env` holds (`tools.rs:130`) and
+fills at `tools.rs:437` from the registered tool list — a snapshot of weak handles, not a
+reference, so `FnTool` setup creates no cycle.
 
 - `visible_tools()` filters out `bash` **and** `dyn`, so a script cannot recurse into the
   shell or re-enter the bridge.
@@ -193,7 +193,7 @@ settles.
 
 ## 5. Cancellation and process groups
 
-`SpawnBook` (`shell_host.rs:259-346`) is the target-side bookkeeping type and is wired into
+`SpawnBook` (`shell_host.rs:526-605`) is the target-side bookkeeping type and is wired into
 every `execute_shell` run:
 
 - `impl SpawnObserver::on_spawn(pid, pgid)` records each non-zero pid and each distinct
@@ -204,8 +204,8 @@ every `execute_shell` run:
   group, then `nix::sys::signal::kill` for any ungrouped pid. `execute_shell` calls it with
   `SIGKILL` after `cancel_token.cancel()` on timeout or abort. `cancel_aborts_spawned_child_via_pgid`
   asserts `sleep 30` returns `outcome == Some("aborted")` well under 5 s.
-- Non-unix builds get `signal_groups_best_effort()` (no-op); `nix` is a unix-only dependency
-  (`crates/omp-cli/Cargo.toml:81-83`).
+- Non-unix builds have no `signal_groups` at all (`#[cfg(unix)]`), so the killpg teardown is
+  skipped there; `nix` is a unix-only dependency (`crates/omp-cli/Cargo.toml:81-83`).
 
 Two other mechanisms exist and must not be confused with it:
 
@@ -230,7 +230,7 @@ for its private dependencies. All three are pure stable Rust, no nightly.
 |---|---|---|
 | `xutf` | `vendor/xutf` | pure stable-Rust stand-in for the xutf APIs the shell stack consumes |
 | `omp-tool` | `vendor/omp-tool` | harness diagnostics (`Diag`) attached to omp tool calls |
-| `omp-proto` | `vendor/omp-proto` | hand-written wire shapes; supplies the `BashIr` type `analyze_script` projects `ScriptIr` into (`shell_host.rs:459-476`), reaching the graph as a path dependency |
+| `omp-proto` | `vendor/omp-proto` | hand-written wire shapes; supplies the `BashIr` type `analyze_script` projects `ScriptIr` into (`shell_host.rs:739-752`), reaching the graph as a path dependency |
 
 Provenance is pinned in `vendor-src.lock`; `omp-shell` and `omp-shell-builtins` are workspace
 members consumed by `crates/omp-cli` as `omp-shell.workspace = true` / `omp-shell-builtins.workspace = true`
@@ -240,7 +240,7 @@ members consumed by `crates/omp-cli` as `omp-shell.workspace = true` / `omp-shel
 
 ## 7. `CliPathPolicy`: write boundaries
 
-`CliPathPolicy` (`shell_host.rs:110-220`) is the `PathPolicy` impl handed to every run:
+`CliPathPolicy` (`shell_host.rs:136-215`) is the `PathPolicy` impl handed to every run:
 
 - `normalize_for_policy` canonicalizes the path, or its deepest existing ancestor with the
   remaining tail re-appended, so `..` and symlink escapes cannot slip past the prefix test.
@@ -257,7 +257,7 @@ members consumed by `crates/omp-cli` as `omp-shell.workspace = true` / `omp-shel
 - `path_policy_enforces_workspace_write_root` pins `ok.txt` allowed, `/dev/null` allowed,
   `outside.txt` denied, and `../outside.txt` denied.
 
-`CliSpawnWrapper` (`shell_host.rs:222-257`) adapts `features::sandbox::wrap_inner(write_root, &[])`
+`CliSpawnWrapper` (`shell_host.rs:489-521`) adapts `features::sandbox::wrap_inner(write_root, &[])`
 to `SpawnWrapper::launcher()`, so external binaries run from the in-process shell still
 re-exec through `omt __sandbox-exec` with Landlock/seccomp; `env_allowed` admits every key.
 Activation is conditional: `wrap_inner` returns a launcher only when `/sandbox` is enabled
@@ -277,7 +277,7 @@ These are target-only and now sit on top of the in-process path:
   switch unchanged.
 - Streaming tap so `proc://<id>` shows live output: `run_with_dyn` passes the job's
   `Arc<Mutex<String>>` as `tap`; `shell_host` trims it with `util::floor_boundary`, and
-  `start_background` hands the same tap to `run_with_dyn` (`:1060-1067`).
+  `start_background` hands the same tap to `run_with_dyn` (`:1078-1086`).
 - `notify` now rides the `on_chunk` callback instead of a reader loop, so matches still arrive
   as chunks land.
 - Service supervision: readiness by log regex **and** TCP probe, 64 KiB readiness buffer,
@@ -305,7 +305,7 @@ threaded to both foreground and background calls; `/dev/tty` denied by `CliPathP
 `ExecutionParameters` fd/cancel plumbing; `-pgid` teardown; `rm`/`mv`/`ln` split; module
 comment in `bash.rs:1-12` updated to describe the in-process local path.
 
-Test coverage for this state: 33 `#[test]`/`#[tokio::test]` functions in `tools/bash.rs` and 9
+Test coverage for this state: 38 `#[test]`/`#[tokio::test]` functions in `tools/bash.rs` and 24
 in `tools/shell_host.rs` (all passing under `cargo test -p omp-cli --no-default-features --bin omt`). The named cases exist and pin the claims above:
 `commands_have_no_controlling_terminal`, `in_process_builtins_grep_wc_and_jq_work_end_to_end`,
 `bash_tool_exposes_registered_tools_via_dyn_bridge`, `in_process_cwd_parameter_isolates_shell_working_dir` (bash);

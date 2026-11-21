@@ -3424,8 +3424,16 @@ impl Runtime {
         if rebuild {
             {
                 let settings = omp_settings::Settings::load(&self.cwd);
-                let (env, mut tools) =
-                    crate::tools::session_builtin_tools_with_env(&self.cwd, mode, &settings);
+                // The rebuild replaces the whole tool list, but the session's
+                // background jobs and services must outlive it: build on the
+                // registry the session already published (`/jobs`, `asyncJobs`
+                // and `proc://` keep seeing pre-swap work).
+                let (env, mut tools) = crate::tools::session_builtin_tools_with_env_and_jobs(
+                    &self.cwd,
+                    mode,
+                    &settings,
+                    crate::tools::session_jobs().unwrap_or_default(),
+                );
                 tools.extend(crate::tools::mcp::mcp_tools(&self.cwd));
                 tools.extend(crate::tools::wasm::wasm_tools(&self.cwd));
                 // TS `reconcileThinkTool`: model swaps re-evaluate the hidden
@@ -3446,6 +3454,8 @@ impl Runtime {
                 // bridge and the session job registry must all dispatch to.
                 env.set_dyn_tools(&tools);
                 crate::tools::set_session_env(&env);
+                // Same registry instance, republished: `set_session_jobs` stays
+                // a no-op for callers that already hold it.
                 crate::tools::set_session_jobs(Some(env.jobs.clone()));
                 crate::tools::eval_bridge::set_session_tools(tools.clone());
                 self.agent.set_tools(tools).await;

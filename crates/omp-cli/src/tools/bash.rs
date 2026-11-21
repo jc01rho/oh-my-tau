@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use pa_agent::abort::AbortSignal;
-use pa_agent::types::AgentToolResult;
+use pa_agent::types::{AgentTool, AgentToolResult};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -1063,7 +1063,17 @@ fn start_background(
     let registry = registry.clone();
     let task_job_id = job_id.clone();
     let task_notify = notify.cloned();
+    // A background job outlives the tool list that started it, and the `dyn`
+    // bridge only holds weak handles, so the job's `dyn` devices would vanish
+    // as soon as the caller rebuilt or dropped its list. Pin the live tools for
+    // the job's lifetime only: they are dropped with the job task, so `Env`
+    // never gains a strong link back to the tools that own it.
+    let keep_alive: Vec<Arc<dyn AgentTool>> = dyn_tools.as_ref().map_or_else(Vec::new, |list| {
+        list.iter().filter_map(std::sync::Weak::upgrade).collect()
+    });
     tokio::spawn(async move {
+        // Held for the whole job; released when this task ends.
+        let _keep = keep_alive;
         let controller = pa_agent::abort::AbortController::new();
         let raw = run_with_dyn(
             &dir,
@@ -1146,6 +1156,19 @@ mod tests {
 
     fn test_env() -> std::sync::Arc<super::super::Env> {
         std::sync::Arc::new(super::super::Env::new(&std::env::temp_dir(), false))
+    }
+
+    /// Wait (bounded) until job `id` leaves the running state.
+    async fn settled_job(env: &super::super::Env, id: &str) -> jobs::Job {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let job = env.jobs.get(id).expect("job registered");
+            if job.status != JobStatus::Running {
+                return job;
+            }
+            assert!(Instant::now() < deadline, "job {id} never settled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Regression (hung TUI menus): neither the in-process shell nor any
@@ -1300,6 +1323,121 @@ mod tests {
             "{}",
             text_of(&after)
         );
+    }
+
+    /// Regression: a background job outlives the tool list that started it,
+    /// and the `dyn` bridge holds its tools weakly, so without a job-scoped
+    /// strong hold a `dyn` call inside a still-running job would find no
+    /// device once the caller rebuilt or dropped its list.
+    #[tokio::test]
+    async fn background_job_keeps_dyn_tools_alive_after_the_list_drops() {
+        /// A `dyn` device; the gated one parks until the test releases it, so the
+        /// caller can drop its tool list at a known point in the command.
+        struct TestTool {
+            name: &'static str,
+            gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        }
+        impl pa_agent::types::AgentTool for TestTool {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn description(&self) -> &'static str {
+                "test device"
+            }
+            fn parameters(&self) -> &Value {
+                static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+                SCHEMA.get_or_init(|| {
+                    serde_json::json!(
+                        {"type":"object","properties":{"msg":{"type":"string"}}}
+                    )
+                })
+            }
+            fn execute(
+                self: Arc<Self>,
+                _id: String,
+                params: Value,
+                _signal: AbortSignal,
+                _on_update: pa_agent::types::AgentToolUpdateCallback,
+            ) -> pa_agent::BoxFut<'static, Result<AgentToolResult>> {
+                Box::pin(async move {
+                    if let Some((entered, release)) = &self.gate {
+                        let release = release.notified();
+                        entered.notify_one();
+                        release.await;
+                    }
+                    let msg = params["msg"].as_str().unwrap_or_default();
+                    Ok(AgentToolResult::text(format!("ran {}:{msg}", self.name)))
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let env = std::sync::Arc::new(super::super::Env::new(dir.path(), false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gated: Arc<dyn pa_agent::types::AgentTool> = Arc::new(TestTool {
+            name: "gate_device",
+            gate: Some((entered.clone(), release.clone())),
+        });
+        let target: Arc<dyn pa_agent::types::AgentTool> = Arc::new(TestTool {
+            name: "target_device",
+            gate: None,
+        });
+        let weak_target = Arc::downgrade(&target);
+        let tools = vec![gated, target];
+        env.set_dyn_tools(&tools);
+
+        // The gated device runs first; the target device runs only after the
+        // caller has dropped the list, so its lookup cannot ride on the caller.
+        let notice = start_background(
+            &env.jobs,
+            dir.path().to_path_buf(),
+            "dyn gate_device --msg go; dyn target_device --msg hi".to_string(),
+            Some(60.0),
+            Vec::new(),
+            SpillConfig::load(dir.path()),
+            String::new(),
+            None,
+            env.dyn_tools(),
+            &sig(),
+        );
+        let text = text_of(&notice);
+        assert!(text.starts_with("Backgrounded as job bg_1"), "{text}");
+
+        tokio::time::timeout(Duration::from_secs(60), entered.notified())
+            .await
+            .expect("the background job never reached the gated dyn device");
+
+        // The caller drops the list it built. The env's snapshot is weak, so the
+        // tools survive only because the running job holds them.
+        drop(tools);
+        assert!(
+            weak_target.upgrade().is_some(),
+            "the running job keeps its dyn tools alive after the list drops"
+        );
+        release.notify_one();
+        let job = settled_job(&env, "bg_1").await;
+        let result = job.result.unwrap_or_default();
+        assert!(
+            job.status == JobStatus::Completed,
+            "the post-drop dyn call failed: {:?}\n{result}",
+            job.error
+        );
+        assert!(
+            result.contains("ran target_device:hi"),
+            "the dyn call made after the list dropped ran: {result}"
+        );
+
+        // The hold is job-scoped: settling the job drops it, so the tool frees
+        // instead of being pinned for the session's lifetime.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while weak_target.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the finished job still pins its dyn tools"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -2085,28 +2223,22 @@ mod tests {
     }
     /// Whether `pid` no longer runs: already reaped, or a zombie whose parent
     /// has not collected it yet. A killed grandchild is briefly either, so both
-    /// count as dead.
+    /// count as dead. Only the pgid teardown test probes pids, and that test is
+    /// unix-only.
+    #[cfg(unix)]
     fn pid_is_dead(pid: i32) -> bool {
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::kill;
-            use nix::unistd::Pid;
-            if kill(Pid::from_raw(pid), None).is_err() {
-                return true;
-            }
-            #[cfg(target_os = "linux")]
-            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                return stat
-                    .rsplit_once(')')
-                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
-            }
-            false
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        if kill(Pid::from_raw(pid), None).is_err() {
+            return true;
         }
-        #[cfg(not(unix))]
-        {
-            let _ = pid;
-            true
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            return stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
         }
+        false
     }
 
     /// Regression: the `cwd` parameter defines `$PWD` as well as the shell's
@@ -2150,6 +2282,7 @@ mod tests {
     /// spellings too. `/dev/../dev/tty` is the same device node under a
     /// different `Path`, so a literal `path == "/dev/tty"` test admits it and
     /// lets the command take over the host terminal.
+    #[cfg(unix)]
     #[tokio::test]
     async fn in_process_tty_alias_is_denied() {
         let policy =
@@ -2186,6 +2319,7 @@ mod tests {
     /// Synchronization is the `child.pid` file the command writes once the
     /// grandchild exists: no fixed delay, and the abort is issued only after
     /// that pid is readable.
+    #[cfg(unix)]
     #[tokio::test]
     async fn in_process_timeout_kills_backgrounded_grandchild_via_pgid() {
         let dir = tempfile::tempdir().unwrap();

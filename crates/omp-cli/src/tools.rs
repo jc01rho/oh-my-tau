@@ -133,12 +133,21 @@ pub struct Env {
 impl Env {
     #[must_use]
     pub fn with_mode(cwd: &Path, edit_mode: EditMode) -> Self {
+        Self::with_mode_and_jobs(cwd, edit_mode, jobs::JobRegistry::default())
+    }
+
+    /// [`Env::with_mode`] over an existing job registry: a tool-list rebuild
+    /// (model swap, edit-mode change) passes the session's registry so the
+    /// background jobs and services started before the rebuild stay visible in
+    /// `/jobs`, `asyncJobs` and `proc://`.
+    #[must_use]
+    pub fn with_mode_and_jobs(cwd: &Path, edit_mode: EditMode, jobs: jobs::JobRegistry) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             store: EditStore::new(),
             edit_mode,
             hashline: edit_mode == EditMode::Hashline,
-            jobs: jobs::JobRegistry::default(),
+            jobs,
             query: parking_lot::Mutex::default(),
             dyn_tools: parking_lot::RwLock::default(),
         }
@@ -256,12 +265,23 @@ pub fn builtin_tools(cwd: &Path, edit_mode: EditMode) -> Vec<Arc<dyn AgentTool>>
 /// final tool list to it once settings, extensions and the approval gate have
 /// had their say (see [`Env::set_dyn_tools`]).
 #[must_use]
-#[allow(clippy::too_many_lines)] // the tool registry table; order mirrors omp's builtinTools
 pub fn builtin_tools_with_env(
     cwd: &Path,
     edit_mode: EditMode,
 ) -> (Arc<Env>, Vec<Arc<dyn AgentTool>>) {
-    let env = Arc::new(Env::with_mode(cwd, edit_mode));
+    builtin_tools_with_env_and_jobs(cwd, edit_mode, jobs::JobRegistry::default())
+}
+
+/// [`builtin_tools_with_env`] over an existing job registry (see
+/// [`Env::with_mode_and_jobs`]).
+#[must_use]
+#[allow(clippy::too_many_lines)] // the tool registry table; order mirrors omp's builtinTools
+pub fn builtin_tools_with_env_and_jobs(
+    cwd: &Path,
+    edit_mode: EditMode,
+    jobs: jobs::JobRegistry,
+) -> (Arc<Env>, Vec<Arc<dyn AgentTool>>) {
+    let env = Arc::new(Env::with_mode_and_jobs(cwd, edit_mode, jobs));
     *LAST_JOBS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(env.jobs.clone());
@@ -462,7 +482,20 @@ pub fn session_builtin_tools_with_env(
     edit_mode: EditMode,
     settings: &omp_settings::Settings,
 ) -> (Arc<Env>, Vec<Arc<dyn AgentTool>>) {
-    let (env, mut tools) = builtin_tools_with_env(cwd, edit_mode);
+    session_builtin_tools_with_env_and_jobs(cwd, edit_mode, settings, jobs::JobRegistry::default())
+}
+
+/// [`session_builtin_tools_with_env`] over an existing job registry, so a
+/// rebuild keeps the session's live background jobs and services (see
+/// [`Env::with_mode_and_jobs`]).
+#[must_use]
+pub fn session_builtin_tools_with_env_and_jobs(
+    cwd: &Path,
+    edit_mode: EditMode,
+    settings: &omp_settings::Settings,
+    jobs: jobs::JobRegistry,
+) -> (Arc<Env>, Vec<Arc<dyn AgentTool>>) {
+    let (env, mut tools) = builtin_tools_with_env_and_jobs(cwd, edit_mode, jobs);
     tools.retain(|t| enabled_by_settings(settings, t.name()));
     env.set_dyn_tools(&tools);
     (env, tools)
@@ -530,6 +563,66 @@ mod tests {
             weak_env.upgrade().is_none(),
             "env outlives the tool list that owns it"
         );
+    }
+
+    #[test]
+    fn rebuild_keeps_the_session_job_registry() {
+        // A model swap (or an edit-mode change) rebuilds the tool list; the
+        // rebuild runs on the session's own registry, so a job backgrounded
+        // before the swap is still listed by `asyncJobs` and `proc://` after.
+        let dir = tempfile::tempdir().unwrap();
+        let settings = omp_settings::Settings::load_from(None, dir.path());
+        let registry = jobs::JobRegistry::default();
+        let job_id = registry.insert(jobs::Job {
+            command: "sleep 30".to_string(),
+            started: std::time::Instant::now(),
+            status: jobs::JobStatus::Running,
+            output: Arc::new(std::sync::Mutex::new(String::new())),
+            result: None,
+            error: None,
+            ended: None,
+        });
+        let (before, tools) = session_builtin_tools_with_env_and_jobs(
+            dir.path(),
+            EditMode::Hashline,
+            &settings,
+            registry.clone(),
+        );
+        drop(tools);
+        // The rebuild passes the registry the session published before it.
+        let (after, tools) = session_builtin_tools_with_env_and_jobs(
+            dir.path(),
+            EditMode::Replace,
+            &settings,
+            registry,
+        );
+        assert!(
+            Arc::ptr_eq(&before.jobs.inner, &after.jobs.inner),
+            "the rebuild runs on the session's registry instance"
+        );
+        assert!(
+            after.jobs.get(&job_id).is_some(),
+            "the rebuilt env still sees the job backgrounded before it"
+        );
+        let proc_listing = jobs::read_proc(&after, "").unwrap();
+        let listing: String = proc_listing
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                pa_agent::types::ToolResultContent::Text(t) => Some(t.text.clone()),
+                pa_agent::types::ToolResultContent::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            listing.contains(&format!("{job_id} [bash] running up ")),
+            "proc:// lists the job after the rebuild: {listing}"
+        );
+        assert!(
+            after.dyn_tools().is_some_and(|t| !t.is_empty()),
+            "the rebuilt env publishes its tools"
+        );
+        drop(tools);
     }
 
     #[test]

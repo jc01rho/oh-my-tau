@@ -37,8 +37,17 @@ Provenance files shipped with the adapted `omp-*` crates; read them before
 reusing or re-vendoring that code:
 
 - [`vendor/omp-core/LICENSE`](vendor/omp-core/LICENSE) and
-  [`vendor/omp-core/NOTICE`](vendor/omp-core/NOTICE) — MIT (Stencil Labs, Inc.);
-  the `slopjson` `json!` muncher is adapted from `serde_json`.
+  [`vendor/omp-core/NOTICE`](vendor/omp-core/NOTICE) — MIT (Stencil Labs, Inc.).
+  The `slopjson` `json!` token-tree muncher
+  ([`vendor/omp-core/src/slopjson/macros.rs`](vendor/omp-core/src/slopjson/macros.rs))
+  is adapted from the `serde_json` `json!` macro. `serde_json` is dual-licensed
+  `MIT OR Apache-2.0`, at the recipient's option; this repository elects the MIT
+  terms, whose complete text ships in [`vendor/omp-core/LICENSE`](vendor/omp-core/LICENSE).
+  [`vendor/omp-core/NOTICE`](vendor/omp-core/NOTICE) also points at a
+  `THIRD-PARTY-NOTICES.txt` for the Apache-2.0 alternative; that file is an upstream
+  `omp2` repository-root file and is **not shipped in this repository**, so the
+  Apache-2.0 option is not available from the vendored tree — obtain it from
+  upstream `serde_json` (https://github.com/serde-rs/json) if you need those terms.
 - [`vendor/omp-macros/LICENSE`](vendor/omp-macros/LICENSE) — MIT (Stencil Labs, Inc.).
 - `omp-vocab` ships no per-crate license file; its terms are the oh-my-pi MIT text in
   [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi).

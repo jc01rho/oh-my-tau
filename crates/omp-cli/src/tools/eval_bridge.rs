@@ -465,107 +465,169 @@ impl EvalBridge {
             // The model-facing intent field is not part of the tool schema.
             obj.remove("i");
         }
-        let mut params = validate_tool_arguments(tool.name(), tool.parameters(), &params)?;
-        let signal = &self.ctx.signal;
-        let mut call = ToolCall {
-            id: format!("{}:{name}", self.ctx.tool_call_id),
-            name: name.to_string(),
-            arguments: params.clone(),
-            thought_signature: None,
-        };
-        let context = || AgentContext {
-            tools: self.policy.tools.clone(),
-            ..AgentContext::default()
-        };
-        if let Some(before) = self.policy.before.as_ref() {
-            let hook = before(
-                BeforeToolCallContext {
-                    assistant_message: synthetic_turn(&call),
-                    tool_call: call.clone(),
-                    args: params.clone(),
-                    context: context(),
-                },
-                signal.clone(),
-            );
-            // A failing hook fails closed, like the agent loop's error result.
-            let outcome = race_with_abort(hook, signal)
-                .await
-                .map_err(|e| format!("{e:#}"))?
-                .map_err(|e| format!("{e:#}"))?;
-            if let Some(outcome) = outcome {
-                if outcome.block {
-                    return Err(outcome
-                        .reason
-                        .unwrap_or_else(|| "Tool execution was blocked".to_string()));
-                }
-                if let Some(revised) = outcome.args {
-                    // Hook revisions are untrusted input to the tool schema.
-                    params = validate_tool_arguments(tool.name(), tool.parameters(), &revised)?;
-                    call.arguments = revised;
-                }
-            }
-        }
         let on_update: AgentToolUpdateCallback = match self.ctx.on_update.as_ref() {
-            Some(cb) => {
-                let cb = Arc::clone(cb);
-                Arc::new(move |partial| cb(partial))
-            }
+            Some(cb) => Arc::clone(cb),
             None => Arc::new(|_| {}),
         };
-        let executed = race_with_abort(
-            Arc::clone(&tool).execute(call.id.clone(), params.clone(), signal.clone(), on_update),
-            signal,
+        let result = execute_with_hooks(
+            &self.policy.tools,
+            self.policy.before.as_ref(),
+            self.policy.after.as_ref(),
+            tool,
+            format!("{}:{name}", self.ctx.tool_call_id),
+            params,
+            &self.ctx.signal,
+            on_update,
         )
-        .await
-        .and_then(|r| r);
-        let (mut result, mut is_error, mut failure) = match executed {
-            Ok(result) => {
-                let is_error = result.is_error == Some(true);
-                (result, is_error, None)
-            }
-            Err(e) => {
-                let message = format!("{e:#}");
-                (AgentToolResult::error(message.clone()), true, Some(message))
-            }
-        };
-        if let Some(after) = self.policy.after.as_ref() {
-            let hook = after(
-                AfterToolCallContext {
-                    assistant_message: synthetic_turn(&call),
-                    tool_call: call.clone(),
-                    args: params,
-                    result: result.clone(),
-                    is_error,
-                    context: context(),
-                },
-                signal.clone(),
-            );
-            match race_with_abort(hook, signal).await.and_then(|r| r) {
-                Ok(Some(overrides)) => {
-                    // Field-by-field merge (TS semantics). Any override turns
-                    // an execution failure into the handler's result.
-                    failure = None;
-                    if let Some(content) = overrides.content {
-                        result.content = content;
-                    }
-                    if let Some(details) = overrides.details {
-                        result.details = details;
-                    }
-                    if let Some(error) = overrides.is_error {
-                        is_error = error;
-                    }
-                    result.is_error = is_error.then_some(true);
-                }
-                Ok(None) => {}
-                Err(e) => return Err(format!("{e:#}")),
-            }
-        }
-        if let Some(message) = failure {
-            return Err(message);
-        }
+        .await?;
         self.emit_status(json!({"op": name}));
         Ok(bridge_value(&result))
     }
+}
+
+/// Runs one tool call under a `tool_call`/`tool_result` hook pair: validate the
+/// arguments, run `before` (block, or an input rewrite revalidated against the
+/// schema), execute the tool raced against `signal`, then run `after` (a
+/// field-by-field result override). Shared by [`EvalBridge::call_tool`] and the
+/// in-process shell's `dyn` host
+/// ([`super::shell_host::CliDynHost`]), so both apply the session's one
+/// tool-call policy. `tools` is the surface the hook contexts report.
+///
+/// # Errors
+/// Returns the hook's block reason, a hook/schema/abort failure, or the
+/// execution failure string when no `after` hook replaced it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "hook pair + tool + call identity + cancellation, all distinct"
+)]
+pub(crate) async fn execute_with_hooks(
+    tools: &[Arc<dyn AgentTool>],
+    before: Option<&BeforeToolCallFn>,
+    after: Option<&AfterToolCallFn>,
+    tool: Arc<dyn AgentTool>,
+    call_id: String,
+    params: Value,
+    signal: &AbortSignal,
+    on_update: AgentToolUpdateCallback,
+) -> Result<AgentToolResult, String> {
+    let mut params = validate_tool_arguments(tool.name(), tool.parameters(), &params)?;
+    let mut call = ToolCall {
+        id: call_id,
+        name: tool.name().to_string(),
+        arguments: params.clone(),
+        thought_signature: None,
+    };
+    let context = || AgentContext {
+        tools: tools.to_vec(),
+        ..AgentContext::default()
+    };
+    if let Some(before) = before {
+        let hook = before(
+            BeforeToolCallContext {
+                assistant_message: synthetic_turn(&call),
+                tool_call: call.clone(),
+                args: params.clone(),
+                context: context(),
+            },
+            signal.clone(),
+        );
+        // A failing hook fails closed, like the agent loop's error result.
+        let outcome = race_with_abort(hook, signal)
+            .await
+            .map_err(|e| format!("{e:#}"))?
+            .map_err(|e| format!("{e:#}"))?;
+        if let Some(outcome) = outcome {
+            if outcome.block {
+                return Err(outcome
+                    .reason
+                    .unwrap_or_else(|| "Tool execution was blocked".to_string()));
+            }
+            if let Some(revised) = outcome.args {
+                // Hook revisions are untrusted input to the tool schema.
+                params = validate_tool_arguments(tool.name(), tool.parameters(), &revised)?;
+                call.arguments = revised;
+            }
+        }
+    }
+    let executed = race_with_abort(
+        Arc::clone(&tool).execute(call.id.clone(), params.clone(), signal.clone(), on_update),
+        signal,
+    )
+    .await
+    .and_then(|r| r);
+    let (mut result, mut is_error, mut failure) = match executed {
+        Ok(result) => {
+            let is_error = result.is_error == Some(true);
+            (result, is_error, None)
+        }
+        Err(e) => {
+            let message = format!("{e:#}");
+            (AgentToolResult::error(message.clone()), true, Some(message))
+        }
+    };
+    if let Some(after) = after {
+        let hook = after(
+            AfterToolCallContext {
+                assistant_message: synthetic_turn(&call),
+                tool_call: call.clone(),
+                args: params,
+                result: result.clone(),
+                is_error,
+                context: context(),
+            },
+            signal.clone(),
+        );
+        match race_with_abort(hook, signal).await.and_then(|r| r) {
+            Ok(Some(overrides)) => {
+                // Field-by-field merge (TS semantics). Any override turns
+                // an execution failure into the handler's result.
+                failure = None;
+                if let Some(content) = overrides.content {
+                    result.content = content;
+                }
+                if let Some(details) = overrides.details {
+                    result.details = details;
+                }
+                if let Some(error) = overrides.is_error {
+                    is_error = error;
+                }
+                result.is_error = is_error.then_some(true);
+            }
+            Ok(None) => {}
+            Err(e) => return Err(format!("{e:#}")),
+        }
+    }
+    if let Some(message) = failure {
+        return Err(message);
+    }
+    Ok(result)
+}
+
+/// [`execute_with_hooks`] with the process session's installed hook pair (see
+/// [`set_session_hooks`]) - the path non-bridge callers use.
+///
+/// # Errors
+/// Same as [`execute_with_hooks`].
+pub(crate) async fn call_with_session_hooks(
+    tools: &[Arc<dyn AgentTool>],
+    tool: Arc<dyn AgentTool>,
+    call_id: String,
+    params: Value,
+    signal: &AbortSignal,
+    on_update: AgentToolUpdateCallback,
+) -> Result<AgentToolResult, String> {
+    let (before, after) = SESSION_HOOKS.read().expect("session hooks lock").clone();
+    execute_with_hooks(
+        tools,
+        before.as_ref(),
+        after.as_ref(),
+        tool,
+        call_id,
+        params,
+        signal,
+        on_update,
+    )
+    .await
 }
 
 impl omp_eval::HostBridge for EvalBridge {

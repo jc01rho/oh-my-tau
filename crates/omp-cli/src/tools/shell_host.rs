@@ -432,6 +432,12 @@ fn open_portable(
     path: &Path,
     request: OpenRequest,
 ) -> std::result::Result<fs::File, PathDenied> {
+    // The controlling terminal is refused on every access, reads included: a
+    // read hands the shell's own terminal back, which is what the unix walk's
+    // descriptor check exists to prevent.
+    if policy.is_controlling_tty(path) {
+        return Err(CliPathPolicy::deny(path, request.access));
+    }
     if !matches!(request.access, PathAccess::Read) && !policy.write_allowed(path) {
         return Err(CliPathPolicy::deny(path, request.access));
     }
@@ -664,6 +670,10 @@ impl DynHost for CliDynHost {
     ) -> DynFuture<'_, DynCallOutput> {
         let name_owned = name.to_owned();
         let found = self.find_tool(name);
+        // A `dyn` call is a model-visible tool call like any other: it passes
+        // the session's `tool_call`/`tool_result` hooks, so a policy that
+        // blocks a tool from the model also blocks it from the shell.
+        let live_tools: Vec<Arc<dyn AgentTool>> = self.visible_tools().collect();
         Box::pin(async move {
             let tool =
                 found.ok_or_else(|| DynFault::new(format!("unknown dyn device: {name_owned}")))?;
@@ -675,9 +685,17 @@ impl DynHost for CliDynHost {
             });
             let id = format!("dyn-{name_owned}");
             let noop_cb: AgentToolUpdateCallback = Arc::new(|_| {});
-            let res = tool.execute(id, args, signal, noop_cb).await;
+            let res = super::eval_bridge::call_with_session_hooks(
+                &live_tools,
+                tool,
+                id,
+                args,
+                &signal,
+                noop_cb,
+            )
+            .await;
             watch.abort();
-            let result: AgentToolResult = res.map_err(|e| DynFault::new(e.to_string()))?;
+            let result: AgentToolResult = res.map_err(DynFault::new)?;
             let output = agent_result_to_dyn_output(&result);
             Ok(DynCallOutput {
                 output,
@@ -1203,6 +1221,83 @@ mod tests {
         drop(echo);
     }
 
+    #[tokio::test]
+    async fn dyn_host_call_runs_session_tool_hooks() {
+        use crate::tools::eval_bridge;
+        use pa_agent::{agent_loop::BeforeToolCallFn, types::BeforeToolCallResult};
+
+        /// Hooks are process-global and other tests drive `dyn` calls in
+        /// parallel (e.g. the background-job test in `tools::bash`), so this
+        /// hook must be inert for every argument except this test's own
+        /// sentinel; the guard then restores the empty pair on any exit.
+        struct ResetHooks;
+        impl Drop for ResetHooks {
+            fn drop(&mut self) {
+                eval_bridge::set_session_hooks(None, None);
+            }
+        }
+        let _reset = ResetHooks;
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_hook = Arc::clone(&seen);
+        let before: BeforeToolCallFn = Arc::new(move |ctx, _| {
+            let seen = Arc::clone(&seen_hook);
+            Box::pin(async move {
+                // Inert for every other device, so a concurrent test's `dyn`
+                // call passes through untouched.
+                if ctx.tool_call.name != "echo_device" {
+                    return Ok(None);
+                }
+                // The hook context must carry the live tool surface, so a
+                // handler can reason about what the shell may reach.
+                seen.lock()
+                    .unwrap()
+                    .extend(ctx.context.tools.iter().map(|t| t.name().to_string()));
+                let blocked = ctx.args.get("msg").and_then(Value::as_str) == Some("blocked");
+                Ok(blocked.then(|| BeforeToolCallResult {
+                    block: true,
+                    reason: Some("dyn denied by policy".into()),
+                    ..BeforeToolCallResult::default()
+                }))
+            })
+        });
+        eval_bridge::set_session_hooks(Some(before), None);
+
+        let echo: Arc<dyn AgentTool> = Arc::new(EchoTool);
+        let host = CliDynHost::new(Arc::new(vec![Arc::downgrade(&echo)]));
+
+        let fault = host
+            .call(
+                "echo_device",
+                json!({"msg": "blocked"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            fault.message.contains("dyn denied by policy"),
+            "got: {}",
+            fault.message
+        );
+
+        let allowed = host
+            .call(
+                "echo_device",
+                json!({"msg": "ok"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.output, DynOutput::Text(Str::new("pong:ok")));
+
+        let names = seen.lock().unwrap().clone();
+        assert!(
+            names.iter().any(|n| n == "echo_device"),
+            "hook context lost the live tools: {names:?}"
+        );
+        drop(echo);
+    }
+
     #[test]
     fn dyn_host_hides_bash_and_dyn_and_drops_dead_tools() {
         let echo: Arc<dyn AgentTool> = Arc::new(EchoTool);
@@ -1721,6 +1816,35 @@ mod tests {
             write_req(PathAccess::Read)
         )
         .is_ok());
+
+        // The controlling terminal is refused on every access, matching the
+        // unix walk's descriptor check: a read hands the shell's own terminal
+        // back, and an alias spelling must not slip past a literal compare.
+        for spelling in ["/dev/tty", "/dev/../dev/tty"] {
+            let path = Path::new(spelling);
+            assert!(
+                open_portable(&sandboxed, path, write_req(PathAccess::Read)).is_err(),
+                "{spelling} read"
+            );
+            assert!(
+                open_portable(&sandboxed, path, write_req(PathAccess::Write)).is_err(),
+                "{spelling} write"
+            );
+        }
+
+        // Deterministic companion: with the write root at `/dev`, `write_allowed`
+        // admits the terminal, so only the tty check can refuse it. A relative
+        // `tty` resolves to `/dev/tty` for the check while `open` would take it
+        // relative to the process cwd — the refusal must come before that open.
+        let dev_root = CliPathPolicy::new(Path::new("/dev"), true);
+        assert!(
+            open_portable(&dev_root, Path::new("tty"), write_req(PathAccess::Write)).is_err(),
+            "tty under a /dev write root"
+        );
+        assert!(
+            open_portable(&dev_root, Path::new("tty"), write_req(PathAccess::Read)).is_err(),
+            "tty read under a /dev write root"
+        );
 
         let open_policy = CliPathPolicy::new(&root, false);
         let free = tmp.path().join("free.txt");
