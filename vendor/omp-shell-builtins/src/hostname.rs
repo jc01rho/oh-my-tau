@@ -144,7 +144,7 @@ fn current_hostname() -> io::Result<OsString> {
 fn current_hostname() -> io::Result<OsString> {
     use std::os::windows::ffi::OsStringExt;
 
-    use windows_sys::Win32::System::SystemInformation::GetComputerNameW;
+    use windows_sys::Win32::System::WindowsProgramming::GetComputerNameW;
 
     let mut buffer = [0u16; 256];
     let mut len = buffer.len() as u32;

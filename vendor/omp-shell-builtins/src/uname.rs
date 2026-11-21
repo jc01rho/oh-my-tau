@@ -89,10 +89,11 @@ fn platform_fields() -> Result<[OsString; 6], ()> {
     use std::os::windows::ffi::OsStringExt;
 
     use windows_sys::Win32::System::SystemInformation::{
-        GetComputerNameW, GetNativeSystemInfo, GetVersionExW, OSVERSIONINFOW,
-        PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_ARCHITECTURE_ARM, PROCESSOR_ARCHITECTURE_ARM64,
-        PROCESSOR_ARCHITECTURE_IA64, PROCESSOR_ARCHITECTURE_INTEL, SYSTEM_INFO,
+        GetNativeSystemInfo, GetVersionExW, OSVERSIONINFOW, PROCESSOR_ARCHITECTURE_AMD64,
+        PROCESSOR_ARCHITECTURE_ARM, PROCESSOR_ARCHITECTURE_ARM64, PROCESSOR_ARCHITECTURE_IA64,
+        PROCESSOR_ARCHITECTURE_INTEL, SYSTEM_INFO,
     };
+    use windows_sys::Win32::System::WindowsProgramming::GetComputerNameW;
 
     let mut hostname = [0u16; 256];
     let mut hostname_len = hostname.len() as u32;

@@ -117,7 +117,7 @@ source = "can1357/oh-my-pi (omp2, crates/shell)"
 reference-commit = "2f92f3b5aa2035d21c9f016f9ff6350795e5685a"
 license = "MIT"
 license-file = "vendor/LICENSE-oh-my-pi"
-modifications = "manifest: version/edition/license/authors pinned literally"
+modifications = "manifest: version/edition/license/authors pinned literally; src/sys/hostname.rs moves GetComputerNameW import from SystemInformation to WindowsProgramming for windows-sys 0.61 compatibility"
 
 [crates.omp-shell-builtins]
 path = "vendor/omp-shell-builtins"
@@ -126,7 +126,7 @@ source = "can1357/oh-my-pi (omp2, crates/shell-builtins)"
 reference-commit = "2f92f3b5aa2035d21c9f016f9ff6350795e5685a"
 license = "MIT"
 license-file = "vendor/LICENSE-oh-my-pi"
-modifications = "manifest: version/edition/license/authors pinned literally"
+modifications = "manifest: version/edition/license/authors pinned literally; src/{hostname,ls,uname}.rs move GetComputerNameW import from SystemInformation to WindowsProgramming for windows-sys 0.61 compatibility"
 
 [crates.xutf]
 path = "vendor/xutf"
