@@ -220,6 +220,12 @@ pub struct Pool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<Aggregate>,
     pub owner_pid: u32,
+    /// The worker model chain after the `before_subagent_spawn` hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_model: Option<String>,
+    /// The routing note the spawn hook attached, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_model_route: Option<String>,
 }
 
 impl Pool {
@@ -431,13 +437,27 @@ impl WorkpoolEngine {
     }
 
     fn persist(&self, pool: &Pool) {
-        let dir = self.pool_dir(&pool.pool_id);
-        let written = serde_json::to_string_pretty(pool)
-            .map_err(std::io::Error::other)
-            .and_then(|text| write_atomic(&dir, "pool.json", &text));
-        if let Err(e) = written {
+        if let Err(e) = self.save(pool) {
             tracing::warn!(pool = %pool.pool_id, "workpool record not saved: {e}");
         }
+    }
+
+    /// Write `pool.json`; an admission (create, push) commits through this
+    /// and is refused when it fails, so no id is handed out that a restart
+    /// could not find.
+    fn save(&self, pool: &Pool) -> std::io::Result<()> {
+        let dir = self.pool_dir(&pool.pool_id);
+        let text = serde_json::to_string_pretty(pool).map_err(std::io::Error::other)?;
+        write_atomic(&dir, "pool.json", &text)
+    }
+
+    fn save_or_refuse(&self, pool: &Pool) -> Result<(), WpError> {
+        self.save(pool).map_err(|e| {
+            wp_error(
+                "admission_refused",
+                format!("The workpool store could not record this change: {e}"),
+            )
+        })
     }
 
     /// A persisted pool of this store (one this process no longer holds).
@@ -519,12 +539,16 @@ impl WorkpoolEngine {
         Ok(pool)
     }
 
-    /// `create`: a new open pool (no worker starts before a push).
+    /// `create`: a new open pool (no worker starts before a push). The
+    /// worker spec passes the `before_subagent_spawn` hook here, once for
+    /// every worker the pool will start (they all share it).
     ///
     /// # Errors
     /// `tools_unavailable` for eval-defined worker tools, `admission_refused`
-    /// past the recursion limit, `pool_name_conflict` for a taken name.
-    pub fn create(
+    /// past the recursion limit or when the store cannot record the pool,
+    /// `policy_denied` when a spawn hook refuses, `pool_name_conflict` for a
+    /// taken name.
+    pub async fn create(
         &self,
         caller: &Caller,
         name: Option<String>,
@@ -539,6 +563,16 @@ impl WorkpoolEngine {
             ));
         }
         omp_task::recursion_gate().map_err(|e| wp_error("admission_refused", e))?;
+        let mut template = worker_spec(&agent, &caller.cwd.display().to_string(), String::new());
+        if let Some(ext) = crate::rpc::slash::extensions() {
+            super::task::apply_subagent_spawn(
+                &ext.host,
+                &mut template,
+                omp_ext::lifecycle::SubagentInvocationKind::Task,
+            )
+            .await
+            .map_err(|e| wp_error("policy_denied", e.to_string()))?;
+        }
         let mut pools = self.lock();
         let mine = pools
             .values()
@@ -569,8 +603,10 @@ impl WorkpoolEngine {
             workers: Vec::new(),
             aggregate: None,
             owner_pid: std::process::id(),
+            worker_model: template.model,
+            worker_model_route: template.model_route,
         };
-        self.persist(&pool);
+        self.save_or_refuse(&pool)?;
         let view = pool.view();
         pools.insert(pool.pool_id.clone(), pool);
         drop(pools);
@@ -582,7 +618,9 @@ impl WorkpoolEngine {
     /// each item's durable id without waiting for capacity.
     ///
     /// # Errors
-    /// `pool_closed`, `duplicate_key_conflict`, `invalid_input`, scope errors.
+    /// `pool_closed`, `duplicate_key_conflict`, `invalid_input`, scope errors,
+    /// `admission_refused` when the store cannot record the items (nothing is
+    /// queued or started then).
     pub fn push(
         &self,
         caller: &Caller,
@@ -597,7 +635,12 @@ impl WorkpoolEngine {
                 "This pool no longer accepts items.",
             ));
         }
-        let receipts = stage_items(&mut pool.items, items)?;
+        let mut staged = pool.items.clone();
+        let receipts = stage_items(&mut staged, items)?;
+        let mut next = pool.clone();
+        next.items = staged;
+        self.save_or_refuse(&next)?;
+        pool.items = next.items;
         self.dispatch_locked(pool);
         self.persist(pool);
         drop(pools);
@@ -662,6 +705,14 @@ impl WorkpoolEngine {
                 return Ok(pool.view());
             }
             pool.status = PoolStatus::Cancelled;
+            // A yield the worker already committed is its item's result:
+            // keep it instead of overwriting it with a cancellation.
+            let yields = self.pool_dir(&pool.pool_id).join("yields");
+            for item in &mut pool.items {
+                if item.status == ItemStatus::Assigned {
+                    apply_committed_yield(item, &yields);
+                }
+            }
             pool.generation += 1;
             for item in &mut pool.items {
                 if matches!(item.status, ItemStatus::Queued | ItemStatus::Assigned) {
@@ -796,21 +847,13 @@ impl WorkpoolEngine {
             pool.agent.prompt.trim(),
             assignment_prompt(&pool.items[index], &pool.pool_id)
         );
-        let mut spec = TaskSpec {
-            id: None,
-            agent: pool.agent.agent_name(),
-            prompt,
-            cwd: PathBuf::from(&pool.cwd),
-            output_schema: None,
-            schema_mode: SchemaMode::Permissive,
-            model: pool.agent.model.clone(),
-            model_route: None,
-            tools: None,
-            depth: omp_task::current_task_depth() + 1,
-            extra_args: Vec::new(),
-        };
-        super::eval_agents::apply_child_policy(&mut spec);
-        super::task::apply_agent_model(&mut spec);
+        let mut spec = worker_spec(&pool.agent, &pool.cwd, prompt);
+        if pool.worker_model.is_some() || pool.worker_model_route.is_some() {
+            // The spawn hook's decision at `create` (its model replacement
+            // and routing note) applies to every worker.
+            spec.model.clone_from(&pool.worker_model);
+            spec.model_route.clone_from(&pool.worker_model_route);
+        }
         let item = &mut pool.items[index];
         if let Err(e) = write_assignment(&file, &assignment) {
             item.status = ItemStatus::Error;
@@ -987,33 +1030,63 @@ fn assignment_prompt(item: &Item, pool_id: &str) -> String {
     )
 }
 
-/// Settle one assigned item from its yield, or record why it has none.
-fn resolve_item(item: &mut Item, yields: &Path, worker: &TaskView) {
+/// Apply the yield the worker committed for this item's current assignment;
+/// `false` when it has none.
+fn apply_committed_yield(item: &mut Item, yields: &Path) -> bool {
     let generation = item.binding.as_ref().map_or(0, |b| b.generation);
     let record = std::fs::read_to_string(yields.join(format!("{}.json", item.item_id)))
         .ok()
         .and_then(|text| serde_json::from_str::<YieldRecord>(&text).ok())
         .filter(|y| y.generation == generation && y.key == item.key);
-    if let Some(record) = record {
-        item.yield_sha256 = Some(record.sha256);
-        if let Some(error) = record.result.get("error") {
-            item.status = ItemStatus::Error;
-            item.error = Some(ItemError {
-                code: error
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("error")
-                    .to_string(),
-                message: error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            });
-        } else {
-            item.status = ItemStatus::Completed;
-            item.data = Some(record.result.get("data").cloned().unwrap_or(Value::Null));
-        }
+    let Some(record) = record else {
+        return false;
+    };
+    item.yield_sha256 = Some(record.sha256);
+    if let Some(error) = record.result.get("error") {
+        item.status = ItemStatus::Error;
+        item.error = Some(ItemError {
+            code: error
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("error")
+                .to_string(),
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    } else {
+        item.status = ItemStatus::Completed;
+        item.data = Some(record.result.get("data").cloned().unwrap_or(Value::Null));
+    }
+    true
+}
+
+/// The worker spec of a pool: its agent, prompt and model after the
+/// session's child policy and the agent definition's model chain.
+fn worker_spec(agent: &AgentSpec, cwd: &str, prompt: String) -> TaskSpec {
+    let mut spec = TaskSpec {
+        id: None,
+        agent: agent.agent_name(),
+        prompt,
+        cwd: PathBuf::from(cwd),
+        output_schema: None,
+        schema_mode: SchemaMode::Permissive,
+        model: agent.model.clone(),
+        model_route: None,
+        tools: None,
+        depth: omp_task::current_task_depth() + 1,
+        extra_args: Vec::new(),
+    };
+    super::eval_agents::apply_child_policy(&mut spec);
+    super::task::apply_agent_model(&mut spec);
+    spec
+}
+
+/// Settle one assigned item from its yield, or record why it has none.
+fn resolve_item(item: &mut Item, yields: &Path, worker: &TaskView) {
+    if apply_committed_yield(item, yields) {
         return;
     }
     item.status = ItemStatus::Error;
@@ -1340,13 +1413,15 @@ pub(crate) async fn run(
                 ),
                 Some(_) => return Err(invalid_input()),
             };
-            engine.create(
-                caller,
-                nonempty_field(obj, "name")?,
-                parse_agent(obj.get("agent"))?,
-                mode,
-                tools.as_deref(),
-            )
+            engine
+                .create(
+                    caller,
+                    nonempty_field(obj, "name")?,
+                    parse_agent(obj.get("agent"))?,
+                    mode,
+                    tools.as_deref(),
+                )
+                .await
         }
         "push" => {
             let pool_id = pool_id_of(obj)?;
@@ -1670,6 +1745,65 @@ done
         let done = h.until(&pool, delivered_aggregate).await;
         assert_eq!(done["generation"], 2);
         assert_eq!(h.delivered.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cancel_keeps_a_yield_the_worker_already_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let yields = dir.path().join("yields");
+        let item_id = format!("wi_{}", "2".repeat(32));
+        let mut item = Item {
+            key: "k".to_string(),
+            input: json!(1),
+            item_id: item_id.clone(),
+            status: ItemStatus::Assigned,
+            binding: Some(Binding {
+                task_id: "st_0123456789ab".to_string(),
+                run_epoch: 1,
+                generation: 1,
+            }),
+            data: None,
+            error: None,
+            yield_sha256: None,
+        };
+        assert!(!apply_committed_yield(&mut item, &yields), "no yield yet");
+        let record = YieldRecord {
+            pool_id: format!("wp_{}", "a".repeat(32)),
+            generation: 1,
+            item_id: item_id.clone(),
+            key: "k".to_string(),
+            result: json!({"key": "k", "data": "kept"}),
+            sha256: "s".to_string(),
+        };
+        write_atomic(
+            &yields,
+            &format!("{item_id}.json"),
+            &serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+        assert!(apply_committed_yield(&mut item, &yields));
+        assert_eq!(item.status, ItemStatus::Completed);
+        assert_eq!(item.data, Some(json!("kept")));
+    }
+
+    #[tokio::test]
+    async fn an_admission_the_store_cannot_record_is_refused() {
+        let h = harness(2, Delivery::Delivered);
+        let pool = h.create("fresh").await;
+        let dir = h.engine.pool_dir(&pool);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, "not a directory").unwrap();
+        let refused = h
+            .call(json!({"op": "push", "pool_id": pool, "items": [{"key": "a", "input": 1}]}))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "admission_refused");
+        std::fs::remove_file(&dir).unwrap();
+        let view = h.engine.inspect(&h.caller, &pool).unwrap();
+        assert!(
+            view["items"].as_array().unwrap().is_empty(),
+            "nothing queued or started"
+        );
     }
 
     #[tokio::test]

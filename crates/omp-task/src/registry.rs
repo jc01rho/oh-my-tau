@@ -1017,7 +1017,10 @@ impl SubagentRegistry {
         }
         entry.control = None;
         let prior = entry.prior.take();
+        // A pool owns its worker's epochs: it needs the failed one settled
+        // (to free the slot), not the previous result restored.
         let reopen_failed = epoch > 1
+            && entry.record.owner.is_none()
             && !control.prompt_sent()
             && entry.record.cancel_reason.is_none()
             && out.status == RunStatus::Failed;
