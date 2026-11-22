@@ -1257,3 +1257,112 @@ async fn failed_load_restores_provider_it_only_unregistered() {
     );
     host.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn rpc_handle_roundtrip() {
+    if common::bun_missing("rpc_handle_roundtrip") {
+        return;
+    }
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let _rx = host.take_incoming().unwrap();
+    let r = host
+        .load(Some(&[fixture("rpc.ts")]), None, "/tmp", None)
+        .await
+        .unwrap();
+    assert_eq!(r.loaded.len(), 1, "{r:?}");
+    assert!(r.loaded[0].rpc.iter().any(|n| n == "fx.rpc"), "{r:?}");
+    assert!(host.has_rpc_handler("fx.rpc"));
+    assert!(!host.has_rpc_handler("omomeow.move-readiness"));
+
+    let budget = Duration::from_secs(5);
+    let v = host
+        .request_extension("fx.rpc", json!({"a": 1}), budget)
+        .await
+        .unwrap();
+    assert_eq!(v, json!({"echo": {"a": 1}}));
+
+    let v = host
+        .request_extension("fx.async", json!({"n": 21}), budget)
+        .await
+        .unwrap();
+    assert_eq!(v, json!({"doubled": 42}));
+
+    let err = host
+        .request_extension("fx.boom", Value::Null, budget)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("handler exploded"), "{err}");
+
+    let err = host
+        .request_extension("nope.nope", Value::Null, budget)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Unknown extension RPC request"),
+        "{err}"
+    );
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rpc_timeout_releases_the_waiter() {
+    if common::bun_missing("rpc_timeout_releases_the_waiter") {
+        return;
+    }
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let _rx = host.take_incoming().unwrap();
+    host.load(Some(&[fixture("rpc.ts")]), None, "/tmp", None)
+        .await
+        .unwrap();
+
+    let err = host
+        .request_extension("fx.hang", Value::Null, Duration::from_millis(200))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("timed out"), "{err}");
+
+    let v = host
+        .request_extension("fx.rpc", json!("after"), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(v, json!({"echo": "after"}));
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_rpc_name_fails_the_second_load() {
+    if common::bun_missing("duplicate_rpc_name_fails_the_second_load") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("omp-rpc-dup-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = |name: &str| {
+        format!(
+            "export default function (pi: any): void {{ pi.rpc.handle(\"dup.name\", () => ({{from: \"{name}\"}})); }}\n"
+        )
+    };
+    let a = dir.join("a.ts");
+    let b = dir.join("b.ts");
+    std::fs::write(&a, body("a")).unwrap();
+    std::fs::write(&b, body("b")).unwrap();
+
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let _rx = host.take_incoming().unwrap();
+    let r = host.load(Some(&[a, b]), None, "/tmp", None).await.unwrap();
+    assert_eq!(r.loaded.len(), 1, "{r:?}");
+    assert_eq!(r.errors.len(), 1, "{r:?}");
+    assert!(
+        r.errors[0]
+            .error
+            .contains("duplicate extension rpc handler"),
+        "{r:?}"
+    );
+
+    let v = host
+        .request_extension("dup.name", Value::Null, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(v, json!({"from": "a"}));
+    host.shutdown().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

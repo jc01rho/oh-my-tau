@@ -30,13 +30,18 @@ pub struct Job {
     pub result: Option<String>,
     pub error: Option<String>,
     pub ended: Option<Duration>,
+    /// Bytes of `output` already handed to `bash_output`: its next read is the delta.
+    pub read_at: Arc<Mutex<usize>>,
+    /// Aborts the job (its process group) from outside: `kill_bash`.
+    pub cancel: Arc<pa_agent::abort::AbortController>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JobStatus {
     Running,
     Completed,
     Failed,
+    Killed,
 }
 
 impl JobStatus {
@@ -45,6 +50,7 @@ impl JobStatus {
             JobStatus::Running => "running",
             JobStatus::Completed => "completed",
             JobStatus::Failed => "failed",
+            JobStatus::Killed => "killed",
         }
     }
 }
@@ -160,6 +166,30 @@ impl JobRegistry {
         }
     }
 
+    /// Abort every running job; returns how many were running.
+    pub fn kill_all(&self) -> usize {
+        let running: Vec<Arc<pa_agent::abort::AbortController>> = {
+            let inner = self.inner.lock().expect("job registry poisoned");
+            inner
+                .jobs
+                .values()
+                .filter(|j| j.status == JobStatus::Running)
+                .map(|j| j.cancel.clone())
+                .collect()
+        };
+        for cancel in &running {
+            cancel.abort();
+        }
+        running.len()
+    }
+
+    /// Abort one job; `None` when the id is unknown.
+    pub fn kill(&self, id: &str) -> Option<bool> {
+        let job = self.get(id)?;
+        job.cancel.abort();
+        Some(job.status == JobStatus::Running)
+    }
+
     pub fn sorted(&self) -> Vec<(String, Job)> {
         let inner = self.inner.lock().expect("job registry poisoned");
         let mut v: Vec<(String, Job)> = inner
@@ -268,6 +298,8 @@ impl Clone for Job {
             result: self.result.clone(),
             error: self.error.clone(),
             ended: self.ended,
+            read_at: self.read_at.clone(),
+            cancel: self.cancel.clone(),
         }
     }
 }

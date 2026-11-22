@@ -61,6 +61,7 @@ fn watch_snapshot(env: &Env) -> Vec<Watched> {
             JobStatus::Running => None,
             JobStatus::Completed => job.result,
             JobStatus::Failed => job.error,
+            JobStatus::Killed => Some("killed".to_string()),
         };
         out.push(Watched { id, finished });
     }
