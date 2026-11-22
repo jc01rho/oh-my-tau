@@ -665,7 +665,7 @@ impl Warmer {
         let evaluation = Evaluation {
             run_id: run.id,
             decision,
-            stop_reason: stop_reason(&run, &decision),
+            stop_reason: stop_reason(&decision),
         };
         st.run = Some(run);
         Some(evaluation)
@@ -997,14 +997,12 @@ fn evaluate(st: &State, run: &Run, decision_at: u64) -> Decision {
 }
 
 /// Stop reason behind a priced decision (`#evaluate`'s `stopReason`).
-fn stop_reason(run: &Run, decision: &Decision) -> &'static str {
+fn stop_reason(decision: &Decision) -> &'static str {
     if !decision.economics_available {
         "cache economics unavailable"
     } else if decision.method.is_none() {
         "request cannot be replayed safely"
     } else if decision.expected_savings < MINIMUM_EXPECTED_SAVINGS {
-        "expected savings below threshold"
-    } else if run.phase == Phase::Idle {
         "expected savings below threshold"
     } else {
         "refresh spend reached the cost of losing the cache"
@@ -1359,8 +1357,10 @@ mod tests {
     fn a_reasoning_budget_that_follows_max_tokens_makes_the_request_unreplayable() {
         let mut model = claude();
         model.reasoning = true;
-        let mut opts = StreamRequestOptions::default();
-        opts.reasoning = ThinkingLevel::High;
+        let mut opts = StreamRequestOptions {
+            reasoning: ThinkingLevel::High,
+            ..StreamRequestOptions::default()
+        };
         assert!(!is_replayable(&model, &opts));
         // No reasoning requested: the output cap cannot move the budget.
         opts.reasoning = ThinkingLevel::Off;
@@ -1618,8 +1618,10 @@ mod tests {
     fn a_request_that_cannot_be_replayed_never_arms() {
         let mut model = claude();
         model.reasoning = true;
-        let mut opts = StreamRequestOptions::default();
-        opts.reasoning = ThinkingLevel::High;
+        let opts = StreamRequestOptions {
+            reasoning: ThinkingLevel::High,
+            ..StreamRequestOptions::default()
+        };
         let warmer = Warmer::new(None);
         warmer.set_mode(Mode::Streaming);
         warmer.start(
@@ -1734,7 +1736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_extension_override_that_pays_keeps_the_entry_warm() {
+    async fn a_warm_override_sends_the_refresh_the_warmer_would_have_skipped() {
         let emitter = Arc::new(CountingEmitter {
             handlers: true,
             calls: Mutex::new(Vec::new()),
@@ -1753,12 +1755,18 @@ mod tests {
             Some((Tier::Short, SHORT_TTL)),
             NOW,
         );
-        warmer.on_response(&message(&model, "stop", 100_000, 0, 20, 0.0), NOW);
+        // 1k tokens: the warmer's own decision is `stop` (savings under the floor).
+        warmer.on_response(&message(&model, "stop", 1_000, 0, 20, 0.0), NOW);
         warmer.step_at(NOW + 270_000).await;
-        assert_eq!(emitter.calls.lock().expect("calls").len(), 1);
+        let calls = emitter.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].action, CacheWarmingAction::Stop);
+        drop(calls);
+        // The override sent the refresh: it hit, was billed, and the next decision is armed.
         let status = warmer.status();
         assert!(status.scheduled, "{status:?}");
-        assert!(status.extension_override);
+        let decision = status.decision.expect("the next decision is priced");
+        assert!((decision.spent_cost - 0.031).abs() < 1e-9, "{decision:?}");
     }
 
     #[test]
