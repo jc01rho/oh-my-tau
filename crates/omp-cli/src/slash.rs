@@ -553,24 +553,22 @@ pub async fn dispatch_builtin(
             })
         }
         "clear" => {
-            // TS `/clear`: close the active session and start a fresh one
-            // (same work as the RPC `new_session` command).
-            if rt
-                .state()
-                .await
-                .get("isStreaming")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            {
-                return Some(usage(
-                    rt,
-                    "Wait for the current response to finish or abort it before starting a new session.",
-                ));
-            }
-            match rt.new_session(None).await {
-                Ok(()) => output(rt, "New session started."),
-                Err(e) if crate::runtime::is_switch_cancelled(&e) => {}
-                Err(e) => return Some(usage(rt, &format!("Failed to start a new session: {e:#}"))),
+            // TS `/clear`: drop the conversation context in place, keeping the
+            // session (TS `handleResetContextCommand` -> `resetSessionContext`).
+            match rt.reset_context().await {
+                None => {
+                    return Some(usage(
+                        rt,
+                        "Wait for the current response to finish or abort it before resetting the context.",
+                    ));
+                }
+                Some(dropped) => {
+                    let noun = if dropped == 1 { "message" } else { "messages" };
+                    output(
+                        rt,
+                        &format!("Context reset — {dropped} {noun} dropped; session continues."),
+                    );
+                }
             }
             Some(Handled {
                 agent_invoked: false,

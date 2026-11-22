@@ -151,6 +151,7 @@ async fn observed_events_reach_extensions_with_omp_payloads() {
             LifecycleEvent::SessionTree { new_leaf_id: Some("n".into()), old_leaf_id: None, summary_entry: None, from_extension: Some(false) },
             r#"{"type":"session_tree","newLeafId":"n","oldLeafId":null,"fromExtension":false}"#.into(),
         ),
+        (LifecycleEvent::SessionClear, r#"{"type":"session_clear"}"#.into()),
         (LifecycleEvent::SessionShutdown, r#"{"type":"session_shutdown"}"#.into()),
     ];
     for (ev, expected) in cases {

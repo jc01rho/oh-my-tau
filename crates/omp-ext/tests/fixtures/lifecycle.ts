@@ -2,7 +2,7 @@
 const OBSERVED = [
   "session_start", "agent_start", "agent_end", "turn_start", "turn_end", "message_start", "message_update", "message_end",
   "tool_execution_start", "tool_execution_update", "tool_execution_end", "session_compact", "session_switch",
-  "session_branch", "session_tree", "session_shutdown",
+  "session_branch", "session_tree", "session_clear", "session_shutdown",
   "assistant_message", "auto_compaction_start", "auto_compaction_end", "auto_retry_start", "auto_retry_end",
   "retry_fallback_applied", "retry_fallback_succeeded", "ttsr_triggered", "todo_reminder", "goal_updated",
   "tool_approval_requested", "tool_approval_resolved",

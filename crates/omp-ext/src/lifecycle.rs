@@ -302,6 +302,10 @@ pub enum LifecycleEvent {
         exclude_from_context: bool,
         cwd: String,
     },
+    /// The live/model context was cleared in place: the session id, title and
+    /// transcript file survive (`/clear`, TS `SessionClearEvent`).
+    #[serde(rename = "session_clear")]
+    SessionClear,
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -522,6 +526,8 @@ impl ExtHost {
         emit_tool_approval_requested(session_id: String, tool_name: String, tool_call_id: String, reason: Option<String>, approval_mode: ApprovalMode) => LifecycleEvent::ToolApprovalRequested { session_id, tool_name, tool_call_id, reason, approval_mode };
         /// `tool_approval_resolved`.
         emit_tool_approval_resolved(session_id: String, tool_name: String, tool_call_id: String, approved: bool, reason: Option<String>) => LifecycleEvent::ToolApprovalResolved { session_id, tool_name, tool_call_id, approved, reason };
+        /// `session_clear`: the context was reset in place, the session kept.
+        emit_session_clear() => LifecycleEvent::SessionClear;
     }
 
     /// `assistant_message`: a handler may rewrite the text of the finalized message (text blocks only).
