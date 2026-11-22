@@ -29,6 +29,7 @@ pub(crate) mod github_cache;
 pub(crate) mod image_gen;
 mod jobs;
 pub mod mcp;
+pub(crate) mod memory;
 pub(crate) mod memory_backend;
 pub(crate) mod memory_tools;
 mod read;

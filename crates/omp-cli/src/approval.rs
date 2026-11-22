@@ -710,6 +710,9 @@ pub fn tool_decision(name: &str, args: &Value, settings: &omp_settings::Settings
         "retain" | "recall" | "reflect" | "memory_edit" | "learn" | "manage_skill" => {
             crate::tools::memory_tools::approval(name, args, settings)
         }
+        // Writes are confined to the bound memory repository (path-validated, one
+        // commit each), like `memory_edit`: no approval beyond a read.
+        "memory" | "memory_apply_patch" => Decision::tier(Tier::Read),
         "vibe_spawn" | "vibe_send" => Decision::tier(Tier::Exec),
         "vibe_wait" | "vibe_kill" | "vibe_list" => Decision::tier(Tier::Read),
         "generate_image" | "tts" => Decision::tier(Tier::Write),
@@ -807,8 +810,66 @@ fn approval_details(name: &str, args: &Value, t: fn(&str) -> String) -> Vec<Stri
             lines
         }
         "task" => task_details(args, t),
+        "memory" => {
+            let command = str_arg(args, "command").unwrap_or("(missing)");
+            let mut lines = vec![format!("Command: {command}")];
+            for (label, key) in [
+                ("Path", "file_path"),
+                ("From", "old_path"),
+                ("To", "new_path"),
+                ("Reason", "reason"),
+                ("Description", "description"),
+                ("Old text", "old_string"),
+                ("New text", "new_string"),
+                ("Insert text", "insert_text"),
+                ("Body", "file_text"),
+            ] {
+                if let Some(value) = str_arg(args, key).filter(|v| !v.is_empty()) {
+                    lines.push(format!("{label}: {}", t(value)));
+                }
+            }
+            if let Some(line) = args.get("insert_line").and_then(Value::as_f64) {
+                lines.push(format!("Insert before line: {line}"));
+            }
+            lines
+        }
+        "memory_apply_patch" => {
+            let input = str_arg(args, "input").unwrap_or("");
+            let mut lines = vec![format!(
+                "Reason: {}",
+                t(str_arg(args, "reason").unwrap_or("(missing)"))
+            )];
+            let targets = patch_targets(input);
+            if !targets.is_empty() {
+                lines.push(format!("Files: {}", t(&targets.join(", "))));
+            }
+            lines.push(format!("Patch:\n{}", t(input)));
+            lines
+        }
         _ => Vec::new(),
     }
+}
+
+/// Every path a memory patch touches, read with the executor's own parser so
+/// a truncated preview cannot hide a target.
+fn patch_targets(input: &str) -> Vec<String> {
+    let Ok(ops) = omp_memory::patch::parse_patch(input) else {
+        return Vec::new();
+    };
+    let mut targets: Vec<String> = Vec::new();
+    for op in ops {
+        let paths = match op {
+            omp_memory::patch::PatchOp::Add { path, .. }
+            | omp_memory::patch::PatchOp::Delete { path } => vec![path],
+            omp_memory::patch::PatchOp::Update { source, target, .. } => vec![source, target],
+        };
+        for path in paths {
+            if !targets.contains(&path) {
+                targets.push(path);
+            }
+        }
+    }
+    targets
 }
 
 fn task_details(args: &Value, t: fn(&str) -> String) -> Vec<String> {
@@ -1202,6 +1263,12 @@ async fn select(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_patch_approval_lists_every_target() {
+        let input = "*** Begin Patch\n*** Update File: a.md\n*** Move to: b.md\n@@\n-x\n+y\n*** Delete File:\tc.md\n*** End Patch";
+        assert_eq!(super::patch_targets(input), ["a.md", "b.md", "c.md"]);
+    }
 
     fn settings() -> omp_settings::Settings {
         omp_settings::Settings::load_from(None, std::path::Path::new("/nonexistent"))

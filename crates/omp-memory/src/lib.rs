@@ -20,12 +20,16 @@
 )]
 
 pub mod bank;
+pub mod block;
 pub mod cache;
 pub mod config;
 pub mod diagnose;
 pub mod extract;
 pub mod link;
+pub mod ops;
+pub mod patch;
 pub mod recall;
+pub mod repo;
 pub mod retain;
 pub mod runtime;
 pub mod session;
@@ -35,6 +39,9 @@ use std::{io, result};
 
 pub use bank::{BankId, BankScope, BankScopeInput};
 pub use config::{AutolearnSettings, BankScoping, MemoryBackend, MemorySettings, MnemopiSettings};
+pub use ops::{run_memory, MemoryParams, WriteOutcome};
+pub use patch::run_apply_patch;
+pub use repo::{MemoryRepo, RepoError};
 pub use runtime::{Capabilities, MemoryRuntime, RuntimeRegistry};
 
 /// Mnemopi unavailable status used consistently by every surface.
@@ -97,5 +104,36 @@ pub(crate) mod test_support {
             "omp-memory-{tag}-{}-{nanos}-{serial}",
             std::process::id()
         ))
+    }
+
+    /// A fresh git repository with one empty commit, for memory repo tests.
+    pub fn init_repo(tag: &str) -> PathBuf {
+        let root = temp_root(tag);
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "core.hooksPath", ".git/hooks"][..],
+            &[
+                "-c",
+                "user.name=seed",
+                "-c",
+                "user.email=seed@omo.local",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        root
     }
 }
