@@ -1,0 +1,14 @@
+{"dir":"out","frame":{"type":"no_such_gateway_cmd","id":"gw-1"}}
+{"dir":"in","frame":{"id":"gw-1","type":"response","command":"no_such_gateway_cmd","success":false,"error":"Unknown command: no_such_gateway_cmd","code":"unknown_command","errorCode":"unknown_command"}}
+{"dir":"out","frame":{"type":"set_client_info","capabilities":[],"id":"gw-2"}}
+{"dir":"in","frame":{"id":"gw-2","type":"response","command":"set_client_info","success":false,"error":"missing field `width`","code":"invalid_params","errorCode":"invalid_params"}}
+{"dir":"out","frame":{"type":"interrupt","intent":"bogus","id":"gw-3"}}
+{"dir":"in","frame":{"id":"gw-3","type":"response","command":"interrupt","success":false,"error":"intent must be \"stop\" or \"abort\".","code":"invalid_params","errorCode":"invalid_params"}}
+{"dir":"out","frame":{"type":"extension_request","name":"   ","id":"gw-4"}}
+{"dir":"in","frame":{"id":"gw-4","type":"response","command":"extension_request","success":false,"error":"Extension RPC request name cannot be empty","code":"invalid_params","errorCode":"invalid_params"}}
+{"dir":"out","frame":{"type":"extension_request","name":"omomeow.move-readiness","id":"gw-5"}}
+{"dir":"in","frame":{"id":"gw-5","type":"response","command":"extension_request","success":false,"error":"extension_unavailable: no extension host for omomeow.move-readiness","code":"extension_unavailable","errorCode":"extension_unavailable"}}
+{"dir":"out","frame":{"__raw":"{not-json"}}
+{"dir":"in","frame":{"type":"response","command":"parse","success":false,"error":"Failed to parse command: key must be a string at line 1 column 2","code":"rpc_failed","errorCode":"rpc_failed"}}
+{"dir":"out","frame":{"type":"get_state","id":"gw-6"}}
+{"dir":"in","frame":{"id":"gw-6","type":"response","command":"get_state","success":true,"data":{"model":{"id":"text","name":"Mock Text","api":"openai-completions","provider":"mock","baseUrl":"<MOCK_BASE_URL>","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":128000,"maxTokens":4096,"compat":{"supportsDeveloperRole":true}},"thinkingLevel":"off","ultra":null,"isStreaming":false,"isCompacting":false,"steeringMode":"one-at-a-time","followUpMode":"one-at-a-time","interruptMode":"immediate","sessionId":"<SESSION_ID>","autoCompactionEnabled":true,"queuedMessageCount":0,"hasPendingAsyncWork":false,"isSettled":true,"queuedMessages":{"steering":[],"followUp":[]},"todoPhases":[],"fastModeEnabled":false,"tokensPerSecond":null,"fastModeActive":false,"messageCount":0,"systemPrompt":["<SYSTEM_PROMPT>"],"dumpTools":"<TOOLS_LIST>","goal":null,"paused":false,"runPaused":false,"pauseSeq":0,"pausedHeldInputCount":0,"pausedNoticeCount":0,"holds":[],"pause":{"pauseSeq":0,"records":[]},"sessionFile":"<SESSION_FILE>","contextUsage":"<CONTEXT_USAGE>"}}}

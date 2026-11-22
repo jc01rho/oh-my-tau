@@ -1,0 +1,6 @@
+{"dir":"out","frame":{"type":"extension_request","name":"omomeow.move-readiness","id":"gw-1"}}
+{"dir":"in","frame":{"id":"gw-1","type":"response","command":"extension_request","success":true,"data":{"activeSources":[]}}}
+{"dir":"out","frame":{"type":"extension_request","name":"omo.feedback.prepare","data":{},"id":"gw-2"}}
+{"dir":"in","frame":{"id":"gw-2","type":"response","command":"extension_request","success":true,"data":{"kind":"unavailable","reason":"test-stub","echo":{}}}}
+{"dir":"out","frame":{"type":"extension_request","name":"omomeow.missing","id":"gw-3"}}
+{"dir":"in","frame":{"id":"gw-3","type":"response","command":"extension_request","success":false,"error":"rpc_request: Unknown extension RPC request: omomeow.missing","code":"unknown_extension_request","errorCode":"unknown_extension_request"}}

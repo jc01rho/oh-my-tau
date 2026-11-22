@@ -1,0 +1,13 @@
+{"dir":"in","frame":{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}}
+{"dir":"out","frame":{"type":"get_protocol_info","id":"gw-1"}}
+{"dir":"in","frame":{"id":"gw-1","type":"response","command":"get_protocol_info","success":true,"data":{"protocolVersion":2,"serverVersion":"<SERVER_VERSION>","engine":"oh-my-tau","mode":"classic","capabilities":"<RPC_COMMANDS>","commands":"<RPC_COMMANDS>","agentDir":"<AGENT_DIR>","sessionId":"<SESSION_ID>"}}}
+{"dir":"out","frame":{"type":"get_state","id":"gw-2"}}
+{"dir":"in","frame":{"id":"gw-2","type":"response","command":"get_state","success":true,"data":{"model":{"id":"text","name":"Mock Text","api":"openai-completions","provider":"mock","baseUrl":"<MOCK_BASE_URL>","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":128000,"maxTokens":4096,"compat":{"supportsDeveloperRole":true}},"thinkingLevel":"off","ultra":null,"isStreaming":false,"isCompacting":false,"steeringMode":"one-at-a-time","followUpMode":"one-at-a-time","interruptMode":"immediate","sessionId":"<SESSION_ID>","autoCompactionEnabled":true,"queuedMessageCount":0,"hasPendingAsyncWork":false,"isSettled":true,"queuedMessages":{"steering":[],"followUp":[]},"todoPhases":[],"fastModeEnabled":false,"tokensPerSecond":null,"fastModeActive":false,"messageCount":0,"systemPrompt":["<SYSTEM_PROMPT>"],"dumpTools":"<TOOLS_LIST>","goal":null,"paused":false,"runPaused":false,"pauseSeq":0,"pausedHeldInputCount":0,"pausedNoticeCount":0,"holds":[],"pause":{"pauseSeq":0,"records":[]},"sessionFile":"<SESSION_FILE>","contextUsage":"<CONTEXT_USAGE>"}}}
+{"dir":"out","frame":{"type":"get_available_models","id":"gw-3"}}
+{"dir":"in","frame":{"id":"gw-3","type":"response","command":"get_available_models","success":true,"data":{"models":["mock/hold","mock/text"]}}}
+{"dir":"out","frame":{"type":"get_available_thinking_levels","id":"gw-4"}}
+{"dir":"in","frame":{"id":"gw-4","type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off"]}}}
+{"dir":"out","frame":{"type":"get_session_stats","id":"gw-5"}}
+{"dir":"in","frame":{"id":"gw-5","type":"response","command":"get_session_stats","success":true,"data":{"sessionId":"<SESSION_ID>","userMessages":0,"assistantMessages":0,"toolCalls":0,"toolResults":0,"totalMessages":0,"tokens":{"input":0,"output":0,"reasoning":0,"cacheRead":0,"cacheWrite":0,"total":0},"premiumRequests":0,"cost":0.0,"sessionFile":"<SESSION_FILE>","contextUsage":"<CONTEXT_USAGE>"}}}
+{"dir":"out","frame":{"type":"get_last_assistant_text","id":"gw-6"}}
+{"dir":"in","frame":{"id":"gw-6","type":"response","command":"get_last_assistant_text","success":true,"data":{"text":null}}}
