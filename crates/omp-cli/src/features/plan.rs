@@ -890,7 +890,7 @@ mod tests {
     /// `inactive` for any other, so a restored or switched-to session reports its own modes.
     #[test]
     fn plan_mode_is_reported_per_session() {
-        let _g = TEST_LOCK.blocking_lock();
+        let _g = crate::features::plan::TEST_LOCK.blocking_lock();
         set_session("modes-test-entered", true, "");
         assert!(is_active("modes-test-entered"));
         assert!(!is_active("modes-test-other"));
