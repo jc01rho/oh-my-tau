@@ -25,6 +25,17 @@ If interrupted mid-step: resume where stopped.
 NEVER pause to summarize progress, re-confirm plan, or ask whether to proceed; continue.
 ";
 
+/// The live session journal behind `/tree` and the double-Esc rewind (TS
+/// `sessionManager.getTree()` input + `getLeafId()`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionJournal {
+    /// Every raw journal entry in append order (the `session` header excluded).
+    pub entries: Vec<Value>,
+    /// The live leaf: where the next entry chains (`None` = before the first
+    /// entry, e.g. after rewinding past the opening prompt).
+    pub leaf: Option<String>,
+}
+
 /// Synchronous bridge to the agent runtime.
 pub trait RuntimePort: Send + Sync + 'static {
     /// Submit a prompt. `behavior` is `Some` when the agent is streaming
@@ -72,6 +83,25 @@ pub trait RuntimePort: Send + Sync + 'static {
     /// (`tree::navigate_tree`); user-authored targets re-prompt the message.
     fn rewind_entry(&self, entry_id: String);
 
+    /// `/tree` navigation (TS `AgentSession.navigateTree`): a user-authored
+    /// target rewinds past itself (its prompt returns to the editor), any other
+    /// entry becomes the leaf; `summarize` first records a summary of the
+    /// abandoned branch. The host answers with a `tree_navigated` frame (the
+    /// new branch's transcript) or reports the failure.
+    fn navigate_tree(&self, entry_id: String, summarize: bool);
+
+    /// Set (`Some`) or clear (`None`) the label of `entry_id` (TS
+    /// `sessionManager.appendLabelChange`). An error string is surfaced as a
+    /// system notice.
+    fn set_entry_label(&self, entry_id: String, label: Option<String>) -> Result<(), String>;
+
+    /// The live session journal for `/tree` and the rewind selector. `None`
+    /// when the host keeps no journal: the app then uses the `message_end`
+    /// frames it saw this run.
+    fn session_journal(&self) -> Option<SessionJournal> {
+        None
+    }
+
     /// Cancel a running auto-compaction. No-op in omp-rs until the runtime
     /// grows a compaction-abort RPC; the method exists so app wiring is
     /// stable.
@@ -114,6 +144,9 @@ pub trait RuntimePort: Send + Sync + 'static {
 pub struct FakePort {
     /// Recorded calls, one debug string each.
     pub log: parking_lot::Mutex<Vec<String>>,
+    /// The journal [`RuntimePort::session_journal`] serves; label edits append
+    /// a `label` entry to it like the real session writer does.
+    pub journal: parking_lot::Mutex<Option<SessionJournal>>,
 }
 
 impl FakePort {
@@ -171,6 +204,37 @@ impl RuntimePort for FakePort {
     }
     fn rewind_entry(&self, entry_id: String) {
         self.record(format!("rewind_entry({entry_id})"));
+    }
+    fn navigate_tree(&self, entry_id: String, summarize: bool) {
+        self.record(format!("navigate_tree({entry_id}, summarize={summarize})"));
+    }
+    fn set_entry_label(&self, entry_id: String, label: Option<String>) -> Result<(), String> {
+        self.record(format!("set_entry_label({entry_id}, {label:?})"));
+        let mut journal = self.journal.lock();
+        let Some(journal) = journal.as_mut() else {
+            return Err("no session journal to label".into());
+        };
+        if !journal
+            .entries
+            .iter()
+            .any(|e| e.get("id").and_then(Value::as_str) == Some(entry_id.as_str()))
+        {
+            return Err(format!("Entry {entry_id} not found"));
+        }
+        let id = format!("label-{}", journal.entries.len());
+        let mut entry = serde_json::json!({
+            "type": "label", "id": id, "parentId": journal.leaf,
+            "timestamp": "9999", "targetId": entry_id,
+        });
+        if let Some(label) = label {
+            entry["label"] = Value::from(label);
+        }
+        journal.entries.push(entry);
+        journal.leaf = Some(id);
+        Ok(())
+    }
+    fn session_journal(&self) -> Option<SessionJournal> {
+        self.journal.lock().clone()
     }
     fn settings_get(&self, ids: &[String]) -> Vec<(String, Value)> {
         self.record(format!("settings_get({ids:?})"));

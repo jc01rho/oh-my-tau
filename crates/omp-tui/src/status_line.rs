@@ -31,6 +31,7 @@ pub use presets::{ContextLineMode, Preset, SegmentId, SeparatorStyle, StatusLine
 use segments::{Ctx, Piece};
 pub use stats::{ContextLevel, QuotaWindow};
 
+pub(crate) use metrics::shorten_path;
 use metrics::str_width;
 
 /// Pull-request info for the `pr` segment.

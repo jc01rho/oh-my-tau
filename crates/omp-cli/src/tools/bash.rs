@@ -2235,16 +2235,15 @@ mod tests {
     fn pid_is_dead(pid: i32) -> bool {
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
-        if kill(Pid::from_raw(pid), None).is_err() {
-            return true;
-        }
+        let alive = kill(Pid::from_raw(pid), None).is_ok();
+        // A zombie still answers `kill(pid, 0)`; Linux exposes its state.
         #[cfg(target_os = "linux")]
-        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            return stat
-                .rsplit_once(')')
-                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
-        }
-        false
+        let alive = alive
+            && !std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+            });
+        !alive
     }
 
     /// Regression: the `cwd` parameter defines `$PWD` as well as the shell's

@@ -337,7 +337,7 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
 }
 
 /// Truncate to `max` columns, ending in `…` when cut (TS `truncateToWidth`).
-fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+pub(crate) fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     if spans_width(&spans) <= max {
         return spans;
     }
@@ -363,7 +363,7 @@ fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     out
 }
 
-fn pad(mut spans: Vec<Span<'static>>, to: usize) -> Vec<Span<'static>> {
+pub(crate) fn pad(mut spans: Vec<Span<'static>>, to: usize) -> Vec<Span<'static>> {
     let w = spans_width(&spans);
     if w < to {
         spans.push(Span::raw(" ".repeat(to - w)));

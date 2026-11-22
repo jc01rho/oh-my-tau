@@ -58,9 +58,9 @@ use crate::keybindings::KeybindingsManager;
 use crate::keys::{KeyCode, KeyEvent, KeyModifiers};
 use crate::overlays::models::{parse_model_string, ModelEntry};
 use crate::overlays::sessions::SessionSource;
-use crate::overlays::tree::TreeMode;
+use crate::overlays::tree::{FilterMode, TreeMode, TreeOptions};
 use crate::overlays::{OpenOverlay, Overlays};
-use crate::port::RuntimePort;
+use crate::port::{RuntimePort, SessionJournal};
 use crate::status_line::StatusLine;
 use crate::theme::Theme;
 
@@ -68,6 +68,18 @@ use crate::theme::Theme;
 const MESSAGE_UPDATE_COALESCE: Duration = Duration::from_millis(33);
 /// Double-Esc / double-Ctrl+C window (input-controller L585, L1527).
 const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
+
+/// Notice for `app.stt.pushToTalk` while `stt.enabled` is on: omp ships no
+/// speech-to-text backend.
+pub const STT_UNAVAILABLE: &str =
+    "speech-to-text is not available: omp has no speech-to-text backend (stt.enabled is on)";
+
+/// `stt.enabled` as the runtime resolves it.
+fn stt_enabled(port: &impl RuntimePort) -> bool {
+    port.settings_get(&["stt.enabled".to_string()])
+        .into_iter()
+        .any(|(_, v)| v.as_bool() == Some(true))
+}
 /// Spinner frames for the "Working…" loader (TS loading animation set).
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// Loader spinner glyph step (TS `SPINNER_ADVANCE_MS`).
@@ -209,9 +221,13 @@ impl EventPump {
     }
 
     /// Owned-frame variant of [`Self::push_frame`]; identical queueing, but
-    /// `session_loaded` moves its (large) message array into the event.
+    /// `session_loaded` / `tree_navigated` move their (large) message array
+    /// into the event.
     pub fn push_frame_owned(&mut self, frame: Value, now: Instant) {
-        if frame.get("type").and_then(Value::as_str) == Some("session_loaded") {
+        if matches!(
+            frame.get("type").and_then(Value::as_str),
+            Some("session_loaded" | "tree_navigated")
+        ) {
             if let Some((at, update)) = self.pending_update.take() {
                 self.queue.push_back((at, AppEvent::MessageUpdate(update)));
             }
@@ -760,6 +776,7 @@ impl App {
                     km.get_conflicts().len()
                 };
                 self.keys = KeybindingsManager::new(user);
+                self.extension_ui.set_keys(self.keys.clone());
                 (conflicts > 0).then(|| {
                     format!("keybindings: {conflicts} conflicting override(s) in {path:?}; first binding wins on the input path")
                 })
@@ -1135,6 +1152,39 @@ impl App {
                 self.title
                     .set_state(TitleState::Idle, Some(&self.title_label));
             }
+            AppEvent::TreeNavigated {
+                messages,
+                name,
+                editor_text,
+                summarized,
+            } => {
+                // TS rebuilds the chat for the new leaf, restores a rewound
+                // prompt into an empty editor and reports the move. The
+                // `message_end` journal stays: it is the tree of a host that
+                // keeps no session journal.
+                self.status.streaming = false;
+                self.messages.rebuild(messages);
+                self.clear_scrollback = true;
+                if let Some(name) = name {
+                    self.title_label.clone_from(name);
+                    self.session_name = Some(name.clone()).filter(|n| !n.is_empty());
+                }
+                self.title
+                    .set_state(TitleState::Idle, Some(&self.title_label));
+                if let Some(text) = editor_text.as_deref().filter(|t| !t.trim().is_empty()) {
+                    if self.editor.is_empty() {
+                        self.set_editor_text(text);
+                    }
+                }
+                self.push_system(
+                    if *summarized {
+                        "Branch summarized; navigated to the selected point"
+                    } else {
+                        "Navigated to the selected point"
+                    }
+                    .into(),
+                );
+            }
             AppEvent::SessionReset => {
                 self.journal.clear();
                 self.status.streaming = false;
@@ -1241,6 +1291,20 @@ impl App {
                 port.resume_session(path, fork);
             }
             Action::Rewind { entry_id } => port.rewind_entry(entry_id),
+            Action::NavigateTree {
+                entry_id,
+                summarize,
+            } => port.navigate_tree(entry_id, summarize),
+            Action::SetEntryLabel { entry_id, label } => {
+                match port.set_entry_label(entry_id, label) {
+                    Ok(()) => {
+                        let journal = self.session_journal(port);
+                        self.overlays.tree_mut().reload(&journal);
+                    }
+                    Err(e) => self.push_system(format!("label failed: {e}")),
+                }
+            }
+            Action::Status(text) => self.push_system(text),
             Action::SetModel { provider, id } => port.set_model(provider, id),
             Action::SetThinkingLevel(level) => port.set_thinking_level(level),
             Action::Slash { name, args } => port.run_slash(name, args),
@@ -1296,13 +1360,20 @@ impl App {
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && (self.editor.is_empty() || self.overlays.open() == Some(OpenOverlay::Help))
         {
-            self.overlays.toggle(OpenOverlay::Help);
+            self.toggle_help();
             return Some(true);
         }
         if self.keys.matches_event(&key, "app.exit") {
             return None; // exit (§6 handleCtrlD)
         }
-        if self.keys.matches_event(&key, "app.tools.expand") {
+        // `/tree` owns Ctrl+O (filter cycling), like TS input-controller.
+        if self.keys.matches_event(&key, "app.tools.expand")
+            && self.overlays.open() != Some(OpenOverlay::Tree)
+        {
+            // An open approval prompt takes the key for its details first.
+            if self.extension_ui.toggle_details() {
+                return Some(true);
+            }
             self.messages.toggle_expanded(); // app.tools.expand (chat.md)
             if self.theme.clean() {
                 // Clean rows collapse in scrollback too: re-commit the whole
@@ -1314,14 +1385,9 @@ impl App {
 
         // Overlay focus: route keys to the stack, top first. Esc closes the
         // top overlay only when it ignored the key (help/palette ignore esc;
-        // the tree navigator consumes esc as "cancel", so it is closed by
-        // the host explicitly).
+        // the tree navigator consumes it while a search or filter is open).
         if self.overlays.wants_focus() {
             if key.code == KeyCode::Esc {
-                if self.overlays.open() == Some(OpenOverlay::Tree) {
-                    self.overlays.pop();
-                    return Some(true);
-                }
                 if !self.overlays.handle_key(key).consumed() {
                     self.overlays.pop();
                 }
@@ -1350,9 +1416,36 @@ impl App {
         }
         self.last_ctrl_c = None;
 
+        // `app.ask.hide` hides/shows a pending dialog without answering it;
+        // `app.approval.approve` answers an approval prompt affirmatively
+        // (upstream app-keybindings.ts).
+        if self.keys.matches_event(&key, "app.ask.hide") {
+            if let Some(hidden) = self.extension_ui.toggle_hidden() {
+                if hidden {
+                    self.push_system(
+                        "Dialog hidden; press the app.ask.hide key again to answer it.".into(),
+                    );
+                }
+                return Some(true);
+            }
+        }
+        if self.extension_ui.wants_focus() && self.keys.matches_event(&key, "app.approval.approve")
+        {
+            if !self.extension_ui.approve_active_at(port, now) {
+                self.push_system("The open dialog is not a tool approval prompt.".into());
+            }
+            return Some(true);
+        }
+
         // Pending extension dialogs own keys before the editor (ExtUi
         // contract): they render modally above the live region.
-        if self.extension_ui.handle_key(key, port) {
+        if self.extension_ui.handle_key_at(key, port, now) {
+            return Some(true);
+        }
+
+        // `app.session.tree` (unbound by default, TS editor key handler).
+        if self.keys.matches_event(&key, "app.session.tree") {
+            self.open_tree_view(TreeMode::Tree, port);
             return Some(true);
         }
 
@@ -1417,6 +1510,18 @@ impl App {
 
         if self.keys.matches_event(&key, "app.interrupt") {
             return Some(self.esc_ladder(now, port));
+        }
+
+        // Push-to-talk (`app.stt.pushToTalk`, default Space on an empty
+        // editor) only claims the key when `stt.enabled` is on, like
+        // upstream. omp has no speech-to-text backend, so say so instead of
+        // swallowing the key silently.
+        if self.editor.is_empty()
+            && self.keys.matches_event(&key, "app.stt.pushToTalk")
+            && stt_enabled(port)
+        {
+            self.push_system(STT_UNAVAILABLE.into());
+            return Some(true);
         }
 
         // Tab accepts the ghost word completion plus a space; the popup branch
@@ -1656,16 +1761,67 @@ impl App {
             .is_some_and(|t| now.duration_since(t) <= DOUBLE_TAP_WINDOW)
         {
             self.last_esc = None;
-            if self.journal.is_empty() {
-                self.push_system("nothing to rewind yet".into());
-            } else {
-                self.overlays
-                    .open_tree(&self.journal.clone(), TreeMode::Rewind);
-            }
+            self.open_tree_view(TreeMode::Rewind, port);
         } else {
             self.last_esc = Some(now);
         }
         true
+    }
+
+    /// `?` / `/help` / `/hotkeys`: toggle the keyboard sheet, rebuilt from the
+    /// effective bindings and theme whenever it opens.
+    fn toggle_help(&mut self) {
+        if !self.overlays.stack().contains(&OpenOverlay::Help) {
+            self.overlays.help_mut().load(&self.keys, &self.theme);
+        }
+        self.overlays.toggle(OpenOverlay::Help);
+    }
+
+    /// The journal behind `/tree` and the rewind column: the host's live
+    /// session journal, else the `message_end` frames seen this run.
+    fn session_journal(&self, port: &impl RuntimePort) -> SessionJournal {
+        port.session_journal().unwrap_or_else(|| SessionJournal {
+            leaf: omp_session::tree::leaf_id(&self.journal).map(str::to_owned),
+            entries: self.journal.clone(),
+        })
+    }
+
+    /// `/tree` / `app.session.tree` (TS `showTreeSelector`) or the double-Esc
+    /// rewind column, with the `treeFilterMode` / `branchSummary.enabled`
+    /// settings and the effective bindings.
+    fn open_tree_view(&mut self, mode: TreeMode, port: &impl RuntimePort) {
+        let journal = self.session_journal(port);
+        if journal.entries.is_empty() {
+            self.push_system(
+                match mode {
+                    TreeMode::Tree => "No entries in session",
+                    TreeMode::Rewind => "nothing to rewind yet",
+                }
+                .into(),
+            );
+            return;
+        }
+        let settings = port.settings_get(&[
+            "treeFilterMode".to_owned(),
+            "branchSummary.enabled".to_owned(),
+        ]);
+        let setting = |id: &str| {
+            settings
+                .iter()
+                .find(|(k, _)| k == id)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Null)
+        };
+        let options = TreeOptions {
+            filter: setting("treeFilterMode")
+                .as_str()
+                .and_then(FilterMode::parse)
+                .unwrap_or_default(),
+            summary_prompt: setting("branchSummary.enabled").as_bool() == Some(true),
+            session_name: self.session_name.clone(),
+            keys: self.keys.clone(),
+        };
+        self.overlays.open_tree(&journal, mode, options);
     }
 
     /// Pop the newest queued message back into the editor (§5.3).
@@ -1881,20 +2037,13 @@ impl App {
         self.armed_bare_command = None;
         match name {
             "exit" => self.quit_requested = true,
-            "help" | "hotkeys" => self.overlays.toggle(OpenOverlay::Help),
+            "help" | "hotkeys" => self.toggle_help(),
             "settings" => self.slash_settings(port),
             // TS `/switch` opens the same model selector (session-only pick).
             "model" | "switch" => self.slash_model(name, args, port),
             "effort" if args.is_empty() => self.open_thinking_selector(),
             "resume" => self.slash_resume(),
-            "tree" => {
-                if self.journal.is_empty() {
-                    self.push_system("no session tree yet".into());
-                } else {
-                    self.overlays
-                        .open_tree(&self.journal.clone(), TreeMode::Tree);
-                }
-            }
+            "tree" => self.open_tree_view(TreeMode::Tree, port),
             "theme" => self.slash_theme(args),
             // TS `/session` (bare or `info`) opens the session info panel;
             // other verbs (delete, pin, …) stay with the runtime.
@@ -4344,6 +4493,268 @@ mod tests {
             .entries()
             .iter()
             .any(|e| e.text.contains("nothing to rewind")));
+    }
+
+    // ---- /tree over the host journal -----------------------------------------
+
+    fn tree_port() -> FakePort {
+        let message = |id: &str, parent: Option<&str>, ts: &str, role: &str, text: &str| {
+            json!({"type": "message", "id": id, "parentId": parent, "timestamp": ts,
+                   "message": {"role": role, "content": text}})
+        };
+        let port = FakePort::default();
+        *port.journal.lock() = Some(SessionJournal {
+            entries: vec![
+                message("u1", None, "01", "user", "first question"),
+                message("a1", Some("u1"), "02", "assistant", "answer one"),
+                message("u2", Some("a1"), "03", "user", "follow up A"),
+                message("a2", Some("u2"), "04", "assistant", "A done"),
+                message("u3", Some("a1"), "05", "user", "follow up B"),
+                message("a3", Some("u3"), "06", "assistant", "B done"),
+            ],
+            leaf: Some("a3".into()),
+        });
+        port
+    }
+
+    fn selected_tree_id(app: &mut App) -> Option<String> {
+        app.overlays.tree_mut().selected_row().map(|r| r.id.clone())
+    }
+
+    #[test]
+    fn slash_tree_reads_the_host_journal_and_enter_navigates() {
+        let mut app = app();
+        let port = tree_port();
+        type_text(&mut app, &port, "/tree");
+        assert!(enter(&mut app, &port));
+        assert_eq!(app.overlays.open(), Some(OpenOverlay::Tree));
+        assert_eq!(selected_tree_id(&mut app).as_deref(), Some("a3"));
+        // Moving the cursor never navigates (the old picker rewound on any key).
+        press(&mut app, &port, key(CtKeyCode::Up));
+        press(&mut app, &port, key(CtKeyCode::Down));
+        press(&mut app, &port, key(CtKeyCode::Up));
+        assert!(!log(&port).iter().any(|c| c.starts_with("navigate_tree(")));
+        assert_eq!(app.overlays.open(), Some(OpenOverlay::Tree));
+        assert!(enter(&mut app, &port));
+        assert!(
+            log(&port).contains(&"navigate_tree(u3, summarize=false)".to_owned()),
+            "{:?}",
+            log(&port)
+        );
+        assert_eq!(app.overlays.open(), None);
+    }
+
+    #[test]
+    fn tree_enter_on_the_leaf_reports_already_here() {
+        let mut app = app();
+        let port = tree_port();
+        type_text(&mut app, &port, "/tree");
+        assert!(enter(&mut app, &port));
+        assert!(enter(&mut app, &port));
+        assert_eq!(app.overlays.open(), None);
+        assert!(!log(&port).iter().any(|c| c.starts_with("navigate_tree(")));
+        assert!(app
+            .messages
+            .entries()
+            .iter()
+            .any(|e| e.text.contains("Already at this point")));
+    }
+
+    #[test]
+    fn tree_esc_clears_search_before_closing_and_owns_ctrl_o() {
+        let mut app = app();
+        let port = tree_port();
+        type_text(&mut app, &port, "/tree");
+        assert!(enter(&mut app, &port));
+        let expanded = app.messages.expanded();
+        press(&mut app, &port, ctrl('o'));
+        assert_eq!(
+            app.overlays.tree_mut().filter_mode(),
+            crate::overlays::tree::FilterMode::NoTools
+        );
+        assert_eq!(
+            app.messages.expanded(),
+            expanded,
+            "ctrl+o is the tree filter here"
+        );
+        type_text(&mut app, &port, "zzz");
+        assert!(app.overlays.tree_mut().visible_ids().is_empty());
+        press(&mut app, &port, key(CtKeyCode::Esc));
+        assert_eq!(
+            app.overlays.open(),
+            Some(OpenOverlay::Tree),
+            "esc cleared the search"
+        );
+        assert_eq!(app.overlays.tree_mut().visible_ids().len(), 6);
+        press(&mut app, &port, key(CtKeyCode::Esc));
+        assert_eq!(app.overlays.open(), None);
+    }
+
+    #[test]
+    fn closed_tree_never_navigates_from_other_overlays() {
+        let mut app = app();
+        let port = tree_port();
+        type_text(&mut app, &port, "/tree");
+        assert!(enter(&mut app, &port));
+        press(&mut app, &port, key(CtKeyCode::Esc));
+        assert_eq!(app.overlays.open(), None);
+        app.overlays.toggle(OpenOverlay::Help);
+        press(&mut app, &port, key(CtKeyCode::Down));
+        press(&mut app, &port, key(CtKeyCode::Up));
+        assert!(
+            !log(&port)
+                .iter()
+                .any(|c| c.starts_with("navigate_tree(") || c.starts_with("rewind_entry(")),
+            "{:?}",
+            log(&port)
+        );
+    }
+
+    #[test]
+    fn tree_label_edit_persists_and_reloads_in_place() {
+        let mut app = app();
+        let port = tree_port();
+        type_text(&mut app, &port, "/tree");
+        assert!(enter(&mut app, &port));
+        press(&mut app, &port, key(CtKeyCode::Up));
+        press(
+            &mut app,
+            &port,
+            KeyEvent::new(CtKeyCode::Char('L'), CtMods::SHIFT),
+        );
+        type_text(&mut app, &port, "keep");
+        assert!(enter(&mut app, &port));
+        assert!(log(&port).contains(&"set_entry_label(u3, Some(\"keep\"))".to_owned()));
+        assert_eq!(app.overlays.open(), Some(OpenOverlay::Tree), "stays open");
+        assert_eq!(selected_tree_id(&mut app).as_deref(), Some("u3"));
+        assert_eq!(
+            app.overlays
+                .tree_mut()
+                .selected_row()
+                .and_then(|r| r.label.clone()),
+            Some("keep".to_owned())
+        );
+    }
+
+    #[test]
+    fn bound_session_tree_key_opens_the_tree() {
+        let mut app = app();
+        let port = tree_port();
+        let mut user = crate::keybindings::UserBindings::new();
+        user.insert("app.session.tree".into(), vec!["alt+t".into()]);
+        app.keys = KeybindingsManager::new(user);
+        press(
+            &mut app,
+            &port,
+            KeyEvent::new(CtKeyCode::Char('t'), CtMods::ALT),
+        );
+        assert_eq!(app.overlays.open(), Some(OpenOverlay::Tree));
+    }
+
+    #[test]
+    fn approve_chord_waits_for_the_approval_prompt_to_arm() {
+        let mut app = app();
+        let port = port();
+        let shown = Instant::now();
+        app.apply_event(&AppEvent::ExtensionUiRequest(json!({
+            "type": "extension_ui_request", "id": "ap", "method": "select", "kind": "approval",
+            "title": "Allow tool: bash\nCommand: ls", "options": ["Approve", "Deny"],
+        })));
+        // Ctrl+Q doubles as the follow-up chord: as the prompt appears it is
+        // swallowed, neither approving nor reaching the editor.
+        assert!(app.handle_key(ctrl('q'), &port, shown).is_some());
+        assert!(log(&port).is_empty(), "{:?}", log(&port));
+        assert!(app.extension_ui.is_active());
+        assert!(app
+            .handle_key(ctrl('q'), &port, shown + Duration::from_secs(1))
+            .is_some());
+        assert!(
+            log(&port)
+                .iter()
+                .any(|c| c.starts_with("extension_ui_response(ap,") && c.contains("Approve")),
+            "{:?}",
+            log(&port)
+        );
+        assert!(!app.extension_ui.is_active());
+    }
+
+    #[test]
+    fn hotkeys_sheet_reflects_user_overrides() {
+        let mut app = app();
+        let port = port();
+        let mut user = crate::keybindings::UserBindings::new();
+        user.insert("app.thinking.cycle".into(), vec!["f2".into()]);
+        app.keys = KeybindingsManager::new(user);
+        type_text(&mut app, &port, "/hotkeys");
+        assert!(enter(&mut app, &port));
+        assert_eq!(app.overlays.open(), Some(OpenOverlay::Help));
+        let groups = app.overlays.help_mut().groups().to_vec();
+        let row = groups
+            .iter()
+            .flat_map(|g| &g.rows)
+            .find(|r| r.action == "Cycle thinking level")
+            .expect("thinking row");
+        assert_eq!(row.keys, "F2");
+    }
+
+    #[test]
+    fn ctrl_o_expands_an_open_approval_prompt_not_tool_output() {
+        let mut app = app();
+        let port = port();
+        app.apply_event(&AppEvent::ExtensionUiRequest(json!({
+            "type": "extension_ui_request", "id": "ap", "method": "select", "kind": "approval",
+            "title": "Allow tool: bash\nCommand: echo head[…3ch elided…]",
+            "fullPrompt": "Allow tool: bash\nCommand: echo head-tail",
+            "options": ["Approve", "Deny"],
+        })));
+        let expanded = app.messages.expanded();
+        press(&mut app, &port, ctrl('o'));
+        assert_eq!(app.messages.expanded(), expanded, "tool output untouched");
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.extension_ui.render(f, f.area(), &Theme::default()))
+            .unwrap();
+        let screen = term.backend().to_string();
+        assert!(screen.contains("echo head-tail"), "{screen}");
+        // With no prompt open the key toggles tool output again.
+        enter(&mut app, &port);
+        press(&mut app, &port, ctrl('o'));
+        assert_ne!(app.messages.expanded(), expanded);
+    }
+
+    #[test]
+    fn tree_navigated_rebuilds_the_transcript_and_restores_the_prompt() {
+        let mut app = app();
+        push_user_turn(&mut app, "u1", None, "old branch");
+        app.apply_event(&AppEvent::TreeNavigated {
+            messages: vec![json!({"role": "user", "content": [{"type": "text", "text": "kept"}]})],
+            name: None,
+            editor_text: Some("follow up B".into()),
+            summarized: false,
+        });
+        assert!(
+            app.take_clear_scrollback(),
+            "the transcript is re-committed"
+        );
+        assert_eq!(app.editor.text(), "follow up B");
+        let texts: Vec<String> = app
+            .messages
+            .entries()
+            .iter()
+            .map(|e| e.text.clone())
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("kept")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("old branch")), "{texts:?}");
+        assert!(texts
+            .iter()
+            .any(|t| t.contains("Navigated to the selected point")));
+        // A draft in progress is never replaced.
+        app.apply_event(&AppEvent::TreeNavigated {
+            messages: Vec::new(),
+            name: None,
+            editor_text: Some("other".into()),
+            summarized: true,
+        });
+        assert_eq!(app.editor.text(), "follow up B");
     }
 
     // ---- terminal title -----------------------------------------------------

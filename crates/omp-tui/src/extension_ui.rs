@@ -26,10 +26,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::keybindings::KeybindingsManager;
 use crate::keys::{KeyCode, KeyEvent, KeyModifiers};
 use crate::port::RuntimePort;
 use crate::theme::Theme;
 use ratatui::text::{Line, Span};
+
+mod approval;
 
 /// One selectable option (`omp-cli/src/tools/ask.rs` `SelectOption`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,17 +194,20 @@ pub struct ActiveDialog {
 
 #[derive(Debug, Clone, PartialEq)]
 enum DialogKind {
-    /// Multi-question ask form: questions answered in order, then submitted.
+    /// Multi-question ask form (TS `AskDialogComponent`): every question keeps
+    /// its own answer, cursor and toggles, so Tab / Shift+Tab and ←/→ revisit
+    /// any question before the form submits.
     Ask {
         questions: Vec<Question>,
+        /// Answer per question (`None` = unanswered).
         answers: Vec<Option<AskAnswer>>,
-        /// Which question is on screen.
+        /// Which question is open.
         current: usize,
-        /// Cursor within the flattened option rows of `current`.
-        cursor: usize,
-        /// Checked option indices when the question is multi-select.
-        checked: Vec<usize>,
-        /// Buffer while typing a custom ("Other") answer.
+        /// Cursor row per question (options, then the Other / Done row).
+        cursors: Vec<usize>,
+        /// Toggled option indices per question (multi-select).
+        checked: Vec<Vec<usize>>,
+        /// Buffer while typing a custom ("Other") answer for `current`.
         custom: Option<String>,
     },
     /// Single-option-picker (`select`, and degraded ask flows).
@@ -218,6 +224,8 @@ enum DialogKind {
         /// e.g. `/login`'s provider picker) instead of a centered popup.
         fullscreen: bool,
     },
+    /// Tool-approval prompt (a `select` tagged `kind: "approval"`).
+    Approval(approval::ApprovalDialog),
     /// Yes/no modal.
     Confirm { title: String, message: String },
     /// Single-line text prompt.
@@ -346,19 +354,40 @@ impl ActiveDialog {
                     .and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(Question::from_value).collect())
                     .unwrap_or_default();
-                // The first question's defaults seed the toggle state.
+                // Each question's defaults seed its toggles; its cursor starts
+                // on the recommended option (TS `clamp(recommended ?? 0)`).
                 let checked = questions
-                    .first()
-                    .filter(|q| q.multi)
-                    .map_or_else(Vec::new, |q| q.checked.clone());
+                    .iter()
+                    .map(|q| {
+                        if q.multi {
+                            q.checked.clone()
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .collect();
+                let cursors = questions
+                    .iter()
+                    .map(|q| q.recommended.unwrap_or(0))
+                    .collect();
                 DialogKind::Ask {
+                    answers: vec![None; questions.len()],
                     questions,
-                    answers: Vec::new(),
                     current: 0,
-                    cursor: 0,
+                    cursors,
                     checked,
                     custom: None,
                 }
+            }
+            "select" if approval::is_approval(params) => {
+                DialogKind::Approval(approval::ApprovalDialog::new(
+                    params,
+                    select_options(params)
+                        .into_iter()
+                        .map(|o| o.label)
+                        .collect(),
+                    Instant::now(),
+                ))
             }
             "select" => {
                 let flag = |k: &str| params.get(k).and_then(Value::as_bool) == Some(true);
@@ -453,6 +482,11 @@ pub struct ExtensionUi {
     widgets_below: Vec<HookWidget>,
     /// Most recent `ui_notify` toast, consumed once by the embedding loop.
     notification: Option<(String, String)>,
+    /// `app.ask.hide`: the active dialog stays pending but neither renders
+    /// nor owns keys until shown again.
+    hidden: bool,
+    /// Effective bindings (the approval dialog's approve / expand keys).
+    keys: KeybindingsManager,
 }
 
 impl ExtensionUi {
@@ -487,6 +521,27 @@ impl ExtensionUi {
         }
     }
 
+    /// Use `keys` for dialog chords and hints (user `keybindings.yml`).
+    pub fn set_keys(&mut self, keys: KeybindingsManager) {
+        self.keys = keys;
+    }
+
+    /// `app.tools.expand` while a tool-approval prompt is open: swap its
+    /// clipped details for every detail, wrapped (TS `toggleDetails`).
+    /// `false` when no approval prompt is active.
+    pub fn toggle_details(&mut self) -> bool {
+        if self.hidden {
+            return false;
+        }
+        match self.active.as_mut().map(|d| &mut d.kind) {
+            Some(DialogKind::Approval(dialog)) => {
+                dialog.toggle_details();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The oldest unanswered request, if any (the active dialog first).
     #[must_use]
     pub fn head(&self) -> Option<&PendingRequest> {
@@ -507,7 +562,56 @@ impl ExtensionUi {
     /// Whether a dialog currently owns the screen and keyboard.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.active.is_some()
+        self.active.is_some() && !self.hidden
+    }
+
+    /// `app.ask.hide`: hide or show the active dialog without answering it.
+    /// Returns the new hidden state, or `None` when no dialog is pending.
+    pub fn toggle_hidden(&mut self) -> Option<bool> {
+        self.active.as_ref()?;
+        self.hidden = !self.hidden;
+        Some(self.hidden)
+    }
+
+    /// Whether a pending dialog is currently hidden by `app.ask.hide`.
+    #[must_use]
+    pub fn is_hidden(&self) -> bool {
+        self.active.is_some() && self.hidden
+    }
+
+    /// `app.approval.approve`: answer the active dialog affirmatively when it
+    /// is an approval prompt — a yes/no confirm, or a select whose options
+    /// include an approve/allow/yes choice. Returns `false` (nothing sent)
+    /// when no such dialog is pending.
+    pub fn approve_active(&mut self, port: &impl RuntimePort) -> bool {
+        self.approve_active_at(port, Instant::now())
+    }
+
+    /// [`Self::approve_active`] at `now`. A tool-approval prompt takes the
+    /// chord only once armed ([`approval::APPROVE_ARM`] after it appeared);
+    /// before that the chord is swallowed and `true` is returned unanswered.
+    pub fn approve_active_at(&mut self, port: &impl RuntimePort, now: Instant) -> bool {
+        let Some(dialog) = self.active.as_ref() else {
+            return false;
+        };
+        let value = match &dialog.kind {
+            DialogKind::Approval(approval) => match approval.approve(now) {
+                Some(label) => serde_json::json!({ "value": label }),
+                None => return true,
+            },
+            DialogKind::Confirm { .. } => serde_json::json!({"value": true}),
+            DialogKind::Select { options, .. } => {
+                let Some(option) = options.iter().find(|o| is_approve_label(&o.label)) else {
+                    return false;
+                };
+                serde_json::json!({"value": option.label.clone()})
+            }
+            _ => return false,
+        };
+        let id = dialog.id.clone();
+        port.extension_ui_response(id.clone(), value);
+        self.complete(&id);
+        true
     }
 
     /// Whether the active dialog is a full-screen picker (frame `fullscreen: true`): the shell
@@ -588,6 +692,7 @@ impl ExtensionUi {
 
     /// Promote the oldest queued request to the active dialog.
     fn activate_next(&mut self) {
+        self.hidden = false;
         self.active_req = self.queue.pop_front();
         self.active = self.active_req.as_ref().map(ActiveDialog::new);
     }
@@ -675,6 +780,31 @@ impl ExtensionUi {
 /// envelope keys (`RpcAskUi` puts `questions`/`timeout` at the top level).
 const ENVELOPE_KEYS: [&str; 4] = ["type", "id", "method", "extension"];
 
+/// Approval prompts label their affirmative choice "Approve", "Allow",
+/// "Allow once", "Yes", ...; match on the leading word.
+fn is_approve_label(label: &str) -> bool {
+    matches!(
+        label_verb(label).as_str(),
+        "approve" | "allow" | "yes" | "accept"
+    )
+}
+
+/// The negative counterpart of [`is_approve_label`] ("Deny", "Reject", …).
+fn is_deny_label(label: &str) -> bool {
+    matches!(
+        label_verb(label).as_str(),
+        "deny" | "reject" | "no" | "decline"
+    )
+}
+
+fn label_verb(label: &str) -> String {
+    label
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
 fn payload_of(frame: &Value) -> Value {
     if let Some(params) = frame.get("params").filter(|p| p.is_object()) {
         return params.clone();
@@ -701,18 +831,24 @@ impl ExtensionUi {
     /// editor (TS `#dialogActive` gates editor input).
     #[must_use]
     pub fn wants_focus(&self) -> bool {
-        self.active.is_some()
+        self.active.is_some() && !self.hidden
     }
 
     /// Handle a key event while a dialog is active. Answers are sent through
     /// `port.extension_ui_response`; `Esc` aborts the active dialog
     /// (`{"cancelled": true}`) and promotes the next queued one.
     pub fn handle_key(&mut self, key: KeyEvent, port: &impl RuntimePort) -> bool {
+        self.handle_key_at(key, port, Instant::now())
+    }
+
+    /// [`Self::handle_key`] at `now` (the approval dialog's arming clock).
+    pub fn handle_key_at(&mut self, key: KeyEvent, port: &impl RuntimePort, now: Instant) -> bool {
         let Some(dialog) = self.active.as_mut() else {
             return false;
         };
         let id = dialog.id.clone();
         let outcome = match &mut dialog.kind {
+            DialogKind::Approval(approval) => approval.handle_key(key, &self.keys, now),
             DialogKind::Confirm { .. } => Self::key_confirm(&mut dialog.kind, key),
             DialogKind::Input { .. } | DialogKind::Editor { .. } => Self::key_text(dialog, key),
             DialogKind::Select { .. } => Self::key_select(dialog, key),
@@ -838,14 +974,15 @@ impl ExtensionUi {
             questions,
             answers,
             current,
-            cursor,
+            cursors,
             checked,
             custom,
         } = &mut dialog.kind
         else {
             return KeyResult::Consumed;
         };
-        let Some(question) = questions.get(*current).cloned() else {
+        let q = *current;
+        let Some(question) = questions.get(q).cloned() else {
             return KeyResult::Cancel; // malformed ask: release the caller
         };
 
@@ -857,14 +994,24 @@ impl ExtensionUi {
                     KeyResult::Consumed
                 }
                 KeyCode::Enter => {
-                    let answer = AskAnswer {
-                        id: question.id.clone(),
+                    let text = buffer.trim().to_owned();
+                    *custom = None;
+                    if text.is_empty() {
+                        // TS: an empty custom answer unselects the Other row.
+                        if answers[q]
+                            .as_ref()
+                            .is_some_and(|a| a.custom_input.is_some())
+                        {
+                            answers[q] = None;
+                        }
+                        return KeyResult::Consumed;
+                    }
+                    answers[q] = Some(AskAnswer {
+                        id: question.id,
                         selected_options: Vec::new(),
-                        custom_input: Some(buffer.trim().to_owned()),
-                    };
-                    Self::ask_advance(
-                        &question, answer, questions, answers, current, cursor, checked, custom,
-                    )
+                        custom_input: Some(text),
+                    });
+                    Self::ask_next(questions, answers, current)
                 }
                 KeyCode::Backspace => {
                     buffer.pop();
@@ -878,96 +1025,104 @@ impl ExtensionUi {
             };
         }
 
-        let labels = question.display_labels();
-        let rows = labels.len() + 1;
+        let options = question.options.len();
+        let last = questions.len() - 1;
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
-            KeyCode::Esc => KeyResult::Cancel,
+            KeyCode::Esc => return KeyResult::Cancel,
+            // Tab / Shift+Tab / ← / → open the previous or next question.
+            KeyCode::Tab if shift => *current = q.saturating_sub(1),
+            KeyCode::BackTab | KeyCode::Left => *current = q.saturating_sub(1),
+            KeyCode::Tab | KeyCode::Right => *current = (q + 1).min(last),
+            // ↑/↓ walk the rows and cross into the neighbouring question.
             KeyCode::Up | KeyCode::Char('k') => {
-                *cursor = cursor.saturating_sub(1).min(rows - 1);
-                KeyResult::Consumed
+                if cursors[q] > 0 {
+                    cursors[q] -= 1;
+                } else if q > 0 {
+                    *current = q - 1;
+                    cursors[q - 1] = questions[q - 1].options.len();
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                *cursor = (*cursor + 1).min(rows - 1);
-                KeyResult::Consumed
+                if cursors[q] < options {
+                    cursors[q] += 1;
+                } else if q < last {
+                    *current = q + 1;
+                    cursors[q + 1] = 0;
+                }
             }
             KeyCode::Char(' ') if question.multi => {
-                if *cursor < labels.len() {
-                    if let Some(pos) = checked.iter().position(|i| *i == *cursor) {
-                        checked.remove(pos);
+                let row = cursors[q];
+                if row < options {
+                    if let Some(pos) = checked[q].iter().position(|i| *i == row) {
+                        checked[q].remove(pos);
                     } else {
-                        checked.push(*cursor);
+                        checked[q].push(row);
                     }
                 }
-                KeyResult::Consumed
             }
             KeyCode::Enter => {
+                let row = cursors[q];
                 if question.multi {
-                    if *cursor == labels.len() {
-                        // "✓ Done selecting": commit the checked options.
-                        let selected = checked
+                    if row < options {
+                        return KeyResult::Consumed; // in multi, only space toggles
+                    }
+                    // "✓ Done selecting": commit the checked options, in option order.
+                    let mut picked = checked[q].clone();
+                    picked.sort_unstable();
+                    answers[q] = Some(AskAnswer {
+                        id: question.id.clone(),
+                        selected_options: picked
                             .iter()
                             .filter_map(|i| question.options.get(*i).map(|o| o.label.clone()))
-                            .collect();
-                        let answer = AskAnswer {
-                            id: question.id.clone(),
-                            selected_options: selected,
-                            custom_input: None,
-                        };
-                        Self::ask_advance(
-                            &question, answer, questions, answers, current, cursor, checked, custom,
-                        )
-                    } else {
-                        KeyResult::Consumed // in multi, only space toggles
-                    }
-                } else if *cursor == labels.len() {
-                    *custom = Some(String::new());
-                    KeyResult::Consumed
-                } else {
-                    let answer = AskAnswer {
-                        id: question.id.clone(),
-                        // The submitted label is the original option label; the
-                        // " (Recommended)" suffix is display-only.
-                        selected_options: vec![question.options[*cursor].label.clone()],
+                            .collect(),
                         custom_input: None,
-                    };
-                    Self::ask_advance(
-                        &question, answer, questions, answers, current, cursor, checked, custom,
-                    )
+                    });
+                    return Self::ask_next(questions, answers, current);
                 }
+                if row == options {
+                    // The Other row re-opens with the previous custom answer.
+                    *custom = Some(
+                        answers[q]
+                            .as_ref()
+                            .and_then(|a| a.custom_input.clone())
+                            .unwrap_or_default(),
+                    );
+                    return KeyResult::Consumed;
+                }
+                answers[q] = Some(AskAnswer {
+                    id: question.id.clone(),
+                    // The submitted label is the original option label; the
+                    // " (Recommended)" suffix is display-only.
+                    selected_options: vec![question.options[row].label.clone()],
+                    custom_input: None,
+                });
+                return Self::ask_next(questions, answers, current);
             }
-            _ => KeyResult::Consumed,
+            _ => {}
         }
+        KeyResult::Consumed
     }
 
-    /// Record one answer and either advance to the next question or submit
-    /// the full `answers` array (validated by `tools/ask.rs` `parse_answers`).
-    #[allow(clippy::too_many_arguments)]
-    fn ask_advance(
-        question: &Question,
-        answer: AskAnswer,
+    /// After answering `current` (TS ask-dialog submit rule): open the next
+    /// question; past the last one, open the first unanswered question, or
+    /// submit the full `answers` array (validated by `tools/ask.rs`
+    /// `parse_answers`) once every question is answered.
+    fn ask_next(
         questions: &[Question],
-        answers: &mut Vec<Option<AskAnswer>>,
+        answers: &[Option<AskAnswer>],
         current: &mut usize,
-        cursor: &mut usize,
-        checked: &mut Vec<usize>,
-        custom: &mut Option<String>,
     ) -> KeyResult {
-        debug_assert_eq!(question.id, answer.id);
-        answers.push(Some(answer));
-        *checked = Vec::new();
-        *custom = None;
         if *current + 1 < questions.len() {
             *current += 1;
-            *cursor = 0;
-            *checked = questions
-                .get(*current)
-                .filter(|q| q.multi)
-                .map_or_else(Vec::new, |q| q.checked.clone());
-            KeyResult::Consumed
-        } else {
-            let payload: Vec<Value> = answers.iter().flatten().map(AskAnswer::to_json).collect();
-            KeyResult::Answer(serde_json::json!({"answers": payload}))
+            return KeyResult::Consumed;
         }
+        if let Some(open) = answers.iter().position(Option::is_none) {
+            *current = open;
+            return KeyResult::Consumed;
+        }
+        let payload: Vec<Value> = answers.iter().flatten().map(AskAnswer::to_json).collect();
+        KeyResult::Answer(serde_json::json!({"answers": payload}))
     }
 
     /// Render the active dialog as a centered bordered modal (TS
@@ -983,6 +1138,9 @@ impl ExtensionUi {
         let Some(dialog) = &self.active else {
             return;
         };
+        if self.hidden {
+            return;
+        }
         let fullscreen = self.wants_fullscreen();
         let popup = if fullscreen {
             area
@@ -1013,10 +1171,20 @@ impl ExtensionUi {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
         // The last inner row is the hint.
-        let lines = self.dialog_lines(theme, usize::from(inner.height.saturating_sub(1)));
+        let body_rows = usize::from(inner.height.saturating_sub(1));
+        let (lines, hint) = if let DialogKind::Approval(approval) = &dialog.kind {
+            let width = usize::from(inner.width);
+            let (lines, overflows) = approval.lines(theme, width, body_rows);
+            (lines, approval.hint(&self.keys, theme, overflows, width))
+        } else {
+            (
+                self.dialog_lines(theme, body_rows),
+                self.dialog_hint().to_owned(),
+            )
+        };
         frame.render_widget(Paragraph::new(lines), inner);
         let hint = Paragraph::new(Span::styled(
-            self.dialog_hint(),
+            hint,
             ratatui::style::Style::default().fg(theme.color("text_muted")),
         ));
         let hint_area = ratatui::layout::Rect {
@@ -1033,11 +1201,20 @@ impl ExtensionUi {
             return String::new();
         };
         let raw = match &dialog.kind {
+            // TS titles a multi-question form `Ask · n of N answered`.
+            DialogKind::Ask {
+                questions, answers, ..
+            } if questions.len() > 1 => format!(
+                "Ask · {} of {} answered",
+                answers.iter().flatten().count(),
+                questions.len()
+            ),
             DialogKind::Ask {
                 questions, current, ..
             } => questions
                 .get(*current)
                 .map_or_else(|| "Question".to_string(), |q| q.text.clone()),
+            DialogKind::Approval(approval) => approval.title.clone(),
             DialogKind::Select { title, .. }
             | DialogKind::Confirm { title, .. }
             | DialogKind::Input { title, .. }
@@ -1064,12 +1241,19 @@ impl ExtensionUi {
             }) => match (
                 custom.is_some(),
                 questions.get(*current).is_some_and(|q| q.multi),
+                questions.len() > 1,
             ) {
-                (true, _) => "type your answer  ·  enter submit  ·  esc back",
-                (_, true) => "space toggle  ·  enter done  ·  esc cancel",
-                _ => "↑/↓ navigate  ·  enter select  ·  esc cancel",
+                (true, _, _) => "type your answer  ·  enter submit  ·  esc back",
+                (_, true, true) => {
+                    "space toggle  ·  enter done  ·  tab/shift+tab question  ·  esc cancel"
+                }
+                (_, true, false) => "space toggle  ·  enter done  ·  esc cancel",
+                (_, false, true) => {
+                    "↑/↓ navigate  ·  enter select  ·  tab/shift+tab question  ·  esc cancel"
+                }
+                (_, false, false) => "↑/↓ navigate  ·  enter select  ·  esc cancel",
             },
-            None => "",
+            Some(DialogKind::Approval(_)) | None => "",
         }
     }
 
@@ -1085,6 +1269,8 @@ impl ExtensionUi {
         let text = Style::default().fg(theme.color("text"));
         let mut lines: Vec<Line<'static>> = Vec::new();
         match &dialog.kind {
+            // Drawn by `render` through `ApprovalDialog::lines` (needs the width).
+            DialogKind::Approval(_) => {}
             DialogKind::Confirm { message, .. } => {
                 for line in message.lines() {
                     lines.push(Line::styled(line.to_string(), text));
@@ -1174,57 +1360,109 @@ impl ExtensionUi {
             }
             DialogKind::Ask {
                 questions,
+                answers,
                 current,
-                cursor,
+                cursors,
                 checked,
                 custom,
-                ..
             } => {
-                if let Some(question) = questions.get(*current) {
-                    if let Some(header) = &question.header {
-                        lines.push(Line::styled(header.clone(), accent));
-                    }
-                    for (i, label) in question.display_labels().iter().enumerate() {
-                        let marker = if i == *cursor {
-                            theme.glyph("prompt")
-                        } else {
-                            " "
-                        };
-                        let mark = if question.multi && checked.contains(&i) {
-                            "[x]"
-                        } else {
-                            ""
-                        };
-                        let style = if i == *cursor { accent } else { text };
-                        lines.push(Line::styled(format!("{marker} {mark}{label}"), style));
-                        if let Some(description) =
-                            question.options.get(i).and_then(|o| o.description.as_ref())
-                        {
-                            lines.push(Line::styled(format!("    {description}"), muted));
+                let Some(question) = questions.get(*current) else {
+                    return lines;
+                };
+                let answer = answers.get(*current).and_then(Option::as_ref);
+                let cursor = cursors.get(*current).copied().unwrap_or(0);
+                let success = Style::default().fg(theme.color("success"));
+                if questions.len() > 1 {
+                    // Every question's state at a glance (TS folded questions):
+                    // ✓ answered, ▸ open, ○ unanswered.
+                    let mut strip: Vec<Span<'static>> = Vec::new();
+                    for (i, q) in questions.iter().enumerate() {
+                        if i > 0 {
+                            strip.push(Span::styled("  ", muted));
                         }
+                        let name: String = q
+                            .header
+                            .as_deref()
+                            .unwrap_or(&q.text)
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .chars()
+                            .take(18)
+                            .collect();
+                        let (mark, style) = if i == *current {
+                            (theme.symbol("nav.expand"), accent)
+                        } else if answers.get(i).is_some_and(Option::is_some) {
+                            (theme.glyph("success"), success)
+                        } else {
+                            (theme.symbol("radio.unselected"), muted)
+                        };
+                        strip.push(Span::styled(format!("{mark} {name}"), style));
                     }
-                    let extra = if question.multi {
-                        DONE_SELECTING_LABEL
+                    lines.push(Line::from(strip));
+                    lines.push(Line::default());
+                }
+                // TS: the optional header, then the question (the title holds
+                // the question of a one-question form).
+                if let Some(header) = &question.header {
+                    lines.push(Line::styled(header.clone(), muted));
+                }
+                if questions.len() > 1 {
+                    lines.push(Line::styled(
+                        question.text.lines().next().unwrap_or_default().to_owned(),
+                        accent.add_modifier(ratatui::style::Modifier::BOLD),
+                    ));
+                }
+                let picked = |i: usize| {
+                    if question.multi {
+                        checked.get(*current).is_some_and(|c| c.contains(&i))
                     } else {
-                        OTHER_OPTION_LABEL
-                    };
-                    let extra_row = question.options.len();
-                    let marker = if *cursor == extra_row {
+                        answer.is_some_and(|a| {
+                            a.selected_options
+                                .iter()
+                                .any(|s| *s == question.options[i].label)
+                        })
+                    }
+                };
+                for (i, label) in question.display_labels().iter().enumerate() {
+                    let marker = if i == cursor {
                         theme.glyph("prompt")
                     } else {
                         " "
                     };
-                    let style = if *cursor == extra_row { accent } else { muted };
-                    lines.push(Line::styled(format!("{marker} {extra}"), style));
-                    if let Some(buffer) = custom {
-                        lines.push(Line::styled(format!("▸ {buffer}▏"), text));
+                    let mark = match (question.multi, picked(i)) {
+                        (true, true) => theme.symbol("checkbox.checked"),
+                        (true, false) => theme.symbol("checkbox.unchecked"),
+                        (false, true) => theme.symbol("radio.selected"),
+                        (false, false) => theme.symbol("radio.unselected"),
+                    };
+                    let style = if i == cursor { accent } else { text };
+                    lines.push(Line::styled(format!("{marker} {mark} {label}"), style));
+                    if let Some(description) =
+                        question.options.get(i).and_then(|o| o.description.as_ref())
+                    {
+                        lines.push(Line::styled(format!("      {description}"), muted));
                     }
-                    if questions.len() > 1 {
-                        lines.push(Line::styled(
-                            format!("question {}/{}", *current + 1, questions.len()),
-                            muted,
-                        ));
+                }
+                let extra = if question.multi {
+                    DONE_SELECTING_LABEL.to_owned()
+                } else {
+                    // The Other row previews a given custom answer (TS).
+                    match answer.and_then(|a| a.custom_input.as_deref()) {
+                        Some(given) => format!("{OTHER_OPTION_LABEL}: \"{given}\""),
+                        None => OTHER_OPTION_LABEL.to_owned(),
                     }
+                };
+                let extra_row = question.options.len();
+                let marker = if cursor == extra_row {
+                    theme.glyph("prompt")
+                } else {
+                    " "
+                };
+                let style = if cursor == extra_row { accent } else { muted };
+                lines.push(Line::styled(format!("{marker} {extra}"), style));
+                if let Some(buffer) = custom {
+                    lines.push(Line::styled(format!("▸ {buffer}▏"), text));
                 }
             }
         }
@@ -1311,6 +1549,199 @@ mod tests {
         assert!(log[0].starts_with("extension_ui_response(sel-2, "));
         assert!(log[0].contains(r#""cancelled":true"#));
         assert!(!log[0].contains(r#""timedOut":true"#));
+    }
+
+    fn approval_frame(title: &str) -> Value {
+        json!({"type":"extension_ui_request","id":"ap","method":"select","kind":"approval",
+               "title": title, "options":["Approve","Deny"]})
+    }
+
+    #[test]
+    fn approval_dialog_shows_details_and_answers_with_the_choice_label() {
+        let mut ui = ExtensionUi::new();
+        ui.push(&approval_frame(
+            "Allow tool: bash\nReason: Critical pattern detected\nCommand: rm -rf build",
+        ));
+        let screen = snapshot(&ui).join("\n");
+        assert!(screen.contains("Allow tool: bash"), "{screen}");
+        assert!(
+            screen.contains("Reason: Critical pattern detected"),
+            "{screen}"
+        );
+        assert!(screen.contains("Command: rm -rf build"), "{screen}");
+        assert!(
+            screen.contains("❯ Approve"),
+            "Approve starts highlighted: {screen}"
+        );
+        assert!(screen.contains("deny"), "{screen}");
+        let port = FakePort::default();
+        ui.handle_key(key(KeyCode::Down), &port);
+        ui.handle_key(key(KeyCode::Enter), &port);
+        assert!(port.log.lock()[0].contains(r#""value":"Deny""#));
+        assert!(!ui.is_active());
+    }
+
+    #[test]
+    fn approval_enter_approves_and_esc_denies() {
+        let mut ui = ExtensionUi::new();
+        ui.push(&approval_frame("Allow tool: write\nPath: a.txt"));
+        let port = FakePort::default();
+        ui.handle_key(key(KeyCode::Enter), &port);
+        assert!(port.log.lock()[0].contains(r#""value":"Approve""#));
+        ui.push(&approval_frame("Allow tool: write\nPath: b.txt"));
+        let port = FakePort::default();
+        ui.handle_key(key(KeyCode::Esc), &port);
+        let log = port.log.lock();
+        assert!(log[0].contains(r#""value":"Deny""#), "esc denies: {log:?}");
+    }
+
+    #[test]
+    fn approve_chord_arms_after_the_dialog_appears() {
+        let mut ui = ExtensionUi::new();
+        let shown = Instant::now();
+        ui.push(&approval_frame("Allow tool: write\nPath: a.txt"));
+        let port = FakePort::default();
+        // Ctrl+Q is also the follow-up chord: pressed as the prompt pops up
+        // it must not approve.
+        let chord = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(ui.handle_key_at(chord, &port, shown));
+        assert!(port.log.lock().is_empty());
+        assert!(ui.is_active());
+        ui.handle_key_at(chord, &port, shown + approval::APPROVE_ARM * 2);
+        assert!(port.log.lock()[0].contains(r#""value":"Approve""#));
+    }
+
+    #[test]
+    fn approval_details_cap_and_scroll() {
+        let rows: Vec<String> = (1..=20).map(|i| format!("line {i:02}")).collect();
+        let mut ui = ExtensionUi::new();
+        ui.push(&approval_frame(&format!(
+            "Allow tool: write\nPath: a.txt\nContent:\n{}",
+            rows.join("\n")
+        )));
+        let screen = snapshot(&ui).join("\n");
+        assert!(
+            screen.contains("line 01") && !screen.contains("line 20"),
+            "{screen}"
+        );
+        assert!(screen.contains("scroll"), "{screen}");
+        let port = FakePort::default();
+        for _ in 0..4 {
+            ui.handle_key(key(KeyCode::PageDown), &port);
+        }
+        let screen = snapshot(&ui).join("\n");
+        assert!(
+            screen.contains("line 20") && !screen.contains("line 01"),
+            "{screen}"
+        );
+        assert!(screen.contains("Approve"), "choices stay in view: {screen}");
+        assert!(port.log.lock().is_empty(), "scrolling never answers");
+    }
+
+    #[test]
+    fn approval_hint_keeps_approve_deny_and_scroll_when_narrow() {
+        let dialog = approval::ApprovalDialog::new(
+            &json!({"title": "Allow tool: bash\nCommand: ls"}),
+            vec!["Approve".into(), "Deny".into()],
+            Instant::now(),
+        );
+        let keys = KeybindingsManager::defaults();
+        let theme = Theme::default();
+        let wide = dialog.hint(&keys, &theme, true, 200);
+        assert!(
+            wide.contains("choose") && wide.contains("details"),
+            "{wide}"
+        );
+        let narrow = dialog.hint(&keys, &theme, true, 50);
+        for kept in ["approve", "deny", "scroll"] {
+            assert!(narrow.contains(kept), "{kept} in {narrow}");
+        }
+        assert!(
+            !narrow.contains("choose") && !narrow.contains("select"),
+            "{narrow}"
+        );
+    }
+
+    #[test]
+    fn approval_expand_swaps_in_the_full_prompt() {
+        let mut ui = ExtensionUi::new();
+        let mut frame = approval_frame("Allow tool: bash\nCommand: echo head[…12ch elided…]");
+        frame["fullPrompt"] = json!("Allow tool: bash\nCommand: echo head-and-the-tail");
+        ui.push(&frame);
+        let screen = snapshot(&ui).join("\n");
+        assert!(
+            screen.contains("elided") && screen.contains("details"),
+            "{screen}"
+        );
+        assert!(ui.toggle_details());
+        let screen = snapshot(&ui).join("\n");
+        assert!(screen.contains("echo head-and-the-tail"), "{screen}");
+        assert!(
+            !screen.contains("elided") && screen.contains("less"),
+            "{screen}"
+        );
+        // Not an approval prompt: the host keeps the key.
+        let mut plain = ExtensionUi::new();
+        plain.push(
+            &json!({"type":"extension_ui_request","id":"s","method":"select",
+            "title":"Pick","options":["A"]}),
+        );
+        assert!(!plain.toggle_details());
+    }
+
+    #[test]
+    fn approve_answers_confirm_and_approval_select_but_not_other_selects() {
+        let mut ui = ExtensionUi::new();
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"c","method":"confirm",
+            "title":"Run bash?","message":"rm -rf build"}),
+        );
+        let port = FakePort::default();
+        assert!(ui.approve_active(&port));
+        assert!(port.log.lock()[0].contains(r#""value":true"#));
+        assert!(!ui.is_active());
+
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"s","method":"select",
+            "title":"Tool approval","options":["Deny","Allow once","Allow always"]}),
+        );
+        let port = FakePort::default();
+        assert!(ui.approve_active(&port));
+        assert!(port.log.lock()[0].contains(r#""value":"Allow once""#));
+
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"p","method":"select",
+            "title":"Pick","options":["Basic","Pro"]}),
+        );
+        let port = FakePort::default();
+        assert!(!ui.approve_active(&port));
+        assert!(port.log.lock().is_empty());
+        assert!(ui.is_active());
+    }
+
+    #[test]
+    fn hide_keeps_the_dialog_pending_and_releases_focus() {
+        let mut ui = ExtensionUi::new();
+        assert_eq!(ui.toggle_hidden(), None);
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"c","method":"confirm",
+            "title":"Switch?","message":"m"}),
+        );
+        assert_eq!(ui.toggle_hidden(), Some(true));
+        assert!(!ui.wants_focus());
+        assert!(ui.is_hidden());
+        assert_eq!(ui.pending_len(), 1);
+        assert_eq!(ui.toggle_hidden(), Some(false));
+        assert!(ui.wants_focus());
+        // Answering resets the hidden flag for the next dialog.
+        ui.toggle_hidden();
+        let port = FakePort::default();
+        assert!(ui.approve_active(&port));
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"d","method":"confirm",
+            "title":"Again?","message":"m"}),
+        );
+        assert!(ui.wants_focus());
     }
 
     #[test]
@@ -1457,8 +1888,15 @@ mod tests {
                 "options":[{"label":"a"},{"label":"b"},{"label":"c"}]}]}),
         );
         let rows = snapshot(&ui).join("\n");
-        assert!(rows.contains("[x]a") && rows.contains("[x]c"), "{rows}");
-        assert!(!rows.contains("[x]b"), "{rows}");
+        let (on, off) = (
+            Theme::default().symbol("checkbox.checked"),
+            Theme::default().symbol("checkbox.unchecked"),
+        );
+        assert!(
+            rows.contains(&format!("{on} a")) && rows.contains(&format!("{on} c")),
+            "{rows}"
+        );
+        assert!(rows.contains(&format!("{off} b")), "{rows}");
         let port = FakePort::default();
         // The defaults are already checked, so committing without toggling
         // sends them back unchanged.
@@ -1525,6 +1963,129 @@ mod tests {
             "options":[{"label":"a"},{"label":"b"},{"label":"c"}]}))
         .expect("question parses");
         assert_eq!(question.checked, vec![2, 0, 1]);
+    }
+
+    fn three_questions() -> Value {
+        json!({"type":"extension_ui_request","id":"ask-3","method":"ask",
+            "questions":[
+                {"id":"db","question":"Storage?","header":"Storage",
+                 "options":[{"label":"SQLite"},{"label":"Postgres"}]},
+                {"id":"cache","question":"Cache size?","recommended":1,
+                 "options":[{"label":"64 MB"},{"label":"128 MB"}]},
+                {"id":"region","question":"Region?",
+                 "options":[{"label":"eu"},{"label":"us"}]}]})
+    }
+
+    #[test]
+    fn ask_tab_skips_ahead_and_the_form_returns_to_unanswered_questions() {
+        let mut ui = ExtensionUi::new();
+        ui.push(&three_questions());
+        let port = FakePort::default();
+        ui.handle_key(key(KeyCode::Enter), &port); // db: SQLite → opens cache
+        ui.handle_key(key(KeyCode::Tab), &port); // skip to region
+        ui.handle_key(key(KeyCode::Down), &port);
+        ui.handle_key(key(KeyCode::Enter), &port); // region: us, cache still open
+        assert!(
+            port.log.lock().is_empty(),
+            "not submitted with an unanswered question"
+        );
+        let screen = snapshot(&ui).join("\n");
+        assert!(screen.contains("Ask · 2 of 3 answered"), "{screen}");
+        assert!(
+            screen.contains("Cache size?"),
+            "the first unanswered question opens: {screen}"
+        );
+        // Its cursor starts on the recommended option.
+        assert!(screen.contains("❯ ○ 128 MB (Recommended)"), "{screen}");
+        ui.handle_key(key(KeyCode::Enter), &port); // cache: 128 MB → region (answered)
+        ui.handle_key(key(KeyCode::Enter), &port); // confirm region → submit
+        let log = port.log.lock();
+        assert_eq!(log.len(), 1, "{log:?}");
+        let order: Vec<usize> = [r#""id":"db""#, r#""id":"cache""#, r#""id":"region""#]
+            .iter()
+            .map(|id| log[0].find(id).expect(id))
+            .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "question order: {log:?}"
+        );
+        assert!(
+            log[0].contains(r#""selectedOptions":["128 MB"]"#),
+            "{log:?}"
+        );
+        assert!(log[0].contains(r#""selectedOptions":["us"]"#), "{log:?}");
+    }
+
+    #[test]
+    fn ask_shift_tab_revisits_and_changes_an_answer() {
+        let mut ui = ExtensionUi::new();
+        ui.push(&three_questions());
+        let port = FakePort::default();
+        ui.handle_key(key(KeyCode::Enter), &port); // db: SQLite
+        ui.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &port);
+        let radio = Theme::default().symbol("radio.selected");
+        let screen = snapshot(&ui).join("\n");
+        assert!(
+            screen.contains(&format!("❯ {radio} SQLite")),
+            "the given answer is marked: {screen}"
+        );
+        ui.handle_key(key(KeyCode::Down), &port);
+        ui.handle_key(key(KeyCode::Enter), &port); // db: Postgres → cache
+        let screen = snapshot(&ui).join("\n");
+        assert!(
+            screen.contains("✓ Storage"),
+            "answered questions fold to ✓: {screen}"
+        );
+        ui.handle_key(key(KeyCode::Enter), &port); // cache: 128 MB → region
+        ui.handle_key(key(KeyCode::Enter), &port); // region: eu → submit
+        let log = port.log.lock();
+        assert!(
+            log[0].contains(r#""selectedOptions":["Postgres"]"#),
+            "{log:?}"
+        );
+        assert!(!log[0].contains("SQLite"), "{log:?}");
+    }
+
+    #[test]
+    fn ask_arrows_cross_question_boundaries() {
+        let mut ui = ExtensionUi::new();
+        ui.push(&three_questions());
+        let port = FakePort::default();
+        ui.handle_key(key(KeyCode::Right), &port); // open cache (cursor on 128 MB)
+        ui.handle_key(key(KeyCode::Up), &port);
+        ui.handle_key(key(KeyCode::Up), &port); // past the top → db's Other row
+        let screen = snapshot(&ui).join("\n");
+        assert!(
+            screen.contains("Storage?") && screen.contains("❯ Other"),
+            "{screen}"
+        );
+        ui.handle_key(key(KeyCode::Down), &port); // past the bottom → cache's first row
+        let screen = snapshot(&ui).join("\n");
+        assert!(screen.contains("❯ ○ 64 MB"), "{screen}");
+    }
+
+    #[test]
+    fn ask_other_reopens_with_the_previous_custom_answer() {
+        let mut ui = ExtensionUi::new();
+        ui.push(&three_questions());
+        let port = FakePort::default();
+        for _ in 0..2 {
+            ui.handle_key(key(KeyCode::Down), &port);
+        }
+        ui.handle_key(key(KeyCode::Enter), &port); // Other
+        for c in "duckdb".chars() {
+            ui.handle_key(key(KeyCode::Char(c)), &port);
+        }
+        ui.handle_key(key(KeyCode::Enter), &port); // db custom → cache
+        ui.handle_key(key(KeyCode::Left), &port);
+        let screen = snapshot(&ui).join("\n");
+        assert!(
+            screen.contains("Other (type your own): \"duckdb\""),
+            "{screen}"
+        );
+        ui.handle_key(key(KeyCode::Enter), &port);
+        let screen = snapshot(&ui).join("\n");
+        assert!(screen.contains("▸ duckdb"), "prefilled: {screen}");
     }
 
     #[test]

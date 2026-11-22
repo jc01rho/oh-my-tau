@@ -111,8 +111,6 @@ pub static APP_KEYBINDINGS: &[(&str, KeybindingDef)] = &[
     ("app.session.rename", def(&["ctrl+r"], "Rename session")),
     ("app.session.delete", def(&["ctrl+d"], "Delete session")),
     ("app.session.deleteNoninvasive", def(&["ctrl+backspace"], "Delete session (non-invasive)")),
-    ("app.tree.foldOrUp", def(&["ctrl+left", "alt+left"], "Fold or move up")),
-    ("app.tree.unfoldOrDown", def(&["ctrl+right", "alt+right"], "Unfold or move down")),
     ("app.session.pin", def(&["alt+k"], "Pin the selected session in the resume picker")),
     ("app.session.unpin", def(&["alt+shift+k"], "Unpin the selected session in the resume picker")),
     ("app.tree.previousBranch", def(&[], "Jump to the previous branch in /tree")),
@@ -300,6 +298,13 @@ impl KeybindingsManager {
         Self::new(UserBindings::new())
     }
 
+    /// The resolved keys of `id` formatted for a hint (TS `getDisplayString`:
+    /// alternatives joined by `/`, empty when unbound).
+    #[must_use]
+    pub fn display_string(&self, id: &str, theme: &crate::theme::Theme) -> String {
+        format_key_hints(&self.get_keys(id), theme)
+    }
+
     /// Hot-path probe: `canonical` was computed once for the current
     /// keystroke (TS `matchesCanonical`).
     #[must_use]
@@ -365,6 +370,121 @@ impl KeybindingsManager {
             })
             .collect()
     }
+}
+
+impl Default for KeybindingsManager {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+/// Modifier → (generic symbol, macOS symbol), in display order (TS
+/// `MODIFIER_SYMBOLS`: ⌃⌥⇧⌘ as macOS menus list them).
+const MODIFIER_SYMBOLS: [(&str, &str, &str); 4] = [
+    ("ctrl", "key.ctrl", "key.ctrlMac"),
+    ("alt", "key.alt", "key.altMac"),
+    ("shift", "key.shift", "key.shift"),
+    ("super", "key.super", "key.superMac"),
+];
+
+/// Keys drawn with a theme `key.*` symbol (TS `KEY_SYMBOLS`).
+fn key_symbol(base: &str) -> Option<&'static str> {
+    Some(match base {
+        "esc" | "escape" => "key.esc",
+        "enter" | "return" => "key.enter",
+        "space" => "key.space",
+        "tab" => "key.tab",
+        "backspace" => "key.backspace",
+        "delete" => "key.delete",
+        "up" => "key.up",
+        "down" => "key.down",
+        "left" => "key.left",
+        "right" => "key.right",
+        _ => return None,
+    })
+}
+
+/// Keys without a keycap glyph, spelled out in every preset (TS `KEY_WORDS`).
+fn key_word(base: &str) -> Option<&'static str> {
+    Some(match base {
+        "home" => "Home",
+        "end" => "End",
+        "pageup" => "PgUp",
+        "pagedown" => "PgDn",
+        "insert" => "Ins",
+        _ => return None,
+    })
+}
+
+/// Format one key with glyphs from `symbol` (TS `formatKey`): modifiers in
+/// canonical order (`shift+ctrl+p` → `⌃⇧P` on macOS, `Ctrl+⇧P` elsewhere),
+/// a glyph modifier followed by the preset's `key.joiner`, a word modifier by
+/// `+`; a bare letter stays lowercase, a letter in a chord is capitalized,
+/// other keys are capitalized (`f5` → `F5`).
+#[must_use]
+pub fn format_key_with(key: &str, mac: bool, symbol: impl Fn(&str) -> &'static str) -> String {
+    // A trailing `+` is the plus key itself (`+`, `ctrl++`), not a separator.
+    let (mods, base): (Vec<&str>, &str) = if let Some(head) = key.strip_suffix('+') {
+        let mut parts: Vec<&str> = head.split('+').collect();
+        parts.pop();
+        (parts, "+")
+    } else {
+        let mut parts: Vec<&str> = key.split('+').collect();
+        let base = parts.pop().unwrap_or_default();
+        (parts, base)
+    };
+    let has_letter = |s: &str| s.chars().any(|c| c.is_ascii_alphanumeric());
+    let mut out = String::new();
+    for (name, generic, mac_symbol) in MODIFIER_SYMBOLS {
+        if !mods.contains(&name) {
+            continue;
+        }
+        let label = symbol(if mac { mac_symbol } else { generic });
+        out.push_str(label);
+        out.push_str(if has_letter(label) {
+            "+"
+        } else {
+            symbol("key.joiner")
+        });
+    }
+    let lower = base.to_lowercase();
+    if let Some((_, generic, mac_symbol)) = MODIFIER_SYMBOLS.iter().find(|(n, _, _)| *n == lower) {
+        out.push_str(symbol(if mac { mac_symbol } else { generic }));
+    } else if let Some(glyph) = key_symbol(&lower) {
+        out.push_str(symbol(glyph));
+    } else if let Some(word) = key_word(&lower) {
+        out.push_str(word);
+    } else if base.chars().count() == 1 {
+        if mods.is_empty() {
+            out.push_str(base);
+        } else {
+            out.push_str(&base.to_uppercase());
+        }
+    } else {
+        let mut chars = base.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
+/// Format one key for display through `theme`'s `key.*` symbols on the host
+/// platform (TS `formatKeyHint`).
+#[must_use]
+pub fn format_key_hint(key: &str, theme: &crate::theme::Theme) -> String {
+    format_key_with(key, cfg!(target_os = "macos"), |s| theme.symbol(s))
+}
+
+/// Alternative keys as one slash-separated hint (TS `formatKeyHints`:
+/// `["f5", "alt+r"]` → `F5/⌥R`).
+#[must_use]
+pub fn format_key_hints(keys: &[String], theme: &crate::theme::Theme) -> String {
+    keys.iter()
+        .map(|k| format_key_hint(k, theme))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Convert a crossterm event into a canonical key id (`parseKey(data)` +
@@ -484,9 +604,15 @@ mod tests {
     // ---- canonical ids (TS canonicalKeyId) -------------------------------
 
     #[test]
-    fn declares_every_upstream_id_plus_two_tree_extras() {
+    fn declares_exactly_the_upstream_ids() {
+        // 32 `tui.*` + 47 `app.*`: the Rust-only `app.tree.foldOrUp` /
+        // `unfoldOrDown` pair is retired like upstream (tui CHANGELOG), since
+        // `/tree` is always fully expanded and branch jumps own those moves.
         let all = keybindings();
-        assert_eq!(all.len(), 81);
+        assert_eq!(all.len(), 79);
+        assert!(!all
+            .iter()
+            .any(|(id, _)| id.ends_with("foldOrUp") || id.ends_with("unfoldOrDown")));
         let km = KeybindingsManager::defaults();
         for (id, keys) in [
             ("app.approval.approve", &["ctrl+enter", "ctrl+q"][..]),
@@ -504,6 +630,33 @@ mod tests {
             assert_eq!(km.get_keys(id), keys, "{id}");
         }
         assert!(km.matches_event(&ev(KeyCode::Char('k'), CtMods::ALT), "app.session.pin"));
+    }
+
+    #[test]
+    fn key_hints_follow_ts_format_key() {
+        let theme = crate::theme::Theme::default(); // unicode preset
+        let fmt = |key: &str, mac: bool| format_key_with(key, mac, |s| theme.symbol(s));
+        assert_eq!(fmt("ctrl+shift+c", true), "⌃⇧C");
+        assert_eq!(fmt("shift+ctrl+c", false), "Ctrl+⇧C");
+        assert_eq!(fmt("escape", false), "⎋");
+        assert_eq!(fmt("alt+up", true), "⌥↑");
+        assert_eq!(fmt("alt+up", false), "Alt+↑");
+        assert_eq!(fmt("q", false), "q");
+        assert_eq!(fmt("alt+q", false), "Alt+Q");
+        assert_eq!(fmt("f5", false), "F5");
+        assert_eq!(fmt("pageUp", false), "PgUp");
+        assert_eq!(fmt("ctrl++", false), "Ctrl++");
+        assert_eq!(fmt("shift", true), "⇧");
+        let km = KeybindingsManager::defaults();
+        assert_eq!(
+            km.display_string("app.clipboard.pasteTextRaw", &theme),
+            format!(
+                "{}/{}",
+                fmt("ctrl+shift+v", cfg!(target_os = "macos")),
+                fmt("alt+shift+v", cfg!(target_os = "macos"))
+            )
+        );
+        assert_eq!(km.display_string("app.session.tree", &theme), "");
     }
 
     #[test]
