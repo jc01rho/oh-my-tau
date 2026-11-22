@@ -18,17 +18,24 @@
 //!   client's prompt draft (TS rpc `set_editor_text`).
 //! - `{"type":"clipboard_copy","text":…}` — `/copy` picked `text`; the client puts it on its
 //!   clipboard (omp-rs extension; the TUI host copies itself).
+//!
+//! Host tools (`set_host_tools`, TS `RpcHostToolBridge`): each registered tool runs on the client.
+//! A call emits `host_tool_call {id, toolCallId, toolName, arguments}`; the client streams
+//! `host_tool_update {id, partialResult}` and finishes with `host_tool_result {id, result,
+//! isError?}`. An abort emits `host_tool_cancel {id, targetId}`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 
 use anyhow::Result;
-use pa_agent::abort::AbortController;
+use pa_agent::abort::{AbortController, AbortSignal};
 use pa_agent::agent::{Agent, QueueMode};
-use pa_agent::types::ThinkingLevel;
+use pa_agent::types::{
+    AgentTool, AgentToolResult, AgentToolUpdateCallback, ThinkingLevel, ToolResultContent,
+};
 use pa_agent::BoxFut;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -277,12 +284,21 @@ fn goal(cmd: &Value) -> CmdResult {
     }
 }
 
-/// `set_host_tools`: omp's validation, then the no-bridge answer (an empty set is a plain success).
-fn set_host_tools(cmd: &Value) -> CmdResult {
+/// A client-side tool registered through `set_host_tools` (TS `RpcHostToolDefinition`).
+struct HostToolDef {
+    name: String,
+    label: String,
+    description: String,
+    parameters: Value,
+}
+
+/// omp's `normalizeHostToolDefinitions`: validated, trimmed definitions.
+fn host_tool_definitions(cmd: &Value) -> Result<Vec<HostToolDef>, CmdError> {
     let tools = cmd
         .get("tools")
         .and_then(Value::as_array)
         .ok_or_else(|| CmdError::new("tools must be an array"))?;
+    let mut defs = Vec::with_capacity(tools.len());
     for (index, tool) in tools.iter().enumerate() {
         let name = tool
             .get("name")
@@ -293,25 +309,210 @@ fn set_host_tools(cmd: &Value) -> CmdResult {
                 "Host tool at index {index} must provide a non-empty name"
             )));
         }
-        if tool
+        let description = tool
             .get("description")
             .and_then(Value::as_str)
-            .is_none_or(|d| d.trim().is_empty())
-        {
+            .map_or("", str::trim);
+        if description.is_empty() {
             return Err(CmdError::new(format!(
                 "Host tool \"{name}\" must provide a non-empty description"
             )));
         }
-        if !tool.get("parameters").is_some_and(Value::is_object) {
+        let Some(parameters) = tool.get("parameters").filter(|p| p.is_object()) else {
             return Err(CmdError::new(format!(
                 "Host tool \"{name}\" must provide a JSON Schema object"
             )));
+        };
+        let label = tool
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .unwrap_or(name);
+        defs.push(HostToolDef {
+            name: name.to_string(),
+            label: label.to_string(),
+            description: description.to_string(),
+            parameters: parameters.clone(),
+        });
+    }
+    Ok(defs)
+}
+
+/// Host tool calls awaiting `host_tool_update` / `host_tool_result` frames (call id -> sink).
+static PENDING_HOST_TOOLS: LazyLock<Mutex<HashMap<String, mpsc::UnboundedSender<Value>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Names installed by the last `set_host_tools` (replaced wholesale by the next one).
+static HOST_TOOL_NAMES: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// Set once the client disconnected: active and later host tool calls fail (TS `close`).
+static HOST_TOOLS_CLOSED: AtomicBool = AtomicBool::new(false);
+static HOST_FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
+
+const HOST_TOOLS_DISCONNECTED: &str =
+    "RPC client disconnected before host tool execution completed";
+
+/// Where a host tool emits its `host_tool_call` / `host_tool_cancel` frames.
+type FrameSink = Arc<dyn Fn(Value) + Send + Sync>;
+
+fn host_frame_id(prefix: &str) -> String {
+    format!(
+        "{prefix}-{}",
+        HOST_FRAME_SEQ.fetch_add(1, Ordering::SeqCst) + 1
+    )
+}
+
+/// Route an inbound `host_tool_result` / `host_tool_update` frame to its pending call.
+/// `false` for unknown ids or frames whose result lacks a `content` array (TS type guards).
+fn route_host_tool_frame(frame: Value) -> bool {
+    let is_result = frame.get("type") == Some(&json!("host_tool_result"));
+    let key = if is_result { "result" } else { "partialResult" };
+    if !frame
+        .get(key)
+        .and_then(|r| r.get("content"))
+        .is_some_and(Value::is_array)
+    {
+        return false;
+    }
+    let Some(id) = frame.get("id").and_then(Value::as_str).map(str::to_string) else {
+        return false;
+    };
+    let tx = {
+        let mut pending = lock(&PENDING_HOST_TOOLS);
+        if is_result {
+            pending.remove(&id)
+        } else {
+            pending.get(&id).cloned()
+        }
+    };
+    tx.is_some_and(|tx| tx.send(frame).is_ok())
+}
+
+/// Fail every in-flight and future host tool call (stdin closed).
+fn close_host_tools() {
+    HOST_TOOLS_CLOSED.store(true, Ordering::SeqCst);
+    lock(&PENDING_HOST_TOOLS).clear();
+}
+
+/// A `set_host_tools` tool proxied to the RPC client (TS `RpcHostToolAdapter`).
+struct HostTool {
+    def: HostToolDef,
+    sink: FrameSink,
+}
+
+impl HostTool {
+    async fn call(
+        &self,
+        tool_call_id: String,
+        arguments: Value,
+        signal: AbortSignal,
+        on_update: AgentToolUpdateCallback,
+    ) -> Result<AgentToolResult> {
+        let name = &self.def.name;
+        if signal.is_aborted() {
+            anyhow::bail!("Host tool \"{name}\" was aborted");
+        }
+        if HOST_TOOLS_CLOSED.load(Ordering::SeqCst) {
+            anyhow::bail!(HOST_TOOLS_DISCONNECTED);
+        }
+        let id = host_frame_id("host-tool");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        lock(&PENDING_HOST_TOOLS).insert(id.clone(), tx);
+        (self.sink)(
+            json!({"type": "host_tool_call", "id": id, "toolCallId": tool_call_id,
+                           "toolName": name, "arguments": arguments}),
+        );
+        loop {
+            let frame = tokio::select! {
+                biased;
+                () = signal.aborted() => {
+                    lock(&PENDING_HOST_TOOLS).remove(&id);
+                    (self.sink)(json!({"type": "host_tool_cancel",
+                                       "id": host_frame_id("host-tool-cancel"), "targetId": id}));
+                    anyhow::bail!("Host tool \"{name}\" was aborted");
+                }
+                frame = rx.recv() => frame,
+            };
+            let Some(mut frame) = frame else {
+                anyhow::bail!(HOST_TOOLS_DISCONNECTED);
+            };
+            if frame.get("type") == Some(&json!("host_tool_update")) {
+                if let Ok(partial) = serde_json::from_value(frame["partialResult"].take()) {
+                    on_update(partial);
+                }
+                continue;
+            }
+            let result: AgentToolResult = serde_json::from_value(frame["result"].take())?;
+            if frame.get("isError") == Some(&json!(true)) {
+                let text = result
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        ToolResultContent::Text(t) => Some(t.text.as_str()),
+                        ToolResultContent::Image(_) => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let text = text.trim();
+                anyhow::bail!(if text.is_empty() {
+                    "Host tool execution failed".to_string()
+                } else {
+                    text.to_string()
+                });
+            }
+            return Ok(result);
         }
     }
-    if tools.is_empty() {
-        return ok(json!({"toolNames": []}));
+}
+
+impl AgentTool for HostTool {
+    fn name(&self) -> &str {
+        &self.def.name
     }
-    Err(unsupported("Host tools"))
+    fn description(&self) -> &str {
+        &self.def.description
+    }
+    fn parameters(&self) -> &Value {
+        &self.def.parameters
+    }
+    fn label(&self) -> &str {
+        &self.def.label
+    }
+    fn execute(
+        self: Arc<Self>,
+        tool_call_id: String,
+        params: Value,
+        signal: AbortSignal,
+        on_update: AgentToolUpdateCallback,
+    ) -> BoxFut<'static, Result<AgentToolResult>> {
+        Box::pin(async move { self.call(tool_call_id, params, signal, on_update).await })
+    }
+}
+
+/// `set_host_tools`: replace the previous host tool set (a same-named tool is shadowed).
+async fn set_host_tools(rt: &Arc<Runtime>, cmd: &Value) -> CmdResult {
+    let defs = host_tool_definitions(cmd)?;
+    let names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
+    let weak = Arc::downgrade(rt);
+    let sink: FrameSink = Arc::new(move |frame| {
+        if let Some(rt) = weak.upgrade() {
+            rt.send(frame);
+        }
+    });
+    let mut tools = rt.agent.tools().await;
+    {
+        let mut installed = lock(&HOST_TOOL_NAMES);
+        tools.retain(|t| !installed.iter().chain(&names).any(|n| n == t.name()));
+        installed.clone_from(&names);
+    }
+    tools.extend(defs.into_iter().map(|def| {
+        Arc::new(HostTool {
+            def,
+            sink: sink.clone(),
+        }) as Arc<dyn AgentTool>
+    }));
+    crate::tools::republish_dyn_tools(&tools);
+    rt.agent.set_tools(tools).await;
+    ok(json!({"toolNames": names}))
 }
 
 /// `set_host_uri_schemes`: omp's scheme validation, then the no-bridge answer.
@@ -337,6 +538,12 @@ fn set_host_uri_schemes(cmd: &Value) -> CmdResult {
             let shown = raw.get("scheme").and_then(Value::as_str).unwrap_or("");
             return Err(CmdError::new(format!(
                 "Host URI scheme contains invalid characters: {shown}"
+            )));
+        }
+        // Built-in schemes (`xd`, `local`, `skill`, ...) are OMP-owned (TS `isBuiltin`).
+        if crate::tools::url_registry().get(&scheme).is_some() {
+            return Err(CmdError::new(format!(
+                "Host URI scheme is reserved by OMP: {scheme}://"
             )));
         }
     }
@@ -821,7 +1028,7 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
             rt.set(|s| s.todo_phases(phases));
             ok(json!({"todoPhases": rt.set(|s| s.todo_phases_value())}))
         }
-        "set_host_tools" => set_host_tools(cmd),
+        "set_host_tools" => set_host_tools(rt, cmd).await,
         "set_host_uri_schemes" => set_host_uri_schemes(cmd),
         "set_subagent_subscription" => {
             let level = str_field(cmd, "level")?;
@@ -1482,11 +1689,12 @@ pub async fn run_with(
             }
             continue;
         }
-        if matches!(
-            kind,
-            "host_tool_result" | "host_tool_update" | "host_uri_result"
-        ) {
-            continue; // side-channel frames for sub-protocols this server never opens
+        if matches!(kind, "host_tool_result" | "host_tool_update") {
+            route_host_tool_frame(cmd);
+            continue;
+        }
+        if kind == "host_uri_result" {
+            continue; // this server never opens `host_uri_request`s (no host URI bridge)
         }
         if kind == "bash" {
             let rt = rt.clone();
@@ -1508,7 +1716,9 @@ pub async fn run_with(
         }
         let _ = cmd_tx.send(cmd);
     }
-    // stdin closed: let accepted work finish and flush its frames.
+    // stdin closed: let accepted work finish and flush its frames. Host tool calls can no
+    // longer be answered, so fail them instead of waiting on the agent forever.
+    close_host_tools();
     drop(cmd_tx);
     let _ = worker.await;
     while background.join_next().await.is_some() {}
@@ -1652,30 +1862,41 @@ mod tests {
             "Unknown goal op: nope"
         );
         assert_eq!(
-            set_host_tools(
+            host_tool_definitions(
                 &json!({"tools": [{"name": " ", "description": "d", "parameters": {}}]})
             )
-            .unwrap_err()
+            .err()
+            .unwrap()
             .message,
             "Host tool at index 0 must provide a non-empty name"
         );
         assert_eq!(
-            set_host_tools(
+            host_tool_definitions(
                 &json!({"tools": [{"name": "t", "description": "d", "parameters": []}]})
             )
-            .unwrap_err()
+            .err()
+            .unwrap()
             .message,
             "Host tool \"t\" must provide a JSON Schema object"
         );
-        assert_eq!(
-            set_host_tools(&json!({"tools": []})).unwrap(),
-            Some(json!({"toolNames": []}))
-        );
+        assert!(host_tool_definitions(&json!({"tools": []}))
+            .unwrap()
+            .is_empty());
         assert_eq!(
             set_host_uri_schemes(&json!({"schemes": [{"scheme": "1bad"}]}))
                 .unwrap_err()
                 .message,
             "Host URI scheme contains invalid characters: 1bad"
+        );
+        assert_eq!(
+            set_host_uri_schemes(&json!({"schemes": [{"scheme": " XD "}]}))
+                .unwrap_err()
+                .message,
+            "Host URI scheme is reserved by OMP: xd://"
+        );
+        assert_eq!(
+            set_host_uri_schemes(&json!({"schemes": []})).unwrap(),
+            Some(json!({"schemes": []}))
         );
         assert_eq!(
             subagent_messages(&json!({})).unwrap_err().message,
@@ -1694,6 +1915,191 @@ mod tests {
                 .message,
             "cursor must be an integer UTF-16 offset within text"
         );
+    }
+}
+
+#[cfg(test)]
+mod host_tool_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Pending calls and the closed flag are process-global; serialize the tests.
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    const WAIT: Duration = Duration::from_secs(5);
+
+    struct Harness {
+        tool: Arc<HostTool>,
+        frames: mpsc::UnboundedReceiver<Value>,
+        updates: Arc<Mutex<Vec<AgentToolResult>>>,
+    }
+
+    impl Harness {
+        fn new(name: &str) -> Self {
+            let (tx, frames) = mpsc::unbounded_channel();
+            let def = host_tool_definitions(&json!({"tools": [{"name": name,
+                "description": " d ", "parameters": {"type": "object"}}]}))
+            .unwrap()
+            .pop()
+            .unwrap();
+            let sink: FrameSink = Arc::new(move |frame| {
+                tx.send(frame).unwrap();
+            });
+            Self {
+                tool: Arc::new(HostTool { def, sink }),
+                frames,
+                updates: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn start(&self, signal: AbortSignal) -> tokio::task::JoinHandle<Result<AgentToolResult>> {
+            let updates = self.updates.clone();
+            let on_update: AgentToolUpdateCallback = Arc::new(move |r| lock(&updates).push(r));
+            let tool = self.tool.clone();
+            tokio::spawn(tool.execute("c1".into(), json!({"message": "hi"}), signal, on_update))
+        }
+
+        async fn next_frame(&mut self) -> Value {
+            tokio::time::timeout(WAIT, self.frames.recv())
+                .await
+                .expect("frame")
+                .expect("open")
+        }
+    }
+
+    async fn settle(
+        call: tokio::task::JoinHandle<Result<AgentToolResult>>,
+    ) -> Result<AgentToolResult> {
+        tokio::time::timeout(WAIT, call)
+            .await
+            .expect("settled")
+            .unwrap()
+    }
+
+    #[test]
+    fn definitions_are_trimmed_and_labelled() {
+        let defs = host_tool_definitions(&json!({"tools": [
+            {"name": " echo ", "description": " says ", "parameters": {}},
+            {"name": "b", "label": " Bee ", "description": "d", "parameters": {}}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            (defs[0].name.as_str(), defs[0].label.as_str()),
+            ("echo", "echo")
+        );
+        assert_eq!(defs[0].description, "says");
+        assert_eq!(defs[1].label, "Bee");
+    }
+
+    #[tokio::test]
+    async fn call_streams_updates_then_resolves_with_the_result() {
+        let _guard = TEST_LOCK.lock().await;
+        let mut h = Harness::new("echo");
+        let call = h.start(AbortSignal::never());
+        let frame = h.next_frame().await;
+        assert_eq!(frame["type"], "host_tool_call");
+        assert_eq!(frame["toolCallId"], "c1");
+        assert_eq!(frame["toolName"], "echo");
+        assert_eq!(frame["arguments"], json!({"message": "hi"}));
+        let id = frame["id"].as_str().unwrap().to_string();
+        assert!(route_host_tool_frame(
+            json!({"type": "host_tool_update", "id": id,
+            "partialResult": {"content": [{"type": "text", "text": "half"}]}})
+        ));
+        assert!(route_host_tool_frame(
+            json!({"type": "host_tool_result", "id": id,
+            "result": {"content": [{"type": "text", "text": "hi"}], "details": {"n": 1}}})
+        ));
+        let result = settle(call).await.unwrap();
+        assert_eq!(result.content, vec![ToolResultContent::text("hi")]);
+        assert_eq!(result.details, json!({"n": 1}));
+        assert_eq!(
+            lock(&h.updates).clone(),
+            vec![AgentToolResult::text("half")]
+        );
+        // Settled: a late result for the same id has nowhere to go.
+        assert!(!route_host_tool_frame(
+            json!({"type": "host_tool_result", "id": id, "result": {"content": []}})
+        ));
+    }
+
+    #[tokio::test]
+    async fn error_results_reject_with_their_text() {
+        let _guard = TEST_LOCK.lock().await;
+        let mut h = Harness::new("fail");
+        let call = h.start(AbortSignal::never());
+        let id = h.next_frame().await["id"].as_str().unwrap().to_string();
+        assert!(route_host_tool_frame(
+            json!({"type": "host_tool_result", "id": id, "isError": true,
+            "result": {"content": [{"type": "text", "text": " boom "}]}})
+        ));
+        assert_eq!(settle(call).await.unwrap_err().to_string(), "boom");
+
+        let call = h.start(AbortSignal::never());
+        let id = h.next_frame().await["id"].as_str().unwrap().to_string();
+        assert!(route_host_tool_frame(
+            json!({"type": "host_tool_result", "id": id, "isError": true,
+            "result": {"content": []}})
+        ));
+        assert_eq!(
+            settle(call).await.unwrap_err().to_string(),
+            "Host tool execution failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_or_unknown_frames_are_not_routed() {
+        let _guard = TEST_LOCK.lock().await;
+        let mut h = Harness::new("echo");
+        let call = h.start(AbortSignal::never());
+        let id = h.next_frame().await["id"].as_str().unwrap().to_string();
+        assert!(!route_host_tool_frame(
+            json!({"type": "host_tool_result", "id": id, "result": {"content": "x"}})
+        ));
+        assert!(!route_host_tool_frame(
+            json!({"type": "host_tool_result", "id": "nope", "result": {"content": []}})
+        ));
+        assert!(route_host_tool_frame(
+            json!({"type": "host_tool_result", "id": id, "result": {"content": []}})
+        ));
+        assert_eq!(settle(call).await.unwrap().content, vec![]);
+    }
+
+    #[tokio::test]
+    async fn abort_emits_host_tool_cancel_and_rejects() {
+        let _guard = TEST_LOCK.lock().await;
+        let mut h = Harness::new("slow");
+        let ctl = AbortController::new();
+        let call = h.start(ctl.signal());
+        let id = h.next_frame().await["id"].as_str().unwrap().to_string();
+        ctl.abort();
+        let cancel = h.next_frame().await;
+        assert_eq!(cancel["type"], "host_tool_cancel");
+        assert_eq!(cancel["targetId"], json!(id));
+        assert_ne!(cancel["id"], json!(id));
+        assert_eq!(
+            settle(call).await.unwrap_err().to_string(),
+            "Host tool \"slow\" was aborted"
+        );
+        assert!(!route_host_tool_frame(
+            json!({"type": "host_tool_result", "id": id, "result": {"content": []}})
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_fails_pending_and_later_calls() {
+        let _guard = TEST_LOCK.lock().await;
+        let mut h = Harness::new("echo");
+        let call = h.start(AbortSignal::never());
+        h.next_frame().await;
+        close_host_tools();
+        let pending = settle(call).await.unwrap_err().to_string();
+        let later = settle(h.start(AbortSignal::never()))
+            .await
+            .unwrap_err()
+            .to_string();
+        HOST_TOOLS_CLOSED.store(false, Ordering::SeqCst);
+        assert_eq!(pending, HOST_TOOLS_DISCONNECTED);
+        assert_eq!(later, HOST_TOOLS_DISCONNECTED);
     }
 }
 
