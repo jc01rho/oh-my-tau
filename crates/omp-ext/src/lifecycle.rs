@@ -70,6 +70,14 @@ pub enum CompactionAction {
     Snapcompact,
 }
 
+/// Why `resources_discover` fires (`ResourcesDiscoverEvent["reason"]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourcesDiscoverReason {
+    Startup,
+    Reload,
+}
+
 /// Tool approval mode (`tools/approval.ts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ApprovalMode {
@@ -302,6 +310,13 @@ pub enum LifecycleEvent {
         exclude_from_context: bool,
         cwd: String,
     },
+    /// Extensions may contribute skill/prompt/theme paths (`ResourcesDiscoverEvent`); emitted after
+    /// `session_start` at startup and on every extension reload.
+    #[serde(rename = "resources_discover", rename_all = "camelCase")]
+    ResourcesDiscover {
+        cwd: String,
+        reason: ResourcesDiscoverReason,
+    },
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -438,6 +453,53 @@ impl UserShellOutcome {
             result: v.get("result").cloned(),
         }
     }
+}
+
+/// One path a `resources_discover` handler contributed, tagged with the extension that returned it
+/// (the host's `{path, extensionPath}` entries).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveredPath {
+    /// Path as the handler spelled it (absolute, `~`-relative or cwd-relative).
+    pub path: String,
+    /// `ext.path` of the contributing extension.
+    pub extension_path: String,
+}
+
+/// Outcome of `resources_discover`: every handler's paths, in load order (`ExtensionRunner.emitResourcesDiscover`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourcesDiscoverOutcome {
+    pub skill_paths: Vec<DiscoveredPath>,
+    pub prompt_paths: Vec<DiscoveredPath>,
+    pub theme_paths: Vec<DiscoveredPath>,
+}
+
+impl ResourcesDiscoverOutcome {
+    fn from_value(v: &Value) -> Self {
+        Self {
+            skill_paths: discovered_paths(v, "skillPaths"),
+            prompt_paths: discovered_paths(v, "promptPaths"),
+            theme_paths: discovered_paths(v, "themePaths"),
+        }
+    }
+}
+
+/// `[{path, extensionPath}]` under `key`; entries without a string `path` are dropped (TS pushes
+/// only the paths it was handed, so a malformed entry has no usable path either).
+fn discovered_paths(v: &Value, key: &str) -> Vec<DiscoveredPath> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    Some(DiscoveredPath {
+                        path: e.get("path").and_then(Value::as_str)?.to_owned(),
+                        extension_path: str_of(e, "extensionPath").unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 macro_rules! notify_helpers {
@@ -619,6 +681,22 @@ impl ExtHost {
             source,
         };
         Ok(InputOutcome::from_value(
+            &self.emit_event(&ev, ctx).await?.result,
+        ))
+    }
+
+    /// `resources_discover`: the skill/prompt/theme paths every handler contributed.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_resources_discover(
+        &self,
+        cwd: String,
+        reason: ResourcesDiscoverReason,
+        ctx: Option<Value>,
+    ) -> Result<ResourcesDiscoverOutcome> {
+        let ev = LifecycleEvent::ResourcesDiscover { cwd, reason };
+        Ok(ResourcesDiscoverOutcome::from_value(
             &self.emit_event(&ev, ctx).await?.result,
         ))
     }

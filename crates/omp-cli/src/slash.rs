@@ -170,10 +170,36 @@ fn command_dirs(cwd: &Path) -> Vec<(PathBuf, &'static str)> {
     dirs
 }
 
+/// Prompt-template paths extensions contributed through `resources_discover` (absolute, discovery
+/// order): a markdown file becomes one command, a directory contributes its `*.md` children.
+static EXTENSION_PROMPT_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Replace the extension-contributed prompt-template paths (a reload re-sends the whole set).
+pub fn set_extension_prompt_paths(paths: Vec<PathBuf>) {
+    *EXTENSION_PROMPT_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = paths;
+}
+
+/// The extension-contributed prompt-template paths currently registered.
+#[must_use]
+pub fn extension_prompt_paths() -> Vec<PathBuf> {
+    EXTENSION_PROMPT_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// Load markdown commands from the user and project `commands/` directories
 /// (TS `loadSlashCommands` builtin provider; frontmatter description /
 /// `argument-hint` honored, first body line as fallback description).
 pub fn load_file_commands(cwd: &Path) -> Vec<FileCommand> {
+    load_file_commands_with(cwd, &extension_prompt_paths())
+}
+
+/// [`load_file_commands`] with explicit extension-contributed prompt paths (the registry, or a
+/// test's own list). Those load last, so a user or project command of the same name wins.
+pub fn load_file_commands_with(cwd: &Path, extension_paths: &[PathBuf]) -> Vec<FileCommand> {
     let mut out: Vec<FileCommand> = Vec::new();
     for (dir, _level) in command_dirs(cwd) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -186,46 +212,71 @@ pub fn load_file_commands(cwd: &Path) -> Vec<FileCommand> {
             .collect();
         paths.sort();
         for path in paths {
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if out.iter().any(|c| c.name == name) {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let (frontmatter, body) = split_frontmatter(&content);
-            let mut description = String::new();
-            let mut argument_hint = None;
-            for line in frontmatter.lines() {
-                if let Some(v) = line.strip_prefix("description:") {
-                    description = v.trim().to_string();
-                }
-                if let Some(v) = line
-                    .strip_prefix("argument-hint:")
-                    .or_else(|| line.strip_prefix("argumentHint:"))
-                {
-                    argument_hint = Some(v.trim().to_string());
+            if let Some(cmd) = load_command_file(&path) {
+                if !out.iter().any(|c| c.name == cmd.name) {
+                    out.push(cmd);
                 }
             }
-            if description.is_empty() {
-                if let Some(first) = body.lines().find(|l| !l.trim().is_empty()) {
-                    description = first.trim().chars().take(60).collect();
-                    if first.trim().chars().count() > 60 {
-                        description.push_str("...");
-                    }
+        }
+    }
+    for path in extension_paths {
+        let mut paths: Vec<PathBuf> = if path.is_dir() {
+            std::fs::read_dir(path)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![path.clone()]
+        };
+        paths.sort();
+        for path in paths {
+            if let Some(cmd) = load_command_file(&path) {
+                if !out.iter().any(|c| c.name == cmd.name) {
+                    out.push(cmd);
                 }
             }
-            out.push(FileCommand {
-                name: name.to_string(),
-                description,
-                argument_hint,
-                content: body.to_string(),
-            });
         }
     }
     out
+}
+
+/// One `commands/*.md` file: `name` from the file stem, frontmatter description / `argument-hint`.
+fn load_command_file(path: &Path) -> Option<FileCommand> {
+    let name = path.file_stem().and_then(|s| s.to_str())?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let (frontmatter, body) = split_frontmatter(&content);
+    let mut description = String::new();
+    let mut argument_hint = None;
+    for line in frontmatter.lines() {
+        if let Some(v) = line.strip_prefix("description:") {
+            description = v.trim().to_string();
+        }
+        if let Some(v) = line
+            .strip_prefix("argument-hint:")
+            .or_else(|| line.strip_prefix("argumentHint:"))
+        {
+            argument_hint = Some(v.trim().to_string());
+        }
+    }
+    if description.is_empty() {
+        if let Some(first) = body.lines().find(|l| !l.trim().is_empty()) {
+            description = first.trim().chars().take(60).collect();
+            if first.trim().chars().count() > 60 {
+                description.push_str("...");
+            }
+        }
+    }
+    Some(FileCommand {
+        name: name.to_string(),
+        description,
+        argument_hint,
+        content: body.to_string(),
+    })
 }
 
 /// Minimal frontmatter split: `---` fenced block at the top of the file.
@@ -3185,7 +3236,45 @@ mod tests {
     }
 
     #[test]
+    fn extension_prompt_paths_load_as_commands() {
+        let dir = std::env::temp_dir().join(format!("omp-slash-ext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cwd = dir.join("project");
+        std::fs::create_dir_all(cwd.join(".omp/commands")).unwrap();
+        std::fs::write(cwd.join(".omp/commands/greet.md"), "Project greet\n").unwrap();
+        let prompts = dir.join("ext/prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("greet.md"), "Extension greet\n").unwrap();
+        std::fs::write(
+            prompts.join("summarize.md"),
+            "---\ndescription: Summarize\nargument-hint: <text>\n---\nSummarize $ARGUMENTS\n",
+        )
+        .unwrap();
+        let single = dir.join("ext/one-more.md");
+        std::fs::write(&single, "One more prompt\n").unwrap();
+
+        let cmds = load_file_commands_with(&cwd, &[prompts, single]);
+        let by_name = |name: &str| cmds.iter().find(|c| c.name == name).cloned();
+        // A project command of the same name shadows the extension prompt.
+        assert_eq!(by_name("greet").unwrap().content.trim(), "Project greet");
+        let summarize = by_name("summarize").expect("extension prompt directory entry");
+        assert_eq!(summarize.description, "Summarize");
+        assert_eq!(summarize.argument_hint.as_deref(), Some("<text>"));
+        assert_eq!(summarize.content.trim(), "Summarize $ARGUMENTS");
+        assert_eq!(
+            by_name("one-more").unwrap().description,
+            "One more prompt",
+            "a single prompt file contributes one command"
+        );
+        // No extension paths: only the project command remains.
+        let plain = load_file_commands_with(&cwd, &[]);
+        assert!(plain.iter().all(|c| c.name != "summarize"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn file_commands_load_and_expand() {
+        let _guard = crate::sysprompt::extension_registry_lock().blocking_lock();
         let dir = std::env::temp_dir().join(format!("omp-slash-test-{}", std::process::id()));
         let cmds = dir.join(".omp/commands");
         std::fs::create_dir_all(&cmds).unwrap();

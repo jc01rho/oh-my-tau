@@ -17,9 +17,10 @@ use ratatui::style::Color;
 
 pub mod loader;
 pub use loader::{
-    appearance_from_colorfgbg, appearance_of, available_themes, custom_themes_dir,
-    detect_appearance, load, load_configured, theme_name_for, Appearance, LoadedTheme, Rgb,
-    ThemeError, ThemeInfo,
+    appearance_from_colorfgbg, appearance_of, available_themes, available_themes_with,
+    custom_themes_dir, detect_appearance, extension_theme_paths, load, load_configured,
+    load_loaded_with, load_with_paths, set_extension_theme_paths, theme_name_for, Appearance,
+    LoadedTheme, Rgb, ThemeError, ThemeInfo,
 };
 
 /// One resolvable style value.

@@ -20,7 +20,10 @@ use pa_agent::types::{
 use serde_json::{json, Value};
 
 use omp_ext::hooks::ExtHooks;
-use omp_ext::lifecycle::{self, InputSource, LifecycleEvent, SwitchReason};
+use omp_ext::lifecycle::{
+    self, DiscoveredPath, InputSource, LifecycleEvent, ResourcesDiscoverOutcome,
+    ResourcesDiscoverReason, SwitchReason,
+};
 use omp_ext::{ExtHost, HostConfig, HostMessage, ToolInfo};
 
 use crate::events::{message_value, ExtUpdateEncoder};
@@ -615,6 +618,53 @@ pub struct Extensions {
     deferred_agent_end: Arc<Mutex<Option<Vec<Value>>>>,
 }
 
+/// `resources_discover` round trip: emit (only when an extension subscribes, TS `hasHandlers`),
+/// then register every returned path with the loader that owns it. Extracted from
+/// [`Extensions::resources_discover`] so the fake-host tests can drive it.
+async fn discover_resources(host: &ExtHost, cwd: &Path, reason: ResourcesDiscoverReason) {
+    if !host.has_handlers("resources_discover") {
+        return;
+    }
+    let wire_cwd = cwd.to_string_lossy().into_owned();
+    match host.emit_resources_discover(wire_cwd, reason, None).await {
+        Ok(outcome) => apply_discovered_resources(&outcome, cwd),
+        Err(e) => eprintln!("omt: extension resources_discover: {e:#}"),
+    }
+}
+
+/// Register a `resources_discover` outcome with the loaders that own each kind of path: skills feed
+/// the system-prompt skill listing, prompt templates become file slash commands, themes join the
+/// theme loader's catalog (`ExtensionRunner.emitResourcesDiscover` shapes; the loader split is tau's).
+fn apply_discovered_resources(outcome: &ResourcesDiscoverOutcome, cwd: &Path) {
+    let resolve = |paths: &[DiscoveredPath]| -> Vec<PathBuf> {
+        paths
+            .iter()
+            .map(|p| resolve_discovered_path(&p.path, cwd))
+            .collect()
+    };
+    crate::sysprompt::set_extension_skill_paths(resolve(&outcome.skill_paths));
+    crate::rpc::slash::set_extension_prompt_paths(resolve(&outcome.prompt_paths));
+    omp_tui::theme::set_extension_theme_paths(resolve(&outcome.theme_paths));
+}
+
+/// Upstream `resolvePath`: `~` expands to the home directory, an absolute path stays as given,
+/// anything else resolves against the session cwd.
+fn resolve_discovered_path(raw: &str, cwd: &Path) -> PathBuf {
+    let expanded = if raw == "~" {
+        std::env::var_os("HOME").map_or_else(|| PathBuf::from(raw), PathBuf::from)
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map_or_else(|| PathBuf::from(raw), |home| PathBuf::from(home).join(rest))
+    } else {
+        PathBuf::from(raw)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    }
+}
+
 /// `session_before_compact` / `session_compact` emission around runtime compactions.
 struct CompactBridge {
     host: Arc<ExtHost>,
@@ -928,6 +978,15 @@ impl Extensions {
         emit_silent(self.host.emit_session_start(None).await);
     }
 
+    /// `resources_discover`: extensions contribute skill, prompt-template and theme paths. Emitted
+    /// at startup once the extensions are loaded (before the session's system prompt is assembled,
+    /// so contributed skills reach it) and again on every extension reload.
+    ///
+    /// Only emitted when an extension subscribes (`has_handlers`), like every other event.
+    pub async fn resources_discover(&self, reason: ResourcesDiscoverReason) {
+        discover_resources(&self.host, &self.cwd, reason).await;
+    }
+
     /// TS `before_agent_start` (agent-session `#promptAgent`, every mode): handlers may
     /// replace the system prompt and inject messages ahead of the prompt.
     ///
@@ -1136,6 +1195,10 @@ impl Extensions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         emit_silent(self.host.emit_session_start(None).await);
+        // A reload re-sends the whole discovered resource set (TS emits `resources_discover` on
+        // extension reload); the loaders keep only the newest set.
+        self.resources_discover(ResourcesDiscoverReason::Reload)
+            .await;
         if let Some(rt) = self
             .rt
             .lock()
@@ -2167,5 +2230,134 @@ mod tests {
         assert!(ExtMode::Tui.has_ui() && ExtMode::Rpc.has_ui());
         assert!(!ExtMode::Print.has_ui() && !ExtMode::Json.has_ui());
         assert_eq!(ExtMode::Tui.name(), "tui");
+    }
+
+    /// Answers every request with the `resources_discover` result read from `$PATHS` (one line) and
+    /// records each received request line in `$LOG`.
+    const DISCOVER_HOST: &str = concat!(
+        "while IFS= read -r line; do\n",
+        "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+        "  if [ -n \"$id\" ]; then\n",
+        "    printf '%s\\n' \"$line\" >> \"$LOG\"\n",
+        "    printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":%s,\"handlers\":[],\"errors\":[]}}\\n' \"$id\" \"$(cat \"$PATHS\")\"\n",
+        "  fi\n",
+        "done\n",
+    );
+
+    /// The wire event carries `{type, cwd, reason}`, and the returned paths reach the loaders that
+    /// own them (skills, prompt templates, themes); a reload replaces the whole set.
+    #[tokio::test]
+    async fn resources_discover_emits_and_applies_paths() {
+        let _guard = crate::sysprompt::extension_registry_lock().lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(cwd.join("skills/one")).unwrap();
+        std::fs::create_dir_all(cwd.join("prompts")).unwrap();
+        std::fs::create_dir_all(cwd.join("themes")).unwrap();
+        std::fs::write(
+            cwd.join("skills/one/SKILL.md"),
+            "---\nname: one\ndescription: From an extension.\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(cwd.join("prompts/hello.md"), "Say hello\n").unwrap();
+        std::fs::write(cwd.join("themes/extheme.json"), "{}").unwrap();
+
+        let payload = dir.path().join("payload.json");
+        let log = dir.path().join("events.log");
+        let write_payload = |v: &str| std::fs::write(&payload, v).unwrap();
+        write_payload(concat!(
+            r#"{"skillPaths":[{"path":"skills/one","extensionPath":"/ext"}],"#,
+            r#""promptPaths":[{"path":"prompts","extensionPath":"/ext"}],"#,
+            r#""themePaths":[{"path":"themes/extheme.json","extensionPath":"/ext"}]}"#,
+        ));
+        let host = sh_host(
+            dir.path(),
+            DISCOVER_HOST,
+            vec![
+                ("PATHS".into(), payload.display().to_string()),
+                ("LOG".into(), log.display().to_string()),
+            ],
+        )
+        .await;
+
+        discover_resources(&host, &cwd, ResourcesDiscoverReason::Startup).await;
+        assert_eq!(
+            crate::sysprompt::extension_skill_paths(),
+            vec![cwd.join("skills/one")]
+        );
+        assert_eq!(
+            crate::rpc::slash::extension_prompt_paths(),
+            vec![cwd.join("prompts")]
+        );
+        assert_eq!(
+            omp_tui::theme::extension_theme_paths(),
+            vec![cwd.join("themes/extheme.json")]
+        );
+        // The paths really reach each loader.
+        let empty_agent = dir.path().join("agent");
+        let skills = crate::sysprompt::load_skills(&empty_agent, &cwd, true);
+        assert_eq!(
+            skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["one"]
+        );
+        assert!(
+            crate::rpc::slash::load_file_commands(&cwd)
+                .iter()
+                .any(|c| c.name == "hello"),
+            "extension prompt template becomes a slash command"
+        );
+        assert!(
+            omp_tui::theme::available_themes()
+                .iter()
+                .any(|t| t.name == "extheme"),
+            "extension theme joins the catalog"
+        );
+
+        // A reload re-sends the whole set: the previous paths are dropped.
+        write_payload(r#"{"skillPaths":[{"path":"/elsewhere/skills","extensionPath":"/ext"}]}"#);
+        discover_resources(&host, &cwd, ResourcesDiscoverReason::Reload).await;
+        assert_eq!(
+            crate::sysprompt::extension_skill_paths(),
+            vec![PathBuf::from("/elsewhere/skills")]
+        );
+        assert!(crate::rpc::slash::extension_prompt_paths().is_empty());
+        assert!(omp_tui::theme::extension_theme_paths().is_empty());
+
+        // Wire shape: upstream `ResourcesDiscoverEvent` with the reason it fired for.
+        let events = std::fs::read_to_string(&log).unwrap();
+        let cwd_wire = cwd.to_string_lossy();
+        assert!(
+            events.contains(&format!(
+                r#"{{"type":"resources_discover","cwd":"{cwd_wire}","reason":"startup"}}"#
+            )),
+            "startup event: {events}"
+        );
+        assert!(
+            events.contains(r#""reason":"reload""#),
+            "reload event: {events}"
+        );
+
+        crate::sysprompt::set_extension_skill_paths(Vec::new());
+        host.shutdown().await.unwrap();
+    }
+
+    /// `resources_discover` paths resolve like upstream `resolvePath`: an absolute path stays,
+    /// anything else resolves against the session cwd, `~` expands to the home directory.
+    #[test]
+    fn discovered_paths_resolve_against_cwd() {
+        let cwd = Path::new("/work/project");
+        assert_eq!(
+            resolve_discovered_path("/abs/skills", cwd),
+            PathBuf::from("/abs/skills")
+        );
+        assert_eq!(
+            resolve_discovered_path("skills/a", cwd),
+            cwd.join("skills/a")
+        );
+        let home = std::env::var("HOME").expect("HOME");
+        assert_eq!(
+            resolve_discovered_path("~/ext/themes", cwd),
+            PathBuf::from(home).join("ext/themes")
+        );
     }
 }

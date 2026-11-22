@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Map, Value};
 
@@ -853,35 +853,84 @@ fn load_skills_dir(dir: &Path, skills: &mut Vec<Skill>) {
         if !path.is_dir() {
             continue;
         }
-        let file = path.join("SKILL.md");
-        let Ok(content) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        let (meta, _body) = parse_frontmatter(&content);
-        let name = meta.get("name").and_then(Value::as_str).map_or_else(
-            || entry.file_name().to_string_lossy().into_owned(),
-            Into::into,
-        );
-        let description = meta
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let hide = meta
-            .get("hide")
-            .and_then(Value::as_str)
-            .is_some_and(|v| v == "true");
-        skills.push(Skill {
-            name,
-            description,
-            hide,
-        });
+        if let Some(skill) = load_skill_dir(&path) {
+            skills.push(skill);
+        }
     }
+}
+
+/// One skill directory: `SKILL.md`'s frontmatter, `name` defaulting to the directory name.
+fn load_skill_dir(path: &Path) -> Option<Skill> {
+    let content = std::fs::read_to_string(path.join("SKILL.md")).ok()?;
+    let (meta, _body) = parse_frontmatter(&content);
+    let name = meta.get("name").and_then(Value::as_str).map_or_else(
+        || {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        },
+        Into::into,
+    );
+    let description = meta
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let hide = meta
+        .get("hide")
+        .and_then(Value::as_str)
+        .is_some_and(|v| v == "true");
+    Some(Skill {
+        name,
+        description,
+        hide,
+    })
+}
+
+/// Skill paths extensions contributed through `resources_discover` (absolute, discovery order).
+/// Each entry is a skill directory (`SKILL.md` inside) or a skills root whose immediate children
+/// hold `SKILL.md`, the same shapes `.omp/skills` accepts.
+static EXTENSION_SKILL_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Replace the extension-contributed skill paths (a reload re-sends the whole set).
+pub fn set_extension_skill_paths(paths: Vec<PathBuf>) {
+    *EXTENSION_SKILL_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = paths;
+}
+
+/// The extension-contributed skill paths currently registered.
+#[must_use]
+pub fn extension_skill_paths() -> Vec<PathBuf> {
+    EXTENSION_SKILL_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Test-only: these registries are process-global, so a test that writes them must not overlap one
+/// that reads them through [`load_skills`]/[`crate::rpc::slash::load_file_commands`]. Sync tests
+/// take it with `blocking_lock()`, async ones with `lock().await` (a std guard would be held across
+/// an await point).
+#[cfg(test)]
+pub(crate) fn extension_registry_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
 }
 
 /// All visible skills for the prompt (TS: `loadSkills` from the agent dir's
 /// `skills/`, `hide: true` dropped from the render).
 pub fn load_skills(agent: &Path, cwd: &Path, enabled: bool) -> Vec<Skill> {
+    load_skills_with(agent, cwd, enabled, &extension_skill_paths())
+}
+
+/// [`load_skills`] with explicit extension-contributed paths (the registry, or a test's own list).
+pub fn load_skills_with(
+    agent: &Path,
+    cwd: &Path,
+    enabled: bool,
+    extension_paths: &[PathBuf],
+) -> Vec<Skill> {
     if !enabled {
         return Vec::new();
     }
@@ -891,6 +940,16 @@ pub fn load_skills(agent: &Path, cwd: &Path, enabled: bool) -> Vec<Skill> {
         load_skills_dir(&dir.join(".omp/skills"), &mut skills);
     }
     load_skills_dir(&agent.join("skills"), &mut skills);
+    // Extension-contributed paths come last: a project or user skill of the same name wins.
+    for path in extension_paths {
+        if path.join("SKILL.md").is_file() {
+            if let Some(skill) = load_skill_dir(path) {
+                skills.push(skill);
+            }
+        } else {
+            load_skills_dir(path, &mut skills);
+        }
+    }
     skills.retain(|s| !s.hide);
     skills
 }
@@ -2113,6 +2172,7 @@ mod tests {
     /// true entries are dropped from the render.
     #[test]
     fn skills_respect_config_and_hide() {
+        let _guard = extension_registry_lock().blocking_lock();
         let root = tempdir("skills");
         let agent = root.join("agent");
         let sk = agent.join("skills/demo");
@@ -2132,9 +2192,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `resources_discover` skill paths: a skill directory and a skills root both load (in that
+    /// order, after the agent dir's skills), `hide: true` is dropped, and `enabled: false` still
+    /// suppresses everything.
+    #[test]
+    fn extension_skill_paths_load() {
+        let root = tempdir("ext-skills");
+        let agent = root.join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let single = root.join("ext/skills/one");
+        write(
+            &single.join("SKILL.md"),
+            "---\nname: one\ndescription: From an extension.\n---\nbody\n",
+        );
+        let skills_root = root.join("ext/more-skills");
+        write(
+            &skills_root.join("two/SKILL.md"),
+            "---\nname: two\ndescription: Second.\n---\nbody\n",
+        );
+        write(
+            &skills_root.join("hidden/SKILL.md"),
+            "---\nname: hidden\nhide: true\n---\nbody\n",
+        );
+        let paths = vec![single, skills_root];
+        let names: Vec<String> = load_skills_with(&agent, &root, true, &paths)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["one", "two"], "hidden skill dropped");
+        assert!(load_skills_with(&agent, &root, false, &paths).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `--tools <csv>` keeps only registered names, in the given order.
     #[test]
     fn tools_csv_restricts_surface() {
+        let _guard = extension_registry_lock().blocking_lock();
         let root = tempdir("tools");
         let agent = root.join("agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -2155,6 +2248,7 @@ mod tests {
     /// bundled prompt is used.
     #[test]
     fn compact_prompt_selection() {
+        let _guard = extension_registry_lock().blocking_lock();
         let root = tempdir("compact");
         let agent = root.join("agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -2177,6 +2271,7 @@ mod tests {
     /// template without the flag.
     #[test]
     fn compact_prompt_setting() {
+        let _guard = extension_registry_lock().blocking_lock();
         let root = tempdir("compact-setting");
         let agent = root.join("agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -2190,6 +2285,7 @@ mod tests {
     /// and `--append-system-prompt` lands at the end of the project block.
     #[test]
     fn flags_replace_and_append() {
+        let _guard = extension_registry_lock().blocking_lock();
         let root = tempdir("flags");
         let agent = root.join("agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -2279,6 +2375,7 @@ mod tests {
     /// `<domain-rules>`, and the scheme docs in the Internal URLs block.
     #[test]
     fn rules_and_internal_urls_render() {
+        let _guard = extension_registry_lock().blocking_lock();
         let root = tempdir("rulesrender");
         let repo = root.join("repo");
         let agent = root.join("agent");
@@ -2316,6 +2413,7 @@ mod tests {
     /// and subagent sessions drop AGENTS.md only.
     #[test]
     fn context_files_render_and_subagents_drop_agents_md() {
+        let _guard = extension_registry_lock().blocking_lock();
         let root = tempdir("ctxrender");
         let repo = root.join("repo");
         let cwd = repo.join("pkg");
