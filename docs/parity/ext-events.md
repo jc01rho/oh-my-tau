@@ -19,7 +19,7 @@ The migration plan counts 45 events (an older upstream snapshot). Upstream `pack
 | 8 | `session.compacting` | `CompactBridge` -> `emit_session_compacting` (`ext.rs`) | last result wins; `context`/`prompt` feed the summary, `preserveData` lands on the entry | emitted, result applied (6b) |
 | 9 | `cache_warming_decision` | `cache_warmer.rs` `step_at` -> `Extensions::cache_warming_decision` | last `action` wins over core proposal | emitted, override applied (6b); `compact` override ignored (no compaction bridge), replay method only, anthropic-messages only |
 | 10 | `session_compact` | `LifecycleEvent::SessionCompact` | observe | emitted |
-| 11 | `session_before_shutdown` | TUI/RPC close paths -> `emit_session_before_shutdown` | session_before_*: `cancel` keeps the session | emitted, result applied (6b) |
+| 11 | `session_before_shutdown` | TUI close paths (`/exit`, Ctrl+D, Ctrl+C twice) -> `Extensions::confirm_close` -> `emit_session_before_shutdown` | session_before_*: `cancel` keeps the session | emitted, result applied (6b) |
 | 12 | `session_shutdown` | `LifecycleEvent::SessionShutdown` | parallel, 2s budget, clears timers | emitted |
 | 13 | `session_before_tree` | `emit_session_before_tree` | session_before_* | emitted |
 | 14 | `session_tree` | `LifecycleEvent::SessionTree` | observe | emitted |
