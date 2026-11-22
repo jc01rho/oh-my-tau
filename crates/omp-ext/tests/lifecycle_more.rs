@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use omp_ext::lifecycle::{ApprovalMode, CompactionAction, CompactionReason, GoalModeState, LifecycleEvent, ModeStatus, PlanModeState, SessionModeState, SubagentInvocationKind};
+use omp_ext::lifecycle::{ApprovalMode, CompactingOutcome, CompactionAction, CompactionReason, GoalModeState, LifecycleEvent, ModeStatus, PlanModeState, SessionModeState, SubagentInvocationKind};
 use omp_ext::{ExtHost, HostConfig, HostMessage};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -317,6 +317,44 @@ async fn before_subagent_spawn_payload_and_result() {
         "the handler's model list replaces the spawn's patterns"
     );
     assert_eq!(out.note.as_deref(), Some("fixture route"));
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+
+async fn session_compacting_payload_and_result() {
+    if common::bun_missing("session_compacting_payload_and_result") {
+        return;
+    }
+    let host = loaded().await;
+    let mut rx = host.take_incoming().unwrap();
+    let messages = vec![json!({"role":"user","content":[{"type":"text","text":"hi"}]})];
+    // Upstream shape: `{type, sessionId, messages}` with the summarized window verbatim.
+    assert_wire(
+        &host,
+        &mut rx,
+        LifecycleEvent::SessionCompacting {
+            session_id: "s1".into(),
+            messages: messages.clone(),
+        },
+        r#"{"type":"session.compacting","sessionId":"s1","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#,
+    )
+    .await;
+
+    // The fixture answers `{context, prompt, preserveData}`; the host keeps the last result and
+    // the core parses it into the outcome it applies to the summary and the entry.
+    let out = host
+        .emit_session_compacting("s1".into(), messages, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        CompactingOutcome {
+            context: vec!["ctx line".into()],
+            prompt: Some("CUSTOM PROMPT".into()),
+            preserve_data: Some(json!({"keep": 1})),
+        }
+    );
     host.shutdown().await.unwrap();
 }
 
