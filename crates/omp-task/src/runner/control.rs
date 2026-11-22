@@ -462,7 +462,14 @@ async fn run_controlled(
         }
         drain_controls(&mut rx);
         shared.set_phase(RunPhase::Settled);
-        return cancelled_output(id, spec.agent, None, String::new(), start);
+        return cancelled_output(
+            id,
+            spec.agent,
+            None,
+            String::new(),
+            start,
+            spec.model_route.clone(),
+        );
     }
     shared.set_phase(RunPhase::Running);
     let out = match spawn_child(&runner.binary, &spec, mode, &opts.env).await {

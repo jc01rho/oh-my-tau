@@ -567,6 +567,7 @@ done
             output_schema: None,
             schema_mode: SchemaMode::Permissive,
             model: None,
+            model_route: None,
             tools: None,
             depth: 1,
             extra_args: Vec::new(),

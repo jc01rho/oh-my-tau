@@ -101,6 +101,9 @@ pub struct SpawnRecord {
     pub output_schema: Option<Value>,
     #[serde(default)]
     pub schema_mode: SchemaMode,
+    /// The routing note an extension attached to the spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_route: Option<String>,
 }
 
 /// Token and cost totals of the child session (its `get_session_stats`).
@@ -580,6 +583,7 @@ impl SubagentRegistry {
                 env: env.clone(),
                 output_schema: spec.output_schema.clone(),
                 schema_mode: spec.schema_mode,
+                model_route: spec.model_route.clone(),
             },
         };
         // A task the store cannot record could never be reconciled after a
@@ -852,6 +856,7 @@ impl SubagentRegistry {
             output_schema: record.spawn.output_schema.clone(),
             schema_mode: record.spawn.schema_mode,
             model: record.spawn.model.clone(),
+            model_route: record.spawn.model_route.clone(),
             tools: record.spawn.tools.clone(),
             depth: record.spawn.depth,
             extra_args: record.spawn.extra_args.clone(),
@@ -1317,6 +1322,7 @@ done
                 output_schema: None,
                 schema_mode: SchemaMode::Permissive,
                 model: None,
+                model_route: None,
                 tools: None,
                 depth: 1,
                 extra_args: Vec::new(),
