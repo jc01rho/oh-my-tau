@@ -189,10 +189,12 @@ impl Drop for Settling {
     }
 }
 
+/// Serializes the tests that drive the process-wide queue (async tests hold
+/// it across awaits, so it is a tokio mutex).
 #[cfg(test)]
-pub(crate) fn test_guard() -> MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+pub(crate) fn test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[cfg(test)]
@@ -219,7 +221,7 @@ mod tests {
 
     #[test]
     fn force_queues_forced_then_none_and_requeues_failures() {
-        let _guard = test_guard();
+        let _guard = test_lock().blocking_lock();
         clear();
         let model = json!({"api": "anthropic-messages"});
         assert_eq!(
@@ -274,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrapped_calls_see_the_queued_choice_in_order() {
-        let _guard = test_guard();
+        let _guard = test_lock().lock().await;
         clear();
         force("bash", &tools(), &json!({"api": "anthropic-messages"})).unwrap();
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -333,7 +335,7 @@ mod tests {
 
     #[test]
     fn an_inactive_forced_tool_drops_its_sequence() {
-        let _guard = test_guard();
+        let _guard = test_lock().blocking_lock();
         clear();
         force("bash", &tools(), &json!({"api": "openai-responses"})).unwrap();
         assert_eq!(take(&["read"]), None);
