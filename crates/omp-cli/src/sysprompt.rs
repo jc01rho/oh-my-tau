@@ -1507,6 +1507,25 @@ pub fn apply_ultrawork_hook(prompt: &str, system_prompt: &str) -> String {
 }
 
 #[must_use]
+pub fn strip_ultrawork_hook(system_prompt: &str) -> String {
+    let Some(start) = system_prompt.find(ULTRAWORK_DIRECTIVE_OPEN_TAG) else {
+        return system_prompt.to_string();
+    };
+    let Some(rel_end) = system_prompt[start..].find(ULTRAWORK_DIRECTIVE_CLOSE_TAG) else {
+        return system_prompt.to_string();
+    };
+    let end = start + rel_end + ULTRAWORK_DIRECTIVE_CLOSE_TAG.len();
+    let before = system_prompt[..start].trim_end();
+    let after = system_prompt[end..].trim_start();
+    match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => before.to_string(),
+        (true, false) => after.to_string(),
+        (false, false) => format!("{before}\n\n{after}"),
+    }
+}
+
+#[must_use]
 pub fn contains_ultrawork(prompt: &str) -> bool {
     let lower_probe = prompt.to_ascii_lowercase();
     if !lower_probe.contains("ulw") && !lower_probe.contains("ultrawork") {
@@ -1591,9 +1610,15 @@ fn valid_ultrawork_after(after: &str) -> bool {
             {
                 let tail = &rest[chain.len()..];
                 let tail_next = tail.chars().next();
-                if tail_next.is_none_or(|c| {
-                    !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-' | '/' | '\\')
-                }) {
+                let is_file_name = tail
+                    .strip_prefix('.')
+                    .and_then(|s| s.chars().next())
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !is_file_name
+                    && tail_next.is_none_or(|c| {
+                        !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-' | '/' | '\\')
+                    })
+                {
                     return true;
                 }
             }
@@ -1828,7 +1853,20 @@ pub struct ContextOptions {
 /// Settings layered over the agent dir's `config.yml` (no project layer).
 fn load_settings(agent: &Path) -> omp_settings::Settings {
     let project_none = agent.join(".no-project-layer");
-    omp_settings::Settings::load_from(Some(&agent.join("config.yml")), &project_none)
+    let omo_global = agent.parent().and_then(|parent| {
+        omp_settings::find_omo_config(parent).or_else(|| {
+            parent
+                .parent()
+                .and_then(|home| omp_settings::find_omo_config(&home.join(".omo")))
+        })
+    });
+    let profile = omp_settings::active_profile_from_env();
+    omp_settings::Settings::load_from_with_omo(
+        Some(&agent.join("config.yml")),
+        omo_global.as_deref(),
+        profile.as_deref(),
+        &project_none,
+    )
 }
 
 /// A string-array setting from the agent config, empty when unset.
@@ -2049,12 +2087,20 @@ pub fn build_full(
         .as_deref()
         .map(resolve_prompt_input);
     let mut generated = opts.generated_append.clone();
+    let already_has_directive = custom_prompt
+        .as_deref()
+        .is_some_and(|s| s.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG))
+        || template
+            .as_deref()
+            .is_some_and(|s| s.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG))
+        || user_append
+            .as_deref()
+            .is_some_and(|s| s.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG))
+        || generated
+            .iter()
+            .any(|g| g.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG));
     if let Some(prompt_text) = opts.prompt.as_deref() {
-        if contains_ultrawork(prompt_text)
-            && !generated
-                .iter()
-                .any(|g| g.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG))
-        {
+        if !already_has_directive && contains_ultrawork(prompt_text) {
             generated.push(ultrawork_bootstrap());
         }
     }
@@ -2745,6 +2791,7 @@ mod tests {
             "ulw-research",
             "ulw-execute",
             "ulw-mass",
+            "ulw-loop.",
             "mass ulw",
             "mass-ulw",
             "mass_ulw",
@@ -2769,6 +2816,8 @@ mod tests {
             "ulw-foo",
             "ulw_bar",
             "ulw.md",
+            "ulw-loop.md",
+            "ulw-plan.rs",
             "ultrawork.rs",
             "/path/to/ulw",
             "ulw/SKILL.md",
@@ -2821,6 +2870,24 @@ mod tests {
         let hooked_from_plain = apply_ultrawork_hook("please ulw this", &plain_joined);
         assert_eq!(
             hooked_from_plain
+                .matches(ULTRAWORK_DIRECTIVE_OPEN_TAG)
+                .count(),
+            1
+        );
+        let stripped = strip_ultrawork_hook(&hooked_from_plain);
+        assert!(!stripped.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG));
+        assert_eq!(stripped, plain_joined);
+
+        let custom_with_directive = Options {
+            system_prompt: Some(format!("custom\n\n{}", ultrawork_bootstrap())),
+            prompt: Some("ulw run".into()),
+            ..Options::default()
+        };
+        let built_custom = build_with(&root, &root, &agent, &custom_with_directive, &[]);
+        assert_eq!(
+            built_custom
+                .blocks
+                .join("\n\n")
                 .matches(ULTRAWORK_DIRECTIVE_OPEN_TAG)
                 .count(),
             1

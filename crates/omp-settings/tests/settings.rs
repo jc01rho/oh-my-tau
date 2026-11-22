@@ -688,6 +688,7 @@ fn omp_and_omo_overlap_precedence_and_native_overlay() {
     assert_eq!(s.get_bool("colorBlindMode"), Some(true));
     assert_eq!(s.get_number("task.maxConcurrency"), Some(10.0));
     assert_eq!(s.get_number("task.globalConcurrency"), Some(6.0));
+    assert_eq!(s.effective_task_concurrency(), Some(6));
     assert_eq!(s.get_number("task.maxRecursionDepth"), Some(5.0));
 
     fs::write(

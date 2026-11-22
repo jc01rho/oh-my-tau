@@ -353,6 +353,25 @@ impl Settings {
     pub fn omo_raw(&self) -> &Map<String, Value> {
         &self.omo_raw
     }
+
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn effective_task_concurrency(&self) -> Option<usize> {
+        let max_c = self
+            .get_number("task.maxConcurrency")
+            .filter(|v| v.is_finite() && *v >= 1.0)
+            .map(|v| v as usize);
+        let global_c = self
+            .get_number("task.globalConcurrency")
+            .filter(|v| v.is_finite() && *v >= 1.0)
+            .map(|v| v as usize);
+        match (max_c, global_c) {
+            (Some(m), Some(g)) => Some(m.min(g)),
+            (Some(m), None) => Some(m),
+            (None, Some(g)) => Some(g),
+            (None, None) => None,
+        }
+    }
 }
 
 impl Settings {
