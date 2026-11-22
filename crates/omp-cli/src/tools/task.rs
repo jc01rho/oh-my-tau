@@ -643,6 +643,7 @@ pub(crate) fn spawn_background(
             parent_session_id: caller.clone(),
             root_session_id: root.clone(),
             env: vec![(super::subagents::ROOT_SESSION_ENV.to_string(), root.clone())],
+            owner: None,
         };
         let label = name.map(|n| format!(" name:{n}")).unwrap_or_default();
         match registry.spawn(request) {
