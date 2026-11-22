@@ -897,7 +897,7 @@ async fn dispatch_ported(rt: &std::sync::Arc<Runtime>, name: &str, args: &str) -
         "hotkeys" => Some(hotkeys_command(rt, args)),
         // Upstream runs these only in the interactive TUI (`handleTui`), which
         // handles them locally; text-mode dispatch says so.
-        "local" | "open" => Some(notice(
+        "local" | "open" | "settings" | "tree" | "resume" | "exit" => Some(notice(
             rt,
             &format!("/{name} is only available in the interactive TUI."),
         )),
@@ -3116,17 +3116,13 @@ fn context_report(_state: &Value, usage: &Value) -> String {
 /// `commands/*.md` cannot claim them, whose behaviour omp has not ported yet.
 /// Each one answers with an explicit not-ported notice.
 const UNPORTED_RESERVED: &[&str] = &[
-    "settings",
     "setup",
     "plan-review",
     "vibe",
     "guided-goal",
     "git",
     "hub",
-    "tree",
-    "resume",
     "delete",
-    "exit",
     "commit",
     "live",
     "record",

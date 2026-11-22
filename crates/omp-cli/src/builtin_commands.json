@@ -954,7 +954,7 @@
  },
  {
   "name": "settings",
-  "description": "Reserved upstream command (not implemented in this build)",
+  "description": "Open settings menu",
   "source": "builtin"
  },
  {
@@ -994,12 +994,12 @@
  },
  {
   "name": "tree",
-  "description": "Reserved upstream command (not implemented in this build)",
+  "description": "Navigate session tree (switch branches)",
   "source": "builtin"
  },
  {
   "name": "resume",
-  "description": "Reserved upstream command (not implemented in this build)",
+  "description": "Resume a different session",
   "source": "builtin"
  },
  {
@@ -1009,7 +1009,7 @@
  },
  {
   "name": "exit",
-  "description": "Reserved upstream command (not implemented in this build)",
+  "description": "Exit the application",
   "source": "builtin"
  },
  {
