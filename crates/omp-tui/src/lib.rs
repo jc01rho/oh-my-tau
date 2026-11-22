@@ -36,6 +36,7 @@ pub mod extension_ui;
 pub mod images;
 pub mod keybindings;
 pub mod keys;
+pub mod links;
 pub mod magic;
 pub mod magic_paint;
 pub mod mouse;
@@ -84,6 +85,10 @@ pub struct RunConfig {
     /// Terminal background from the startup OSC 11 probe (`None` →
     /// COLORFGBG / dark default inside [`theme::detect_appearance`]).
     pub osc11_bg: Option<theme::Rgb>,
+    /// Link schemes the loaded extensions claimed with
+    /// `pi.registerLinkScheme`; the `app.links.hint` picker offers only links
+    /// with one of these (`omp-cli` `Extensions::link_schemes`).
+    pub link_schemes: Vec<String>,
 }
 
 /// Run the interactive TUI until the user quits (Ctrl+C / Ctrl+Q / `:q` in

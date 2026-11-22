@@ -58,6 +58,11 @@ pub trait RuntimePort: Send + Sync + 'static {
     /// Answer an extension dialog (`extension_ui_response` frame).
     fn extension_ui_response(&self, id: String, value: Value);
 
+    /// Raise `link_activate` for `url` on the extension that claimed its
+    /// scheme (TS `emitLinkActivate`). Links no extension owns are dropped by
+    /// the port; a transport failure is surfaced as a system notice.
+    fn link_activate(&self, url: String);
+
     /// Resume a session journal (`Runtime::load_session`) or fork it
     /// (`tree::fork`) when `fork` is set.
     fn resume_session(&self, path: std::path::PathBuf, fork: bool);
@@ -199,6 +204,9 @@ impl RuntimePort for FakePort {
     }
     fn extension_ui_response(&self, id: String, value: Value) {
         self.record(format!("extension_ui_response({id}, {value})"));
+    }
+    fn link_activate(&self, url: String) {
+        self.record(format!("link_activate({url:?})"));
     }
     fn resume_session(&self, path: std::path::PathBuf, fork: bool) {
         self.record(format!("resume_session({path:?}, fork={fork})"));

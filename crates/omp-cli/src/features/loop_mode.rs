@@ -158,6 +158,12 @@ async fn eval_condition(rt: &Runtime, command: &str) -> Verdict {
     }
 }
 
+/// Whether a `/loop` run is in progress (the `loop` half of `mode_changed`).
+#[must_use]
+pub fn is_running() -> bool {
+    RUNNING.load(Ordering::SeqCst)
+}
+
 /// Slash-command entry point.
 pub async fn command(rt: &Arc<Runtime>, args: &str) -> Outcome {
     let trimmed = args.trim();
@@ -209,9 +215,11 @@ pub async fn command(rt: &Arc<Runtime>, args: &str) -> Outcome {
     let rt2 = rt.clone();
     tokio::spawn(async move {
         RUNNING.store(true, Ordering::SeqCst);
+        crate::features::modes::notify(&rt2);
         run_loop(&rt2, kind).await;
         RUNNING.store(false, Ordering::SeqCst);
         CANCEL.store(false, Ordering::SeqCst);
+        crate::features::modes::notify(&rt2);
     });
 
     Outcome::Handled {

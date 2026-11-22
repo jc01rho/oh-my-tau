@@ -482,6 +482,7 @@ mod tests {
             schema: SchemaValidation::Valid,
             duration: std::time::Duration::ZERO,
             truncated: false,
+            resolved_model_route: None,
         }
     }
 

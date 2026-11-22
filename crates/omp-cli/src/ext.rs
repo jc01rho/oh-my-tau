@@ -4,8 +4,9 @@
 //! registers extension tools, serves host->core requests (`append_entry`,
 //! `send_message`, ui frames), and emits omp lifecycle events.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,8 +21,15 @@ use pa_agent::types::{
 use serde_json::{json, Value};
 
 use omp_ext::hooks::ExtHooks;
-use omp_ext::lifecycle::{self, InputSource, LifecycleEvent, SwitchReason};
+use omp_ext::lifecycle::{
+    self, CacheWarmingDecisionEvent, CacheWarmingOutcome, CompactingOutcome, DiscoveredPath,
+    InputSource, LifecycleEvent, PlanReviewBy, PlanReviewChoice, PlanReviewRequest,
+    ResourcesDiscoverOutcome, ResourcesDiscoverReason, SwitchReason,
+};
 use omp_ext::{ExtHost, HostConfig, HostMessage, ToolInfo};
+use omp_providers::auth::{
+    on_credential_disabled, CredentialDisabledEvent, CredentialDisabledSubscription,
+};
 
 use crate::events::{message_value, ExtUpdateEncoder};
 use crate::runtime::Runtime;
@@ -433,7 +441,7 @@ impl omp_ext::lifecycle::HostResponder for RuntimeResponder {
         request: Value,
     ) -> omp_ext::lifecycle::BoxFuture<'_, Result<Value, String>> {
         Box::pin(async move {
-            let turn = EphemeralTurn::parse(&request)?;
+            let mut turn = EphemeralTurn::parse(&request)?;
             let rt = self
                 .rt
                 .upgrade()
@@ -441,11 +449,36 @@ impl omp_ext::lifecycle::HostResponder for RuntimeResponder {
             let mut messages = crate::features::btw::conversation(&rt)
                 .await
                 .map_err(|e| format!("runEphemeralTurn: failed to read the conversation: {e}"))?;
-            messages.extend(turn.tail);
-            use crate::features::btw::{SideTurn, SideTurnError};
-            match crate::features::btw::complete_side_turn(&rt, messages, turn.max_tokens).await {
-                Ok(SideTurn::Done(response)) => Ok(ephemeral_result(&response)),
-                Ok(SideTurn::Failed(response)) => Err(format!(
+            messages.extend(std::mem::take(&mut turn.tail));
+            let context = crate::features::btw::side_context(messages);
+            turn.check_context_bytes(&context)?;
+            let options = crate::features::btw::SideTurnOptions {
+                max_tokens: turn.max_tokens,
+                thinking_level: crate::adapter::model_thinking_level(
+                    rt.agent.thinking_level().await,
+                ),
+                minimize_effort: turn.minimize_effort,
+                session_id: Some(turn.side_session_id(&rt.session_id())),
+            };
+            let observer = DeltaObserver {
+                host: rt.ext_host(),
+                stream_id: turn.stream_id.clone(),
+            };
+            use crate::features::btw::{pump_side_stream, side_stream, SideTurn};
+            let stream = side_stream(&rt, &context, &options)
+                .await
+                .map_err(ephemeral_turn_error)?;
+            let reply = pump_side_stream(stream, &observer)
+                .await
+                .map_err(ephemeral_turn_error)?;
+            let (response, failed) = match reply.outcome {
+                SideTurn::Done(response) => (response, false),
+                SideTurn::Failed(response) => (response, true),
+            };
+            // TS reports usage where the provider settles the attempt, failed ones included.
+            turn.journal(&rt, &response);
+            if failed {
+                return Err(format!(
                     "runEphemeralTurn: the side turn {}: {}",
                     if response.stop_reason == pa_types::ai::StopReason::Aborted {
                         "was aborted"
@@ -456,14 +489,72 @@ impl omp_ext::lifecycle::HostResponder for RuntimeResponder {
                         .error_message
                         .as_deref()
                         .unwrap_or("no error message")
-                )),
-                Err(SideTurnError::NoModel(e)) => {
-                    Err(format!("runEphemeralTurn: no model available: {e}"))
-                }
-                Err(SideTurnError::Request(e)) => {
-                    Err(format!("runEphemeralTurn: request failed: {e}"))
-                }
+                ));
             }
+            // TS builds `replyText` from the accumulated text deltas, so the reply is exactly the text
+            // the host was streamed (tau has no obfuscator, so no later expansion can add to it).
+            let text = reply.text.trim();
+            let reply_text = if turn.dedupe_reply {
+                dedupe_ephemeral_reply(text, turn.reply_max_bytes)
+            } else {
+                text.to_string()
+            };
+            Ok(ephemeral_result(&reply_text, &response))
+        })
+    }
+
+    fn resolve_plan_review<'a>(
+        &'a self,
+        review_id: &'a str,
+        choice: &'a str,
+        feedback: Option<&'a str>,
+        role: Option<&'a str>,
+    ) -> omp_ext::lifecycle::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            self.rt.upgrade().is_some_and(|rt| {
+                crate::features::plan::resolve_review(&rt, review_id, choice, feedback, role)
+            })
+        })
+    }
+}
+
+/// Prefix a side-turn failure the way the request's error messages read.
+fn ephemeral_turn_error(error: crate::features::btw::SideTurnError) -> String {
+    use crate::features::btw::SideTurnError;
+    match error {
+        SideTurnError::NoModel(e) => format!("runEphemeralTurn: no model available: {e}"),
+        SideTurnError::Request(e) => format!("runEphemeralTurn: request failed: {e}"),
+    }
+}
+
+/// Delivers one side turn's text to the host's `onTextDelta` (TS awaits each delivery in order, and
+/// a rejected delivery rejects the turn).
+struct DeltaObserver {
+    host: Option<Arc<ExtHost>>,
+    /// The host's side-turn id; `None` when the caller passed no `onTextDelta`.
+    stream_id: Option<Value>,
+}
+
+impl crate::features::btw::SideTurnObserver for DeltaObserver {
+    fn text_delta<'a>(
+        &'a self,
+        delta: &'a str,
+    ) -> crate::features::btw::BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let Some(stream_id) = &self.stream_id else {
+                return Ok(());
+            };
+            let host = self
+                .host
+                .as_ref()
+                .ok_or_else(|| "the extension host is not loaded".to_string())?;
+            host.request(
+                "ephemeral_delta",
+                json!({"streamId": stream_id, "delta": delta}),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         })
     }
 }
@@ -471,12 +562,35 @@ impl omp_ext::lifecycle::HostResponder for RuntimeResponder {
 /// Output-token cap of a side turn whose caller set none (the `/btw` ceiling).
 const EPHEMERAL_DEFAULT_MAX_TOKENS: u64 = 4096;
 
+/// Reply cap of an ephemeral turn whose caller set none (TS `EPHEMERAL_REPLY_MAX_BYTES`).
+const EPHEMERAL_REPLY_MAX_BYTES: u64 = 4096;
+
+/// Longest reply a `model_usage` entry keeps; a longer one is left out, never truncated
+/// (TS `COMPLETION_TEXT_MAX_CHARS`).
+const EPHEMERAL_COMPLETION_TEXT_MAX_CHARS: usize = 4000;
+
 /// A validated `run_ephemeral_turn` request (TS `EphemeralTurnOptions`, wire form from `host.ts`).
 #[derive(Debug)]
 struct EphemeralTurn {
     /// `history` copies followed by the prompt; appended after the live conversation.
     tail: Vec<pa_types::ai::Message>,
     max_tokens: u64,
+    /// TS `maxContextBytes`: reject the turn when its provider context is larger.
+    max_context_bytes: Option<u64>,
+    /// TS `minimizeEffort`: run at the model's lowest effort instead of the session's level.
+    minimize_effort: bool,
+    /// TS `conversationKey`: related side turns share one provider lineage.
+    conversation_key: Option<String>,
+    /// TS `purpose`: journal the settled attempt as a `model_usage` entry under this name.
+    purpose: Option<String>,
+    /// TS `dedupeReply` (default `true`): collapse repeated lines and bound the reply.
+    dedupe_reply: bool,
+    /// TS `replyMaxBytes` (default 4096): byte ceiling of the deduped reply.
+    reply_max_bytes: u64,
+    /// Host id echoed on every `ephemeral_delta`; `None` when there is no `onTextDelta`.
+    stream_id: Option<Value>,
+    /// The host's own `onUsage` reporter is in place, so the `purpose` journal would double count.
+    usage_callback: bool,
 }
 
 impl EphemeralTurn {
@@ -487,14 +601,51 @@ impl EphemeralTurn {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| "runEphemeralTurn: promptText must be a non-empty string".to_string())?;
-        let max_tokens = match request.get("maxTokens") {
-            None | Some(Value::Null) => EPHEMERAL_DEFAULT_MAX_TOKENS,
-            Some(v) => v
-                .as_u64()
-                .filter(|n| (1..=(1u64 << 53) - 1).contains(n))
-                .ok_or_else(|| {
-                    "runEphemeralTurn: maxTokens must be a positive safe integer".to_string()
-                })?,
+        let positive = |field: &str| -> Result<Option<u64>, String> {
+            match request.get(field) {
+                None | Some(Value::Null) => Ok(None),
+                Some(v) => v
+                    .as_u64()
+                    .filter(|n| (1..=(1u64 << 53) - 1).contains(n))
+                    .map(Some)
+                    .ok_or_else(|| {
+                        format!("runEphemeralTurn: {field} must be a positive safe integer")
+                    }),
+            }
+        };
+        let max_tokens = positive("maxTokens")?.unwrap_or(EPHEMERAL_DEFAULT_MAX_TOKENS);
+        let max_context_bytes = positive("maxContextBytes")?;
+        let reply_max_bytes = positive("replyMaxBytes")?.unwrap_or(EPHEMERAL_REPLY_MAX_BYTES);
+        let flag = |field: &str| -> Result<bool, String> {
+            match request.get(field) {
+                None | Some(Value::Null) => Ok(false),
+                Some(Value::Bool(b)) => Ok(*b),
+                Some(_) => Err(format!("runEphemeralTurn: {field} must be a boolean")),
+            }
+        };
+        let minimize_effort = flag("minimizeEffort")?;
+        // TS `args.dedupeReply === false`: only an explicit `false` turns the dedupe off.
+        let dedupe_reply = match request.get("dedupeReply") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("runEphemeralTurn: dedupeReply must be a boolean".into()),
+        };
+        let usage_callback = flag("usageCallback")?;
+        let text = |field: &str| -> Result<Option<String>, String> {
+            match request.get(field) {
+                None | Some(Value::Null) => Ok(None),
+                // An empty string is no key at all (TS reads these with a truthiness test).
+                Some(Value::String(s)) if s.is_empty() => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s.clone())),
+                Some(_) => Err(format!("runEphemeralTurn: {field} must be a string")),
+            }
+        };
+        let conversation_key = text("conversationKey")?;
+        let purpose = text("purpose")?;
+        let stream_id = match request.get("streamId") {
+            None | Some(Value::Null) => None,
+            Some(v @ (Value::Number(_) | Value::String(_))) => Some(v.clone()),
+            Some(_) => return Err("runEphemeralTurn: streamId must be a number or a string".into()),
         };
         match request.get("tools") {
             None | Some(Value::Null | Value::Bool(false)) => {}
@@ -518,15 +669,163 @@ impl EphemeralTurn {
         }))
         .map_err(|e| format!("runEphemeralTurn: invalid promptImages: {e}"))?;
         tail.push(user);
-        Ok(Self { tail, max_tokens })
+        Ok(Self {
+            tail,
+            max_tokens,
+            max_context_bytes,
+            minimize_effort,
+            conversation_key,
+            purpose,
+            dedupe_reply,
+            reply_max_bytes,
+            stream_id,
+            usage_callback,
+        })
+    }
+
+    /// TS `maxContextBytes`: the encoded provider context must fit the caller's ceiling.
+    fn check_context_bytes(&self, context: &pa_types::ai::Context) -> Result<(), String> {
+        let Some(limit) = self.max_context_bytes else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(context)
+            .map_err(|e| format!("runEphemeralTurn: failed to encode the context: {e}"))?
+            .len() as u64;
+        if bytes > limit {
+            return Err(format!(
+                "runEphemeralTurn: ephemeral turn context exceeds the configured {limit}-byte limit"
+            ));
+        }
+        Ok(())
+    }
+
+    /// TS `sideSessionId`: a keyed conversation keeps one provider lineage across its side turns,
+    /// an unkeyed one gets a fresh lineage per call.
+    fn side_session_id(&self, session: &str) -> String {
+        match &self.conversation_key {
+            Some(key) => format!("{session}:side:conversation:{key}"),
+            None => format!("{session}:side:{}", crate::persist::uuid_v7()),
+        }
+    }
+
+    /// TS `journalCompletion`: the settled attempt becomes a `model_usage` entry, so a side turn's
+    /// spend counts in session totals and `omt stats`. The host's own `onUsage` wins when the
+    /// caller passed one, and a failed write is logged rather than failing the turn.
+    fn journal(&self, rt: &Arc<Runtime>, response: &pa_types::ai::AssistantMessage) {
+        let Some(purpose) = self.journal_purpose() else {
+            return;
+        };
+        let payload = ephemeral_usage_payload(purpose, response);
+        if let Err(e) = rt.append_entry("model_usage", payload) {
+            eprintln!("omt: ephemeral turn: model usage journal failed: {e}");
+        }
+    }
+
+    /// The name the settled attempt is journaled under, or `None` when nothing is journaled: a turn
+    /// without a `purpose` has no name, and a host that reports usage itself already counted it.
+    fn journal_purpose(&self) -> Option<&str> {
+        match (&self.purpose, self.usage_callback) {
+            (Some(purpose), false) => Some(purpose),
+            _ => None,
+        }
     }
 }
 
-/// TS `EphemeralTurnResult`.
-fn ephemeral_result(response: &pa_types::ai::AssistantMessage) -> Value {
+/// The `model_usage` entry one settled side turn journals (TS `journalCompletion` + `completionRecord`).
+fn ephemeral_usage_payload(purpose: &str, response: &pa_types::ai::AssistantMessage) -> Value {
+    let reply = completion_reply(response);
+    let mut completion = serde_json::Map::new();
+    // TS counts UTF-16 code units (`reply.length`); longer text is left out, not truncated.
+    if reply.encode_utf16().count() <= EPHEMERAL_COMPLETION_TEXT_MAX_CHARS {
+        completion.insert("reply".into(), Value::String(reply));
+    }
+    let mut payload = json!({
+        "purpose": purpose,
+        "api": response.api,
+        "provider": response.provider,
+        "model": response.model,
+        "usage": response.usage,
+        "stopReason": response.stop_reason,
+        "completion": Value::Object(completion),
+    });
+    // The provider's own timing is journaled alongside, as TS does.
+    for key in ["duration", "ttft"] {
+        if let Some(value) = response.rest.get(key) {
+            payload[key] = value.clone();
+        }
+    }
+    if let Some(message) = &response.error_message {
+        payload["errorMessage"] = Value::String(message.clone());
+    }
+    payload
+}
+
+/// TS `completionRecord`'s reply: the text blocks, or — for a call answered through a forced tool
+/// call, which has no text — its arguments as JSON lines.
+fn completion_reply(response: &pa_types::ai::AssistantMessage) -> String {
+    let text = crate::features::btw::message_text(response);
+    if !text.is_empty() {
+        return text;
+    }
+    let mut reply = String::new();
+    for block in &response.content {
+        if let pa_types::ai::AssistantContentBlock::ToolCall(call) = block {
+            if !reply.is_empty() {
+                reply.push('\n');
+            }
+            reply.push_str(&Value::Object(call.arguments.clone()).to_string());
+        }
+    }
+    reply
+}
+
+/// TS `dedupeEphemeralReply`: collapse runs of one repeated line longer than three, then bound the
+/// text to `max_bytes` on a UTF-8 character boundary.
+fn dedupe_ephemeral_reply(text: &str, max_bytes: u64) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let mut j = i + 1;
+        while j < lines.len() && lines[j] == lines[i] {
+            j += 1;
+        }
+        let run = j - i;
+        if run > 3 {
+            out.push(lines[i].to_string());
+            out.push(format!("[…{run}×]"));
+        } else {
+            out.extend(std::iter::repeat_n(lines[i].to_string(), run));
+        }
+        i = j;
+    }
+    let result = out.join("\n");
+    if result.len() as u64 <= max_bytes {
+        return result;
+    }
+    let suffix = "\n[…truncated]";
+    let bytes = result.as_bytes();
+    let mut cut = (max_bytes.saturating_sub(suffix.len() as u64) as usize).min(bytes.len());
+    // Back off continuation bytes so a multi-byte character straddling the budget is dropped whole.
+    while cut > 0 && bytes[cut] & 0xc0 == 0x80 {
+        cut -= 1;
+    }
+    format!("{}{suffix}", &result[..cut])
+}
+
+/// TS `EphemeralTurnResult`; the assistant message never carries tool calls (a side turn has no
+/// tools to run, so a provider that emitted one has it dropped).
+fn ephemeral_result(reply_text: &str, response: &pa_types::ai::AssistantMessage) -> Value {
+    let mut sanitized = response.clone();
+    sanitized
+        .content
+        .retain(|block| !matches!(block, pa_types::ai::AssistantContentBlock::ToolCall(_)));
     json!({
-        "replyText": crate::features::btw::reply_text(response),
-        "assistantMessage": response,
+        "replyText": reply_text,
+        "assistantMessage": sanitized,
     })
 }
 
@@ -583,6 +882,51 @@ struct Live {
     needs_branch: std::sync::atomic::AtomicBool,
 }
 
+/// TS `MAX_PENDING_CREDENTIAL_DISABLED` (runner.ts): the backlog kept for the window between the
+/// auth store's automatic soft-disable and the session that emits it.
+const MAX_PENDING_CREDENTIAL_DISABLED: usize = 32;
+
+/// Bridge from the auth store's process-wide listener to the host (TS `runner.ts`'s
+/// `#pendingCredentialDisabled` + `emitCredentialDisabled`): the store tears a credential down
+/// before, or long after, a runtime is attached, so events queue here and one drainer task emits
+/// them in order from the moment the session is live.
+#[derive(Default)]
+struct CredentialDisabledFeed {
+    queue: Mutex<Vec<CredentialDisabledEvent>>,
+    /// Wakes the drainer. `notify_one` keeps a permit, so a push that lands between a drain and
+    /// its `await` cannot be lost.
+    wake: tokio::sync::Notify,
+    /// The drainer runs once per session.
+    draining: AtomicBool,
+    /// Held for the session's lifetime: dropping it unsubscribes from the store.
+    sub: Mutex<Option<CredentialDisabledSubscription>>,
+}
+
+impl CredentialDisabledFeed {
+    /// Buffer one event; the store's listener may run on any thread, so this stays synchronous.
+    fn push(&self, event: CredentialDisabledEvent) {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queue.len() >= MAX_PENDING_CREDENTIAL_DISABLED {
+            queue.remove(0);
+        }
+        queue.push(event);
+        drop(queue);
+        self.wake.notify_one();
+    }
+
+    fn take(&self) -> Vec<CredentialDisabledEvent> {
+        std::mem::take(
+            &mut *self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
 /// Live extension host and its agent-facing hooks.
 pub struct Extensions {
     pub host: Arc<ExtHost>,
@@ -613,9 +957,62 @@ pub struct Extensions {
     /// Print/json runs: TS reaches extensions with `agent_end` only after `session_shutdown`
     /// (its settle path emits it detached), so the messages wait here for [`Self::shutdown`].
     deferred_agent_end: Arc<Mutex<Option<Vec<Value>>>>,
+    /// Automatic credential soft-disables on their way to extensions (see
+    /// [`CredentialDisabledFeed`]).
+    credential_disabled: Arc<CredentialDisabledFeed>,
+    /// MCP server notifications (`mcp_notification`), buffered until the session ctx is wired.
+    mcp: McpNotificationSink,
 }
 
-/// `session_before_compact` / `session_compact` emission around runtime compactions.
+/// `resources_discover` round trip: emit (only when an extension subscribes, TS `hasHandlers`),
+/// then register every returned path with the loader that owns it. Extracted from
+/// [`Extensions::resources_discover`] so the fake-host tests can drive it.
+async fn discover_resources(host: &ExtHost, cwd: &Path, reason: ResourcesDiscoverReason) {
+    if !host.has_handlers("resources_discover") {
+        return;
+    }
+    let wire_cwd = cwd.to_string_lossy().into_owned();
+    match host.emit_resources_discover(wire_cwd, reason, None).await {
+        Ok(outcome) => apply_discovered_resources(&outcome, cwd),
+        Err(e) => eprintln!("omt: extension resources_discover: {e:#}"),
+    }
+}
+
+/// Register a `resources_discover` outcome with the loaders that own each kind of path: skills feed
+/// the system-prompt skill listing, prompt templates become file slash commands, themes join the
+/// theme loader's catalog (`ExtensionRunner.emitResourcesDiscover` shapes; the loader split is tau's).
+fn apply_discovered_resources(outcome: &ResourcesDiscoverOutcome, cwd: &Path) {
+    let resolve = |paths: &[DiscoveredPath]| -> Vec<PathBuf> {
+        paths
+            .iter()
+            .map(|p| resolve_discovered_path(&p.path, cwd))
+            .collect()
+    };
+    crate::sysprompt::set_extension_skill_paths(resolve(&outcome.skill_paths));
+    crate::rpc::slash::set_extension_prompt_paths(resolve(&outcome.prompt_paths));
+    omp_tui::theme::set_extension_theme_paths(resolve(&outcome.theme_paths));
+}
+
+/// Upstream `resolvePath`: `~` expands to the home directory, an absolute path stays as given,
+/// anything else resolves against the session cwd.
+fn resolve_discovered_path(raw: &str, cwd: &Path) -> PathBuf {
+    let expanded = if raw == "~" {
+        std::env::var_os("HOME").map_or_else(|| PathBuf::from(raw), PathBuf::from)
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map_or_else(|| PathBuf::from(raw), |home| PathBuf::from(home).join(rest))
+    } else {
+        PathBuf::from(raw)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    }
+}
+
+/// `session_before_compact` / `session.compacting` / `session_compact` emission around runtime
+/// compactions.
 struct CompactBridge {
     host: Arc<ExtHost>,
 }
@@ -645,6 +1042,30 @@ impl crate::runtime::CompactionHooks for CompactBridge {
                 Err(e) => {
                     eprintln!("omt: extension session_before_compact: {e:#}");
                     false
+                }
+            }
+        })
+    }
+
+    fn compacting<'a>(
+        &'a self,
+        session_id: &'a str,
+        messages: Vec<Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CompactingOutcome>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if !self.host.has_handlers("session.compacting") {
+                return None;
+            }
+            match self
+                .host
+                .emit_session_compacting(session_id.to_owned(), messages, None)
+                .await
+            {
+                Ok(outcome) => Some(outcome),
+                Err(e) => {
+                    eprintln!("omt: extension session.compacting: {e:#}");
+                    None
                 }
             }
         })
@@ -753,6 +1174,7 @@ impl Extensions {
         }
 
         let ext = Arc::new(Self {
+            mcp: McpNotificationSink::new(host.clone()),
             host,
             hooks,
             sub: Mutex::new(None),
@@ -768,7 +1190,23 @@ impl Extensions {
             rt: Mutex::new(None),
             blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_agent_end: Arc::new(Mutex::new(None)),
+            credential_disabled: Arc::new(CredentialDisabledFeed::default()),
         });
+        {
+            // The store keeps the events of a session that has not subscribed yet, and hands its
+            // backlog to the first subscriber: subscribing here covers both windows.
+            let feed = ext.credential_disabled.clone();
+            let sub = on_credential_disabled(move |event| feed.push(event.clone()));
+            *ext.credential_disabled
+                .sub
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sub);
+        }
+
+        // MCP managers publish every server notification here, whether they were
+        // created before or after this session (omp `sdk.ts` bridges the manager's
+        // `addNotificationListener` into each session's runner).
+        register_mcp_notifications(ext.mcp.clone());
         ext.live.needs_branch.store(
             sources_read_branch(ext.dir.as_deref(), &ext.extra),
             Ordering::Relaxed,
@@ -824,15 +1262,30 @@ impl Extensions {
         (transform, before, after)
     }
 
-    /// Notify request-accounting hooks at the real provider boundary.
-    /// Currently payload mutation remains on the native Rust stream path.
-    pub async fn before_provider_request(&self) -> Result<()> {
-        if self.host.has_handlers("before_provider_request") {
-            self.host
-                .emit(json!({"type":"before_provider_request","payload":{}}), None)
-                .await?;
-        }
-        Ok(())
+    /// The real outbound payload at the provider boundary: every
+    /// `before_provider_request` handler sees the previous handler's payload, and a
+    /// returned payload replaces it, so the rewrite lands in the request that is
+    /// actually sent (TS `emitBeforeProviderRequest`). `None` keeps it unchanged.
+    pub fn before_provider_request(&self, payload: Value) -> Option<Value> {
+        provider_payload(&self.host, payload)
+    }
+
+    /// Whether any loaded extension subscribes to `cache_warming_decision`: the warmer emits
+    /// nothing otherwise.
+    #[must_use]
+    pub fn cache_warming_handlers(&self) -> bool {
+        self.host.has_handlers("cache_warming_decision")
+    }
+
+    /// Emit `cache_warming_decision`; the last handler's `action` overrides the warmer's own.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn cache_warming_decision(
+        &self,
+        event: &CacheWarmingDecisionEvent,
+    ) -> Result<CacheWarmingOutcome> {
+        self.host.emit_cache_warming_decision(event, None).await
     }
 
     /// Extension tools as `AgentTool` wrappers (`list_tools` -> `call_tool`).
@@ -875,7 +1328,12 @@ impl Extensions {
             ctx.session_file = session_file.map(Path::to_path_buf);
             ctx.model = model.to_string();
         }
-        self.send_ctx().await
+        self.send_ctx().await?;
+        // The host now carries this session's ctx, so buffered MCP notifications can
+        // run their handlers against it (omp drains `#pendingMcpNotifications` once
+        // `initialize()` wired the runtime context).
+        self.mcp.attach();
+        Ok(())
     }
 
     /// Update the session title in the host's ctx state (`host.ts set_ctx`
@@ -926,6 +1384,15 @@ impl Extensions {
     /// `session_start` (once per session).
     pub async fn session_start(&self) {
         emit_silent(self.host.emit_session_start(None).await);
+    }
+
+    /// `resources_discover`: extensions contribute skill, prompt-template and theme paths. Emitted
+    /// at startup once the extensions are loaded (before the session's system prompt is assembled,
+    /// so contributed skills reach it) and again on every extension reload.
+    ///
+    /// Only emitted when an extension subscribes (`has_handlers`), like every other event.
+    pub async fn resources_discover(&self, reason: ResourcesDiscoverReason) {
+        discover_resources(&self.host, &self.cwd, reason).await;
     }
 
     /// TS `before_agent_start` (agent-session `#promptAgent`, every mode): handlers may
@@ -1136,6 +1603,10 @@ impl Extensions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         emit_silent(self.host.emit_session_start(None).await);
+        // A reload re-sends the whole discovered resource set (TS emits `resources_discover` on
+        // extension reload); the loaders keep only the newest set.
+        self.resources_discover(ResourcesDiscoverReason::Reload)
+            .await;
         if let Some(rt) = self
             .rt
             .lock()
@@ -1164,7 +1635,10 @@ impl Extensions {
             let (ext, weak) = (ext.clone(), weak.clone());
             tokio::spawn(async move {
                 let Some(rt) = weak.upgrade() else { return };
+                // The previous session's plan review closes unanswered (TS: session switch).
+                crate::features::plan::cancel_reviews(Some(ext.as_ref()));
                 ext.push_session_ctx(&rt).await;
+                crate::features::modes::notify(&rt);
                 // A branch/fork-into-file move emits `session_branch` from the caller (TS).
                 if reason == "branch" {
                     return;
@@ -1201,7 +1675,9 @@ impl Extensions {
             })
         })));
         self.push_session_ctx(&rt).await;
+        crate::features::modes::notify(&rt);
         self.session_start().await;
+        self.start_credential_disabled_feed();
     }
 
     /// Refresh the live ctx facts from the runtime. `with_branch` also re-reads the session
@@ -1308,6 +1784,7 @@ impl Extensions {
 
     /// Emit `session_shutdown` and stop the host.
     pub async fn shutdown(&self) {
+        crate::features::plan::cancel_reviews(Some(self));
         emit_silent(self.host.emit_session_shutdown(None).await);
         let deferred = self
             .deferred_agent_end
@@ -1354,6 +1831,99 @@ impl Extensions {
             let _ = decision_tx.send(close);
         });
         Some((decision, abort))
+    }
+
+    /// Emit the credential soft-disables the auth store reported before this session attached, then
+    /// every later one as it arrives (TS `runner.ts`'s `emitCredentialDisabled`, whose pre-init
+    /// buffer is [`CredentialDisabledFeed`]). Runs once per session, after `session_start`.
+    fn start_credential_disabled_feed(self: &Arc<Self>) {
+        let feed = self.credential_disabled.clone();
+        if feed.draining.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let ext = self.clone();
+        tokio::spawn(async move {
+            loop {
+                flush_credential_disabled(&ext.host, &feed).await;
+                feed.wake.notified().await;
+            }
+        });
+    }
+
+    /// Link schemes the loaded extensions claimed with `pi.registerLinkScheme()`, in load order
+    /// (first claimer first). The TUI offers exactly these links for `link_activate`.
+    #[must_use]
+    pub fn link_schemes(&self) -> Vec<String> {
+        self.host.link_schemes()
+    }
+
+    /// Deliver a click on `url` as `link_activate` to the extension that claimed its scheme.
+    /// `false` when no extension owns the link.
+    ///
+    /// # Errors
+    /// Transport failure to the extension host.
+    pub async fn activate_link(&self, url: &str) -> Result<bool> {
+        self.host.link_activate(url).await
+    }
+}
+
+/// Emit every buffered credential soft-disable in order (TS `runner.ts`'s
+/// `emitCredentialDisabled`, which drains `#pendingCredentialDisabled` once initialized).
+async fn flush_credential_disabled(host: &ExtHost, feed: &CredentialDisabledFeed) {
+    for event in feed.take() {
+        emit_silent(
+            host.emit_credential_disabled(
+                event.provider,
+                event.disabled_cause,
+                event.credential_id,
+                event.email,
+                event.account_id,
+                event.org_id,
+                event.org_name,
+                None,
+            )
+            .await,
+        );
+    }
+}
+
+/// Plan-review transitions reach the host as ordered fire-and-forget emits whose explicit ctx
+/// sets `pendingPlanReview` (backing `ctx.getPendingPlanReview()` / `ctx.resolvePlanReview`). The
+/// ctx merge is sent even when no extension subscribes (the host applies it and runs no
+/// handler), so a later handler or command still sees the current review. The live snapshot
+/// keeps it too, so a reconnected host gets it back on the next emit.
+fn send_plan_review(host: &ExtHost, live: &Live, pending: Value, event: &LifecycleEvent) {
+    live.snap
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert("pendingPlanReview".into(), pending.clone());
+    let ctx = json!({ "pendingPlanReview": pending });
+    if let Err(e) = host.emit_nowait(&event.to_value(), Some(ctx), emit_silent) {
+        eprintln!("omt: extension emit: {e:#}");
+    }
+}
+
+impl crate::features::plan::ReviewSink for Extensions {
+    fn opened(&self, request: &PlanReviewRequest) {
+        // TS `getPendingPlanReview` returns the event as delivered (with `type`).
+        let event = LifecycleEvent::PlanReviewRequested(request.clone());
+        send_plan_review(&self.host, &self.live, event.to_value(), &event);
+    }
+
+    fn closed(
+        &self,
+        review_id: &str,
+        session_id: &str,
+        choice: Option<PlanReviewChoice>,
+        by: PlanReviewBy,
+    ) {
+        let event = LifecycleEvent::PlanReviewResolved {
+            review_id: review_id.to_string(),
+            session_id: session_id.to_string(),
+            choice,
+            by,
+        };
+        send_plan_review(&self.host, &self.live, Value::Null, &event);
     }
 }
 
@@ -1406,6 +1976,114 @@ fn handle_notification(rt: &Arc<Runtime>, msg: HostMessage) {
             );
         }
         _ => {}
+    }
+}
+
+/// Cap on `mcp_notification` frames buffered before the session ctx is wired (omp
+/// `MAX_PENDING_MCP_NOTIFICATIONS`); drop-oldest under pressure.
+const MAX_PENDING_MCP_NOTIFICATIONS: usize = 100;
+
+/// One session's MCP notification state: the host that runs the handlers, whether the
+/// session ctx has been sent yet, and the frames received before it was.
+struct McpNotificationState {
+    host: Arc<ExtHost>,
+    attached: AtomicBool,
+    pending: Mutex<VecDeque<LifecycleEvent>>,
+}
+
+/// Sink for MCP server notifications: every connected server's frames reach
+/// [`Extensions`] here, which emits them as `mcp_notification` (omp `emitMcpNotification`).
+#[derive(Clone)]
+pub struct McpNotificationSink {
+    state: Arc<McpNotificationState>,
+}
+
+impl McpNotificationSink {
+    fn new(host: Arc<ExtHost>) -> Self {
+        Self {
+            state: Arc::new(McpNotificationState {
+                host,
+                attached: AtomicBool::new(false),
+                pending: Mutex::new(VecDeque::new()),
+            }),
+        }
+    }
+
+    /// One JSON-RPC notification from `server`, after the runtime handled it. Buffered
+    /// while the session ctx is not wired yet; emitted at once afterwards.
+    pub fn publish(&self, server: String, method: String, params: Value) {
+        let event = LifecycleEvent::McpNotification {
+            server,
+            method,
+            params,
+        };
+        if !self.state.attached.load(Ordering::Relaxed) {
+            let mut pending = self
+                .state
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.len() >= MAX_PENDING_MCP_NOTIFICATIONS {
+                pending.pop_front();
+            }
+            pending.push_back(event);
+            return;
+        }
+        self.emit(event);
+    }
+
+    /// Session ctx wired: emit the frames that arrived earlier, in arrival order.
+    fn attach(&self) {
+        if self.state.attached.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let pending: Vec<LifecycleEvent> = self
+            .state
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        for event in pending {
+            self.emit(event);
+        }
+    }
+
+    /// Observe-only emit: the host runs the handlers serially in wire order and no
+    /// result is read back (`ext-host/host.ts` "everything else: observe").
+    fn emit(&self, event: LifecycleEvent) {
+        notify(&self.state.host, "mcp_notification", || event);
+    }
+}
+
+/// Sessions forwarding MCP notifications. Weak, so a dropped session unregisters itself.
+static MCP_NOTIFICATION_SINKS: Mutex<Vec<std::sync::Weak<McpNotificationState>>> =
+    Mutex::new(Vec::new());
+
+fn register_mcp_notifications(sink: McpNotificationSink) {
+    let mut sinks = MCP_NOTIFICATION_SINKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    sinks.retain(|weak| weak.strong_count() > 0);
+    sinks.push(Arc::downgrade(&sink.state));
+}
+
+/// Publish one server notification to every live extension session, like omp's
+/// `sdk.ts` bridge from `MCPManager.addNotificationListener` into each session's runner.
+pub fn publish_mcp_notification(notification: &omp_mcp::ServerNotification) {
+    let sinks: Vec<Arc<McpNotificationState>> = {
+        let mut list = MCP_NOTIFICATION_SINKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list.retain(|weak| weak.strong_count() > 0);
+        list.iter().filter_map(std::sync::Weak::upgrade).collect()
+    };
+    for state in sinks {
+        McpNotificationSink { state }.publish(
+            notification.server.clone(),
+            notification.method.clone(),
+            notification.params.clone(),
+        );
     }
 }
 
@@ -1556,6 +2234,40 @@ impl Extensions {
             })
             .await
     }
+
+    /// [`Self::before_provider_request`] as the loop's payload hook
+    /// (`StreamRequestOptions::on_payload`): the provider calls it with the payload it
+    /// is about to send.
+    pub fn payload_hook(self: &Arc<Self>) -> pa_agent::stream::OnPayloadHook {
+        let ext = Arc::clone(self);
+        Arc::new(move |payload: Value, _model: &pa_agent::types::Model| {
+            ext.before_provider_request(payload)
+        })
+    }
+}
+
+/// [`Extensions::before_provider_request`] for the requests that build their own
+/// `SimpleStreamOptions` instead of going through the loop (compaction, side turns);
+/// upstream wires the same hook there.
+pub fn ai_payload_hook(host: Arc<ExtHost>) -> pa_ai::types::OnPayloadHook {
+    Arc::new(move |payload: Value, _model: &pa_types::ai::Model| provider_payload(&host, payload))
+}
+
+/// One `before_provider_request` round trip: nothing when no extension subscribes
+/// (`has_handlers`), the handlers' chained replacement otherwise. A transport failure
+/// leaves the payload alone and is reported, like a failing handler in TS.
+fn provider_payload(host: &Arc<ExtHost>, payload: Value) -> Option<Value> {
+    if !host.has_handlers("before_provider_request") {
+        return None;
+    }
+    let event = json!({"type": "before_provider_request", "payload": payload});
+    match host.emit_blocking(event, None) {
+        Ok(result) => result.result.get("payload").cloned(),
+        Err(error) => {
+            eprintln!("omt: before_provider_request: {error:#}");
+            None
+        }
+    }
 }
 
 /// Emit `session_stop` from the would-stop point and translate its outcome
@@ -1654,6 +2366,57 @@ fn notify(host: &ExtHost, ty: &str, build: impl FnOnce() -> LifecycleEvent) {
     if let Err(e) = host.emit_nowait(&build().to_value(), None, emit_silent) {
         eprintln!("omt: extension emit: {e:#}");
     }
+}
+
+/// The session stream's provider-response observation hook: TS `sdk.ts` wires
+/// `SimpleStreamOptions.onResponse` to `emitAfterProviderResponse`, so an extension sees every
+/// provider response once the HTTP response has landed and before its stream body is read.
+/// Observe-only (the runner discards handler results), so the emit rides [`notify`] instead of
+/// blocking the provider hook, which is sync by contract.
+#[must_use]
+pub fn after_provider_response_hook(host: Arc<ExtHost>) -> pa_agent::stream::OnResponseHook {
+    Arc::new(
+        move |response: pa_agent::stream::ProviderResponse, _model: &pa_agent::types::Model| {
+            // TS `normalizeProviderResponse` is handed the provider's request id
+            // (`request-id` for Anthropic, `x-request-id` elsewhere); this core's
+            // `ProviderResponse` carries headers only, so it is read back from them exactly as
+            // the providers do.
+            let request_id = response
+                .headers
+                .get("request-id")
+                .or_else(|| response.headers.get("x-request-id"))
+                .cloned();
+            notify(&host, "after_provider_response", || {
+                LifecycleEvent::AfterProviderResponse {
+                    status: response.status,
+                    headers: response.headers,
+                    request_id,
+                }
+            });
+        },
+    )
+}
+
+/// Compose [`after_provider_response_hook`] onto `base`: a response hook the request already
+/// carried runs first, then the extension observation (TS `agent-loop.ts` wraps the user's
+/// `onResponse` the same way).
+#[must_use]
+pub fn with_response_hook(
+    base: pa_agent::stream::StreamFn,
+    hook: pa_agent::stream::OnResponseHook,
+) -> pa_agent::stream::StreamFn {
+    Arc::new(move |model, context, mut options| {
+        let hook = hook.clone();
+        let composed: pa_agent::stream::OnResponseHook = match options.on_response.take() {
+            Some(existing) => Arc::new(move |response, model| {
+                existing(response.clone(), model);
+                hook(response, model);
+            }),
+            None => hook,
+        };
+        options.on_response = Some(composed);
+        base(model, context, options)
+    })
 }
 
 /// Queue one `message_update` as a delta frame against the message the host
@@ -1925,6 +2688,165 @@ mod tests {
         .unwrap()
     }
 
+    /// A fake host that appends every request line to `$LOG` and answers each request: `load`
+    /// with no extensions loaded, everything else with an empty emit outcome. Reading the log
+    /// after an awaited request is deterministic: the host runs queued emits in wire order.
+    const LOG_HOST: &str = concat!(
+        "while IFS= read -r line; do\n",
+        "  printf '%s\\n' \"$line\" >> \"$LOG\"\n",
+        "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+        "  case \"$line\" in\n",
+        "    *'\"method\":\"load\"'*) result='{\"loaded\":[],\"errors\":[]}';;\n",
+        "    *) result='{\"result\":null,\"handlers\":[],\"errors\":[]}';;\n",
+        "  esac\n",
+        "  if [ -n \"$id\" ]; then\n",
+        "    printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}\\n' \"$id\" \"$result\"\n",
+        "  fi\n",
+        "done\n",
+    );
+
+    /// The observation hook the session stream installs (`sdk.ts` `onResponse` →
+    /// `emitAfterProviderResponse`) hands the provider's status, headers and request id to the
+    /// host once the response lands.
+    #[tokio::test]
+    async fn after_provider_response_reaches_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = sh_host(
+            dir.path(),
+            LOG_HOST,
+            vec![("LOG".into(), log.display().to_string())],
+        )
+        .await;
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("request-id".to_string(), "req_abc".to_string());
+        headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        let hook = after_provider_response_hook(host.clone());
+        hook(
+            pa_agent::stream::ProviderResponse {
+                status: 429,
+                headers,
+            },
+            &pa_agent::types::Model::unknown(),
+        );
+        // Barrier: the host answers requests in order, so its reply to this awaited emit proves
+        // the queued observation above already reached it.
+        host.emit(json!({"type": "session_shutdown"}), None)
+            .await
+            .unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        let line = logged
+            .lines()
+            .find(|line| line.contains("after_provider_response"))
+            .expect("after_provider_response reached the host");
+        let value: Value = serde_json::from_str(line).unwrap();
+        let event = &value["params"]["event"];
+        assert_eq!(event["type"], json!("after_provider_response"));
+        assert_eq!(event["status"], json!(429));
+        assert_eq!(event["headers"]["content-type"], json!("text/event-stream"));
+        assert_eq!(event["headers"]["request-id"], json!("req_abc"));
+        assert_eq!(event["requestId"], json!("req_abc"));
+        host.shutdown().await.unwrap();
+    }
+
+    /// With no `after_provider_response` subscriber the hook stays silent (`hasHandlers` gate).
+    #[tokio::test]
+    async fn after_provider_response_skipped_without_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = sh_host(
+            dir.path(),
+            LOG_HOST,
+            vec![("LOG".into(), log.display().to_string())],
+        )
+        .await;
+        // `load` with no extensions: nothing subscribes, so the gate is closed.
+        host.load(None, None, "/tmp", None).await.unwrap();
+        assert!(!host.has_handlers("after_provider_response"));
+        let hook = after_provider_response_hook(host.clone());
+        hook(
+            pa_agent::stream::ProviderResponse {
+                status: 200,
+                headers: std::collections::BTreeMap::default(),
+            },
+            &pa_agent::types::Model::unknown(),
+        );
+        host.emit(json!({"type": "session_shutdown"}), None)
+            .await
+            .unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(!logged.contains("after_provider_response"), "{logged}");
+        host.shutdown().await.unwrap();
+    }
+
+    /// The session stream composes the observation onto the response hook a request already
+    /// carried, and both run (TS `agent-loop.ts` wraps the caller's `onResponse` the same way).
+    #[tokio::test]
+    async fn session_stream_composes_provider_response_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = sh_host(
+            dir.path(),
+            LOG_HOST,
+            vec![("LOG".into(), log.display().to_string())],
+        )
+        .await;
+        let caller_hook_calls = Arc::new(AtomicU64::new(0));
+        let seen = caller_hook_calls.clone();
+        // Stands in for the provider: fires the request's response hook exactly where `pa-ai`
+        // does, right after the HTTP response and before the body is read.
+        let base: pa_agent::stream::StreamFn = Arc::new(move |_model, _context, options| {
+            Box::pin(async move {
+                if let Some(hook) = &options.on_response {
+                    let mut headers = std::collections::BTreeMap::new();
+                    headers.insert("x-request-id".to_string(), "req_xyz".to_string());
+                    hook(
+                        pa_agent::stream::ProviderResponse {
+                            status: 503,
+                            headers,
+                        },
+                        &pa_agent::types::Model::unknown(),
+                    );
+                }
+                let no_body: anyhow::Result<Box<dyn pa_agent::stream::ModelStream>> = Err(
+                    anyhow::anyhow!("no body: the hook is what this test observes"),
+                );
+                no_body
+            })
+        });
+        let stream = with_response_hook(base, after_provider_response_hook(host.clone()));
+        let options = pa_agent::stream::StreamRequestOptions {
+            on_response: Some(Arc::new(move |_response, _model| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })),
+            ..pa_agent::stream::StreamRequestOptions::default()
+        };
+        let _ = stream(
+            pa_agent::types::Model::unknown(),
+            pa_agent::stream::LlmContext::default(),
+            options,
+        )
+        .await;
+        assert_eq!(
+            caller_hook_calls.load(Ordering::SeqCst),
+            1,
+            "the caller's response hook still runs"
+        );
+        host.emit(json!({"type": "session_shutdown"}), None)
+            .await
+            .unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        let line = logged
+            .lines()
+            .find(|line| line.contains("after_provider_response"))
+            .expect("observation reached the host");
+        let value: Value = serde_json::from_str(line).unwrap();
+        let event = &value["params"]["event"];
+        assert_eq!(event["status"], json!(503));
+        assert_eq!(event["requestId"], json!("req_xyz"));
+        host.shutdown().await.unwrap();
+    }
+
     /// Answers every request with a `session_stop` outcome of
     /// `continue: true, additionalContext: "keep going"`.
     const CONTINUE_HOST: &str = concat!(
@@ -1935,6 +2857,84 @@ mod tests {
         "  fi\n",
         "done\n",
     );
+
+    /// Records every frame the core writes, answering each request with an empty emit result.
+    const RECORDING_HOST: &str = concat!(
+        "while IFS= read -r line; do\n",
+        "  printf '%s\\n' \"$line\" >> \"$REC\"\n",
+        "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+        "  if [ -n \"$id\" ]; then\n",
+        "    printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":null,\"handlers\":[],\"errors\":[]}}\\n' \"$id\"\n",
+        "  fi\n",
+        "done\n",
+    );
+
+    /// `plan_review_requested` then `plan_review_resolved` go out in order as fire-and-forget
+    /// emits whose ctx sets/clears `pendingPlanReview` (the host's `getPendingPlanReview`).
+    #[tokio::test]
+    async fn plan_review_events_carry_pending_review_ctx() {
+        use omp_ext::lifecycle::PlanReviewOption;
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("frames.jsonl");
+        let host = sh_host(
+            dir.path(),
+            RECORDING_HOST,
+            vec![("REC".into(), rec.to_string_lossy().into_owned())],
+        )
+        .await;
+        let live = Live::default();
+        let request = PlanReviewRequest {
+            review_id: "r1".into(),
+            session_id: "s1".into(),
+            title: "T".into(),
+            plan_file_path: "local://T-plan.md".into(),
+            plan_content: "# T".into(),
+            options: vec![PlanReviewOption {
+                id: PlanReviewChoice::Execute,
+                label: "Approve and execute".into(),
+                disabled: false,
+            }],
+            tiers: None,
+        };
+        let requested = LifecycleEvent::PlanReviewRequested(request);
+        send_plan_review(&host, &live, requested.to_value(), &requested);
+        assert_eq!(
+            live.snap.lock().unwrap()["pendingPlanReview"]["reviewId"],
+            "r1"
+        );
+        let resolved = LifecycleEvent::PlanReviewResolved {
+            review_id: "r1".into(),
+            session_id: "s1".into(),
+            choice: Some(PlanReviewChoice::Execute),
+            by: PlanReviewBy::Extension,
+        };
+        send_plan_review(&host, &live, Value::Null, &resolved);
+        assert!(live.snap.lock().unwrap()["pendingPlanReview"].is_null());
+        // The shell answers in order: once this reply is back, both emits were recorded.
+        host.set_ctx(json!({})).await.unwrap();
+        let frames: Vec<Value> = std::fs::read_to_string(&rec)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|f: &Value| f["method"] == "emit")
+            .collect();
+        assert_eq!(frames.len(), 2);
+        let p0 = &frames[0]["params"];
+        assert_eq!(p0["nowait"], true);
+        assert_eq!(
+            serde_json::to_string(&p0["event"]).unwrap(),
+            r##"{"type":"plan_review_requested","reviewId":"r1","sessionId":"s1","title":"T","planFilePath":"local://T-plan.md","planContent":"# T","options":[{"id":"execute","label":"Approve and execute","disabled":false}]}"##
+        );
+        assert_eq!(p0["ctx"]["pendingPlanReview"], p0["event"]);
+        let p1 = &frames[1]["params"];
+        assert_eq!(
+            p1["event"],
+            json!({"type": "plan_review_resolved", "reviewId": "r1", "sessionId": "s1",
+                   "choice": "execute", "by": "extension"})
+        );
+        assert!(p1["ctx"]["pendingPlanReview"].is_null());
+        host.shutdown().await.unwrap();
+    }
 
     /// `run_ephemeral_turn` contract: options are validated before inference
     /// (TS `EphemeralTurnOptions`), the prompt follows the detached history.
@@ -1952,10 +2952,55 @@ mod tests {
         assert!(err(json!({"promptText": "q", "tools": true})).contains("tools"));
         assert!(err(json!({"promptText": "q", "history": "x"})).contains("history"));
         assert!(err(json!({"promptText": "q", "promptImages": {}})).contains("promptImages"));
+        assert!(err(json!({"promptText": "q", "maxContextBytes": 0})).contains("maxContextBytes"));
+        assert!(
+            err(json!({"promptText": "q", "maxContextBytes": 9_007_199_254_740_992_u64}))
+                .contains("maxContextBytes")
+        );
+        assert!(err(json!({"promptText": "q", "replyMaxBytes": 1.5})).contains("replyMaxBytes"));
+        assert!(err(json!({"promptText": "q", "minimizeEffort": "yes"})).contains("minimizeEffort"));
+        assert!(err(json!({"promptText": "q", "dedupeReply": 1})).contains("dedupeReply"));
+        assert!(err(json!({"promptText": "q", "conversationKey": 3})).contains("conversationKey"));
+        assert!(err(json!({"promptText": "q", "purpose": {}})).contains("purpose"));
+        assert!(err(json!({"promptText": "q", "streamId": true})).contains("streamId"));
 
         let bare = EphemeralTurn::parse(&json!({"promptText": "why?", "tools": false})).unwrap();
         assert_eq!(bare.max_tokens, EPHEMERAL_DEFAULT_MAX_TOKENS);
         assert_eq!(bare.tail.len(), 1);
+        assert_eq!(bare.max_context_bytes, None);
+        assert!(
+            !bare.minimize_effort,
+            "effort is the session's unless minimized"
+        );
+        assert_eq!(bare.conversation_key, None);
+        assert_eq!(bare.purpose, None);
+        assert!(
+            bare.dedupe_reply,
+            "a reply is deduped unless the caller opts out"
+        );
+        assert_eq!(bare.reply_max_bytes, EPHEMERAL_REPLY_MAX_BYTES);
+        assert_eq!(bare.stream_id, None, "no onTextDelta, no stream");
+
+        let options = EphemeralTurn::parse(&json!({
+            "promptText": "q",
+            "maxContextBytes": 1024,
+            "minimizeEffort": true,
+            "conversationKey": "topic",
+            "purpose": "recap",
+            "dedupeReply": false,
+            "replyMaxBytes": 64,
+            "streamId": 7,
+            "usageCallback": true,
+        }))
+        .unwrap();
+        assert_eq!(options.max_context_bytes, Some(1024));
+        assert!(options.minimize_effort);
+        assert_eq!(options.conversation_key.as_deref(), Some("topic"));
+        assert_eq!(options.purpose.as_deref(), Some("recap"));
+        assert!(!options.dedupe_reply);
+        assert_eq!(options.reply_max_bytes, 64);
+        assert_eq!(options.stream_id, Some(json!(7)));
+        assert!(options.usage_callback);
 
         let full = EphemeralTurn::parse(&json!({
             "promptText": "and now?",
@@ -1998,10 +3043,260 @@ mod tests {
             "timestamp": 5,
         }))
         .unwrap();
-        let result = ephemeral_result(&response);
+        let result = ephemeral_result("it is fine", &response);
         assert_eq!(result["replyText"], "it is fine");
         assert_eq!(result["assistantMessage"]["model"], "m");
         assert_eq!(result["assistantMessage"]["stopReason"], "stop");
+    }
+
+    /// TS `dedupeEphemeralReply`: runs of one repeated line longer than three collapse, and an
+    /// over-budget reply is cut on a UTF-8 boundary and marked.
+    #[test]
+    fn ext_ephemeral_dedupe_reply_collapses_repeats_and_bounds_bytes() {
+        assert_eq!(dedupe_ephemeral_reply("", 4096), "");
+        assert_eq!(dedupe_ephemeral_reply("a\nb\nb\nb", 4096), "a\nb\nb\nb");
+        assert_eq!(
+            dedupe_ephemeral_reply("a\nb\nb\nb\nb\nc", 4096),
+            "a\nb\n[…4×]\nc"
+        );
+        let long = "가".repeat(10);
+        let bounded = dedupe_ephemeral_reply(&long, 20);
+        assert!(bounded.ends_with("\n[…truncated]"));
+        let kept = bounded.trim_end_matches("\n[…truncated]");
+        assert_eq!(
+            kept, "가",
+            "a character straddling the budget is dropped whole"
+        );
+        assert!(bounded.len() <= 20);
+    }
+
+    /// TS `journalCompletion`: a side turn with a `purpose` journals its settled attempt as a
+    /// `model_usage` entry, keeping the reply only while it is small and a forced tool call's
+    /// arguments when there is no text.
+    #[test]
+    fn ext_ephemeral_purpose_journals_the_settled_attempt() {
+        let payload = ephemeral_usage_payload("recap", &streamed_message("hi"));
+        assert_eq!(payload["purpose"], "recap");
+        assert_eq!(payload["model"], "a");
+        assert_eq!(payload["stopReason"], "stop");
+        assert_eq!(payload["completion"]["reply"], "hi");
+        assert!(payload.get("errorMessage").is_none());
+
+        // A reply past the journal's ceiling is left out, never truncated.
+        let long = ephemeral_usage_payload("recap", &streamed_message(&"x".repeat(4001)));
+        assert!(long["completion"].get("reply").is_none());
+        let at_limit = ephemeral_usage_payload("recap", &streamed_message(&"x".repeat(4000)));
+        assert_eq!(
+            at_limit["completion"]["reply"].as_str().unwrap().len(),
+            4000
+        );
+
+        // A call answered through a forced tool call has no text: its arguments are the reply.
+        let forced: pa_types::ai::AssistantMessage = serde_json::from_value(json!({
+            "content": [{"type": "toolCall", "id": "t", "name": "answer",
+                         "arguments": {"text": "it is fine"}}],
+            "api": "openai-completions", "provider": "p", "model": "a",
+            "usage": {"input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 3,
+                      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+            "stopReason": "error", "errorMessage": "boom", "timestamp": 5
+        }))
+        .unwrap();
+        let failed = ephemeral_usage_payload("recap", &forced);
+        assert_eq!(failed["completion"]["reply"], "{\"text\":\"it is fine\"}");
+        assert_eq!(failed["errorMessage"], "boom");
+    }
+
+    /// A `purpose` names the journal entry, and a host that reports usage itself (`onUsage`) already
+    /// counted the attempt, so the core journals nothing then (TS `args.onUsage ?? journalCompletion`).
+    #[test]
+    fn ext_ephemeral_journals_only_an_unreported_purpose() {
+        let parse = |extra: Value| {
+            let mut request = json!({"promptText": "q"});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            EphemeralTurn::parse(&request).unwrap()
+        };
+        assert_eq!(
+            parse(json!({"purpose": "recap"})).journal_purpose(),
+            Some("recap")
+        );
+        assert_eq!(
+            parse(json!({"purpose": "recap", "usageCallback": true})).journal_purpose(),
+            None,
+            "the host's own onUsage reporter wins"
+        );
+        assert_eq!(
+            parse(json!({"usageCallback": true})).journal_purpose(),
+            None
+        );
+        assert_eq!(parse(json!({})).journal_purpose(), None);
+    }
+
+    /// TS `maxContextBytes`: the encoded provider context must fit the caller's ceiling.
+    #[test]
+    fn ext_ephemeral_turn_context_ceiling_rejects_a_large_context() {
+        let messages = vec![serde_json::from_value(
+            json!({"role": "user", "content": "hello", "timestamp": 1}),
+        )
+        .unwrap()];
+        let context = crate::features::btw::side_context(messages);
+        let turn =
+            EphemeralTurn::parse(&json!({"promptText": "q", "maxContextBytes": 16})).unwrap();
+        assert!(turn
+            .check_context_bytes(&context)
+            .unwrap_err()
+            .contains("16-byte limit"));
+        let roomy =
+            EphemeralTurn::parse(&json!({"promptText": "q", "maxContextBytes": 4096})).unwrap();
+        assert!(roomy.check_context_bytes(&context).is_ok());
+        let unlimited = EphemeralTurn::parse(&json!({"promptText": "q"})).unwrap();
+        assert!(unlimited.check_context_bytes(&context).is_ok());
+    }
+
+    /// TS `sideSessionId`: a `conversationKey` keeps one provider lineage; without one every side
+    /// turn gets its own.
+    #[test]
+    fn ext_ephemeral_side_session_id_keys_a_conversation() {
+        let keyed =
+            EphemeralTurn::parse(&json!({"promptText": "q", "conversationKey": "topic"})).unwrap();
+        assert_eq!(keyed.side_session_id("s1"), "s1:side:conversation:topic");
+        assert_eq!(
+            keyed.side_session_id("s1"),
+            keyed.side_session_id("s1"),
+            "a keyed lineage is stable across calls"
+        );
+        let unkeyed = EphemeralTurn::parse(&json!({"promptText": "q"})).unwrap();
+        let first = unkeyed.side_session_id("s1");
+        assert!(first.starts_with("s1:side:") && !first.contains("conversation"));
+        assert_ne!(first, unkeyed.side_session_id("s1"));
+    }
+
+    /// TS `minimizeEffort` runs a side turn at the model's lowest effort; without it the turn asks
+    /// for the session's level, and a model without a thinking surface asks for nothing.
+    #[test]
+    fn ext_ephemeral_minimize_effort_lowers_the_requested_level() {
+        use pa_types::ai::ModelThinkingLevel;
+        let model: pa_types::ai::Model = serde_json::from_value(json!({
+            "id": "a", "name": "a", "api": "openai-completions", "provider": "p",
+            "baseUrl": "http://127.0.0.1:9", "reasoning": true, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 100_000, "maxTokens": 4096
+        }))
+        .unwrap();
+        let mut options = crate::features::btw::SideTurnOptions {
+            max_tokens: 64,
+            thinking_level: ModelThinkingLevel::High,
+            minimize_effort: false,
+            session_id: None,
+        };
+        assert_eq!(
+            crate::features::btw::side_turn_thinking_level(&model, &options),
+            Some(ModelThinkingLevel::High)
+        );
+        options.minimize_effort = true;
+        assert_eq!(
+            crate::features::btw::side_turn_thinking_level(&model, &options),
+            Some(ModelThinkingLevel::Minimal)
+        );
+        let mut plain = model;
+        plain.reasoning = false;
+        assert_eq!(
+            crate::features::btw::side_turn_thinking_level(&plain, &options),
+            None
+        );
+    }
+
+    /// Collects the deltas one side turn delivers.
+    struct Recording(std::sync::Mutex<Vec<String>>);
+
+    impl crate::features::btw::SideTurnObserver for Recording {
+        fn text_delta<'a>(
+            &'a self,
+            delta: &'a str,
+        ) -> crate::features::btw::BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(delta.to_string());
+                Ok(())
+            })
+        }
+    }
+
+    /// Refuses every delivery (a host whose `onTextDelta` threw).
+    struct Refusing;
+
+    impl crate::features::btw::SideTurnObserver for Refusing {
+        fn text_delta<'a>(
+            &'a self,
+            _delta: &'a str,
+        ) -> crate::features::btw::BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("the callback threw".into()) })
+        }
+    }
+
+    fn streamed_message(text: &str) -> pa_types::ai::AssistantMessage {
+        serde_json::from_value(json!({
+            "content": [{"type": "text", "text": text}],
+            "api": "openai-completions", "provider": "p", "model": "a",
+            "usage": {"input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 3,
+                      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+            "stopReason": "stop", "timestamp": 5
+        }))
+        .unwrap()
+    }
+
+    /// Every text delta reaches the observer in the provider's order, and the delivered deltas are
+    /// exactly the reply's text (TS `onTextDelta` + `providerReplyText`).
+    #[tokio::test]
+    async fn ext_ephemeral_stream_delivers_every_delta_in_order() {
+        use pa_types::ai::{AssistantMessageEvent, DoneStopReason};
+        let (writer, stream) = pa_ai::AssistantMessageEventStream::new();
+        let partial = streamed_message("");
+        let deltas = ["Hel", "lo, ", "world"];
+        for delta in deltas {
+            writer.push(AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: delta.into(),
+                partial: partial.clone(),
+            });
+        }
+        writer.push(AssistantMessageEvent::Done {
+            reason: DoneStopReason::Stop,
+            message: streamed_message("Hello, world"),
+        });
+        let seen = Recording(std::sync::Mutex::new(Vec::new()));
+        let Ok(reply) = crate::features::btw::pump_side_stream(stream, &seen).await else {
+            panic!("the stream settles");
+        };
+        let seen = seen.0.into_inner().unwrap();
+        assert_eq!(
+            seen,
+            deltas.iter().map(|d| d.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(seen.concat(), reply.text);
+        assert!(matches!(
+            reply.outcome,
+            crate::features::btw::SideTurn::Done(_)
+        ));
+    }
+
+    /// A delta the observer refuses aborts the side turn (TS: the awaited `onTextDelta` rejects).
+    #[tokio::test]
+    async fn ext_ephemeral_stream_stops_when_a_delta_is_not_delivered() {
+        use pa_types::ai::AssistantMessageEvent;
+        let (writer, stream) = pa_ai::AssistantMessageEventStream::new();
+        writer.push(AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "x".into(),
+            partial: streamed_message("x"),
+        });
+        let Err(err) = crate::features::btw::pump_side_stream(stream, &Refusing).await else {
+            panic!("a refused delivery fails the turn");
+        };
+        assert!(
+            matches!(err, crate::features::btw::SideTurnError::Request(m) if m.contains("not delivered"))
+        );
     }
 
     /// A core without a side-turn implementation answers with an explicit error,
@@ -2195,11 +3490,485 @@ mod tests {
         assert!(injected_message(&json!(7)).is_none());
     }
 
+    /// `credential_disabled`: events the auth store reported before the session was live wait in
+    /// the feed and reach the host, in the omp payload shape, on the next flush.
+    #[tokio::test]
+    async fn credential_disabled_feed_flushes_to_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("emits.log");
+        let host = sh_host(
+            dir.path(),
+            concat!(
+                "while IFS= read -r line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"method\":\"emit\"'*)\n",
+                "      printf '%s\\n' \"$line\" >> \"$LOG\"\n",
+                "      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":null,\"handlers\":[],\"errors\":[]}}\\n' \"$id\";;\n",
+                "  esac\n",
+                "done\n",
+            ),
+            vec![("LOG".into(), log.display().to_string())],
+        )
+        .await;
+        let feed = CredentialDisabledFeed::default();
+        feed.push(CredentialDisabledEvent {
+            provider: "anthropic".into(),
+            disabled_cause: "oauth refresh failed: invalid_grant".into(),
+            credential_id: Some(7),
+            email: Some("gone@example.com".into()),
+            account_id: Some("acct".into()),
+            org_id: None,
+            org_name: None,
+        });
+        flush_credential_disabled(&host, &feed).await;
+        assert!(feed.take().is_empty(), "the flush drains the queue");
+
+        let written = std::fs::read_to_string(&log).unwrap();
+        let request: Value = serde_json::from_str(written.lines().next().unwrap()).unwrap();
+        assert_eq!(request["method"], "emit");
+        let event = &request["params"]["event"];
+        assert_eq!(event["type"], "credential_disabled");
+        assert_eq!(event["provider"], "anthropic");
+        assert_eq!(
+            event["disabledCause"],
+            "oauth refresh failed: invalid_grant"
+        );
+        assert_eq!(event["credentialId"], 7);
+        assert_eq!(event["email"], "gone@example.com");
+        assert_eq!(event["accountId"], "acct");
+        assert!(
+            event.get("orgId").is_none(),
+            "absent identity fields are omitted"
+        );
+        host.shutdown().await.unwrap();
+    }
+
+    /// Fake host for the payload hook: logs every request line to `$OMP_TEST_LOG`,
+    /// answers `load` with the subscribers in `$OMP_TEST_HANDLERS` and `emit` with a
+    /// replacement payload (what `host.ts` returns after the handler chain).
+    const PAYLOAD_HOST: &str = concat!(
+        "while IFS= read -r line; do\n",
+        "  printf '%s\\n' \"$line\" >> \"$OMP_TEST_LOG\"\n",
+        "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+        "  case \"$line\" in\n",
+        "    *'\"method\":\"load\"'*)\n",
+        "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"loaded\":[{\"path\":\"/e.ts\",\"name\":\"e\",\"handlers\":%s}],\"errors\":[]}}\\n' \"$id\" \"$OMP_TEST_HANDLERS\"\n",
+        "      ;;\n",
+        "    *'\"method\":\"emit\"'*)\n",
+        "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":{\"payload\":{\"model\":\"rewritten\",\"n\":2}},\"handlers\":[],\"errors\":[]}}\\n' \"$id\"\n",
+        "      ;;\n",
+        "  esac\n",
+        "done\n",
+    );
+
+    async fn payload_host(dir: &std::path::Path, handlers: &str) -> Arc<ExtHost> {
+        let log = dir.join("requests.log");
+        sh_host(
+            dir,
+            PAYLOAD_HOST,
+            vec![
+                ("OMP_TEST_LOG".into(), log.to_string_lossy().into_owned()),
+                ("OMP_TEST_HANDLERS".into(), handlers.into()),
+            ],
+        )
+        .await
+    }
+
+    /// An [`Extensions`] over an already-spawned (fake) host.
+    fn sh_ext(host: Arc<ExtHost>, cwd: &std::path::Path) -> Arc<Extensions> {
+        Arc::new(Extensions {
+            mcp: McpNotificationSink::new(host.clone()),
+            hooks: ExtHooks::new(host.clone()),
+            host,
+            sub: Mutex::new(None),
+            turn: Arc::new(AtomicU64::new(0)),
+            stop: Arc::new(Mutex::new(StopState::default())),
+            cwd: cwd.to_path_buf(),
+            extra: Vec::new(),
+            dir: None,
+            ctx: Mutex::new(SessionCtx::default()),
+            mode: Mutex::new(ExtMode::Print),
+            prompt_override: Mutex::new(None),
+            live: Arc::new(Live::default()),
+            rt: Mutex::new(None),
+            blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_agent_end: Arc::new(Mutex::new(None)),
+            credential_disabled: Arc::new(CredentialDisabledFeed::default()),
+        })
+    }
+
+    fn agent_model() -> pa_agent::types::Model {
+        serde_json::from_value(json!({
+            "id": "a", "name": "a", "api": "openai-completions", "provider": "p",
+            "baseUrl": "http://127.0.0.1:9"
+        }))
+        .expect("agent model json")
+    }
+
+    /// The provider's real payload reaches `before_provider_request`, and the payload
+    /// the handlers leave behind is what the request goes out with.
+    #[tokio::test]
+    async fn before_provider_request_sends_the_real_payload_and_applies_the_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = payload_host(dir.path(), r#"{"before_provider_request":1}"#).await;
+        let ext = sh_ext(host, dir.path());
+
+        let sent = json!({
+            "model": "orig",
+            "messages": [{"role": "user", "text": "real-payload-marker"}]
+        });
+        let out = ext
+            .before_provider_request(sent)
+            .expect("the handler's replacement payload");
+        assert_eq!(out, json!({"model": "rewritten", "n": 2}));
+
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            seen.contains(r#""type":"before_provider_request""#),
+            "the event carries the TS name: {seen}"
+        );
+        assert!(
+            seen.contains("real-payload-marker"),
+            "the real payload crosses, not an empty one: {seen}"
+        );
+    }
+
+    /// Hooks chain the way the loop composes them: the extension hook sees the earlier
+    /// hook's payload and its own replacement is the final one.
+    #[tokio::test]
+    async fn before_provider_request_chains_onto_an_earlier_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = payload_host(dir.path(), r#"{"before_provider_request":1}"#).await;
+        let ext = sh_ext(host, dir.path());
+
+        let earlier: pa_agent::stream::OnPayloadHook = Arc::new(|mut payload: Value, _model| {
+            payload["earlier"] = json!(true);
+            Some(payload)
+        });
+        let hook =
+            crate::adapter::chain_agent_payload_hooks(Some(earlier), Some(ext.payload_hook()))
+                .expect("both hooks present");
+
+        let out = hook(json!({"model": "orig"}), &agent_model()).expect("replacement");
+        assert_eq!(out, json!({"model": "rewritten", "n": 2}));
+
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            seen.contains(r#""earlier":true"#),
+            "the extension hook saw the earlier hook's payload: {seen}"
+        );
+    }
+
+    /// No subscriber: no round trip and no payload change (`has_handlers`).
+    #[tokio::test]
+    async fn before_provider_request_skips_the_round_trip_without_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = payload_host(dir.path(), r#"{"session_start":1}"#).await;
+        host.load(None, None, "/w", None).await.unwrap();
+        let ext = sh_ext(host, dir.path());
+
+        assert!(ext
+            .before_provider_request(json!({"model": "orig"}))
+            .is_none());
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !seen.contains(r#""method":"emit""#),
+            "no emit without a subscriber: {seen}"
+        );
+    }
+
+    /// Fake host that records every request line it receives into `$OUT` and
+    /// answers each one with an empty emit result (order == wire order).
+    const RECORD_HOST: &str = concat!(
+        "while IFS= read -r line; do\n",
+        "  printf '%s\\n' \"$line\" >> \"$OUT\"\n",
+        "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+        "  if [ -n \"$id\" ]; then\n",
+        "    printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":null,\"handlers\":[],\"errors\":[]}}\\n' \"$id\"\n",
+        "  fi\n",
+        "done\n",
+    );
+
+    /// `Extensions` over a fake host (no `start`: no bun, no extension load).
+    fn test_extensions(host: Arc<ExtHost>) -> Arc<Extensions> {
+        Arc::new(Extensions {
+            mcp: McpNotificationSink::new(host.clone()),
+            credential_disabled: Arc::new(CredentialDisabledFeed::default()),
+            host: host.clone(),
+            hooks: ExtHooks::new(host),
+            sub: Mutex::new(None),
+            turn: Arc::new(AtomicU64::new(0)),
+            stop: Arc::new(Mutex::new(StopState::default())),
+            cwd: PathBuf::from("."),
+            extra: Vec::new(),
+            dir: None,
+            ctx: Mutex::new(SessionCtx::default()),
+            mode: Mutex::new(ExtMode::Print),
+            prompt_override: Mutex::new(None),
+            live: Arc::new(Live::default()),
+            rt: Mutex::new(None),
+            blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_agent_end: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Every recorded `emit` frame of `ty`, in wire order.
+    fn emitted_events(path: &std::path::Path, ty: &str) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|v| v["method"] == "emit" && v["params"]["event"]["type"] == ty)
+            .map(|v| v["params"]["event"].clone())
+            .collect()
+    }
+
+    /// MCP notifications received before the session ctx is wired are buffered and
+    /// then emitted in arrival order with the omp payload shape (omp
+    /// `emitMcpNotification` + `#pendingMcpNotifications` drain).
+    #[tokio::test]
+    async fn mcp_notification_buffers_until_session_ctx_then_emits() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("frames.jsonl");
+        let host = sh_host(
+            dir.path(),
+            RECORD_HOST,
+            vec![("OUT".into(), out.display().to_string())],
+        )
+        .await;
+        let ext = test_extensions(host.clone());
+        let sink = ext.mcp.clone();
+        sink.publish(
+            "srv".into(),
+            "notifications/tools/list_changed".into(),
+            json!({}),
+        );
+        sink.publish("srv".into(), "custom/progress".into(), json!({"pct": 7}));
+        assert!(
+            emitted_events(&out, "mcp_notification").is_empty(),
+            "nothing reaches the host before the session ctx is wired"
+        );
+
+        // Wiring the session ctx drains the buffer; the awaited `session_start`
+        // afterwards is the ordering barrier (the host runs queued emits first).
+        ext.set_session_ctx("s1", Some(std::path::Path::new("/s.jsonl")), "p/m")
+            .await
+            .unwrap();
+        ext.session_start().await;
+        let frames = emitted_events(&out, "mcp_notification");
+        assert_eq!(frames.len(), 2, "both buffered frames: {frames:?}");
+        assert_eq!(frames[0]["server"], json!("srv"));
+        assert_eq!(
+            frames[0]["method"],
+            json!("notifications/tools/list_changed")
+        );
+        assert_eq!(frames[0]["params"], json!({}));
+        assert_eq!(frames[1]["method"], json!("custom/progress"));
+        assert_eq!(frames[1]["params"], json!({"pct": 7}));
+
+        // Attached: a new frame goes out at once.
+        sink.publish("other".into(), "custom/late".into(), Value::Null);
+        ext.session_start().await;
+        let frames = emitted_events(&out, "mcp_notification");
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2]["server"], json!("other"));
+        assert_eq!(frames[2]["method"], json!("custom/late"));
+        host.shutdown().await.unwrap();
+    }
+
+    /// The pre-attach buffer is bounded at the omp cap (100), drop-oldest.
+    #[tokio::test]
+    async fn mcp_notification_buffer_drops_oldest_at_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("frames.jsonl");
+        let host = sh_host(
+            dir.path(),
+            RECORD_HOST,
+            vec![("OUT".into(), out.display().to_string())],
+        )
+        .await;
+        let ext = test_extensions(host.clone());
+        let sink = ext.mcp.clone();
+        for i in 0..MAX_PENDING_MCP_NOTIFICATIONS + 5 {
+            sink.publish("srv".into(), "custom/tick".into(), json!({"i": i}));
+        }
+        ext.set_session_ctx("s1", None, "p/m").await.unwrap();
+        ext.session_start().await;
+        let frames = emitted_events(&out, "mcp_notification");
+        assert_eq!(frames.len(), MAX_PENDING_MCP_NOTIFICATIONS);
+        assert_eq!(frames[0]["params"], json!({"i": 5}), "oldest dropped");
+        host.shutdown().await.unwrap();
+    }
+
+    /// The manager-side bridge: one published notification reaches every live
+    /// session's sink (omp `sdk.ts` `addNotificationListener` -> runner).
+    #[tokio::test]
+    async fn publish_mcp_notification_reaches_registered_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("frames.jsonl");
+        let host = sh_host(
+            dir.path(),
+            RECORD_HOST,
+            vec![("OUT".into(), out.display().to_string())],
+        )
+        .await;
+        let ext = test_extensions(host.clone());
+        ext.set_session_ctx("s1", None, "p/m").await.unwrap();
+        register_mcp_notifications(ext.mcp.clone());
+
+        publish_mcp_notification(&omp_mcp::ServerNotification {
+            server: "Fake Server.v1".into(),
+            method: "notifications/custom/ping".into(),
+            params: json!({"detail": "custom"}),
+        });
+        ext.session_start().await;
+
+        let frames = emitted_events(&out, "mcp_notification");
+        assert_eq!(frames.len(), 1, "frames: {frames:?}");
+        assert_eq!(frames[0]["server"], json!("Fake Server.v1"));
+        assert_eq!(frames[0]["method"], json!("notifications/custom/ping"));
+        assert_eq!(frames[0]["params"], json!({"detail": "custom"}));
+        host.shutdown().await.unwrap();
+    }
+
     #[test]
     fn extension_mode_matches_ts_has_ui() {
         // TS `hasUI()` is true exactly when a UI context was provided: tui and non-headless rpc.
         assert!(ExtMode::Tui.has_ui() && ExtMode::Rpc.has_ui());
         assert!(!ExtMode::Print.has_ui() && !ExtMode::Json.has_ui());
         assert_eq!(ExtMode::Tui.name(), "tui");
+    }
+
+    /// Answers every request with the `resources_discover` result read from `$PATHS` (one line) and
+    /// records each received request line in `$LOG`.
+    const DISCOVER_HOST: &str = concat!(
+        "while IFS= read -r line; do\n",
+        "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+        "  if [ -n \"$id\" ]; then\n",
+        "    printf '%s\\n' \"$line\" >> \"$LOG\"\n",
+        "    printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":%s,\"handlers\":[],\"errors\":[]}}\\n' \"$id\" \"$(cat \"$PATHS\")\"\n",
+        "  fi\n",
+        "done\n",
+    );
+
+    /// The wire event carries `{type, cwd, reason}`, and the returned paths reach the loaders that
+    /// own them (skills, prompt templates, themes); a reload replaces the whole set.
+    #[tokio::test]
+    async fn resources_discover_emits_and_applies_paths() {
+        let _guard = crate::sysprompt::extension_registry_lock().lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(cwd.join("skills/one")).unwrap();
+        std::fs::create_dir_all(cwd.join("prompts")).unwrap();
+        std::fs::create_dir_all(cwd.join("themes")).unwrap();
+        std::fs::write(
+            cwd.join("skills/one/SKILL.md"),
+            "---\nname: one\ndescription: From an extension.\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(cwd.join("prompts/hello.md"), "Say hello\n").unwrap();
+        std::fs::write(cwd.join("themes/extheme.json"), "{}").unwrap();
+
+        let payload = dir.path().join("payload.json");
+        let log = dir.path().join("events.log");
+        let write_payload = |v: &str| std::fs::write(&payload, v).unwrap();
+        write_payload(concat!(
+            r#"{"skillPaths":[{"path":"skills/one","extensionPath":"/ext"}],"#,
+            r#""promptPaths":[{"path":"prompts","extensionPath":"/ext"}],"#,
+            r#""themePaths":[{"path":"themes/extheme.json","extensionPath":"/ext"}]}"#,
+        ));
+        let host = sh_host(
+            dir.path(),
+            DISCOVER_HOST,
+            vec![
+                ("PATHS".into(), payload.display().to_string()),
+                ("LOG".into(), log.display().to_string()),
+            ],
+        )
+        .await;
+
+        discover_resources(&host, &cwd, ResourcesDiscoverReason::Startup).await;
+        assert_eq!(
+            crate::sysprompt::extension_skill_paths(),
+            vec![cwd.join("skills/one")]
+        );
+        assert_eq!(
+            crate::rpc::slash::extension_prompt_paths(),
+            vec![cwd.join("prompts")]
+        );
+        assert_eq!(
+            omp_tui::theme::extension_theme_paths(),
+            vec![cwd.join("themes/extheme.json")]
+        );
+        // The paths really reach each loader.
+        let empty_agent = dir.path().join("agent");
+        let skills = crate::sysprompt::load_skills(&empty_agent, &cwd, true);
+        assert_eq!(
+            skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["one"]
+        );
+        assert!(
+            crate::rpc::slash::load_file_commands(&cwd)
+                .iter()
+                .any(|c| c.name == "hello"),
+            "extension prompt template becomes a slash command"
+        );
+        assert!(
+            omp_tui::theme::available_themes()
+                .iter()
+                .any(|t| t.name == "extheme"),
+            "extension theme joins the catalog"
+        );
+
+        // A reload re-sends the whole set: the previous paths are dropped.
+        write_payload(r#"{"skillPaths":[{"path":"/elsewhere/skills","extensionPath":"/ext"}]}"#);
+        discover_resources(&host, &cwd, ResourcesDiscoverReason::Reload).await;
+        assert_eq!(
+            crate::sysprompt::extension_skill_paths(),
+            vec![PathBuf::from("/elsewhere/skills")]
+        );
+        assert!(crate::rpc::slash::extension_prompt_paths().is_empty());
+        assert!(omp_tui::theme::extension_theme_paths().is_empty());
+
+        // Wire shape: upstream `ResourcesDiscoverEvent` with the reason it fired for.
+        let events = std::fs::read_to_string(&log).unwrap();
+        let cwd_wire = cwd.to_string_lossy();
+        assert!(
+            events.contains(&format!(
+                r#"{{"type":"resources_discover","cwd":"{cwd_wire}","reason":"startup"}}"#
+            )),
+            "startup event: {events}"
+        );
+        assert!(
+            events.contains(r#""reason":"reload""#),
+            "reload event: {events}"
+        );
+
+        crate::sysprompt::set_extension_skill_paths(Vec::new());
+        host.shutdown().await.unwrap();
+    }
+
+    /// `resources_discover` paths resolve like upstream `resolvePath`: an absolute path stays,
+    /// anything else resolves against the session cwd, `~` expands to the home directory.
+    #[test]
+    fn discovered_paths_resolve_against_cwd() {
+        let cwd = Path::new("/work/project");
+        assert_eq!(
+            resolve_discovered_path("/abs/skills", cwd),
+            PathBuf::from("/abs/skills")
+        );
+        assert_eq!(
+            resolve_discovered_path("skills/a", cwd),
+            cwd.join("skills/a")
+        );
+        let home = std::env::var("HOME").expect("HOME");
+        assert_eq!(
+            resolve_discovered_path("~/ext/themes", cwd),
+            PathBuf::from(home).join("ext/themes")
+        );
     }
 }

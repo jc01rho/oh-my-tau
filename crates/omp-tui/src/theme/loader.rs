@@ -119,6 +119,26 @@ pub fn custom_themes_dir() -> PathBuf {
     p
 }
 
+/// Theme paths extensions contributed through `resources_discover` (absolute, discovery order):
+/// each entry is a theme JSON file or a directory of them.
+static EXTENSION_THEME_PATHS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Replace the extension-contributed theme paths (a reload re-sends the whole set).
+pub fn set_extension_theme_paths(paths: Vec<PathBuf>) {
+    *EXTENSION_THEME_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = paths;
+}
+
+/// The extension-contributed theme paths currently registered.
+#[must_use]
+pub fn extension_theme_paths() -> Vec<PathBuf> {
+    EXTENSION_THEME_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// A loadable theme: name plus file path when it comes from disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemeInfo {
@@ -127,9 +147,16 @@ pub struct ThemeInfo {
 }
 
 /// Every loadable theme: embedded built-ins, then `~/.omp/agent/themes/*.json`
-/// (custom names never shadow built-ins; TS `getAvailableThemesWithPaths`).
+/// (custom names never shadow built-ins; TS `getAvailableThemesWithPaths`), then
+/// extension-contributed paths.
 #[must_use]
 pub fn available_themes() -> Vec<ThemeInfo> {
+    available_themes_with(&extension_theme_paths())
+}
+
+/// [`available_themes`] with explicit extension-contributed paths (the registry, or a test's list).
+#[must_use]
+pub fn available_themes_with(extension_paths: &[PathBuf]) -> Vec<ThemeInfo> {
     let mut out: Vec<ThemeInfo> = BUILTIN
         .iter()
         .map(|(name, _)| ThemeInfo {
@@ -137,22 +164,38 @@ pub fn available_themes() -> Vec<ThemeInfo> {
             path: None,
         })
         .collect();
+    let mut add_file = |path: PathBuf| {
+        if !path.extension().is_some_and(|e| e == "json") {
+            return;
+        }
+        let name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if !out.iter().any(|t| t.name == name) {
+            out.push(ThemeInfo {
+                name,
+                path: Some(path),
+            });
+        }
+    };
     if let Ok(entries) = std::fs::read_dir(custom_themes_dir()) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "json") {
-                let name = path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                if !out.iter().any(|t| t.name == name) {
-                    out.push(ThemeInfo {
-                        name,
-                        path: Some(path),
-                    });
+            add_file(entry.path());
+        }
+    }
+    for path in extension_paths {
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                files.sort();
+                for file in files {
+                    add_file(file);
                 }
             }
+        } else {
+            add_file(path.clone());
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -496,7 +539,19 @@ fn build_theme(name: &str, parsed: &ParsedTheme) -> Result<LoadedTheme, ThemeErr
 /// file exists but cannot be read; [`ThemeError::Invalid`] on parse or schema
 /// failures.
 pub fn load_loaded(name_or_path: &str) -> Result<LoadedTheme, ThemeError> {
-    let json = load_theme_json(name_or_path)?;
+    load_loaded_with(name_or_path, &extension_theme_paths())
+}
+
+/// [`load_loaded`] with explicit extension-contributed theme paths (the registry, or a test's list).
+///
+/// # Errors
+///
+/// As [`load_loaded`].
+pub fn load_loaded_with(
+    name_or_path: &str,
+    extension_paths: &[PathBuf],
+) -> Result<LoadedTheme, ThemeError> {
+    let json = load_theme_json(name_or_path, extension_paths)?;
     let parsed = parse_theme_json(name_or_path, &json)?;
     build_theme(name_or_path, &parsed)
 }
@@ -507,7 +562,19 @@ pub fn load_loaded(name_or_path: &str) -> Result<LoadedTheme, ThemeError> {
 ///
 /// As [`load_loaded`].
 pub fn load(name_or_path: &str) -> Result<Theme, ThemeError> {
-    load_loaded(name_or_path).map(|t| t.theme)
+    load_with_paths(name_or_path, &extension_theme_paths())
+}
+
+/// [`load`] with explicit extension-contributed theme paths (the registry, or a test's list).
+///
+/// # Errors
+///
+/// As [`load`].
+pub fn load_with_paths(
+    name_or_path: &str,
+    extension_paths: &[PathBuf],
+) -> Result<Theme, ThemeError> {
+    load_loaded_with(name_or_path, extension_paths).map(|t| t.theme)
 }
 
 /// Load the configured theme for an appearance, with the omp settings keys
@@ -529,20 +596,36 @@ pub fn load_configured(
     load(name)
 }
 
-fn load_theme_json(name_or_path: &str) -> Result<String, ThemeError> {
+fn load_theme_json(name_or_path: &str, extension_paths: &[PathBuf]) -> Result<String, ThemeError> {
     // TS `loadThemeJson`: built-ins first (never shadowed).
     if let Some((_, json)) = BUILTIN.iter().find(|(n, _)| *n == name_or_path) {
         return Ok((*json).to_owned());
     }
-    let path = if name_or_path.contains('/') {
-        PathBuf::from(name_or_path)
-    } else {
-        custom_themes_dir().join(format!("{name_or_path}.json"))
+    let read = |path: &PathBuf| {
+        std::fs::read_to_string(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => ThemeError::NotFound(name_or_path.to_owned()),
+            _ => ThemeError::Io(format!("{}: {e}", path.display())),
+        })
     };
-    std::fs::read_to_string(&path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => ThemeError::NotFound(name_or_path.to_owned()),
-        _ => ThemeError::Io(format!("{}: {e}", path.display())),
-    })
+    if name_or_path.contains('/') {
+        return read(&PathBuf::from(name_or_path));
+    }
+    let custom = custom_themes_dir().join(format!("{name_or_path}.json"));
+    if custom.is_file() {
+        return read(&custom);
+    }
+    // Extension-contributed themes (a file whose stem matches, or `<dir>/<name>.json`).
+    for path in extension_paths {
+        let candidate = if path.is_dir() {
+            path.join(format!("{name_or_path}.json"))
+        } else {
+            path.clone()
+        };
+        if candidate.file_stem().is_some_and(|s| s == name_or_path) && candidate.is_file() {
+            return read(&candidate);
+        }
+    }
+    Err(ThemeError::NotFound(name_or_path.to_owned()))
 }
 
 #[cfg(test)]
@@ -681,5 +764,48 @@ mod tests {
     fn load_json_text(name: &str, json: &str) -> Result<Theme, ThemeError> {
         let parsed = parse_theme_json(name, json)?;
         build_theme(name, &parsed).map(|t| t.theme)
+    }
+
+    /// `resources_discover` theme paths: a directory of theme files and a single theme file both
+    /// load by name, appear in the catalog, and never shadow a built-in.
+    #[test]
+    fn extension_theme_paths_load_and_list() {
+        let dir = std::env::temp_dir().join(format!("omp-theme-ext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let themes = dir.join("ext/themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        let mut json: Value =
+            serde_json::from_str(BUILTIN.iter().find(|(n, _)| *n == "light").unwrap().1).unwrap();
+        json["colors"]["accent"] = Value::String("#010203".into());
+        let text = serde_json::to_string(&json).unwrap();
+        std::fs::write(themes.join("extlight.json"), &text).unwrap();
+        let single = dir.join("ext/solo.json");
+        std::fs::write(&single, &text).unwrap();
+
+        let loaded = load_with_paths("extlight", std::slice::from_ref(&themes)).unwrap();
+        assert_eq!(loaded.color("accent"), Color::Rgb(1, 2, 3));
+        assert_eq!(
+            load_with_paths("solo", std::slice::from_ref(&single))
+                .unwrap()
+                .color("accent"),
+            Color::Rgb(1, 2, 3),
+            "a single theme file resolves by its stem"
+        );
+        let listed = available_themes_with(&[themes.clone(), single]);
+        assert!(
+            listed
+                .iter()
+                .any(|t| t.name == "extlight" && t.path == Some(themes.join("extlight.json"))),
+            "extension theme is listed with its path"
+        );
+        assert!(listed.iter().any(|t| t.name == "solo"));
+        assert!(load_with_paths("missing-theme", std::slice::from_ref(&themes)).is_err());
+        // A built-in name is never shadowed by an extension file of the same name.
+        std::fs::write(themes.join("light.json"), &text).unwrap();
+        assert_eq!(
+            load_with_paths("light", &[themes]).unwrap().color("accent"),
+            load("light").unwrap().color("accent")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

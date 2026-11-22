@@ -327,6 +327,10 @@ pub struct App {
     /// `{type:"message",id,parentId,message}`) feeding the rewind column /
     /// tree overlay; reset when a session is resumed.
     journal: Vec<Value>,
+    /// Link schemes the loaded extensions claimed with
+    /// `pi.registerLinkScheme`, lowercase, in load order. Only these links
+    /// are offered by the `app.links.hint` picker (TS `getLinkSchemes`).
+    link_schemes: Vec<String>,
     /// Set by `session_reset`: the controller erases the terminal scrollback
     /// and re-commits the (now empty) transcript before the next paint.
     clear_scrollback: bool,
@@ -414,6 +418,7 @@ impl App {
             word_host: None,
             word_started: false,
             magic_off: 0,
+            link_schemes: Vec::new(),
         }
     }
 
@@ -693,6 +698,32 @@ impl App {
         self.session_sources = session_sources;
         self.refresh_model_pricing();
         self.reload_display_prefs();
+    }
+
+    /// Record the link schemes the loaded extensions claimed with
+    /// `pi.registerLinkScheme`; the `app.links.hint` picker offers exactly
+    /// these links and `link_activate` reaches their owner.
+    pub fn set_link_schemes(&mut self, schemes: Vec<String>) {
+        self.link_schemes = schemes;
+    }
+
+    /// Open the extension link picker (`app.links.hint`, TS `startLinkHints`):
+    /// every transcript link whose scheme an extension claimed, tagged for a
+    /// one-key pick. With none, say so instead of opening an empty panel.
+    fn open_link_hints(&mut self) {
+        let urls = self.messages.link_urls(&self.link_schemes);
+        if urls.is_empty() {
+            self.push_system(if self.link_schemes.is_empty() {
+                "links: no extension registered a link scheme".to_owned()
+            } else {
+                format!(
+                    "links: no {} link in the transcript",
+                    self.link_schemes.join(", ")
+                )
+            });
+            return;
+        }
+        self.overlays.open_link_hints(urls);
     }
 
     /// Re-read the transcript display settings the chat model honours
@@ -1259,6 +1290,7 @@ impl App {
             }
             Action::SettingPreview { id, value } => self.preview_setting(&id, &value),
             Action::ExtensionUiResponse { id, value } => port.extension_ui_response(id, value),
+            Action::LinkActivate { url } => port.link_activate(url),
             Action::Scroll(dir) => self.apply_scroll(dir),
             Action::Quit => {}
         }
@@ -1309,6 +1341,13 @@ impl App {
                 // transcript in the new state.
                 self.clear_scrollback = true;
             }
+            return Some(true);
+        }
+        // Extension links (`app.links.hint`, TS `startLinkHints`): pick a
+        // transcript link whose scheme an extension claimed; the pick raises
+        // `link_activate` on the owning extension.
+        if self.keys.matches_event(&key, "app.links.hint") {
+            self.open_link_hints();
             return Some(true);
         }
 
@@ -2777,6 +2816,62 @@ mod tests {
 
     fn start_streaming(app: &mut App) {
         app.apply_event(&AppEvent::AgentStart);
+    }
+
+    /// Commit one settled assistant message carrying `text`.
+    fn assistant_says(app: &mut App, text: &str) {
+        let t0 = Instant::now();
+        app.push_frame(
+            &json!({"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":text}]}}),
+            t0,
+        );
+        assert!(app.pump_events(t0 + Duration::from_millis(40)));
+    }
+
+    fn alt(c: char) -> KeyEvent {
+        CtKeyEvent::new(CtKeyCode::Char(c), CtMods::ALT)
+    }
+
+    // ---- extension links --------------------------------------------------
+
+    #[test]
+    fn link_hints_offer_claimed_links_and_activate_the_pick() {
+        let mut app = app();
+        let port = port();
+        app.set_link_schemes(vec!["cc-stretch".to_owned()]);
+        assistant_says(
+            &mut app,
+            "see [the diff](cc-stretch:open/1792/0/2) or https://example.com",
+        );
+        assert!(press(&mut app, &port, alt('o')));
+        assert_eq!(app.overlays.open(), Some(OpenOverlay::LinkHints));
+        assert!(press(&mut app, &port, key(CtKeyCode::Char('a'))));
+        assert_eq!(
+            log(&port),
+            vec!["link_activate(\"cc-stretch:open/1792/0/2\")".to_owned()]
+        );
+        assert_eq!(app.overlays.open(), None, "the pick closes the picker");
+    }
+
+    #[test]
+    fn link_hints_say_so_when_no_link_is_offered() {
+        let mut app = app();
+        let port = port();
+        assistant_says(&mut app, "nothing to click here");
+        assert!(press(&mut app, &port, alt('o')));
+        assert_eq!(app.overlays.open(), None, "no empty panel");
+        let notice = app
+            .messages
+            .entries()
+            .last()
+            .expect("a notice")
+            .text
+            .clone();
+        assert!(
+            notice.contains("no extension registered a link scheme"),
+            "{notice}"
+        );
+        assert!(log(&port).is_empty(), "nothing was activated");
     }
 
     // ---- submit pipeline -------------------------------------------------

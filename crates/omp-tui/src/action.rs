@@ -87,6 +87,12 @@ pub enum Action {
     /// Refresh the online model catalog (`F5` in the /model browser;
     /// TS `ModelRegistry.refresh` → `models.db` update).
     RefreshModels,
+    /// Activate a link an extension claimed with `pi.registerLinkScheme`: the
+    /// owning extension receives `link_activate` (TS `emitLinkActivate`).
+    LinkActivate {
+        /// The clicked URL, scheme included.
+        url: String,
+    },
     /// Leave the TUI (Ctrl+C on the idle editor / `:q` future).
     Quit,
 }

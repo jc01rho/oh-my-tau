@@ -26,6 +26,7 @@ use pa_types::ai::{AssistantMessage, Model};
 use serde_json::{json, Value};
 
 use crate::persist::{iso_from_ms, Persistence};
+use omp_ext::lifecycle::CompactingOutcome;
 
 /// `compaction.*` from `config.yml` (flat dotted keys are honoured too), TS defaults otherwise.
 #[must_use]
@@ -200,6 +201,9 @@ pub struct LiveCompleter {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Stored credential row behind `api_key`: re-resolved per summary (expired OAuth refreshes).
     pub credential_id: Option<i64>,
+    /// The session's extension payload hook: a summary request carries the same
+    /// `before_provider_request` handlers as a live turn (upstream `onPayload`).
+    pub payload: Option<pa_ai::types::OnPayloadHook>,
 }
 
 impl Completer for LiveCompleter {
@@ -219,6 +223,7 @@ impl Completer for LiveCompleter {
                     max_tokens: Some(request.max_tokens),
                     api_key,
                     headers: headers.map(|h| h.into_iter().collect()),
+                    on_payload: self.payload.clone(),
                     ..pa_ai::types::StreamOptions::default()
                 },
                 // `resolveCompactionEffort`: High by default, only for reasoning models.
@@ -252,6 +257,7 @@ impl LiveCompleter {
             api_key: t.api_key,
             headers: t.headers,
             credential_id: t.credential_id,
+            payload: None,
         })
     }
 }
@@ -320,6 +326,25 @@ pub trait CompactHook: Send + Sync {
         preparation: Value,
         custom_instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+
+    /// `session.compacting`: handlers may replace the summary prompt, add context lines and stash
+    /// `preserveData` on the entry (`None` when no extension subscribes).
+    fn compacting<'a>(
+        &'a self,
+        session_id: &'a str,
+        messages: Vec<Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CompactingOutcome>> + Send + 'a>>;
+}
+
+/// `mergeLlmCompactionPreserveData`: the handler's `preserveData` with the compaction's own on top.
+fn merge_preserve_data(hook: Option<&Value>, result: Option<&Value>) -> Option<Value> {
+    let mut merged = serde_json::Map::new();
+    for value in [hook, result].into_iter().flatten() {
+        if let Value::Object(map) = value {
+            merged.extend(map.clone());
+        }
+    }
+    (!merged.is_empty()).then_some(Value::Object(merged))
 }
 
 fn now_ms() -> u64 {
@@ -665,13 +690,36 @@ pub async fn compact_now(
             return Err(anyhow!("Compaction cancelled"));
         }
     }
-    let mut summary_params = SummaryParams::new(now_ms()).for_model(params.model_id);
+    // TS `#prepareCompactionFromHooks`: only when `session_before_compact` did not already supply
+    // the summary (tau has no such path) and an extension subscribes, handlers may replace the
+    // summarization prompt, add context lines and stash `preserveData` on the entry.
+    let mut hook_context: Vec<String> = Vec::new();
+    let mut hook_prompt: Option<String> = None;
+    let mut hook_preserve: Option<Value> = None;
+    if let Some(hook) = params.hook {
+        let messages: Vec<Value> = prep
+            .messages_to_summarize
+            .iter()
+            .chain(prep.turn_prefix_messages.iter())
+            .cloned()
+            .collect();
+        let session_id = persist.session_id();
+        if let Some(outcome) = hook.compacting(&session_id, messages).await {
+            hook_context = outcome.context;
+            hook_prompt = outcome.prompt;
+            hook_preserve = outcome.preserve_data;
+        }
+    }
+    let mut summary_params: SummaryParams<'_> =
+        SummaryParams::new(now_ms()).for_model(params.model_id);
     summary_params.reserve_tokens = params
         .settings
         .reserve_tokens
         .unwrap_or(omp_compact::settings::DEFAULT_RESERVE_TOKENS);
     summary_params.context_window = params.context_window;
     summary_params.custom_instructions = params.custom_instructions;
+    summary_params.extra_context = &hook_context;
+    summary_params.prompt_override = hook_prompt.as_deref();
     let method = params.method.unwrap_or("soft");
     // Handoff (`/handoff`, `/compact handoff`): a handoff-document oneshot over the
     // caller-built context instead of the history summary; the document is the
@@ -704,7 +752,14 @@ pub async fn compact_now(
                 omp_compact::handoff::handoff_summary_from_document(document, &prep.file_ops).1;
             result
         }
-        None => omp_compact::compact(completer, &prep, &summary_params).await?,
+        None => {
+            let mut result = omp_compact::compact(completer, &prep, &summary_params).await?;
+            // `mergeLlmCompactionPreserveData`: the handler's data first, the compaction's own
+            // (the cumulative snapcompact archive) on top.
+            result.preserve_data =
+                merge_preserve_data(hook_preserve.as_ref(), result.preserve_data.as_ref());
+            result
+        }
     };
     // Commit gate (TS `sessionId() !== sourceSessionId || getBranch().at(-1)?.id
     // !== sourceLeafId`): a session switch, a `/tree` move, a concurrent append
@@ -731,6 +786,7 @@ pub async fn compact_now(
                 tokens_before: result.tokens_before,
                 tokens_after,
                 file_ops: &prep.file_ops,
+                preserve_data: hook_preserve.as_ref(),
             };
             persist
                 .append_handoff(document, &ts, &commit)
@@ -969,6 +1025,7 @@ mod tests {
     use super::*;
     use crate::adapter::{json_round_trip, ProviderTarget};
     use crate::runtime::Runtime;
+    use omp_compact::SummaryKind;
 
     fn pa_model() -> Model {
         serde_json::from_value(json!({
@@ -1533,6 +1590,251 @@ mod tests {
             "handoff replay wrapper: {:?}",
             after[0]
         );
+    }
+
+    /// A `CompactionHooks` stub standing in for `CompactBridge`: it records the preparation and
+    /// the `session.compacting` messages and answers with a fixed outcome.
+    struct ScriptedCompacting {
+        outcome: Option<CompactingOutcome>,
+        preparations: std::sync::Mutex<Vec<Value>>,
+        messages: std::sync::Mutex<Vec<(String, Vec<Value>)>>,
+    }
+
+    impl ScriptedCompacting {
+        fn new(outcome: Option<CompactingOutcome>) -> Self {
+            Self {
+                outcome,
+                preparations: std::sync::Mutex::new(Vec::new()),
+                messages: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::runtime::CompactionHooks for ScriptedCompacting {
+        fn before<'a>(
+            &'a self,
+            preparation: Value,
+            _branch_entries: Vec<Value>,
+            _custom_instructions: Option<&'a str>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            self.preparations.lock().unwrap().push(preparation);
+            Box::pin(async { false })
+        }
+
+        fn compacting<'a>(
+            &'a self,
+            session_id: &'a str,
+            messages: Vec<Value>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Option<CompactingOutcome>> + Send + 'a>>
+        {
+            self.messages
+                .lock()
+                .unwrap()
+                .push((session_id.to_owned(), messages));
+            let outcome = self.outcome.clone();
+            Box::pin(async move { outcome })
+        }
+
+        fn after<'a>(
+            &'a self,
+            _compaction_entry: Value,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+    }
+
+    /// The rendered base summarization prompt (the one a `prompt` override replaces).
+    fn default_summary_prompt() -> String {
+        omp_compact::prompts::render_static(omp_compact::prompts::SUMMARIZATION)
+    }
+
+    /// Requests a capturing summarizer recorded: `(kind, user text)`.
+    type CapturedRequests = Arc<std::sync::Mutex<Vec<(SummaryKind, String)>>>;
+
+    /// An injected summarizer that records every request as `(kind, user text)`.
+    fn capturing_kind_summarizer(text: &'static str) -> (SummarizeFn, CapturedRequests) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let f: SummarizeFn = Arc::new(move |req: SummaryRequest| {
+            sink.lock()
+                .unwrap()
+                .push((req.kind, request_user_text(&req.context)));
+            Box::pin(async move { Ok(reply(text)) })
+        });
+        (f, seen)
+    }
+
+    /// The single user message of a summarization context, as text.
+    fn request_user_text(context: &pa_types::ai::Context) -> String {
+        use pa_types::ai::{Message, UserContent, UserContentBlock};
+        context
+            .messages
+            .iter()
+            .map(|m| match m {
+                Message::User(u) => match &u.content {
+                    UserContent::Text(t) => t.clone(),
+                    UserContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            UserContentBlock::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                },
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn request_text(requests: &[(SummaryKind, String)], kind: SummaryKind) -> String {
+        requests
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_else(|| panic!("no {kind:?} request in {requests:?}"))
+    }
+
+    /// `session.compacting` (TS `#prepareCompactionFromHooks`): the handler's `context` lines and
+    /// `prompt` reach the real summarization request and its `preserveData` lands on the
+    /// committed `compaction` entry.
+    #[tokio::test]
+    async fn compacting_hook_context_prompt_and_preserve_data_reach_the_request_and_entry() {
+        let mut h = harness(3).await;
+        h.rt.set_compaction_settings(CompactionSettings {
+            enabled: false,
+            ..small_keep()
+        });
+        let (fake, seen) = capturing_kind_summarizer("HOOK SUMMARY");
+        h.rt.set_summarizer(Some(fake));
+        let hook = Arc::new(ScriptedCompacting::new(Some(CompactingOutcome {
+            context: vec!["CTX-LINE".to_owned()],
+            prompt: Some("CUSTOM SUMMARY PROMPT".to_owned()),
+            preserve_data: Some(json!({"fromHandler": true})),
+        })));
+        let hooks: Arc<dyn crate::runtime::CompactionHooks> = hook.clone();
+        h.rt.set_compaction_hooks(Some(hooks));
+        talk(&mut h, 3).await;
+
+        let result = h.rt.compact(None, None).await.expect("compact");
+        assert!(
+            result["summary"].as_str().unwrap().contains("HOOK SUMMARY"),
+            "{result}"
+        );
+
+        let text = request_text(
+            &seen.lock().unwrap().clone(),
+            SummaryKind::CompactionSummary,
+        );
+        assert!(text.contains("CUSTOM SUMMARY PROMPT"), "{text}");
+        assert!(
+            !text.contains(&default_summary_prompt()),
+            "the override replaces the base prompt: {text}"
+        );
+        assert!(
+            text.contains(
+                "<additional-context>\n- CTX-LINE\n</additional-context>\n\nCUSTOM SUMMARY PROMPT"
+            ),
+            "context lines ride the request ahead of the prompt: {text}"
+        );
+
+        // One emit per compaction, carrying the preparation's messages (summarize + turn prefix)
+        // and the session id.
+        let preparations = hook.preparations.lock().unwrap().clone();
+        let messages = hook.messages.lock().unwrap().clone();
+        assert_eq!(messages.len(), 1, "one session.compacting per compaction");
+        let (session_id, sent) = &messages[0];
+        assert!(!session_id.is_empty(), "the live session id");
+        let prep = &preparations[0];
+        let expected = prep["messagesToSummarize"].as_array().unwrap().len()
+            + prep["turnPrefixMessages"].as_array().unwrap().len();
+        assert_eq!(
+            sent.len(),
+            expected,
+            "messagesToSummarize + turnPrefixMessages"
+        );
+        assert!(!sent.is_empty(), "the summarized window is never empty");
+
+        let entries = h.rt.entries().unwrap();
+        let comp = entries
+            .iter()
+            .find(|e| e["type"] == "compaction")
+            .expect("compaction entry");
+        assert_eq!(
+            comp["preserveData"],
+            json!({"fromHandler": true}),
+            "the handler's preserveData is stored on the entry: {comp}"
+        );
+    }
+
+    /// Without a `session.compacting` subscriber (the bridge yields `None`, mirroring
+    /// `has_handlers`) the summarization request is exactly the default one.
+    #[tokio::test]
+    async fn compacting_without_a_subscriber_leaves_the_request_untouched() {
+        let mut h = harness(3).await;
+        h.rt.set_compaction_settings(CompactionSettings {
+            enabled: false,
+            ..small_keep()
+        });
+        let (fake, seen) = capturing_kind_summarizer("PLAIN SUMMARY");
+        h.rt.set_summarizer(Some(fake));
+        let hooks: Arc<dyn crate::runtime::CompactionHooks> =
+            Arc::new(ScriptedCompacting::new(None));
+        h.rt.set_compaction_hooks(Some(hooks));
+        talk(&mut h, 3).await;
+
+        h.rt.compact(None, None).await.expect("compact");
+        let text = request_text(
+            &seen.lock().unwrap().clone(),
+            SummaryKind::CompactionSummary,
+        );
+        assert!(
+            text.contains(&default_summary_prompt()),
+            "the base prompt stays: {text}"
+        );
+        assert!(!text.contains("<additional-context>"), "{text}");
+
+        let entries = h.rt.entries().unwrap();
+        let comp = entries
+            .iter()
+            .find(|e| e["type"] == "compaction")
+            .expect("compaction entry");
+        assert!(
+            comp.get("preserveData").is_none(),
+            "no handler, no preserveData: {comp}"
+        );
+    }
+
+    /// A handoff compaction carries the handler's `preserveData` on its entry (upstream
+    /// `preserveData = compactionPrep.preserveData`) while `context`/`prompt` stay unused (the
+    /// document comes from the handoff context).
+    #[tokio::test]
+    async fn handoff_compaction_keeps_the_compacting_preserve_data() {
+        let mut h = harness(3).await;
+        h.rt.set_compaction_settings(CompactionSettings {
+            enabled: false,
+            ..small_keep()
+        });
+        let (fake, _) = fake_summarizer("## Goal\nKeep the hook data.\n\n## State\nWired.");
+        h.rt.set_summarizer(Some(fake));
+        let hook = Arc::new(ScriptedCompacting::new(Some(CompactingOutcome {
+            context: vec!["CTX-LINE".to_owned()],
+            prompt: Some("CUSTOM SUMMARY PROMPT".to_owned()),
+            preserve_data: Some(json!({"handoff": "kept"})),
+        })));
+        let hooks: Arc<dyn crate::runtime::CompactionHooks> = hook.clone();
+        h.rt.set_compaction_hooks(Some(hooks));
+        talk(&mut h, 3).await;
+
+        h.rt.compact(None, Some("handoff")).await.expect("handoff");
+        let entries = h.rt.entries().unwrap();
+        let comp = entries
+            .iter()
+            .find(|e| e["type"] == "compaction")
+            .expect("compaction entry");
+        assert_eq!(comp["method"], "handoff");
+        assert_eq!(comp["preserveData"], json!({"handoff": "kept"}), "{comp}");
     }
 
     /// A handoff document without a `## Goal` heading (or empty) is rejected

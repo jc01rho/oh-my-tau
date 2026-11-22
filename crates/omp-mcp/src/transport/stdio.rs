@@ -41,6 +41,8 @@ pub struct StdioTransport {
     ids: RequestIdAllocator,
     shared: Option<Arc<Shared>>,
     shutdown: CancellationToken,
+    /// Server→client notification sink installed by the owner (default: debug log).
+    on_notification: Option<NotificationCallback>,
 }
 
 /// Write one NDJSON frame under the stdin lock.
@@ -89,6 +91,7 @@ impl StdioTransport {
             ids: RequestIdAllocator::default(),
             shared: None,
             shutdown: CancellationToken::new(),
+            on_notification: None,
         }
     }
 
@@ -106,6 +109,10 @@ impl StdioTransport {
 }
 
 impl McpTransport for StdioTransport {
+    fn set_notification_handler(&mut self, handler: NotificationCallback) {
+        self.on_notification = Some(handler);
+    }
+
     fn request(&mut self, method: &str, params: Value) -> TransportFut<Result<Value, McpError>> {
         let Some(stdin) = self.stdin.clone() else {
             return Box::pin(async { Err(Self::not_connected()) });
@@ -286,9 +293,12 @@ impl StdioTransport {
                 });
             })
         };
-        let on_notification: NotificationCallback = Arc::new(|method, params| {
-            tracing::debug!("MCP server notification: {method} {params}");
-        });
+        let on_notification: NotificationCallback =
+            self.on_notification.clone().unwrap_or_else(|| {
+                Arc::new(|method: &str, params: Value| {
+                    tracing::debug!("MCP server notification: {method} {params}");
+                })
+            });
         let shared = Arc::new(Shared {
             pending: pending.clone(),
             handler: default_handler(self.cwd.clone()),
