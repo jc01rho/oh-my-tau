@@ -1850,6 +1850,13 @@ impl Runtime {
                 }
             };
             // Queued prompts carry their notices in the same batch, ahead of the message.
+            if crate::sysprompt::contains_ultrawork(message) {
+                let current = self.agent.system_prompt().await;
+                let updated = crate::sysprompt::apply_ultrawork_hook(message, &current);
+                if updated != current {
+                    self.agent.set_system_prompt(updated).await;
+                }
+            }
             let mut batch = self.prompt_notices(message, false).await;
             let queued = if batch.is_empty() {
                 pa_agent::agent::AgentMessageBatch::Single(user_message(message))
@@ -1898,6 +1905,13 @@ impl Runtime {
                 .then(|| serde_json::to_value(&images).ok())
                 .flatten();
             injected = hook(message.to_string(), images_json).await;
+        }
+        if crate::sysprompt::contains_ultrawork(message) {
+            let current = self.agent.system_prompt().await;
+            let updated = crate::sysprompt::apply_ultrawork_hook(message, &current);
+            if updated != current {
+                self.agent.set_system_prompt(updated).await;
+            }
         }
         let mut notices = self.prompt_notices(message, true).await;
         // Advisor notes held since the last run ride ahead of the prompt.
@@ -2484,6 +2498,11 @@ impl Runtime {
         self.agent.abort();
         self.agent.wait_for_idle().await;
         self.agent.reset().await;
+        let current_prompt = self.agent.system_prompt().await;
+        let stripped_prompt = crate::sysprompt::strip_ultrawork_hook(&current_prompt);
+        if stripped_prompt != current_prompt {
+            self.agent.set_system_prompt(stripped_prompt).await;
+        }
         // A forced tool choice belongs to the session it was set in.
         crate::tool_choice::clear();
         crate::features::advisor::reset_for_new_session(self).await;
