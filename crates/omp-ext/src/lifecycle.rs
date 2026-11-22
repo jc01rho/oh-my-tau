@@ -302,6 +302,17 @@ pub enum LifecycleEvent {
         exclude_from_context: bool,
         cwd: String,
     },
+    /// A JSON-RPC notification received from a connected MCP server, after the
+    /// runtime's own handling of the frame (omp `McpNotificationEvent`).
+    #[serde(rename = "mcp_notification")]
+    McpNotification {
+        /// Server name exactly as declared in the MCP config (raw, unsanitized).
+        server: String,
+        /// JSON-RPC method (`notifications/tools/list_changed`, or server-custom).
+        method: String,
+        /// JSON-RPC params, opaque to the runtime.
+        params: Value,
+    },
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -522,6 +533,8 @@ impl ExtHost {
         emit_tool_approval_requested(session_id: String, tool_name: String, tool_call_id: String, reason: Option<String>, approval_mode: ApprovalMode) => LifecycleEvent::ToolApprovalRequested { session_id, tool_name, tool_call_id, reason, approval_mode };
         /// `tool_approval_resolved`.
         emit_tool_approval_resolved(session_id: String, tool_name: String, tool_call_id: String, approved: bool, reason: Option<String>) => LifecycleEvent::ToolApprovalResolved { session_id, tool_name, tool_call_id, approved, reason };
+        /// `mcp_notification`: a server→client MCP notification, after the runtime handled it.
+        emit_mcp_notification(server: String, method: String, params: Value) => LifecycleEvent::McpNotification { server, method, params };
     }
 
     /// `assistant_message`: a handler may rewrite the text of the finalized message (text blocks only).

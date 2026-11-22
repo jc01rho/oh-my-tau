@@ -35,6 +35,10 @@ pub trait McpTransport: Send {
     /// Record the protocol version negotiated by `initialize`; HTTP sends it
     /// as the `MCP-Protocol-Version` header afterwards (default: no-op).
     fn set_protocol_version(&mut self, _version: &str) {}
+    /// Install the server→client notification sink. Transports that receive
+    /// notifications (stdio, SSE) call it for every JSON-RPC frame without an
+    /// `id`, after their own handling of it (omp `onNotification`).
+    fn set_notification_handler(&mut self, _handler: NotificationCallback) {}
 }
 
 /// Default answer for server→client requests, port of `defaultRequestHandler`.

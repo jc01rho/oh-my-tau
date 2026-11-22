@@ -13,6 +13,7 @@ use crate::timeout::is_timeout_enabled;
 use crate::transport::http::HttpTransport;
 use crate::transport::stdio::StdioTransport;
 use crate::transport::McpTransport;
+use crate::transport::NotificationCallback;
 use crate::transport::PROTOCOL_VERSION;
 use crate::{Content, ToolCallResult, ToolDefinition};
 
@@ -33,14 +34,32 @@ pub struct Connection {
 /// Connect to an MCP server: create the transport, run `initialize`, send
 /// `notifications/initialized`, all under the configured timeout (omp
 /// `connectToServer`; the deadline defaults to 30s, `0` disables it).
+///
+/// # Errors
+/// Transport/connect failures, including the connection timeout.
 pub async fn connect_to_server(
     name: &str,
     config: &McpServerConfig,
     cwd: Arc<PathBuf>,
 ) -> Result<Connection, McpError> {
+    connect_to_server_with(name, config, cwd, None).await
+}
+
+/// [`connect_to_server`] with a server→client notification sink: the transport
+/// delivers every notification frame it receives to `notification` (omp
+/// `connectToServer({onNotification})`).
+///
+/// # Errors
+/// Transport/connect failures, including the connection timeout.
+pub async fn connect_to_server_with(
+    name: &str,
+    config: &McpServerConfig,
+    cwd: Arc<PathBuf>,
+    notification: Option<NotificationCallback>,
+) -> Result<Connection, McpError> {
     let timeout_ms = config.timeout_ms();
     let connect = async {
-        let mut transport = create_transport(name, config, cwd)?;
+        let mut transport = create_transport(name, config, cwd, notification)?;
         let init_result = initialize_connection(&mut *transport).await?;
         if let Some(version) = init_result.get("protocolVersion").and_then(Value::as_str) {
             transport.set_protocol_version(version);
@@ -83,15 +102,23 @@ fn create_transport(
     name: &str,
     config: &McpServerConfig,
     cwd: Arc<PathBuf>,
+    notification: Option<NotificationCallback>,
 ) -> Result<Box<dyn McpTransport>, McpError> {
     match config.kind {
         ServerKind::Stdio => {
             let mut transport = StdioTransport::new(name, config.clone(), cwd);
+            if let Some(notification) = notification {
+                transport.set_notification_handler(notification);
+            }
             futures::executor::block_on(transport.connect())?;
             Ok(Box::new(transport))
         }
         ServerKind::Http | ServerKind::Sse => {
-            Ok(Box::new(HttpTransport::new(name, config.clone(), cwd)))
+            let mut transport = HttpTransport::new(name, config.clone(), cwd);
+            if let Some(notification) = notification {
+                transport.set_notification_handler(notification);
+            }
+            Ok(Box::new(transport))
         }
     }
 }
