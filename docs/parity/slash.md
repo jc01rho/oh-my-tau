@@ -231,13 +231,13 @@ or a `commands/*.md` file can claim any of these today.
 | `/plan-review` | modes | **Not ported (8b-2)**: needs the plan-review overlay and a `plan_review_requested` producer (tui.md §2). |
 | `/vibe` | modes | **Not ported (8b-2)**: vibe mode (persistent fast/good worker sessions, read-only toolset) has no omp-rs mode controller; only the hidden `vibe_*` tools exist. |
 | `/guided-goal` | modes | **Not ported (8b-2)**: it interviews the user and finishes with `goal create`, but omp-rs goal mode is unported (the hidden `goal` tool has no runtime, §1 #56), so the kickoff could not complete. |
-| `/hotkeys` | session | Keybinding help overlay; blocked on the 9 missing binding ids (`tui.md` §1). |
+| `/hotkeys` | session | **Ported (#15)**: text mode lists the resolved keybindings (`keybindings.yml` overrides applied, `hotkeys_command`); the TUI opens the help overlay (`toggle_help`). Remaining binding gaps are tracked in `tui.md` §1. |
 | `/git` | session | **Not ported (8b-2)**: the git UI (split diff viewer, staging, commit composer) is an absent overlay. |
 | `/local` | session | **Ported (8b-2), TUI-only like TS `handleTui`**: picker over the session's `local://` files or `/local <name>`, opened in `$VISUAL`/`$EDITOR` with the TUI stopped (`app.local.open` runs the same flow); text-mode dispatch says it needs the TUI. |
 | `/hub` | session | **Not ported (8b-2)**: the Agent Hub overlay is absent (tui.md §2 "Agent hub"). |
 | `/tree` | session | **TUI-only like TS**: `overlays/tree.rs` (8c); text-mode dispatch says it needs the TUI (8b-2). |
 | `/resume` | lifecycle | **TUI-only like TS**: `overlays/sessions.rs` with pins (8b-2); text-mode dispatch says it needs the TUI. |
-| `/unpin` | lifecycle | `/pin` exists, unpin-by-id does not. |
+| `/unpin` | lifecycle | **Ported (#15)**: `unpin_command` removes the current (or given) session id from the pins file, which the resume picker shares since 8b-2 (`omp_session::pins`). Differences: an id is used as given (TS resolves it against resumable sessions) and an unpinned id answers `Session <id> is not pinned.` (TS `Session is not pinned.`). |
 | `/delete` | lifecycle | **Ported (8b-2)**: `Runtime::delete_session` starts a new session, then deletes the old session file and its artifacts dir (TS `newSession({ drop: true })`); "Nothing to delete (in-memory session)". |
 | `/exit` | lifecycle | **TUI-only like TS**: the TUI quits; text-mode dispatch says it needs the TUI (8b-2). |
 | `/clear` | lifecycle | **Dispatches in tau** but is unadvertised/unreserved — see §5. |
