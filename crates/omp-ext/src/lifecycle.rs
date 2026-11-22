@@ -808,9 +808,11 @@ impl ExtHost {
         emit_mode_changed(previous: SessionModeState, state: SessionModeState) => LifecycleEvent::ModeChanged { previous, state };
         /// `after_provider_response`.
         emit_after_provider_response(status: u16, headers: std::collections::BTreeMap<String, String>, request_id: Option<String>) => LifecycleEvent::AfterProviderResponse { status, headers, request_id };
-    }
         /// `mcp_notification`: a server→client MCP notification, after the runtime handled it.
         emit_mcp_notification(server: String, method: String, params: Value) => LifecycleEvent::McpNotification { server, method, params };
+        /// `session_clear`: the context was reset in place, the session kept.
+        emit_session_clear() => LifecycleEvent::SessionClear;
+    }
 
     /// `before_subagent_spawn`: `block` refuses the spawn; `model` replaces the pattern list.
     ///
@@ -856,8 +858,6 @@ impl ExtHost {
             &self.emit_event(&ev, ctx).await?.result,
         ))
     }
-        /// `session_clear`: the context was reset in place, the session kept.
-        emit_session_clear() => LifecycleEvent::SessionClear;
 
     /// `assistant_message`: a handler may rewrite the text of the finalized message (text blocks only).
     ///

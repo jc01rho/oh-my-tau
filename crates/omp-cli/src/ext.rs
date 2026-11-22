@@ -21,7 +21,10 @@ use pa_agent::types::{
 use serde_json::{json, Value};
 
 use omp_ext::hooks::ExtHooks;
-use omp_ext::lifecycle::{CompactingOutcome, DiscoveredPath, InputSource, LifecycleEvent, ResourcesDiscoverOutcome, ResourcesDiscoverReason, SwitchReason, self};
+use omp_ext::lifecycle::{
+    self, CompactingOutcome, DiscoveredPath, InputSource, LifecycleEvent, ResourcesDiscoverOutcome,
+    ResourcesDiscoverReason, SwitchReason,
+};
 use omp_ext::{ExtHost, HostConfig, HostMessage, ToolInfo};
 use omp_providers::auth::{
     on_credential_disabled, CredentialDisabledEvent, CredentialDisabledSubscription,
@@ -942,10 +945,9 @@ pub struct Extensions {
     /// Automatic credential soft-disables on their way to extensions (see
     /// [`CredentialDisabledFeed`]).
     credential_disabled: Arc<CredentialDisabledFeed>,
-}
-
     /// MCP server notifications (`mcp_notification`), buffered until the session ctx is wired.
     mcp: McpNotificationSink,
+}
 
 /// `resources_discover` round trip: emit (only when an extension subscribes, TS `hasHandlers`),
 /// then register every returned path with the loader that owns it. Extracted from
@@ -1777,6 +1779,22 @@ impl Extensions {
             }
         });
     }
+
+    /// Link schemes the loaded extensions claimed with `pi.registerLinkScheme()`, in load order
+    /// (first claimer first). The TUI offers exactly these links for `link_activate`.
+    #[must_use]
+    pub fn link_schemes(&self) -> Vec<String> {
+        self.host.link_schemes()
+    }
+
+    /// Deliver a click on `url` as `link_activate` to the extension that claimed its scheme.
+    /// `false` when no extension owns the link.
+    ///
+    /// # Errors
+    /// Transport failure to the extension host.
+    pub async fn activate_link(&self, url: &str) -> Result<bool> {
+        self.host.link_activate(url).await
+    }
 }
 
 /// Emit every buffered credential soft-disable in order (TS `runner.ts`'s
@@ -1798,23 +1816,6 @@ async fn flush_credential_disabled(host: &ExtHost, feed: &CredentialDisabledFeed
         );
     }
 }
-
-
-    /// Link schemes the loaded extensions claimed with `pi.registerLinkScheme()`, in load order
-    /// (first claimer first). The TUI offers exactly these links for `link_activate`.
-    #[must_use]
-    pub fn link_schemes(&self) -> Vec<String> {
-        self.host.link_schemes()
-    }
-
-    /// Deliver a click on `url` as `link_activate` to the extension that claimed its scheme.
-    /// `false` when no extension owns the link.
-    ///
-    /// # Errors
-    /// Transport failure to the extension host.
-    pub async fn activate_link(&self, url: &str) -> Result<bool> {
-        self.host.link_activate(url).await
-    }
 
 fn emit_silent(r: Result<omp_ext::EmitResult>) {
     match r {
@@ -3389,6 +3390,7 @@ mod tests {
     /// An [`Extensions`] over an already-spawned (fake) host.
     fn sh_ext(host: Arc<ExtHost>, cwd: &std::path::Path) -> Arc<Extensions> {
         Arc::new(Extensions {
+            mcp: McpNotificationSink::new(host.clone()),
             hooks: ExtHooks::new(host.clone()),
             host,
             sub: Mutex::new(None),
@@ -3507,6 +3509,7 @@ mod tests {
     fn test_extensions(host: Arc<ExtHost>) -> Arc<Extensions> {
         Arc::new(Extensions {
             mcp: McpNotificationSink::new(host.clone()),
+            credential_disabled: Arc::new(CredentialDisabledFeed::default()),
             host: host.clone(),
             hooks: ExtHooks::new(host),
             sub: Mutex::new(None),
