@@ -2195,6 +2195,10 @@ impl Runtime {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // A goal belongs to the session that created it.
         crate::tools::reset_session_goal();
+        // A new session must not inherit the old one's watches (nor their late wakes).
+        if let Some(jobs) = crate::tools::session_jobs() {
+            jobs.monitors.end_session();
+        }
     }
 
     /// Prompt a message bound to session generation `generation`: `None` when the
@@ -2371,7 +2375,11 @@ impl Runtime {
     /// Put a `monitor` wake into the next turn: queued behind a live run, or the start of a turn
     /// on an idle session. A held lane (`interrupt stop`) only queues it: a monitor never lifts a hold.
     pub async fn inject_monitor_wake(self: &Arc<Self>, text: &str) {
-        if lock(&self.pause).paused() {
+        let retry_pending = lock(&self.retry_task)
+            .as_ref()
+            .is_some_and(|task| !task.is_finished());
+        // A held lane stays held, and a pending retry is not replaced: the wake waits in the queue.
+        if retry_pending || lock(&self.pause).paused() {
             self.follow_up(text);
             return;
         }

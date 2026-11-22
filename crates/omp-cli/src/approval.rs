@@ -636,8 +636,12 @@ fn bash_decision(args: &Value, settings: &omp_settings::Settings) -> Decision {
 pub fn tool_decision(name: &str, args: &Value, settings: &omp_settings::Settings) -> Decision {
     match name {
         "bash" => bash_decision(args, settings),
-        // A command watch runs a shell command: it answers to the same bash rules.
-        "monitor" if str_arg(args, "command").is_some() => bash_decision(args, settings),
+        // A command watch runs a shell command: it answers to the same bash rules, and a user
+        // `bash` policy (deny included) governs it; a `monitor` entry only applies without one.
+        "monitor" if str_arg(args, "command").is_some() => Decision {
+            policy_key: Some("bash".into()),
+            ..bash_decision(args, settings)
+        },
         "monitor" => Decision::tier(read_tier(str_arg(args, "path").unwrap_or(""))),
         "read" => Decision::tier(read_tier(str_arg(args, "path").unwrap_or(""))),
         "grep" => Decision::tier(read_tier(&path_list(args).join("\n"))),
@@ -730,6 +734,10 @@ fn approval_details(name: &str, args: &Value, t: fn(&str) -> String) -> Vec<Stri
         "bash" => vec![format!(
             "Command: {}",
             t(str_arg(args, "command").unwrap_or("(missing)"))
+        )],
+        "monitor" if str_arg(args, "action") == Some("rearm") => vec![format!(
+            "Re-arm: {}",
+            str_arg(args, "bash_id").unwrap_or("every muted monitor")
         )],
         "monitor" => match str_arg(args, "command") {
             Some(command) => vec![format!("Command: {}", t(command))],
@@ -1250,6 +1258,34 @@ mod tests {
             &settings(),
         );
         assert!(path.tier == Tier::Read);
+    }
+
+    #[test]
+    fn a_bash_deny_also_denies_a_command_watch() {
+        let cmd = json!({"command": "printf ready", "description": "d"});
+        let deny = json!({"bash": "deny"});
+        assert_eq!(
+            resolve("monitor", &cmd, ApprovalMode::Yolo, &deny).policy,
+            Policy::Deny
+        );
+        let both = json!({"bash": "deny", "monitor": "allow"});
+        assert_eq!(
+            resolve("monitor", &cmd, ApprovalMode::Yolo, &both).policy,
+            Policy::Deny,
+            "the bash policy governs a command watch"
+        );
+        let own = json!({"monitor": "deny"});
+        assert_eq!(
+            resolve("monitor", &cmd, ApprovalMode::Yolo, &own).policy,
+            Policy::Deny,
+            "a monitor entry applies when bash has none"
+        );
+        let path = json!({"path": "a", "description": "d"});
+        assert_eq!(
+            resolve("monitor", &path, ApprovalMode::Yolo, &deny).policy,
+            Policy::Allow,
+            "a path watch runs no command"
+        );
     }
 
     #[test]

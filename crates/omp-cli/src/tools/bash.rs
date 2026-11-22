@@ -24,6 +24,7 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
 use super::jobs::{self, JobRegistry, JobStatus, Service, ServiceState};
+use super::monitor::{WatchMsg, WatchSink};
 use super::util::{
     enforce_inline_byte_cap, notice_with_artifact, resolve_to_cwd, save_artifact, sink_window,
     str_arg, truncate_tail, SpillConfig, DEFAULT_MAX_BYTES,
@@ -184,15 +185,7 @@ pub(super) struct Notify {
     state: Mutex<NotifyState>,
     /// A `monitor` command watch: matching lines go to this sink as they arrive
     /// instead of being kept for the settle-time report.
-    sink: Option<tokio::sync::mpsc::UnboundedSender<WatchMsg>>,
-}
-
-/// What a streaming [`Notify`] tells its `monitor` while the job runs.
-pub(super) enum WatchMsg {
-    /// One line that matched the filter (cut to [`NOTIFY_MAX_LINE_CHARS`]).
-    Line(String),
-    /// The job reached its final state; the registry already holds it.
-    Settled(JobStatus),
+    sink: Option<WatchSink>,
 }
 
 #[derive(Default)]
@@ -220,10 +213,7 @@ impl Notify {
     }
 
     /// A `notify` that streams every matching line to `sink` (a `monitor` command).
-    pub(super) fn streaming(
-        source: &str,
-        sink: tokio::sync::mpsc::UnboundedSender<WatchMsg>,
-    ) -> Result<Self> {
+    pub(super) fn streaming(source: &str, sink: WatchSink) -> Result<Self> {
         Ok(Self {
             sink: Some(sink),
             ..Self::new(source)?
@@ -233,7 +223,7 @@ impl Notify {
     /// Tell a streaming watcher the job is final (after the registry update).
     fn settled(&self, status: JobStatus) {
         if let Some(sink) = &self.sink {
-            let _ = sink.send(WatchMsg::Settled(status));
+            sink.end(WatchMsg::Settled(status));
         }
     }
 
@@ -293,7 +283,7 @@ impl Notify {
                 continue;
             }
             if let Some(sink) = &self.sink {
-                let _ = sink.send(WatchMsg::Line(clamp_chars(&line, NOTIFY_MAX_LINE_CHARS)));
+                sink.line(clamp_chars(&line, NOTIFY_MAX_LINE_CHARS));
                 continue;
             }
             if st.lines.len() < NOTIFY_MAX_LINES {
@@ -483,11 +473,24 @@ async fn run_remote_ssh(
             () = signal.aborted() => { outcome = Some("aborted"); break; }
         }
     }
+    // Output can close while the command still runs: the wait must honour the deadline and abort too.
     let code = if outcome.is_some() {
         let _ = child.kill().await;
         None
     } else {
-        child.wait().await.context("waiting for command")?.code()
+        tokio::select! {
+            status = child.wait() => status.context("waiting for command")?.code(),
+            () = &mut deadline => {
+                outcome = Some("timeout");
+                let _ = child.kill().await;
+                None
+            }
+            () = signal.aborted() => {
+                outcome = Some("aborted");
+                let _ = child.kill().await;
+                None
+            }
+        }
     };
     if !carry.is_empty() {
         // End of output: a truncated sequence now really is invalid text.
