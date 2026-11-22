@@ -136,6 +136,8 @@ pub struct Runtime {
     commands: Mutex<Vec<Value>>,
     /// The session's advisor (`/advisor`, `features::advisor`).
     pub(crate) advisor: crate::features::advisor::Advisor,
+    /// The session's one-shot model handoff (`/prewalk`, `features::prewalk`).
+    pub(crate) prewalk: crate::features::prewalk::Prewalk,
     announced: std::sync::atomic::AtomicBool,
     settled: tokio::sync::Notify,
     /// The task running the current retry saga (`recover`); awaited after cancelling it.
@@ -526,6 +528,7 @@ impl Runtime {
             resolver,
             commands: Mutex::new(Vec::new()),
             advisor: crate::features::advisor::Advisor::default(),
+            prewalk: crate::features::prewalk::Prewalk::default(),
             announced: std::sync::atomic::AtomicBool::new(false),
             settled: tokio::sync::Notify::new(),
             retry_task: Mutex::new(None),
@@ -859,6 +862,8 @@ impl Runtime {
             }
             AgentEvent::TurnEnd { tool_results, .. } => {
                 self.maybe_apply_rewind();
+                // TS `advanceAtTurnEnd`: a pending prewalk handoff advances.
+                crate::features::prewalk::on_turn_end(self, tool_results);
                 // TS `onPrimaryTurnEnd`: the advisor reviews the update.
                 crate::features::advisor::on_primary_turn_end(self, tool_results.is_empty());
             }
@@ -1418,7 +1423,7 @@ impl Runtime {
         anyhow::bail!("agent stayed busy")
     }
 
-    fn live_provider_id(&self) -> Option<(String, String)> {
+    pub(crate) fn live_provider_id(&self) -> Option<(String, String)> {
         let t = self
             .target
             .read()
@@ -2477,6 +2482,7 @@ impl Runtime {
         // A forced tool choice belongs to the session it was set in.
         crate::tool_choice::clear();
         crate::features::advisor::reset_for_new_session(self).await;
+        crate::features::prewalk::reset_for_new_session(self);
         self.persist.start_new(&self.cwd, dir)?;
         self.bump_generation();
         self.publish_session_file();
@@ -3681,6 +3687,18 @@ impl Runtime {
     }
 
     // -------------------------------------------------------------- models
+
+    /// Resolve a model reference (`provider/id[:level]` or a role) through
+    /// the session's resolver, the one `set_model` uses.
+    ///
+    /// # Errors
+    /// The reference names no known model.
+    pub(crate) async fn resolve_model_ref(
+        &self,
+        reference: &str,
+    ) -> anyhow::Result<omp_providers::ResolvedModel> {
+        (self.resolver)(reference.to_string()).await
+    }
 
     /// `set_model`: `model_change` entry with role `default`.
     pub async fn set_model(&self, provider: &str, model_id: &str) -> Result<Value, CmdError> {

@@ -1217,6 +1217,74 @@ mod tests {
         }
     }
 
+    fn command_texts(rx: &mut UnboundedReceiver<Value>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|f| match f["type"].as_str() {
+                Some("command_output") => f["text"].as_str().map(str::to_string),
+                Some("notice") => f["message"].as_str().map(str::to_string),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn prewalk_arms_switches_at_the_first_edit_and_disarms() {
+        let mut h = harness(&[], cfg(&[])).await;
+        crate::features::prewalk::command(&h.rt, "p/a").await;
+        assert!(
+            h.rt.prewalk.armed().is_none(),
+            "the active model is a no-op target"
+        );
+        crate::features::prewalk::command(&h.rt, "p/b").await;
+        let texts = command_texts(&mut h.rx);
+        assert!(
+            texts.iter().any(|t| t.contains("nothing to switch")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.contains(
+                &"Prewalk on: switching to p/b at the next edit/write (todo-gated).".to_string()
+            ),
+            "{texts:?}"
+        );
+        assert_eq!(h.rt.prewalk.armed().map(|t| t.id), Some("b".to_string()));
+        let read: pa_agent::types::ToolResultMessage = serde_json::from_value(json!({
+            "role": "toolResult", "toolCallId": "r", "toolName": "read",
+            "content": [], "isError": false, "timestamp": 0
+        }))
+        .unwrap();
+        crate::features::prewalk::advance(&h.rt, &[read]).await;
+        assert_eq!(
+            h.rt.live_provider_id(),
+            Some(("p".to_string(), "a".to_string())),
+            "a read is not an implementation action"
+        );
+        let edit: pa_agent::types::ToolResultMessage = serde_json::from_value(json!({
+            "role": "toolResult", "toolCallId": "e", "toolName": "edit",
+            "content": [], "isError": false, "timestamp": 0
+        }))
+        .unwrap();
+        crate::features::prewalk::advance(&h.rt, &[edit]).await;
+        assert_eq!(
+            h.rt.live_provider_id(),
+            Some(("p".to_string(), "b".to_string())),
+            "switched at the first edit"
+        );
+        assert!(h.rt.prewalk.armed().is_none(), "one-shot");
+        assert!(command_texts(&mut h.rx)
+            .contains(&"Prewalk: switched to p/b after first edit call.".to_string()));
+        crate::features::prewalk::command(&h.rt, "off").await;
+        assert_eq!(
+            command_texts(&mut h.rx),
+            ["Prewalk already off for this session; keeping the active model."]
+        );
+        crate::features::prewalk::command(&h.rt, "a b").await;
+        assert_eq!(
+            command_texts(&mut h.rx),
+            ["Usage: /prewalk [into] | restart [from] [into] | off"]
+        );
+    }
+
     fn fast_cfg(chain: &[&str], max_retries: u32, base_delay_ms: u64) -> RecoveryConfig {
         let mut c = cfg(chain);
         c.retry.max_retries = max_retries;

@@ -127,6 +127,8 @@ pub fn wrap_stream(base: StreamFn) -> StreamFn {
         move |model: AgentModel, context: LlmContext, options: StreamRequestOptions| {
             let base = base.clone();
             Box::pin(async move {
+                // A prewalk handoff decided at the last turn end lands first.
+                crate::features::prewalk::wait_for_handoff().await;
                 let active: Vec<&str> = context.tools.iter().map(|t| t.name.as_str()).collect();
                 let Some(choice) = take(&active) else {
                     return base(model, context, options).await;

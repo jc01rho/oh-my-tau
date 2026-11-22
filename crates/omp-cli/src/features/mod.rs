@@ -9,6 +9,7 @@ pub mod local_editor;
 pub mod loop_mode;
 pub mod memory;
 pub mod plan;
+pub mod prewalk;
 pub mod report_issue;
 pub mod restart;
 pub mod sandbox;

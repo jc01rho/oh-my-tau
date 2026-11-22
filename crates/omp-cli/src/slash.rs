@@ -903,7 +903,7 @@ async fn dispatch_ported(rt: &std::sync::Arc<Runtime>, name: &str, args: &str) -
         )),
         "computer" => Some(crate::features::browser::computer_command(rt, args).await),
         "ratchet" => Some(notice(rt, "/ratchet needs the ratchet eval-harness subsystem (eval preludes + hill-climb runner), which is not ported to omt.")),
-        "prewalk" => Some(notice(rt, "Prewalk is a startup-time feature in omt (the --prewalk/--no-prewalk/--prewalk-into flags); arming or restarting it mid-session is not supported.")),
+        "prewalk" => Some(crate::features::prewalk::command(rt, args).await),
         "security" => Some(crate::features::security::command(rt, args).await),
         "share" => Some(crate::features::share::command(rt, args).await),
         "browser" => Some(crate::features::browser::command(rt, args).await),
