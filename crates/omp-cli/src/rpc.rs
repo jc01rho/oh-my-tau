@@ -1015,17 +1015,7 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
                 }
             }
         }
-        "reload" => {
-            // Extensions reload; the session and any hold survive (the gateway reloads while
-            // holding a lane).
-            if let Some(ext) = crate::rpc::slash::extensions() {
-                if let Err(e) = ext.reload().await {
-                    eprintln!("omt: extension reload: {e:#}");
-                }
-            }
-            rt.announce_commands();
-            ok(json!({"cancelled": false}))
-        }
+        "reload" => reload_with_ext(rt, crate::rpc::slash::extensions()).await,
         "resume_session" => {
             rt.release_pause("resume_session");
             none()
@@ -1454,6 +1444,23 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
     }
 }
 
+async fn reload_with_ext(
+    rt: &Arc<Runtime>,
+    ext: Option<&Arc<crate::ext::Extensions>>,
+) -> CmdResult {
+    // Extensions reload; the session and any hold survive (the gateway reloads while holding a
+    // lane). Failures propagate to the client via `CmdError` without dropping session or hold.
+    if let Some(ext) = ext {
+        ext.reload().await.map_err(CmdError::from)?;
+    }
+    let commands = slash::dynamic_commands_for(rt, ext).await;
+    rt.set_available_commands(commands);
+    if !rt.commands_announced() {
+        rt.announce_commands();
+    }
+    ok(json!({"cancelled": false}))
+}
+
 /// `get_protocol_info` payload: what the gateway needs to branch on before it drives a session.
 fn protocol_info(rt: &Arc<Runtime>) -> Value {
     json!({
@@ -1566,6 +1573,8 @@ fn overflow_frame(frame: &Value) -> Value {
                 json!(cap(frame.get("command")).unwrap_or_else(|| "unknown".into())),
             );
             m.insert("success".into(), json!(false));
+            m.insert("code".into(), json!("rpc_failed"));
+            m.insert("errorCode".into(), json!("rpc_failed"));
             m.insert(
                 "error".into(),
                 json!("RPC response exceeded the transport limit"),
@@ -1947,25 +1956,148 @@ mod tests {
         assert_eq!(frame["errorCode"], json!("rpc_failed"));
     }
 
-    #[test]
-    fn catalog_matches_dispatch() {
-        // Every advertised command must appear as a `match kind` arm, so `get_protocol_info`
-        // cannot advertise a command the dispatcher answers with `unknown_command`.
-        let source = include_str!("rpc.rs");
-        let body = source
+    fn dispatch_command_patterns(source: &str) -> Vec<String> {
+        let dispatch_src = source
             .split("async fn dispatch")
             .nth(1)
-            .and_then(|rest| rest.split("\n        other => Err(CmdError::coded(").next())
-            .expect("dispatch body");
-        let mut seen = std::collections::BTreeSet::new();
+            .expect("dispatch fn");
+        let after_match = dispatch_src
+            .split("match kind {")
+            .nth(1)
+            .expect("dispatch match kind");
+        let bytes = after_match.as_bytes();
+        let mut cmds = Vec::new();
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut line_comment = false;
+        let mut block_comment = false;
+        let mut collecting_pattern = true;
+        let mut pattern = String::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            let next = bytes.get(i + 1).copied();
+            if line_comment {
+                if b == b'\n' {
+                    line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+            if block_comment {
+                if b == b'*' && next == Some(b'/') {
+                    block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if in_str {
+                if collecting_pattern && depth == 0 {
+                    pattern.push(b as char);
+                }
+                if esc {
+                    esc = false;
+                } else if b == b'\\' {
+                    esc = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            if b == b'/' && next == Some(b'/') {
+                line_comment = true;
+                i += 2;
+                continue;
+            }
+            if b == b'/' && next == Some(b'*') {
+                block_comment = true;
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = true;
+                if collecting_pattern && depth == 0 {
+                    pattern.push('"');
+                }
+                i += 1;
+                continue;
+            }
+            if depth == 0 && b == b'=' && next == Some(b'>') {
+                let pat = pattern.split(" if ").next().unwrap_or(&pattern);
+                let mut rest = pat;
+                while let Some(start) = rest.find('"') {
+                    let after_open = &rest[start + 1..];
+                    let Some(end) = after_open.find('"') else {
+                        break;
+                    };
+                    cmds.push(after_open[..end].to_string());
+                    rest = &after_open[end + 1..];
+                }
+                pattern.clear();
+                collecting_pattern = false;
+                i += 2;
+                continue;
+            }
+            if b == b'{' {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if b == b'}' {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    collecting_pattern = true;
+                    pattern.clear();
+                }
+                i += 1;
+                continue;
+            }
+            if depth == 0 && !collecting_pattern && b == b',' {
+                collecting_pattern = true;
+                pattern.clear();
+                i += 1;
+                continue;
+            }
+            if depth == 0 && collecting_pattern {
+                pattern.push(b as char);
+            }
+            i += 1;
+        }
+        cmds
+    }
+
+    #[test]
+    fn catalog_matches_dispatch() {
+        // Every advertised command must match `dispatch`'s top-level `match kind` patterns in
+        // both directions, so neither `get_protocol_info` nor `dispatch` can drift silently.
+        let source = include_str!("rpc.rs");
+        let mut catalog = std::collections::BTreeSet::new();
         for command in RPC_COMMANDS {
-            assert!(seen.insert(*command), "duplicate catalog entry: {command}");
-            let quoted = format!("\"{command}\"");
             assert!(
-                body.contains(&quoted),
-                "catalog lists `{command}` but dispatch has no arm for it"
+                catalog.insert((*command).to_string()),
+                "duplicate catalog entry: {command}"
             );
         }
+        let mut dispatched = std::collections::BTreeSet::new();
+        for command in dispatch_command_patterns(source) {
+            assert!(
+                dispatched.insert(command.clone()),
+                "duplicate dispatch arm pattern: {command}"
+            );
+        }
+        let catalog_only: Vec<_> = catalog.difference(&dispatched).cloned().collect();
+        let dispatch_only: Vec<_> = dispatched.difference(&catalog).cloned().collect();
+        assert!(
+            catalog_only.is_empty() && dispatch_only.is_empty(),
+            "RPC_COMMANDS vs dispatch mismatch: catalog_only={catalog_only:?}, dispatch_only={dispatch_only:?}"
+        );
     }
 
     #[test]
@@ -1998,6 +2130,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"id": "g2", "type": "response", "command": "get_available_models", "success": false,
+                   "code": "rpc_failed", "errorCode": "rpc_failed",
                    "error": "RPC response exceeded the transport limit"})
         );
     }
@@ -2156,6 +2289,154 @@ mod tests {
                 .message,
             "cursor must be an integer UTF-16 offset within text"
         );
+    }
+
+    async fn rpc_test_runtime(
+        dir: &std::path::Path,
+    ) -> (Arc<Runtime>, mpsc::UnboundedReceiver<Value>) {
+        let model: pa_types::ai::Model = serde_json::from_value(json!({
+            "id": "a", "name": "a", "api": "openai-completions", "provider": "p",
+            "baseUrl": "http://127.0.0.1:9", "reasoning": false, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 100_000, "maxTokens": 4096
+        }))
+        .unwrap();
+        let agent = pa_agent::agent::Agent::new(pa_agent::agent::AgentOptions {
+            initial_state: pa_agent::agent::AgentInitialState {
+                system_prompt: Some("test".into()),
+                model: crate::adapter::json_round_trip(&model),
+                thinking_level: Some(pa_agent::types::ThinkingLevel::Off),
+                tools: Some(Vec::new()),
+                messages: None,
+            },
+            ..pa_agent::agent::AgentOptions::default()
+        });
+        let persist = crate::persist::attach_in(&agent, dir, dir, None, crate::persist::uuid_v7())
+            .await
+            .unwrap();
+        let target = Arc::new(std::sync::RwLock::new(Some(
+            crate::adapter::ProviderTarget {
+                api_key: Some("k".into()),
+                model,
+                service_tier: None,
+                headers: None,
+                credential_id: None,
+            },
+        )));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = Runtime::start(Arc::new(agent), target, dir.to_path_buf(), persist, tx).await;
+        (rt, rx)
+    }
+
+    #[tokio::test]
+    async fn reload_returns_cmd_error_on_failure_and_refreshes_command_catalog_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let fail_flag = dir.path().join("fail");
+        let phase_file = dir.path().join("phase");
+        std::fs::write(&phase_file, "1").unwrap();
+
+        let script = dir.path().join("reload-host.sh");
+        std::fs::write(
+            &script,
+            concat!(
+                "while IFS= read -r line; do\n",
+                "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+                "  p=$(cat \"$PHASE_FILE\")\n",
+                "  case \"$line\" in\n",
+                "    *'\"method\":\"load\"'*)\n",
+                "      if [ -f \"$FAIL_FILE\" ]; then\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":-32000,\"message\":\"boom reload\"}}\\n' \"$id\"\n",
+                "      else\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"loaded\":[],\"handlers\":[],\"errors\":[]}}\\n' \"$id\"\n",
+                "      fi;;\n",
+                "    *'\"method\":\"list_commands\"'*)\n",
+                "      if [ \"$p\" = \"1\" ]; then\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[{\"name\":\"old_cmd\",\"description\":\"old\",\"extension\":\"ext\"}]}\\n' \"$id\"\n",
+                "      else\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[{\"name\":\"new_cmd\",\"description\":\"new\",\"extension\":\"ext\"}]}\\n' \"$id\"\n",
+                "      fi;;\n",
+                "    *'\"method\":\"list_tools\"'*)\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[]}\\n' \"$id\";;\n",
+                "    *)\n",
+                "      if [ -n \"$id\" ]; then\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{}}\\n' \"$id\"\n",
+                "      fi;;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .unwrap();
+        let host = omp_ext::ExtHost::spawn(&omp_ext::HostConfig {
+            bun: "/bin/sh".into(),
+            host_script: script,
+            trace: None,
+            handler_timeout_ms: None,
+            env: vec![
+                ("FAIL_FILE".into(), fail_flag.display().to_string()),
+                ("PHASE_FILE".into(), phase_file.display().to_string()),
+            ],
+            shared_socket: None,
+        })
+        .await
+        .unwrap();
+        let ext = crate::ext::Extensions::for_test(host, dir.path());
+        let (rt, mut rx) = rpc_test_runtime(dir.path()).await;
+        rt.set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        rt.pause_for_stop().await.unwrap();
+        let session_before = rt.session_id();
+        let initial_cmds = slash::dynamic_commands_for(&rt, Some(&ext)).await;
+        rt.set_available_commands(initial_cmds);
+        rt.announce_commands();
+        while rx.try_recv().is_ok() {}
+
+        // Reload failure must propagate CmdError while keeping session + hold intact.
+        std::fs::write(&fail_flag, "1").unwrap();
+        let err_frame = response(
+            Some(&json!("r1")),
+            "reload",
+            reload_with_ext(&rt, Some(&ext)).await,
+        );
+        assert_eq!(err_frame["success"], json!(false));
+        assert!(err_frame["error"].as_str().unwrap().contains("boom reload"));
+        assert_eq!(rt.session_id(), session_before);
+        assert_eq!(rt.state().await["paused"], json!(true));
+
+        // Reload success must recompute slash commands before announcing.
+        std::fs::remove_file(&fail_flag).unwrap();
+        std::fs::write(&phase_file, "2").unwrap();
+        let ok_frame = response(
+            Some(&json!("r2")),
+            "reload",
+            reload_with_ext(&rt, Some(&ext)).await,
+        );
+        assert_eq!(ok_frame["success"], json!(true));
+        let names: Vec<String> = rt
+            .available_commands()
+            .iter()
+            .filter_map(|c| c["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(names.contains(&"new_cmd".to_string()), "{names:?}");
+        assert!(!names.contains(&"old_cmd".to_string()), "{names:?}");
+        let announced = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|f| f["type"] == "available_commands_update")
+            .expect("available_commands_update emitted");
+        let announced_names: Vec<String> = announced["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            announced_names.contains(&"new_cmd".to_string()),
+            "{announced_names:?}"
+        );
+        assert!(
+            !announced_names.contains(&"old_cmd".to_string()),
+            "{announced_names:?}"
+        );
+
+        ext.host.shutdown().await.unwrap();
     }
 }
 

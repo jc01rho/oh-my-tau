@@ -822,101 +822,29 @@ pub struct Skill {
     pub hide: bool,
 }
 
-/// Parse a SKILL.md frontmatter block: `---` fenced `key: value` pairs.
-fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
-    let mut meta = Map::new();
-    let mut body = content;
-    if let Some(rest) = content.strip_prefix("---") {
-        if let Some(end) = rest.find("\n---") {
-            for line in rest[..end].lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    meta.insert(
-                        k.trim().to_string(),
-                        Value::String(v.trim().trim_matches('"').to_string()),
-                    );
-                }
-            }
-            body = &rest[end + 4..];
-        }
-    }
-    (meta, body.trim().to_string())
-}
-
-/// Load skills from a `skills/` dir (`~/.omp/agent/skills`, project
-/// `.omp/skills`): one directory per skill with a SKILL.md.
-fn load_skills_dir(dir: &Path, skills: &mut Vec<Skill>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let file = path.join("SKILL.md");
-        let Ok(content) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        let (meta, _body) = parse_frontmatter(&content);
-        let name = meta.get("name").and_then(Value::as_str).map_or_else(
-            || entry.file_name().to_string_lossy().into_owned(),
-            Into::into,
-        );
-        if skills.iter().any(|s| s.name == name) {
-            continue;
-        }
-        let description = meta
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let hide = meta
-            .get("hide")
-            .and_then(Value::as_str)
-            .is_some_and(|v| v == "true");
-        skills.push(Skill {
-            name,
-            description,
-            hide,
-        });
-    }
-}
-
-/// Extra skill roots from `--skill <path>` (repeatable). Set once at startup; each entry is
-/// a skill directory or a single `SKILL.md`-bearing directory, as mhc accepts both.
-static SKILL_EXTRA_ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-
-/// Record the `--skill` roots for [`load_skills`]. Later calls are ignored (one process, one argv).
+/// Record the `--skill` roots shared with [`load_skills`] and `omp_urls` `skill://` resolution.
 pub fn set_skill_paths(paths: Vec<PathBuf>) {
-    let _ = SKILL_EXTRA_ROOTS.set(paths);
+    omp_urls::schemes::skill::set_extra_skill_paths(paths);
 }
 
 /// All visible skills for the prompt (TS: `loadSkills` from the agent dir's
-/// `skills/`, `hide: true` dropped from the render).
+/// `skills/` + project `.omp/skills` + `--skill` roots, `hide: true` and
+/// `skills.disabled` dropped, closest priority winning on duplicate names).
 pub fn load_skills(agent: &Path, cwd: &Path, enabled: bool) -> Vec<Skill> {
     if !enabled {
         return Vec::new();
     }
-    let mut skills = Vec::new();
-    // Project `.omp/skills` walk-up, closest first.
-    for dir in cwd.ancestors() {
-        load_skills_dir(&dir.join(".omp/skills"), &mut skills);
-    }
-    load_skills_dir(&agent.join("skills"), &mut skills);
-    // `--skill` roots come last so a gateway-provided root cannot shadow project skills.
-    if let Some(extra) = SKILL_EXTRA_ROOTS.get() {
-        for root in extra {
-            if root.is_dir() && !root.join("SKILL.md").is_file() {
-                load_skills_dir(root, &mut skills);
-            } else if let Some(parent) = root.parent() {
-                // A `--skill <dir>/SKILL.md` path: load its containing skill dir.
-                load_skills_dir(parent, &mut skills);
-            }
-        }
-    }
     let disabled = settings_string_array(agent, "skills.disabled");
-    skills.retain(|s| !s.hide && !disabled.contains(&s.name));
-    skills
+    let mut seen = HashSet::new();
+    omp_urls::schemes::skill::discover_skills(agent, cwd)
+        .into_iter()
+        .filter(|s| seen.insert(s.name.clone()) && !disabled.contains(&s.name))
+        .map(|s| Skill {
+            name: s.name,
+            description: s.description,
+            hide: false,
+        })
+        .collect()
 }
 
 /// `resolvePromptInput`: multi-line input is literal; otherwise try reading
@@ -2549,6 +2477,51 @@ mod tests {
         let skills = load_skills(&agent, &root, true);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "demo");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_skill_paths_shares_roots_with_skill_url_provider() {
+        use omp_urls::{parse_internal_url, schemes::skill::SkillProvider, UrlCtx, UrlProvider};
+
+        static SKILL_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SKILL_PATH_LOCK.lock().unwrap();
+        let prev = omp_urls::schemes::skill::extra_skill_paths();
+
+        let root = tempdir("shared-skills");
+        let agent = root.join("agent");
+        let cwd = root.join("cwd");
+        let extra = root.join("extra");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(extra.join("alpha")).unwrap();
+        std::fs::create_dir_all(extra.join("beta")).unwrap();
+        std::fs::write(
+            extra.join("alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: Alpha skill\n---\nAlpha body\n",
+        )
+        .unwrap();
+        std::fs::write(
+            extra.join("beta/SKILL.md"),
+            "---\nname: beta\ndescription: Sibling\n---\nBeta body\n",
+        )
+        .unwrap();
+
+        set_skill_paths(vec![extra.join("alpha/SKILL.md")]);
+        let listed = load_skills(&agent, &cwd, true);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "alpha");
+
+        let ctx = UrlCtx {
+            cwd: Some(cwd),
+            ..UrlCtx::default()
+        };
+        let res = SkillProvider
+            .read(&parse_internal_url("skill://alpha").unwrap(), &ctx)
+            .unwrap();
+        assert!(res.content.contains("Alpha body"));
+
+        set_skill_paths(prev);
         let _ = std::fs::remove_dir_all(&root);
     }
 

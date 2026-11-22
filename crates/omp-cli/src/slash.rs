@@ -76,10 +76,8 @@ pub fn extensions() -> Option<&'static Arc<Ext>> {
     EXTENSIONS.get()
 }
 
-/// Extension commands registered via `pi.registerCommand`, in TS
-/// `buildAvailableSlashCommands` order/shape (source `extension`).
-pub async fn extension_commands() -> Vec<serde_json::Value> {
-    let Some(ext) = extensions() else {
+pub(crate) async fn extension_commands_for(ext: Option<&Arc<Ext>>) -> Vec<serde_json::Value> {
+    let Some(ext) = ext else {
         return Vec::new();
     };
     match ext.host.list_commands().await {
@@ -3162,8 +3160,15 @@ use self::Outcome::{Handled, Prompt};
 /// Extension + file commands in TS `buildAvailableSlashCommands` order.
 /// Appended after the builtin catalog by `Runtime::available_commands`.
 pub async fn dynamic_commands(rt: &std::sync::Arc<Runtime>) -> Vec<Value> {
+    dynamic_commands_for(rt, extensions()).await
+}
+
+pub(crate) async fn dynamic_commands_for(
+    rt: &std::sync::Arc<Runtime>,
+    ext: Option<&Arc<Ext>>,
+) -> Vec<Value> {
     refresh_file_commands(&rt.cwd);
-    let mut out = extension_commands().await;
+    let mut out = extension_commands_for(ext).await;
     out.extend(crate::tools::wasm::command_catalog(&rt.cwd));
     for cmd in FILE_COMMANDS
         .lock()

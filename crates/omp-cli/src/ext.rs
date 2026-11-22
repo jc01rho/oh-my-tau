@@ -607,6 +607,8 @@ pub struct Extensions {
     live: Arc<Live>,
     /// Runtime attached via [`Extensions::attach`]; re-served on reconnect.
     rt: Mutex<Option<Arc<Runtime>>>,
+    /// Last extension tool definitions installed onto `rt.agent` (for `reload` reconciliation).
+    installed_tools: Mutex<Vec<ToolInfo>>,
     /// Tool calls an extension `tool_call` handler blocked: their result events are delivered to
     /// extensions in TS's order (see `subscribe_lifecycle`).
     blocked_calls: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -766,6 +768,7 @@ impl Extensions {
             prompt_override: Mutex::new(None),
             live: Arc::new(Live::default()),
             rt: Mutex::new(None),
+            installed_tools: Mutex::new(Vec::new()),
             blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_agent_end: Arc::new(Mutex::new(None)),
         });
@@ -787,6 +790,33 @@ impl Extensions {
             tokio::spawn(async move { ext.supervise_reconnect().await });
         }
         Ok(ext)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(host: Arc<ExtHost>, cwd: &Path) -> Arc<Self> {
+        let hooks = ExtHooks::new(host.clone());
+        let ext = Arc::new(Self {
+            host,
+            hooks,
+            sub: Mutex::new(None),
+            turn: Arc::new(AtomicU64::new(0)),
+            stop: Arc::new(Mutex::new(StopState::default())),
+            cwd: cwd.to_path_buf(),
+            extra: Vec::new(),
+            dir: None,
+            ctx: Mutex::new(SessionCtx::default()),
+            mode: Mutex::new(ExtMode::Rpc),
+            prompt_override: Mutex::new(None),
+            live: Arc::new(Live::default()),
+            rt: Mutex::new(None),
+            installed_tools: Mutex::new(Vec::new()),
+            blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_agent_end: Arc::new(Mutex::new(None)),
+        });
+        let live = ext.live.clone();
+        ext.host
+            .set_ctx_provider(Some(Arc::new(move |_ty: &str| live.provide())));
+        ext
     }
 
     /// `pa-agent` hook points backed by the host.
@@ -840,10 +870,12 @@ impl Extensions {
     /// # Errors
     /// Transport failure on `list_tools`.
     pub async fn tools(&self) -> Result<Vec<Arc<dyn AgentTool>>> {
-        Ok(self
-            .host
-            .list_tools()
-            .await?
+        let infos = self.host.list_tools().await?;
+        *self
+            .installed_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = infos.clone();
+        Ok(infos
             .into_iter()
             .map(|info| {
                 Arc::new(ExtTool {
@@ -852,6 +884,50 @@ impl Extensions {
                 }) as Arc<dyn AgentTool>
             })
             .collect())
+    }
+
+    async fn reconcile_tools(&self, rt: &Arc<Runtime>) -> Result<()> {
+        let latest = self.host.list_tools().await?;
+        let prev = self
+            .installed_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut tools = rt.agent.tools().await;
+        let all_present = latest
+            .iter()
+            .all(|info| tools.iter().any(|t| t.name() == info.name));
+        if prev == latest && all_present {
+            return Ok(());
+        }
+        let remove_names: std::collections::HashSet<String> = prev
+            .iter()
+            .chain(latest.iter())
+            .map(|info| info.name.clone())
+            .collect();
+        tools.retain(|t| !remove_names.contains(t.name()));
+        let mut added: Vec<Arc<dyn AgentTool>> = latest
+            .iter()
+            .cloned()
+            .map(|info| {
+                Arc::new(ExtTool {
+                    host: self.host.clone(),
+                    info,
+                }) as Arc<dyn AgentTool>
+            })
+            .collect();
+        if let Some(gate) = crate::approval::Gate::get() {
+            added = gate.wrap_tools(added);
+        }
+        tools.extend(added);
+        crate::tools::republish_dyn_tools(&tools);
+        crate::tools::eval_bridge::refresh_session_tools(&tools);
+        rt.agent.set_tools(tools).await;
+        *self
+            .installed_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = latest;
+        Ok(())
     }
 
     /// Merge session info into the host's ctx state. Also sends the stored
@@ -1144,13 +1220,19 @@ impl Extensions {
             .branch_len
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        emit_silent(self.host.emit_session_start(None).await);
-        if let Some(rt) = self
+        let rt = self
             .rt
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
+            .clone();
+        if let Some(rt) = &rt {
+            self.reconcile_tools(rt).await?;
+            if self.live.needs_branch.load(Ordering::Relaxed) {
+                self.refresh_branch(rt);
+            }
+        }
+        emit_silent(self.host.emit_session_start(None).await);
+        if let Some(rt) = rt {
             self.serve_incoming(&rt);
         }
         Ok(())
@@ -2176,5 +2258,142 @@ mod tests {
         assert!(ExtMode::Tui.has_ui() && ExtMode::Rpc.has_ui());
         assert!(!ExtMode::Print.has_ui() && !ExtMode::Json.has_ui());
         assert_eq!(ExtMode::Tui.name(), "tui");
+    }
+
+    async fn test_runtime(dir: &Path, extra_tools: Vec<Arc<dyn AgentTool>>) -> Arc<Runtime> {
+        use pa_agent::agent::{Agent, AgentInitialState, AgentOptions};
+
+        let model: pa_types::ai::Model = serde_json::from_value(json!({
+            "id": "a", "name": "a", "api": "openai-completions", "provider": "p",
+            "baseUrl": "http://127.0.0.1:9", "reasoning": false, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 100_000, "maxTokens": 4096
+        }))
+        .unwrap();
+        let mut tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(StubTool("keep_builtin"))];
+        tools.extend(extra_tools);
+        let agent = Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                system_prompt: Some("test".into()),
+                model: crate::adapter::json_round_trip(&model),
+                thinking_level: Some(pa_agent::types::ThinkingLevel::Off),
+                tools: Some(tools),
+                messages: None,
+            },
+            ..AgentOptions::default()
+        });
+        let persist = crate::persist::attach_in(&agent, dir, dir, None, crate::persist::uuid_v7())
+            .await
+            .unwrap();
+        let target = Arc::new(std::sync::RwLock::new(Some(
+            crate::adapter::ProviderTarget {
+                api_key: Some("k".into()),
+                model,
+                service_tier: None,
+                headers: None,
+                credential_id: None,
+            },
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        Runtime::start(Arc::new(agent), target, dir.to_path_buf(), persist, tx).await
+    }
+
+    struct StubTool(&'static str);
+
+    impl AgentTool for StubTool {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            "stub"
+        }
+        fn parameters(&self) -> &Value {
+            static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(|| json!({"type": "object", "properties": {}}))
+        }
+        fn execute(
+            self: Arc<Self>,
+            _id: String,
+            _params: Value,
+            _signal: AbortSignal,
+            _on_update: pa_agent::types::AgentToolUpdateCallback,
+        ) -> pa_agent::BoxFut<'static, Result<AgentToolResult>> {
+            Box::pin(async { Ok(AgentToolResult::text("ok")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_reconciles_tools_and_rebuilds_branch_for_session_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.jsonl");
+        let phase = dir.path().join("phase");
+        std::fs::write(&phase, "1").unwrap();
+        let host = sh_host(
+            dir.path(),
+            concat!(
+                "while IFS= read -r line; do\n",
+                "  printf '%s\\n' \"$line\" >> \"$REQ_LOG\"\n",
+                "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+                "  p=$(cat \"$PHASE_FILE\")\n",
+                "  case \"$line\" in\n",
+                "    *'\"method\":\"load\"'*)\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"loaded\":[{\"path\":\"ext.ts\",\"name\":\"ext\",\"handlers\":{\"session_start\":1}}],\"errors\":[]}}\\n' \"$id\";;\n",
+                "    *'\"method\":\"list_tools\"'*)\n",
+                "      if [ \"$p\" = \"1\" ]; then\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[{\"name\":\"ext_keep\",\"description\":\"v1\",\"parameters\":{\"type\":\"object\"},\"extension\":\"ext\"},{\"name\":\"ext_drop\",\"description\":\"drop\",\"parameters\":{\"type\":\"object\"},\"extension\":\"ext\"}]}\\n' \"$id\"\n",
+                "      else\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[{\"name\":\"ext_keep\",\"description\":\"v2\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}},\"extension\":\"ext\"},{\"name\":\"ext_added\",\"description\":\"new\",\"parameters\":{\"type\":\"object\"},\"extension\":\"ext\"}]}\\n' \"$id\"\n",
+                "      fi;;\n",
+                "    *)\n",
+                "      if [ -n \"$id\" ]; then\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{}}\\n' \"$id\"\n",
+                "      fi;;\n",
+                "  esac\n",
+                "done\n",
+            ),
+            vec![
+                ("REQ_LOG".into(), log.display().to_string()),
+                ("PHASE_FILE".into(), phase.display().to_string()),
+            ],
+        )
+        .await;
+        let ext = Extensions::for_test(host, dir.path());
+        ext.live.needs_branch.store(true, Ordering::Relaxed);
+        let initial_tools = ext.tools().await.unwrap();
+        let rt = test_runtime(dir.path(), initial_tools).await;
+        rt.append_entry("custom", json!({"customType": "note", "v": 1}))
+            .unwrap();
+        ext.attach(rt.clone());
+        // Simulate an earlier emit having consumed `Live.branch` before idle reload.
+        *ext.live.branch.lock().unwrap() = None;
+
+        std::fs::write(&phase, "2").unwrap();
+        ext.reload().await.unwrap();
+
+        let tools = rt.agent.tools().await;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"keep_builtin"), "{names:?}");
+        assert!(names.contains(&"ext_added"), "{names:?}");
+        assert!(!names.contains(&"ext_drop"), "{names:?}");
+        let kept = tools.iter().find(|t| t.name() == "ext_keep").unwrap();
+        assert_eq!(kept.description(), "v2");
+        assert!(kept.parameters()["properties"]["x"].is_object());
+
+        let reqs = std::fs::read_to_string(&log).unwrap();
+        let start_line = reqs
+            .lines()
+            .rfind(|l| l.contains("\"type\":\"session_start\""))
+            .expect("session_start emitted");
+        let start_val: Value = serde_json::from_str(start_line).unwrap();
+        let branch = start_val["params"]["ctx"]["branch"]
+            .as_array()
+            .expect("branch array in session_start ctx");
+        assert!(!branch.is_empty(), "{start_val}");
+        assert!(
+            start_val["params"]["ctx"]["leafId"].is_string(),
+            "{start_val}"
+        );
+
+        ext.host.shutdown().await.unwrap();
     }
 }

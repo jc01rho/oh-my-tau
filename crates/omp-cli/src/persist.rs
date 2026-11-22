@@ -106,6 +106,8 @@ pub struct Persistence {
     /// compaction's own abort of the live turn (TS detaches the session from the
     /// agent around that abort, so the stub never reaches the journal).
     drop_empty_aborted: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_append: Arc<AtomicBool>,
 }
 
 impl Drop for Persistence {
@@ -140,12 +142,21 @@ impl Persistence {
     /// Fails on serialization or I/O errors.
     #[allow(dead_code)]
     pub fn append_entry(&self, kind: &str, payload: serde_json::Value) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_append.load(Ordering::SeqCst) {
+            anyhow::bail!("injected journal write failure");
+        }
         self.writer
             .lock()
             .unwrap()
             .append_entry(kind, payload, &now_iso())
             .map(|_| ())
             .inspect(|_| self.clear_nav())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_fail_append(&self, fail: bool) {
+        self.fail_append.store(fail, Ordering::SeqCst);
     }
 
     /// A shareable sink appending non-message entries (`model_usage`, …) to
@@ -407,6 +418,8 @@ impl Persistence {
             defer_errors: Arc::new(AtomicBool::new(false)),
             deferred: Arc::new(Mutex::new(None)),
             drop_empty_aborted: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_append: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -673,6 +686,8 @@ pub(crate) async fn attach_in(
         defer_errors,
         deferred,
         drop_empty_aborted,
+        #[cfg(test)]
+        fail_append: Arc::new(AtomicBool::new(false)),
     })
 }
 

@@ -162,6 +162,11 @@ pub struct Runtime {
     /// Lane hold state behind `interrupt intent:stop`, `get_state`'s pause fields and
     /// `resume_session` (`pieces/01`, `pieces/03`).
     pause: Mutex<crate::pause::PauseState>,
+    /// Number of `pause_for_stop` calls currently between `abort()` and installing the hold.
+    stop_pending: std::sync::atomic::AtomicUsize,
+    /// Monotonically incremented whenever `pause_for_stop` starts so a prompt admitted before
+    /// `abort()` cannot start a turn after a concurrent stop takes the hold.
+    stop_epoch: std::sync::atomic::AtomicU64,
     /// Set while a manual compaction aborts the live turn (TS
     /// `disconnectFromAgent` around that abort): the empty aborted stub is
     /// neither rendered nor journaled — the turn resumes after the summary.
@@ -529,6 +534,8 @@ impl Runtime {
             post_turn_task: Mutex::new(None),
             user_interrupt: std::sync::atomic::AtomicBool::new(false),
             pause: Mutex::new(crate::pause::PauseState::default()),
+            stop_pending: std::sync::atomic::AtomicUsize::new(0),
+            stop_epoch: std::sync::atomic::AtomicU64::new(0),
             compaction_abort: std::sync::atomic::AtomicBool::new(false),
             compaction_stub_start: std::sync::atomic::AtomicBool::new(false),
             ui_context_frames: std::sync::atomic::AtomicBool::new(false),
@@ -800,15 +807,18 @@ impl Runtime {
                 _ => {}
             }
         }
-        self.emit_event(frame);
-        match event {
-            AgentEvent::AgentStart => {
+        if matches!(event, AgentEvent::AgentStart) {
+            {
                 let mut p = lock(&self.prompts);
                 p.agent_starts += 1;
                 p.active = true;
-                drop(p);
-                self.herdr_working();
+                self.emit_event(frame);
             }
+            self.herdr_working();
+            return;
+        }
+        self.emit_event(frame);
+        match event {
             AgentEvent::ToolExecutionStart {
                 tool_name, args, ..
             } if tool_name == "ask" => {
@@ -1351,6 +1361,11 @@ impl Runtime {
     /// own abort signal (TS `#scheduleAgentContinue` -> `agent.continue()`), so an
     /// empty Enter that interrupts a turn delivers the queued steer as a real turn.
     fn drain_stranded_queue(self: &Arc<Self>) {
+        if self.stop_pending.load(std::sync::atomic::Ordering::SeqCst) > 0
+            || lock(&self.pause).paused()
+        {
+            return;
+        }
         let (steering, _follow) = self.queued();
         let interrupted = self
             .user_interrupt
@@ -1361,6 +1376,13 @@ impl Runtime {
         let rt = self.clone();
         tokio::spawn(async move {
             rt.agent.wait_for_idle().await;
+            // Re-read the stop/hold state here after `wait_for_idle`: `pause_for_stop` records the
+            // hold only after `abort()` resolves, and `stop_pending` covers the gap in between.
+            if rt.stop_pending.load(std::sync::atomic::Ordering::SeqCst) > 0
+                || lock(&rt.pause).paused()
+            {
+                return;
+            }
             if !rt.agent.has_queued_messages() {
                 return;
             }
@@ -1744,7 +1766,7 @@ impl Runtime {
     fn report_prompts(self: &Arc<Self>, outcome: &RunOutcome) {
         // Tickets of the runs that just ended are claimed now: a prompt admitted during the delay
         // below belongs to the next run and must not inherit this result.
-        let claimed = {
+        let (claimed, starts_at_end) = {
             let mut p = lock(&self.prompts);
             let starts = p.agent_starts;
             let (ready, rest): (Vec<_>, Vec<_>) = p
@@ -1752,7 +1774,7 @@ impl Runtime {
                 .drain(..)
                 .partition(|t| !t.waiting && starts > t.starts_at_begin);
             p.open = rest;
-            ready
+            (ready, starts)
         };
         let rt = self.clone();
         let outcome = outcome.clone();
@@ -1767,12 +1789,14 @@ impl Runtime {
             // response still goes out before the result frame.
             rt.agent.wait_for_idle().await;
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            rt.report_prompts_now(&outcome, claimed);
+            rt.report_prompts_now(&outcome, claimed, starts_at_end);
         });
     }
 
-    /// Emit `prompt_result` frames then `session_settled` after a terminal end.
-    fn report_prompts_now(&self, outcome: &RunOutcome, claimed: Vec<Ticket>) {
+    /// Emit `prompt_result` frames then `session_settled` / `agent_settled` after a terminal end.
+    /// Hold `self.prompts` across sending the settle frames so a concurrently admitted run's
+    /// `AgentStart` cannot emit `agent_start` ahead of stale settle frames.
+    fn report_prompts_now(&self, outcome: &RunOutcome, claimed: Vec<Ticket>, expected_starts: u64) {
         let drained = self.queued_count() == 0;
         let mut p = lock(&self.prompts);
         let mut remaining = Vec::new();
@@ -1785,11 +1809,10 @@ impl Runtime {
             }
         }
         p.open = remaining;
-        let settle = p.active && drained && p.open.is_empty();
+        let settle = p.active && p.agent_starts == expected_starts && drained && p.open.is_empty();
         if settle {
             p.active = false;
         }
-        drop(p);
         for t in reports {
             let mut frame = json!({"type": "prompt_result", "agentInvoked": true, "status": outcome.status, "sessionSettled": drained});
             if let Some(id) = t.id {
@@ -1806,6 +1829,7 @@ impl Runtime {
             self.send(json!({"type": "session_settled"}));
             self.send(json!({"type": "agent_settled"}));
         }
+        drop(p);
         self.settled.notify_waiters();
     }
 
@@ -1826,6 +1850,7 @@ impl Runtime {
             return Err(CmdError::new(msg));
         }
         self.release_pause("input");
+        let stop_epoch = self.stop_epoch.load(std::sync::atomic::Ordering::SeqCst);
         // A prompt during in-flight compaction cancels it and waits for the
         // pass to settle first (TS prompt-side `abortCompaction` +
         // `waitForManualMaintenanceCleanup`): the turn must start on the
@@ -1833,6 +1858,12 @@ impl Runtime {
         // before the auto-title spawn so the title task cannot append its way
         // into a running pass.
         self.cancel_compaction_and_wait().await;
+        if self.interrupted_by_stop(stop_epoch) {
+            return Err(CmdError::coded(
+                "Prompt interrupted by stop before execution",
+                "session_paused",
+            ));
+        }
         self.spawn_auto_title(message);
         if self.agent.is_streaming().await {
             let steer = match behavior {
@@ -1909,6 +1940,18 @@ impl Runtime {
             }
         }
         let notices = self.prompt_notices(message, true).await;
+        // Re-check stop/hold right before `prompt_until_accepted`: if `pause_for_stop` ran while
+        // `before_start` or `prompt_notices` awaited (with no active run for `abort()` to cancel),
+        // refuse to start a turn under the newly installed hold.
+        if self.interrupted_by_stop(stop_epoch) {
+            lock(&self.prompts)
+                .open
+                .retain(|t| !(t.starts_at_begin == starts && t.id == id && !t.waiting));
+            return Err(CmdError::coded(
+                "Prompt interrupted by stop before execution",
+                "session_paused",
+            ));
+        }
         let input = prompt_input(message, images, notices, injected);
         let pua = self.agent.prompt_until_accepted(input).await;
         if let Err(e) = pua {
@@ -2040,20 +2083,38 @@ impl Runtime {
         crate::pause::set_client_info(&mut pause, cmd).map_err(CmdError::coded_params)
     }
 
+    fn interrupted_by_stop(&self, stop_epoch: u64) -> bool {
+        self.stop_epoch.load(std::sync::atomic::Ordering::SeqCst) != stop_epoch
+            || self.stop_pending.load(std::sync::atomic::Ordering::SeqCst) > 0
+            || lock(&self.pause).paused()
+    }
+
     /// `interrupt intent:"stop"`: abort the turn, stop the shell, then hold the lane.
     ///
     /// # Errors
     /// The peer never declared `interactive_user`.
     pub async fn pause_for_stop(&self) -> Result<(), CmdError> {
+        struct StopPendingGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for StopPendingGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
         if let Err(message) = crate::pause::require_interactive(&lock(&self.pause)) {
             return Err(CmdError::coded(message, "stop_requires_interactive_client"));
         }
+        self.stop_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.stop_pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _guard = StopPendingGuard(&self.stop_pending);
         self.abort().await;
         self.set(|s| s.abort_bash());
         let at = crate::persist::now_iso();
         let seq = crate::pause::hold(&mut lock(&self.pause), &at);
-        self.journal_hold("hold", seq, None, &at);
-        self.send(crate::pause::paused_frame(seq, &at));
+        let persisted = self.journal_hold("hold", seq, None, &at);
+        self.send(crate::pause::paused_frame(seq, &at, persisted));
         Ok(())
     }
 
@@ -2067,16 +2128,20 @@ impl Runtime {
             }
             crate::pause::release(&mut pause)
         };
-        self.journal_hold("release", seq, Some(cause), &at);
+        let _ = self.journal_hold("release", seq, Some(cause), &at);
         self.send(crate::pause::resumed_frame(seq, cause, &at));
     }
 
-    fn journal_hold(&self, op: &str, seq: u64, cause: Option<&str>, at: &str) {
-        if let Err(e) = self
+    fn journal_hold(&self, op: &str, seq: u64, cause: Option<&str>, at: &str) -> bool {
+        match self
             .persist
             .append_entry("custom", crate::pause::journal(op, seq, cause, at))
         {
-            eprintln!("omt: session-hold journal: {e:#}");
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("omt: session-hold journal: {e:#}");
+                false
+            }
         }
     }
 
@@ -2475,6 +2540,7 @@ impl Runtime {
             st.last_queue = (Vec::new(), Vec::new());
         }
         lock(&self.prompts).open.clear();
+        lock(&self.pause).reset_session();
         self.record_model_state().await;
         // Interactive TUI: drop the rendered transcript and the terminal
         // scrollback (TS `#runNewSessionFlow`: `resetTranscript()` +
@@ -2698,6 +2764,16 @@ impl Runtime {
         }
         self.herdr_session("resume");
         lock(&self.prompts).open.clear();
+        if fork || branched {
+            lock(&self.pause).reset_session();
+        } else {
+            let restored = latest_session_hold(&index, path, &branch)?;
+            let mut pause = lock(&self.pause);
+            match restored {
+                Some((seq, since)) => pause.restore_from_journal(seq, since),
+                None => pause.reset_session(),
+            }
+        }
         self.restore_title_from(&index);
         self.notify_session_switch(
             if branched {
@@ -2746,7 +2822,10 @@ impl Runtime {
             if resolved.provider != provider || resolved.id != id || resolved.api_key.is_none() {
                 continue;
             }
-            lock(&self.recovery).reconfigure(RecoveryConfig::from_resolved(&resolved));
+            let mut cfg = RecoveryConfig::from_resolved(&resolved);
+            cfg.model_fallback_disabled =
+                MODEL_FALLBACK_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
+            lock(&self.recovery).reconfigure(cfg);
             self.swap_model(&resolved, None, false, false).await;
             return;
         }
@@ -3082,6 +3161,44 @@ fn latest_todo_phases(
         Ok(std::ops::ControlFlow::Continue(()))
     })?;
     Ok(phases.unwrap_or_default())
+}
+
+/// Latest session-hold transition (`(pauseSeq, Some(since))` when held, `(pauseSeq, None)` when
+/// released) on `branch`, preserving session-scoped pause ownership across `load_session_as`.
+fn latest_session_hold(
+    index: &omp_session::index::SessionIndex,
+    path: &Path,
+    branch: &[u32],
+) -> Result<Option<(u64, Option<String>)>> {
+    let mut found: Option<(u64, Option<String>)> = None;
+    let rev: Vec<u32> = branch
+        .iter()
+        .rev()
+        .copied()
+        .filter(|&i| index.refs[i as usize].kind == omp_session::index::EntryKind::Custom)
+        .collect();
+    index.scan_lines(path, &rev, |_r, raw| {
+        if raw.contains("\"customType\":\"session-hold\"") {
+            if let Ok(v) = serde_json::from_str::<Value>(raw) {
+                let body = v.get("data").filter(|d| d.is_object()).unwrap_or(&v);
+                if let (Some(op), Some(seq)) = (
+                    body.get("op").and_then(Value::as_str),
+                    body.get("pauseSeq").and_then(Value::as_u64),
+                ) {
+                    let since = (op == "hold").then(|| {
+                        body.get("at")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    });
+                    found = Some((seq, since));
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            }
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
+    Ok(found)
 }
 
 impl Runtime {
@@ -3701,8 +3818,11 @@ impl Runtime {
         let info = model_info(&resolved.model);
         // A user selection ends fallback ownership and clears the selector's cooldown.
         {
+            let mut cfg = RecoveryConfig::from_resolved(&resolved);
+            cfg.model_fallback_disabled =
+                MODEL_FALLBACK_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
             let mut rec = lock(&self.recovery);
-            rec.reconfigure(RecoveryConfig::from_resolved(&resolved));
+            rec.reconfigure(cfg);
             rec.clear_cooldown(&reference);
         }
         self.swap_model(&resolved, role, false, true).await;
@@ -4081,6 +4201,11 @@ impl Runtime {
         if self.announced.load(std::sync::atomic::Ordering::SeqCst) {
             self.announce_commands();
         }
+    }
+
+    #[must_use]
+    pub fn commands_announced(&self) -> bool {
+        self.announced.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Emit `available_commands_update` with the current catalog.
@@ -6397,5 +6522,436 @@ mod compaction_guard_tests {
             "the turn landed in the new session: {:?}",
             fresh.last().unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod pr18_review_regressions {
+    use std::time::Duration;
+
+    use pa_agent::agent::{Agent, AgentInitialState, AgentOptions};
+    use pa_agent::scripted::ScriptedProvider;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    use super::*;
+    use crate::adapter::ProviderTarget;
+
+    static FALLBACK_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn test_model(provider: &str, id: &str) -> pa_types::ai::Model {
+        serde_json::from_value(json!({
+            "id": id, "name": id, "api": "openai-completions", "provider": provider,
+            "baseUrl": "http://127.0.0.1:9", "reasoning": false, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 100_000, "maxTokens": 4096
+        }))
+        .expect("model json")
+    }
+
+    fn resolved_with_fallback(provider: &str, id: &str, fb: &str) -> omp_providers::ResolvedModel {
+        let model: omp_providers::Model = serde_json::from_value(json!({
+            "id": id, "name": id, "api": "openai-completions", "provider": provider,
+            "baseUrl": "http://127.0.0.1:9", "reasoning": false, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 100_000, "maxTokens": 4096
+        }))
+        .unwrap();
+        omp_providers::ResolvedModel {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            api: "openai-completions".to_string(),
+            base_url: "http://127.0.0.1:9".to_string(),
+            api_key: Some("k".to_string()),
+            credential_id: None,
+            headers: Vec::new(),
+            context_window: 100_000,
+            max_tokens: 4096,
+            reasoning: false,
+            thinking: None,
+            thinking_auto: false,
+            thinking_source: omp_providers::ThinkingSource::None,
+            selector: format!("{provider}/{id}"),
+            role: None,
+            fallbacks: vec![fb.to_string()],
+            retry: omp_providers::RetryConfig::default(),
+            model,
+        }
+    }
+
+    struct Env {
+        rt: Arc<Runtime>,
+        rx: UnboundedReceiver<Value>,
+        provider: Arc<ScriptedProvider>,
+        dir: tempfile::TempDir,
+    }
+
+    async fn make_env(
+        resolver: Option<recovery::Resolver>,
+        recovery_cfg: Option<recovery::RecoveryConfig>,
+    ) -> Env {
+        let m = test_model("p", "a");
+        let provider = Arc::new(ScriptedProvider::new(
+            json_round_trip(&m).expect("agent model"),
+        ));
+        let agent = Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                system_prompt: Some("test".into()),
+                model: json_round_trip(&m),
+                thinking_level: Some(ThinkingLevel::Off),
+                tools: Some(Vec::new()),
+                messages: None,
+            },
+            stream_fn: Some(provider.stream_fn()),
+            ..AgentOptions::default()
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let persist = crate::persist::attach_in(
+            &agent,
+            dir.path(),
+            dir.path(),
+            None,
+            crate::persist::uuid_v7(),
+        )
+        .await
+        .expect("session");
+        let target = Arc::new(std::sync::RwLock::new(Some(ProviderTarget {
+            api_key: Some("k".into()),
+            model: m,
+            service_tier: None,
+            headers: None,
+            credential_id: None,
+        })));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let resolver = resolver.unwrap_or_else(recovery::default_resolver);
+        let rt = Runtime::start_with(
+            Arc::new(agent),
+            target,
+            dir.path().to_path_buf(),
+            persist,
+            tx,
+            resolver,
+            recovery_cfg,
+        )
+        .await;
+        Env {
+            rt,
+            rx,
+            provider,
+            dir,
+        }
+    }
+
+    async fn next_frame_matching(
+        rx: &mut UnboundedReceiver<Value>,
+        pred: impl Fn(&Value) -> bool,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let f = rx.recv().await.expect("channel open");
+                if pred(&f) {
+                    return f;
+                }
+            }
+        })
+        .await
+        .expect("matching frame")
+    }
+
+    #[tokio::test]
+    async fn no_model_fallback_survives_select_model_and_restore_session_model() {
+        let _guard = FALLBACK_FLAG_LOCK.lock().await;
+        let prev_flag = MODEL_FALLBACK_DISABLED.swap(true, std::sync::atomic::Ordering::Relaxed);
+        let resolver: recovery::Resolver = Arc::new(|reference: String| {
+            Box::pin(async move {
+                let (p, i) = reference.split_once('/').unwrap_or(("p", "a"));
+                Ok(resolved_with_fallback(p, i, "fb/model"))
+            })
+        });
+        let env = make_env(Some(resolver), None).await;
+        let failed = |model: &str| recovery::FailedTurn {
+            message: "429 rate limit".into(),
+            status: Some(429),
+            provider: "p".into(),
+            model: model.into(),
+            retry_after_ms: None,
+        };
+        {
+            let mut rec = lock(&env.rt.recovery);
+            let f = failed("a");
+            let attempt = rec.begin_attempt(&f, 0.0);
+            assert!(rec.consult("p/a", &attempt, 1_000, 0.0).is_empty());
+        }
+
+        env.rt.set_model("p", "b").await.unwrap();
+        {
+            let mut rec = lock(&env.rt.recovery);
+            let f = failed("b");
+            let attempt = rec.begin_attempt(&f, 0.0);
+            assert!(
+                rec.consult("p/b", &attempt, 2_000, 0.0).is_empty(),
+                "select_model must preserve --no-model-fallback"
+            );
+        }
+
+        let mut models = std::collections::BTreeMap::new();
+        models.insert("default".to_string(), "p/c".to_string());
+        let saved = SessionModelState {
+            models,
+            last_role: Some("default".to_string()),
+            thinking: None,
+            ultra: None,
+        };
+        env.rt.restore_session_model(&saved).await;
+        {
+            let mut rec = lock(&env.rt.recovery);
+            let f = failed("c");
+            let attempt = rec.begin_attempt(&f, 0.0);
+            assert!(
+                rec.consult("p/c", &attempt, 3_000, 0.0).is_empty(),
+                "restore_session_model must preserve --no-model-fallback"
+            );
+        }
+
+        // When the flag is off, fallback chains still apply after reconfigure.
+        MODEL_FALLBACK_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let normal_env = make_env(
+            Some(Arc::new(|reference: String| {
+                Box::pin(async move {
+                    let (p, i) = reference.split_once('/').unwrap_or(("p", "a"));
+                    Ok(resolved_with_fallback(p, i, "fb/model"))
+                })
+            })),
+            None,
+        )
+        .await;
+        normal_env.rt.set_model("p", "d").await.unwrap();
+        {
+            let mut rec = lock(&normal_env.rt.recovery);
+            let f = failed("d");
+            let attempt = rec.begin_attempt(&f, 0.0);
+            assert_eq!(
+                rec.consult("p/d", &attempt, 4_000, 0.0),
+                vec!["fb/model".to_string()],
+                "ordinary fallback must work when --no-model-fallback is absent"
+            );
+        }
+
+        MODEL_FALLBACK_DISABLED.store(prev_flag, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn settle_frames_are_serialized_before_next_agent_start() {
+        let mut env = make_env(None, None).await;
+        env.provider.push_text_turn("first");
+        env.provider.push_text_turn("second");
+
+        env.rt
+            .prompt(Some(json!("p1")), "hello", None, Vec::new())
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        loop {
+            let f = next_frame_matching(&mut env.rx, |_| true).await;
+            let done = f["type"] == "agent_settled";
+            seen.push(f);
+            if done {
+                break;
+            }
+        }
+        let s_idx = seen
+            .iter()
+            .position(|f| f["type"] == "session_settled")
+            .unwrap();
+        let a_idx = seen
+            .iter()
+            .position(|f| f["type"] == "agent_settled")
+            .unwrap();
+        assert!(s_idx < a_idx);
+
+        // Even if a second run's AgentStart overlaps `report_prompts_now` holding `prompts`,
+        // `session_settled`/`agent_settled` from the first run cannot land after the second `agent_start`.
+        let starts_now = lock(&env.rt.prompts).agent_starts;
+        {
+            let mut p = lock(&env.rt.prompts);
+            p.active = true;
+        }
+        let rt2 = env.rt.clone();
+        let outcome = RunOutcome {
+            status: "completed",
+            error: None,
+        };
+        // Hold `prompts` briefly in `report_prompts_now` order and spawn a concurrent prompt;
+        // verify the emitted frame sequence on `rx` never puts `agent_settled` after the new `agent_start`.
+        rt2.report_prompts_now(&outcome, Vec::new(), starts_now);
+        env.rt
+            .prompt(Some(json!("p2")), "world", None, Vec::new())
+            .await
+            .unwrap();
+        let mut second = Vec::new();
+        loop {
+            let f = next_frame_matching(&mut env.rx, |_| true).await;
+            let done = f["type"] == "agent_settled"
+                && second.iter().any(|x: &Value| x["type"] == "agent_start");
+            second.push(f);
+            if done {
+                break;
+            }
+        }
+        let prev_settled = second
+            .iter()
+            .position(|f| f["type"] == "agent_settled")
+            .unwrap();
+        let next_start = second
+            .iter()
+            .position(|f| f["type"] == "agent_start")
+            .unwrap();
+        assert!(
+            prev_settled < next_start,
+            "previous agent_settled must precede next agent_start: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_session_and_load_session_scope_pause_and_preserve_client_info() {
+        let env = make_env(None, None).await;
+        env.rt
+            .set_client_info(&json!({"width": 90, "capabilities": ["interactive_user"]}))
+            .unwrap();
+
+        // Session A is paused (with a message so `discard_if_preamble_only` keeps the file).
+        seed_resumed_message(&env.rt.persist, &user_message("a"), None);
+        let session_a = env.rt.session_file();
+        env.rt.pause_for_stop().await.unwrap();
+        assert_eq!(env.rt.state().await["paused"], json!(true));
+        assert_eq!(env.rt.state().await["pauseSeq"], json!(1));
+
+        // Switching to a new session clears the hold and seq, while preserving ClientInfo.
+        env.rt.new_session(Some(env.dir.path())).await.unwrap();
+        assert_eq!(env.rt.state().await["paused"], json!(false));
+        assert_eq!(env.rt.state().await["pauseSeq"], json!(0));
+        seed_resumed_message(&env.rt.persist, &user_message("b"), None);
+        let session_b = env.rt.session_file();
+
+        // ClientInfo survived: interactive_user is still declared on session B.
+        env.rt.pause_for_stop().await.unwrap();
+        assert_eq!(env.rt.state().await["paused"], json!(true));
+
+        // Create an unpaused session C and switch back: hold must not leak from B.
+        env.rt.new_session(Some(env.dir.path())).await.unwrap();
+        seed_resumed_message(&env.rt.persist, &user_message("c"), None);
+        let session_c = env.rt.session_file();
+        env.rt.load_session(&session_b, None).await.unwrap();
+        assert_eq!(env.rt.state().await["paused"], json!(true));
+        assert_eq!(env.rt.state().await["pauseSeq"], json!(1));
+
+        env.rt.load_session(&session_c, None).await.unwrap();
+        assert_eq!(env.rt.state().await["paused"], json!(false));
+        assert_eq!(env.rt.state().await["pauseSeq"], json!(0));
+
+        // Loading paused session A restores A's hold + seq, still keeping ClientInfo.
+        env.rt.load_session(&session_a, None).await.unwrap();
+        assert_eq!(env.rt.state().await["paused"], json!(true));
+        assert_eq!(env.rt.state().await["pauseSeq"], json!(1));
+        assert!(lock(&env.rt.pause).client.is_interactive());
+    }
+
+    #[tokio::test]
+    async fn interrupt_stop_prevents_queued_steering_from_starting_new_run() {
+        let mut env = make_env(None, None).await;
+        env.rt
+            .set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        env.provider.push_stalled_turn("working");
+        env.provider.push_text_turn("should not run");
+
+        env.rt
+            .prompt(Some(json!("p1")), "start", None, Vec::new())
+            .await
+            .unwrap();
+        next_frame_matching(&mut env.rx, |f| f["type"] == "turn_start").await;
+
+        // Queue a steering message while the first turn is active.
+        env.rt.steer("queued steer");
+        assert!(env.rt.agent.has_queued_messages());
+
+        // `interrupt intent:"stop"` aborts the run and installs the hold.
+        env.rt.pause_for_stop().await.unwrap();
+        next_frame_matching(&mut env.rx, |f| f["type"] == "session_paused").await;
+        tokio::task::yield_now().await;
+        env.rt.agent.wait_for_idle().await;
+
+        assert_eq!(env.rt.state().await["paused"], json!(true));
+        assert!(
+            !env.rt.agent.is_streaming().await,
+            "queued steering must not start a run while held"
+        );
+        assert_eq!(
+            env.provider.calls().len(),
+            1,
+            "second provider turn must never start under stop hold"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_admitted_during_stop_window_does_not_run_under_hold() {
+        let env = make_env(None, None).await;
+        env.rt
+            .set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        env.provider.push_text_turn("should not run");
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let entered2 = entered.clone();
+        let proceed2 = proceed.clone();
+        env.rt.set_before_start_hook(Some(Arc::new(move |_, _| {
+            let entered = entered2.clone();
+            let proceed = proceed2.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                proceed.notified().await;
+                Vec::new()
+            })
+        })));
+
+        let rt2 = env.rt.clone();
+        let prompt_task = tokio::spawn(async move {
+            rt2.prompt(Some(json!("p-race")), "hello", None, Vec::new())
+                .await
+        });
+
+        // Wait until `prompt` passed `release_pause("input")` and is parked in `before_start`.
+        entered.notified().await;
+        // Now `pause_for_stop` runs while the agent has no active run yet.
+        env.rt.pause_for_stop().await.unwrap();
+        assert_eq!(env.rt.state().await["paused"], json!(true));
+
+        // Release `before_start`; the prompt must not start a turn under the hold.
+        proceed.notify_one();
+        let err = prompt_task
+            .await
+            .unwrap()
+            .expect_err("prompt must be stopped");
+        assert_eq!(err.code, Some("session_paused"));
+        assert_eq!(env.provider.calls().len(), 0);
+        assert_eq!(env.rt.state().await["paused"], json!(true));
+        assert!(!env.rt.agent.is_streaming().await);
+    }
+
+    #[tokio::test]
+    async fn journal_hold_failure_reports_persisted_false_and_keeps_hold() {
+        let mut env = make_env(None, None).await;
+        env.rt
+            .set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        env.rt.persist.set_fail_append(true);
+
+        env.rt.pause_for_stop().await.unwrap();
+        let paused = next_frame_matching(&mut env.rx, |f| f["type"] == "session_paused").await;
+        assert_eq!(paused["persisted"], json!(false));
+        assert_eq!(paused["pauseSeq"], json!(1));
+        assert_eq!(env.rt.state().await["paused"], json!(true));
+        assert_eq!(env.rt.state().await["pauseSeq"], json!(1));
+        let _ = &env.dir;
     }
 }
