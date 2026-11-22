@@ -119,6 +119,25 @@ pub trait AskUi: Send + Sync {
         true
     }
 
+    /// Whether the host speaks the gateway `question` dialog (`ask_user_question`):
+    /// a `question` frame with `title` and `questions[{id, question, options}]`,
+    /// answered by a flat `answers` map keyed by question id.
+    fn has_question_dialog(&self) -> bool {
+        false
+    }
+
+    /// Present a gateway `question` dialog and resolve with the raw
+    /// `extension_ui_response` object; `Ok(None)` means no response arrived.
+    fn question(
+        &self,
+        title: String,
+        questions: Value,
+        timeout_ms: Option<u64>,
+    ) -> BoxFut<'static, Result<Option<Value>>> {
+        let _ = (title, questions, timeout_ms);
+        Box::pin(async { Err(anyhow!("question dialogs are not supported by this host")) })
+    }
+
     /// Show a select prompt; resolves with the picked label, `Ok(None)` on
     /// cancel. `checked` are the pre-checked option indices (multi-select);
     /// `initial_index` is the cursor start.
@@ -1094,8 +1113,11 @@ fn result_json(result: &QuestionResult) -> Value {
     Value::Object(obj)
 }
 
+/// Message of the error a cancelled dialog raises (`ask_user_question` matches on it).
+pub(super) const CANCELLED_MESSAGE: &str = "Ask tool was cancelled by the user";
+
 fn cancelled() -> anyhow::Error {
-    anyhow!("Ask tool was cancelled by the user")
+    anyhow!(CANCELLED_MESSAGE)
 }
 
 /// Navigation controls for the degraded prompts (omp `NavigationControls`).

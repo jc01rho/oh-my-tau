@@ -7,6 +7,7 @@
 
 pub(crate) mod aliases;
 pub mod ask;
+mod ask_goal_compat;
 mod ast;
 pub mod bash;
 pub(crate) mod bash_output;
@@ -337,7 +338,7 @@ pub fn builtin_tools_with_env_and_jobs(
             })
         })
     };
-    let tools = vec![
+    let mut tools = vec![
         mk(
             "read",
             READ_DESCRIPTION.to_string(),
@@ -437,6 +438,7 @@ pub fn builtin_tools_with_env_and_jobs(
             Arc::new(|env, args, signal| Box::pin(ast::ast_edit(env, args, signal))),
         ),
         ask::tool(),
+        ask_goal_compat::ask_user_question_tool(),
         todo::tool(),
         web_search::tool(),
         lsp::tool(env.clone()),
@@ -451,6 +453,7 @@ pub fn builtin_tools_with_env_and_jobs(
         // Gated off by default (`generate_image.enabled`).
         image_gen::tool(env.clone()),
     ];
+    tools.extend(ask_goal_compat::goal_tools());
     env.set_dyn_tools(&tools);
     (env, tools)
 }
@@ -523,7 +526,9 @@ pub fn enabled_by_settings(settings: &omp_settings::Settings, name: &str) -> boo
         "tts" => flag("speechgen.enabled", false),
         // `generate_image.enabled`; off by default.
         "generate_image" => flag("generate_image.enabled", false),
-        "ask" => flag("ask.enabled", true),
+        "ask" | "ask_user_question" => flag("ask.enabled", true),
+        // omomeow's goal tools follow the same gate as tau's own `goal`.
+        "create_goal" | "get_goal" | "update_goal" => flag("goal.enabled", true),
         // Inert until the context-management tools land (they need the session
         // journal as a `ContextNotesHost`).
         "context_notes" | "new_context" => flag("compaction.experimentalContextManagement", false),
@@ -704,6 +709,7 @@ where
 }
 
 pub use ask::{tool_with_ui, AskUi, SelectOption};
+pub use ask_goal_compat::{ask_user_question_with_ui, FollowUpSink};
 
 #[cfg(test)]
 mod tests {

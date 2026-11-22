@@ -169,6 +169,30 @@ impl AskUi for RpcAskUi {
         })
     }
 
+    // The gateway's dialog parser only knows `confirm|select|input|editor|question`
+    // (omo-nyang `dialogs.ts`), so `ask_user_question` always uses `question`,
+    // whether or not the client sent `set_ask_dialog`.
+    fn has_question_dialog(&self) -> bool {
+        true
+    }
+
+    fn question(
+        &self,
+        title: String,
+        questions: Value,
+        timeout_ms: Option<u64>,
+    ) -> BoxFut<'static, anyhow::Result<Option<Value>>> {
+        Box::pin(async move {
+            let mut frame = Map::new();
+            frame.insert("title".into(), json!(title));
+            frame.insert("questions".into(), questions);
+            if let Some(ms) = timeout_ms {
+                frame.insert("timeout".into(), json!(ms));
+            }
+            Self::request("question", frame).await
+        })
+    }
+
     fn select(
         &self,
         prompt: String,
@@ -1765,9 +1789,24 @@ pub async fn run_with(
         let mut tools = rt.agent.tools().await;
         if let Some(slot) = tools.iter_mut().find(|t| t.name() == "ask") {
             *slot = crate::tools::tool_with_ui(Arc::new(RpcAskUi));
-            crate::tools::republish_dyn_tools(&tools);
-            rt.agent.set_tools(tools).await;
         }
+        if let Some(slot) = tools.iter_mut().find(|t| t.name() == "ask_user_question") {
+            // `waitForAnswer: false` returns at once and delivers the answer later
+            // as a user message (a follow-up when a turn is running, a new turn
+            // when idle).
+            let follow_up_rt = Arc::clone(&rt);
+            let follow_up: crate::tools::FollowUpSink = Arc::new(move |message: String| {
+                let rt = Arc::clone(&follow_up_rt);
+                tokio::spawn(async move {
+                    if let Err(e) = rt.prompt(None, &message, Some("followUp"), Vec::new()).await {
+                        eprintln!("omt: ask_user_question follow-up: {e:?}");
+                    }
+                });
+            });
+            *slot = crate::tools::ask_user_question_with_ui(Arc::new(RpcAskUi), Some(follow_up));
+        }
+        crate::tools::republish_dyn_tools(&tools);
+        rt.agent.set_tools(tools).await;
     }
     let writer = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
