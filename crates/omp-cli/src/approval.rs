@@ -636,6 +636,9 @@ fn bash_decision(args: &Value, settings: &omp_settings::Settings) -> Decision {
 pub fn tool_decision(name: &str, args: &Value, settings: &omp_settings::Settings) -> Decision {
     match name {
         "bash" => bash_decision(args, settings),
+        // A command watch runs a shell command: it answers to the same bash rules.
+        "monitor" if str_arg(args, "command").is_some() => bash_decision(args, settings),
+        "monitor" => Decision::tier(read_tier(str_arg(args, "path").unwrap_or(""))),
         "read" => Decision::tier(read_tier(str_arg(args, "path").unwrap_or(""))),
         "grep" => Decision::tier(read_tier(&path_list(args).join("\n"))),
         "write" => match str_arg(args, "path") {
@@ -728,6 +731,13 @@ fn approval_details(name: &str, args: &Value, t: fn(&str) -> String) -> Vec<Stri
             "Command: {}",
             t(str_arg(args, "command").unwrap_or("(missing)"))
         )],
+        "monitor" => match str_arg(args, "command") {
+            Some(command) => vec![format!("Command: {}", t(command))],
+            None => vec![format!(
+                "Path: {}",
+                t(str_arg(args, "path").unwrap_or("(missing)"))
+            )],
+        },
         "write" => vec![
             format!("Path: {}", t(str_arg(args, "path").unwrap_or("(missing)"))),
             format!("Content:\n{}", t(str_arg(args, "content").unwrap_or(""))),
@@ -1225,6 +1235,21 @@ mod tests {
                 "{t}"
             );
         }
+    }
+
+    #[test]
+    fn monitor_command_follows_the_bash_rules_and_a_path_watch_is_a_read() {
+        let cmd = json!({"command": "rm -rf /", "description": "d"});
+        let watched = tool_decision("monitor", &cmd, &settings());
+        let bash = tool_decision("bash", &cmd, &settings());
+        assert!(watched.tier == bash.tier && watched.policy == bash.policy);
+        assert!(watched.tier == Tier::Exec);
+        let path = tool_decision(
+            "monitor",
+            &json!({"path": "a", "description": "d"}),
+            &settings(),
+        );
+        assert!(path.tier == Tier::Read);
     }
 
     #[test]

@@ -182,6 +182,17 @@ pub(super) struct Notify {
     /// The regex as given, quoted back in the report.
     source: String,
     state: Mutex<NotifyState>,
+    /// A `monitor` command watch: matching lines go to this sink as they arrive
+    /// instead of being kept for the settle-time report.
+    sink: Option<tokio::sync::mpsc::UnboundedSender<WatchMsg>>,
+}
+
+/// What a streaming [`Notify`] tells its `monitor` while the job runs.
+pub(super) enum WatchMsg {
+    /// One line that matched the filter (cut to [`NOTIFY_MAX_LINE_CHARS`]).
+    Line(String),
+    /// The job reached its final state; the registry already holds it.
+    Settled(JobStatus),
 }
 
 #[derive(Default)]
@@ -204,7 +215,26 @@ impl Notify {
             re,
             source: source.to_string(),
             state: Mutex::new(NotifyState::default()),
+            sink: None,
         })
+    }
+
+    /// A `notify` that streams every matching line to `sink` (a `monitor` command).
+    pub(super) fn streaming(
+        source: &str,
+        sink: tokio::sync::mpsc::UnboundedSender<WatchMsg>,
+    ) -> Result<Self> {
+        Ok(Self {
+            sink: Some(sink),
+            ..Self::new(source)?
+        })
+    }
+
+    /// Tell a streaming watcher the job is final (after the registry update).
+    fn settled(&self, status: JobStatus) {
+        if let Some(sink) = &self.sink {
+            let _ = sink.send(WatchMsg::Settled(status));
+        }
     }
 
     /// Match the complete lines in `text`; the remainder waits for the next
@@ -260,6 +290,10 @@ impl Notify {
         }
         for line in lines {
             if line.trim().is_empty() || !self.re.is_match(&line) {
+                continue;
+            }
+            if let Some(sink) = &self.sink {
+                let _ = sink.send(WatchMsg::Line(clamp_chars(&line, NOTIFY_MAX_LINE_CHARS)));
                 continue;
             }
             if st.lines.len() < NOTIFY_MAX_LINES {
@@ -1037,7 +1071,7 @@ fn append_notify_report(text: &str, report: &str, spill: &SpillConfig) -> String
 /// omp `BashTool` async mode: register a `bg_N` job, run it detached, and
 /// return `formatBackgroundNotice` (the result is read later via `proc://`).
 #[allow(clippy::too_many_arguments)] // job plumbing: registry, command, limits, spill policy, request query
-fn start_background(
+pub(super) fn start_background(
     registry: &JobRegistry,
     dir: std::path::PathBuf,
     command: String,
@@ -1126,6 +1160,9 @@ fn start_background(
             job.error = error;
             job.ended = Some(job.started.elapsed());
         });
+        if let Some(notify) = &task_notify {
+            notify.settled(status);
+        }
     });
     let mut lines: Vec<String> = Vec::new();
     lines.extend(notices);
@@ -1139,6 +1176,27 @@ fn start_background(
     let mut result = AgentToolResult::text(lines.join("\n"));
     result.details = serde_json::json!({"bash_id": job_id, "status": "running"});
     result
+}
+
+/// Run `command` as a background job with no deadline of its own, its matching lines streaming
+/// into `notify` (a `monitor` command watch). Returns the job's `bg_N` id.
+pub(super) fn start_watch(env: &super::Env, command: String, notify: &Arc<Notify>) -> String {
+    let started = start_background(
+        &env.jobs,
+        env.cwd.clone(),
+        command,
+        None,
+        Vec::new(),
+        SpillConfig::load(&env.cwd),
+        env.query(),
+        Some(notify),
+        env.dyn_tools(),
+        &AbortSignal::never(),
+    );
+    started.details["bash_id"]
+        .as_str()
+        .expect("start_background reports details.bash_id")
+        .to_owned()
 }
 
 #[cfg(test)]

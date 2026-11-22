@@ -1332,6 +1332,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_wake_starts_a_turn_on_an_idle_session() {
+        let mut h = harness(&[Ok("noted")], fast_cfg(&[], 1, 1)).await;
+        h.rt.inject_monitor_wake("<system-reminder>\nMonitor event(x): y\n</system-reminder>")
+            .await;
+        let frames = until_settled(&mut h.rx).await;
+        let ks = kinds(&frames);
+        assert!(ks.contains(&"agent_start".to_string()), "{ks:?}");
+        let result = frames
+            .iter()
+            .find(|f| f["type"] == "prompt_result")
+            .unwrap();
+        assert_eq!(result["status"], "completed", "{result}");
+        let entries = session_entries(&h.session_file);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.to_string().contains("Monitor event(x): y")),
+            "the wake is the turn's user message"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_wake_on_a_held_lane_queues_without_starting_a_turn() {
+        let h = harness(&[], fast_cfg(&[], 1, 1)).await;
+        h.rt.set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        h.rt.pause_for_stop().await.unwrap();
+        h.rt.inject_monitor_wake("Monitor event(x): y").await;
+        assert_eq!(h.rt.queued_count(), 1, "queued behind the hold");
+        assert!(!h.rt.agent.is_streaming().await, "no turn was started");
+    }
+
+    #[tokio::test]
     async fn retry_saga_with_fallback_switch_orders_frames_and_entries() {
         let mut h = harness(
             &[

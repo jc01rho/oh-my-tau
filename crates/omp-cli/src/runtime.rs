@@ -467,6 +467,31 @@ fn message_text(m: &AgentMessage) -> String {
     }
 }
 
+/// The session's `monitor` wake sink: events become turns, and the running-watch count goes to the
+/// gateway as its `wake_source_state` extension event.
+struct MonitorWakes {
+    rt: std::sync::Weak<Runtime>,
+    handle: tokio::runtime::Handle,
+}
+
+impl crate::tools::monitor::WakeSink for MonitorWakes {
+    fn deliver(&self, text: String) {
+        let Some(rt) = self.rt.upgrade() else { return };
+        self.handle
+            .spawn(async move { rt.inject_monitor_wake(&text).await });
+    }
+
+    fn active(&self, count: usize) {
+        if let Some(rt) = self.rt.upgrade() {
+            rt.send(json!({
+                "type": "extension_event",
+                "name": "wake_source_state",
+                "data": {"source": "monitor", "activeCount": count},
+            }));
+        }
+    }
+}
+
 impl Runtime {
     /// Wire the agent to the rpc output channel.
     pub async fn start(
@@ -598,6 +623,7 @@ impl Runtime {
             reported_mode: Mutex::new(omp_ext::lifecycle::SessionModeState::default()),
         });
         rt.publish_session_file();
+        rt.bind_monitor_wakes();
         let host: Arc<dyn crate::tools::context_notes::ContextNotesHost> = rt.clone();
         crate::tools::context_host::bind(&host);
         rt.record_model_state().await;
@@ -2329,6 +2355,33 @@ impl Runtime {
     pub fn follow_up(&self, message: &str) {
         self.agent.follow_up(user_message(message));
         self.emit_queue_update();
+    }
+
+    /// Route `monitor` wakes of this session's job registry into this runtime.
+    fn bind_monitor_wakes(self: &Arc<Self>) {
+        let Some(jobs) = crate::tools::session_jobs() else {
+            return;
+        };
+        jobs.monitors.bind(Arc::new(MonitorWakes {
+            rt: Arc::downgrade(self),
+            handle: tokio::runtime::Handle::current(),
+        }));
+    }
+
+    /// Put a `monitor` wake into the next turn: queued behind a live run, or the start of a turn
+    /// on an idle session. A held lane (`interrupt stop`) only queues it: a monitor never lifts a hold.
+    pub async fn inject_monitor_wake(self: &Arc<Self>, text: &str) {
+        if lock(&self.pause).paused() {
+            self.follow_up(text);
+            return;
+        }
+        if let Err(e) = self.prompt(None, text, Some("followUp"), Vec::new()).await {
+            eprintln!(
+                "omt: monitor wake could not start a turn, queued instead: {}",
+                e.message
+            );
+            self.follow_up(text);
+        }
     }
 
     /// Remove the first queued user message whose text is exactly `message` from `queue`

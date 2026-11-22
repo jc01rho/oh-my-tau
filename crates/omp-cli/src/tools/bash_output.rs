@@ -13,7 +13,7 @@ use super::Env;
 const DESCRIPTION: &str = "Read a background bash job's new output. Omit nothing on the first call; each call returns only what arrived since the last one. `filter` is a regex applied per line; `view: \"screen\"` is not available (no PTY).";
 
 const KILL_DESCRIPTION: &str =
-    "Stop background bash jobs: `bash_id` for one, `all: true` for every running job.";
+    "Stop background bash jobs and monitors: `bash_id` (a job id or a monitor id) for one, `all: true` for every running one.";
 
 #[must_use]
 pub fn schema() -> Value {
@@ -136,13 +136,19 @@ pub fn kill_bash(env: &Env, args: &Value) -> Result<AgentToolResult> {
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
     let id = args.get("bash_id").and_then(Value::as_str);
     if all {
-        let n = env.jobs.kill_all();
+        // Command watches are jobs; only the file watches are counted on top.
+        let n = env.jobs.kill_all() + env.jobs.monitors.kill_path_watches();
         return Ok(text(format!("Killed {n} session(s).")));
     }
     let Some(id) = id else {
         anyhow::bail!("provide `bash_id` or `all: true`");
     };
-    match env.jobs.kill(id) {
+    let killed = if id.starts_with("mon_") {
+        env.jobs.monitors.kill(id)
+    } else {
+        env.jobs.kill(id)
+    };
+    match killed {
         None => anyhow::bail!("No terminal session found with id: {id}"),
         Some(_) => Ok(text(format!("Killed {id}."))),
     }
