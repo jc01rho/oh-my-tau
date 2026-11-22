@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use omp_ext::lifecycle::{
     ApprovalMode, CompactingOutcome, CompactionAction, CompactionReason, DiscoveredPath,
-    GoalModeState, LifecycleEvent, ModeStatus, PlanModeState, ResourcesDiscoverReason,
-    SessionModeState, SubagentInvocationKind,
+    GoalModeState, LifecycleEvent, ModeStatus, PlanModeState, PlanReviewBy, PlanReviewChoice,
+    PlanReviewOption, PlanReviewRequest, PlanReviewTier, ResourcesDiscoverReason, SessionModeState,
+    SubagentInvocationKind,
 };
 use omp_ext::{ExtHost, HostConfig, HostMessage};
 use serde_json::{json, Value};
@@ -212,6 +213,60 @@ async fn retry_compaction_goal_approval_and_user_shell_payloads() {
                 reason: Some(s("no UI")),
             },
             r#"{"type":"tool_approval_resolved","sessionId":"s1","toolName":"bash","toolCallId":"c1","approved":false,"reason":"no UI"}"#,
+        ),
+        (
+            LifecycleEvent::PlanReviewRequested(PlanReviewRequest {
+                review_id: s("r1"),
+                session_id: s("s1"),
+                title: s("Auth"),
+                plan_file_path: s("local://Auth-plan.md"),
+                plan_content: s("# Auth"),
+                options: vec![
+                    PlanReviewOption {
+                        id: PlanReviewChoice::Execute,
+                        label: s("Approve and execute"),
+                        disabled: false,
+                    },
+                    PlanReviewOption {
+                        id: PlanReviewChoice::Keep,
+                        label: s("Approve and keep context"),
+                        disabled: true,
+                    },
+                ],
+                tiers: Some(vec![
+                    PlanReviewTier {
+                        role: s("default"),
+                        provider: s("anthropic"),
+                        model: s("m1"),
+                        thinking_level: None,
+                    },
+                    PlanReviewTier {
+                        role: s("slow"),
+                        provider: s("openai"),
+                        model: s("m2"),
+                        thinking_level: Some(s("high")),
+                    },
+                ]),
+            }),
+            r##"{"type":"plan_review_requested","reviewId":"r1","sessionId":"s1","title":"Auth","planFilePath":"local://Auth-plan.md","planContent":"# Auth","options":[{"id":"execute","label":"Approve and execute","disabled":false},{"id":"keep","label":"Approve and keep context","disabled":true}],"tiers":[{"role":"default","provider":"anthropic","model":"m1"},{"role":"slow","provider":"openai","model":"m2","thinkingLevel":"high"}]}"##,
+        ),
+        (
+            LifecycleEvent::PlanReviewResolved {
+                review_id: s("r1"),
+                session_id: s("s1"),
+                choice: Some(PlanReviewChoice::Refine),
+                by: PlanReviewBy::Extension,
+            },
+            r#"{"type":"plan_review_resolved","reviewId":"r1","sessionId":"s1","choice":"refine","by":"extension"}"#,
+        ),
+        (
+            LifecycleEvent::PlanReviewResolved {
+                review_id: s("r2"),
+                session_id: s("s1"),
+                choice: None,
+                by: PlanReviewBy::Local,
+            },
+            r#"{"type":"plan_review_resolved","reviewId":"r2","sessionId":"s1","by":"local"}"#,
         ),
         (
             LifecycleEvent::UserBash {
@@ -473,4 +528,57 @@ async fn resources_discover_collects_tagged_paths() {
         );
     }
     host.shutdown().await.unwrap();
+}
+
+/// `resolve_plan_review` (host `ctx.resolvePlanReview`) reaches the responder with its arguments; a core
+/// without a plan review answers `false` (the TS runner default), never a fake success.
+#[tokio::test]
+async fn resolve_plan_review_request_routes_to_responder() {
+    use omp_ext::lifecycle::{answer, BoxFuture, HeadlessResponder, HostResponder};
+    use std::sync::Mutex;
+
+    /// `(reviewId, choice, feedback, role)` of one call.
+    type Call = (String, String, Option<String>, Option<String>);
+    #[derive(Default)]
+    struct Rec(Mutex<Vec<Call>>);
+    impl HostResponder for Rec {
+        fn resolve_plan_review<'a>(
+            &'a self,
+            review_id: &'a str,
+            choice: &'a str,
+            feedback: Option<&'a str>,
+            role: Option<&'a str>,
+        ) -> BoxFuture<'a, bool> {
+            self.0.lock().unwrap().push((
+                review_id.into(),
+                choice.into(),
+                feedback.map(Into::into),
+                role.map(Into::into),
+            ));
+            Box::pin(async move { choice == "refine" })
+        }
+    }
+
+    let params = json!({"reviewId": "r1", "choice": "refine", "input": {"feedback": "more"}});
+    let rec = Rec::default();
+    assert_eq!(
+        answer(&rec, "resolve_plan_review", &params).await,
+        Ok(json!(true))
+    );
+    let params = json!({"reviewId": "r1", "choice": "execute", "input": {"role": "slow"}});
+    assert_eq!(
+        answer(&rec, "resolve_plan_review", &params).await,
+        Ok(json!(false))
+    );
+    assert_eq!(
+        *rec.0.lock().unwrap(),
+        [
+            ("r1".into(), "refine".into(), Some("more".into()), None),
+            ("r1".into(), "execute".into(), None, Some("slow".into())),
+        ]
+    );
+    assert_eq!(
+        answer(&HeadlessResponder, "resolve_plan_review", &params).await,
+        Ok(json!(false))
+    );
 }

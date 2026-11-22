@@ -23,7 +23,8 @@ use serde_json::{json, Value};
 use omp_ext::hooks::ExtHooks;
 use omp_ext::lifecycle::{
     self, CacheWarmingDecisionEvent, CacheWarmingOutcome, CompactingOutcome, DiscoveredPath,
-    InputSource, LifecycleEvent, ResourcesDiscoverOutcome, ResourcesDiscoverReason, SwitchReason,
+    InputSource, LifecycleEvent, PlanReviewBy, PlanReviewChoice, PlanReviewRequest,
+    ResourcesDiscoverOutcome, ResourcesDiscoverReason, SwitchReason,
 };
 use omp_ext::{ExtHost, HostConfig, HostMessage, ToolInfo};
 use omp_providers::auth::{
@@ -499,6 +500,20 @@ impl omp_ext::lifecycle::HostResponder for RuntimeResponder {
                 text.to_string()
             };
             Ok(ephemeral_result(&reply_text, &response))
+        })
+    }
+
+    fn resolve_plan_review<'a>(
+        &'a self,
+        review_id: &'a str,
+        choice: &'a str,
+        feedback: Option<&'a str>,
+        role: Option<&'a str>,
+    ) -> omp_ext::lifecycle::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            self.rt.upgrade().is_some_and(|rt| {
+                crate::features::plan::resolve_review(&rt, review_id, choice, feedback, role)
+            })
         })
     }
 }
@@ -1620,6 +1635,8 @@ impl Extensions {
             let (ext, weak) = (ext.clone(), weak.clone());
             tokio::spawn(async move {
                 let Some(rt) = weak.upgrade() else { return };
+                // The previous session's plan review closes unanswered (TS: session switch).
+                crate::features::plan::cancel_reviews(Some(ext.as_ref()));
                 ext.push_session_ctx(&rt).await;
                 crate::features::modes::notify(&rt);
                 // A branch/fork-into-file move emits `session_branch` from the caller (TS).
@@ -1767,6 +1784,7 @@ impl Extensions {
 
     /// Emit `session_shutdown` and stop the host.
     pub async fn shutdown(&self) {
+        crate::features::plan::cancel_reviews(Some(self));
         emit_silent(self.host.emit_session_shutdown(None).await);
         let deferred = self
             .deferred_agent_end
@@ -1832,6 +1850,46 @@ async fn flush_credential_disabled(host: &ExtHost, feed: &CredentialDisabledFeed
             )
             .await,
         );
+    }
+}
+
+/// Plan-review transitions reach the host as ordered fire-and-forget emits whose explicit ctx
+/// sets `pendingPlanReview` (backing `ctx.getPendingPlanReview()` / `ctx.resolvePlanReview`). The
+/// ctx merge is sent even when no extension subscribes (the host applies it and runs no
+/// handler), so a later handler or command still sees the current review. The live snapshot
+/// keeps it too, so a reconnected host gets it back on the next emit.
+fn send_plan_review(host: &ExtHost, live: &Live, pending: Value, event: &LifecycleEvent) {
+    live.snap
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert("pendingPlanReview".into(), pending.clone());
+    let ctx = json!({ "pendingPlanReview": pending });
+    if let Err(e) = host.emit_nowait(&event.to_value(), Some(ctx), emit_silent) {
+        eprintln!("omt: extension emit: {e:#}");
+    }
+}
+
+impl crate::features::plan::ReviewSink for Extensions {
+    fn opened(&self, request: &PlanReviewRequest) {
+        // TS `getPendingPlanReview` returns the event as delivered (with `type`).
+        let event = LifecycleEvent::PlanReviewRequested(request.clone());
+        send_plan_review(&self.host, &self.live, event.to_value(), &event);
+    }
+
+    fn closed(
+        &self,
+        review_id: &str,
+        session_id: &str,
+        choice: Option<PlanReviewChoice>,
+        by: PlanReviewBy,
+    ) {
+        let event = LifecycleEvent::PlanReviewResolved {
+            review_id: review_id.to_string(),
+            session_id: session_id.to_string(),
+            choice,
+            by,
+        };
+        send_plan_review(&self.host, &self.live, Value::Null, &event);
     }
 }
 
@@ -2765,6 +2823,84 @@ mod tests {
         "  fi\n",
         "done\n",
     );
+
+    /// Records every frame the core writes, answering each request with an empty emit result.
+    const RECORDING_HOST: &str = concat!(
+        "while IFS= read -r line; do\n",
+        "  printf '%s\\n' \"$line\" >> \"$REC\"\n",
+        "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+        "  if [ -n \"$id\" ]; then\n",
+        "    printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":null,\"handlers\":[],\"errors\":[]}}\\n' \"$id\"\n",
+        "  fi\n",
+        "done\n",
+    );
+
+    /// `plan_review_requested` then `plan_review_resolved` go out in order as fire-and-forget
+    /// emits whose ctx sets/clears `pendingPlanReview` (the host's `getPendingPlanReview`).
+    #[tokio::test]
+    async fn plan_review_events_carry_pending_review_ctx() {
+        use omp_ext::lifecycle::PlanReviewOption;
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("frames.jsonl");
+        let host = sh_host(
+            dir.path(),
+            RECORDING_HOST,
+            vec![("REC".into(), rec.to_string_lossy().into_owned())],
+        )
+        .await;
+        let live = Live::default();
+        let request = PlanReviewRequest {
+            review_id: "r1".into(),
+            session_id: "s1".into(),
+            title: "T".into(),
+            plan_file_path: "local://T-plan.md".into(),
+            plan_content: "# T".into(),
+            options: vec![PlanReviewOption {
+                id: PlanReviewChoice::Execute,
+                label: "Approve and execute".into(),
+                disabled: false,
+            }],
+            tiers: None,
+        };
+        let requested = LifecycleEvent::PlanReviewRequested(request);
+        send_plan_review(&host, &live, requested.to_value(), &requested);
+        assert_eq!(
+            live.snap.lock().unwrap()["pendingPlanReview"]["reviewId"],
+            "r1"
+        );
+        let resolved = LifecycleEvent::PlanReviewResolved {
+            review_id: "r1".into(),
+            session_id: "s1".into(),
+            choice: Some(PlanReviewChoice::Execute),
+            by: PlanReviewBy::Extension,
+        };
+        send_plan_review(&host, &live, Value::Null, &resolved);
+        assert!(live.snap.lock().unwrap()["pendingPlanReview"].is_null());
+        // The shell answers in order: once this reply is back, both emits were recorded.
+        host.set_ctx(json!({})).await.unwrap();
+        let frames: Vec<Value> = std::fs::read_to_string(&rec)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|f: &Value| f["method"] == "emit")
+            .collect();
+        assert_eq!(frames.len(), 2);
+        let p0 = &frames[0]["params"];
+        assert_eq!(p0["nowait"], true);
+        assert_eq!(
+            serde_json::to_string(&p0["event"]).unwrap(),
+            r##"{"type":"plan_review_requested","reviewId":"r1","sessionId":"s1","title":"T","planFilePath":"local://T-plan.md","planContent":"# T","options":[{"id":"execute","label":"Approve and execute","disabled":false}]}"##
+        );
+        assert_eq!(p0["ctx"]["pendingPlanReview"], p0["event"]);
+        let p1 = &frames[1]["params"];
+        assert_eq!(
+            p1["event"],
+            json!({"type": "plan_review_resolved", "reviewId": "r1", "sessionId": "s1",
+                   "choice": "execute", "by": "extension"})
+        );
+        assert!(p1["ctx"]["pendingPlanReview"].is_null());
+        host.shutdown().await.unwrap();
+    }
 
     /// `run_ephemeral_turn` contract: options are validated before inference
     /// (TS `EphemeralTurnOptions`), the prompt follows the detached history.
