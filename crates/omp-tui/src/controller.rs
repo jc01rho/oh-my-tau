@@ -206,7 +206,9 @@ async fn drive(cfg: RunConfig, port: impl RuntimePort, shell: &mut StdShell) -> 
             drop(keys);
             shell.leave().context("suspend terminal for the editor")?;
             let result = run_editor(&launch).await;
-            *shell = Shell::enter(LIVE_HEIGHT).context("resume terminal after the editor")?;
+            shell
+                .reenter()
+                .context("resume terminal after the editor")?;
             keys = EventStream::new();
             app.editor_closed(&launch, result);
         }

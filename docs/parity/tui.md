@@ -11,7 +11,7 @@ scope (see `docs/research/18-omp-tui-gap-analysis.md`).
 
 | Area | omp-tui | upstream `pi-tui` | Status |
 |---|---|---|---|
-| Keybinding ids | 79 (32 `tui.*` + 47 `app.*`) | 79 | **79/79 declared**; 14 `app.*` ids wired, the editor chords hard-wired (§1) |
+| Keybinding ids | 79 (32 `tui.*` + 47 `app.*`) | 79 | **79/79 declared**; 19 `app.*` ids wired, the editor chords hard-wired (§1) |
 | Overlays / dialogs | 10 overlays + extension dialogs | 83 files (74 + `extensions/` 9), 54,924 lines | **8 ported, 15 partial, 60 absent** (§2) |
 | Terminal capability matrix | `terminal_capabilities.rs` (Phase 8) | `terminal-capabilities.ts` | **ported** (§3) |
 | E2E parity harness | `tests-e2e/tui/run.py`, 24 scenarios | — | **22 green, 2 tracked** (§4) |
@@ -51,6 +51,10 @@ macOS, `Ctrl+` elsewhere) plus `display_string` ↔ `getDisplayString`.
 | `app.session.tree` | `app.rs` (editor) | opens `/tree`; unbound by default like upstream |
 | `app.tree.previousBranch` / `nextBranch` | `overlays/tree.rs` | jump to the first visible row of the adjacent branch (wraps); unbound by default like upstream, shown in the `/tree` hints once bound |
 | `app.stt.pushToTalk` | `app.rs` | notice only (`stt.enabled` on, empty editor): omp has no STT backend (Phase 8b) |
+| `app.session.pin` / `unpin` | `overlays/sessions.rs` | pin / unpin the selected `/resume` row (TS `requestPin`): pinned rows list first with the pin icon, the footer offers the applicable action; the store is `omp_session::pins` (`~/.omp-rs/session-pins.json`), shared with `/pin` / `/unpin` (Phase 8b-2) |
+| `app.local.open` | `app.rs` → `overlays/local_files.rs` | the `/local` picker over the session's `local://` files (newest first, sizes); the pick is re-resolved (realpath + root containment) and opened in `$VISUAL`/`$EDITOR` with the TUI stopped (input stream dropped, terminal restored) and resumed after; "Closed local://… in editor." or the non-zero exit, like TS `local-file-editor.ts` (Phase 8b-2) |
+| `app.ask.note` | `extension_ui.rs` | `n` / Alt+N on an ask option row opens an inline note (Enter saves, blank removes, Esc keeps); `✎ note` / `✎ draft` markers; notes on selected options travel as `optionNotes` and the ask tool renders TS's "Option notes:" block (Phase 8b-2) |
+| `app.btw.inject` | `app.rs` | with `btw.inject` on, `/btw` asks for one `<inject>` block; the TUI draws it behind a rail with "Inject into main session" and Alt+I sends it once (steer while streaming, else a new turn; never expanded as a command); nothing ready → the key falls through (Phase 8b-2) |
 
 Editor chords (`tui.editor.*`, follow-up `ctrl+enter`/`ctrl+q`, newline
 `shift+enter`/`ctrl+j`, undo `ctrl+-`) are hard-wired in
@@ -58,10 +62,11 @@ Editor chords (`tui.editor.*`, follow-up `ctrl+enter`/`ctrl+q`, newline
 
 ### Declared but not wired
 
-`app.ask.note` (needs per-option notes in the ask tool, §2), `app.btw.inject`
-(no btw panel), `app.links.hint` (no link browser), `app.local.open` (no
-`local://` store), `app.session.pin` / `unpin` (no pin store),
-`app.suspend`, `app.display.reset`, `app.model.cycleForward` /
+`app.links.hint` (upstream tags links whose scheme an extension claimed with
+`pi.registerLinkScheme` and raises `link_activate` for it; the omp-rs
+ext-host has no `registerLinkScheme`, markdown draws no extension-link
+markers and there is no link browser, so there is nothing to tag — the
+link-opening half lives in `/open`), `app.suspend`, `app.display.reset`, `app.model.cycleForward` /
 `cycleBackward`, `app.model.select`, `app.model.selectTemporary`,
 `app.plan.toggle`, `app.history.search`, `app.tools.toggleVisibility`,
 `app.thinking.toggle`, `app.editor.external`, `app.retry`,
@@ -137,11 +142,11 @@ palette and PgUp/PgDn scroll the chat; neither is true).
 | `annotation-overlay.ts` | 2040 | ABSENT | `overlays/diff.rs` ports the older `diff-overlay.ts` (read-only diff); annotations absent |
 | `annotation-types.ts` | 104 | ABSENT |  |
 | `approval-dialog.ts` | 530 | PORTED | `extension_ui/approval.rs` (8c) — no grants / approve-for-session rows (the omp-cli gate offers Approve/Deny only) and no type-to-deny-and-steer draft |
-| `ask-dialog.ts` | 1561 | PARTIAL | `extension_ui.rs` Ask (8c) — question strip, Tab/Shift+Tab/←/→ and edge-crossing ↑/↓ navigation, per-question answers, ◉/○ ☑/☐ markers, Other preview; missing per-option notes (`app.ask.note`, needs omp-cli ask-tool note fields), option previews, Ctrl+O description expand, "Chat about this" |
+| `ask-dialog.ts` | 1561 | PARTIAL | `extension_ui.rs` Ask (8c) — question strip, Tab/Shift+Tab/←/→ and edge-crossing ↑/↓ navigation, per-question answers, ◉/○ ☑/☐ markers, Other preview, per-option notes (`app.ask.note`, 8b-2: single-line, no image paste); missing option previews, Ctrl+O description expand, "Chat about this" |
 | `bordered-loader.ts` | 59 | ABSENT |  |
 | `btw-history-panel.ts` | 1206 | ABSENT |  |
 | `btw-history.ts` | 109 | ABSENT |  |
-| `btw-inject.ts` | 91 | ABSENT | `app.btw.inject` unwired |
+| `btw-inject.ts` | 91 | PARTIAL | `app.rs` `btw_answer_display` (8b-2): the `<inject>` block behind a rail with the label and key; sending appends "Injected into main session" instead of recolouring the block in place |
 | `btw-note.ts` | 225 | ABSENT |  |
 | `btw-panel.ts` | 283 | ABSENT |  |
 | `cleanse-panel.ts` | 260 | ABSENT |  |
@@ -186,7 +191,7 @@ palette and PgUp/PgDn scroll the chat; neither is true).
 | `session-account-selector.ts` | 104 | ABSENT |  |
 | `session-info-overlay.ts` | 401 | PORTED | `overlays/session_info.rs` |
 | `session-observer-registry.ts` | 297 | ABSENT |  |
-| `session-selector.ts` | 2353 | PARTIAL | `overlays/sessions.rs` — no pin/unpin store (`app.session.pin`/`unpin` unwired) |
+| `session-selector.ts` | 2353 | PARTIAL | `overlays/sessions.rs` — pins (8b-2: pinned-first, pin icon, `app.session.pin`/`unpin`); no day groups, rename (F2) or history-search merge |
 | `settings-defs.ts` | 368 | PARTIAL | `overlays/settings_defs.rs` |
 | `settings-selector.ts` | 2016 | PARTIAL | `overlays/settings.rs` |
 | `show-images-selector.ts` | 62 | ABSENT |  |
@@ -225,12 +230,10 @@ ported (§1). Rust-only overlays with no file of their own upstream:
    `plan-save-overlay.ts`): no `plan_review_requested` producer in omp-cli.
 3. **Agent hub** (`agent-hub*.ts`, `agents-hub.ts`, transcript viewer):
    state exists in `tools/task.rs`, no overlay.
-4. **Ask notes** (`app.ask.note`): the omp-cli ask tool parses no note fields
-   and renders none into the tool result.
-5. **Model detail extras** (badges, intelligence, tps/ttft, description,
+4. **Model detail extras** (badges, intelligence, tps/ttft, description,
    over-context compact-then-switch): need catalog fields and a runtime
    compact-before-switch.
-6. **Rewind replay** (`rewind-selector.ts` transcript replay + branch strip),
+5. **Rewind replay** (`rewind-selector.ts` transcript replay + branch strip),
    **history search**, **copy selector**, **context viewer**, **usage
    dashboard**, **MCP add wizard**, **extensions dashboard** (`extensions/`),
    **btw panels**, **jobs panel**, then the long tail in the table above.

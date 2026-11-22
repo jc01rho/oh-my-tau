@@ -465,6 +465,49 @@ impl Shell<ShellBackend, io::Stdout> {
         result
     }
 
+    /// Take the terminal back after an external program ran on it between
+    /// [`Self::leave`] and here (TS `ui.start()` after `openEditorOnPath`):
+    /// raw mode, bracketed paste, DECCKM, the keyboard mode the startup
+    /// probe settled (re-pushed, not re-probed) and a fresh inline viewport
+    /// at the cursor.
+    ///
+    /// Dropping the input `EventStream` wakes crossterm's shared reader; when
+    /// no read was in flight that wake stays pending and makes the next
+    /// terminal query return early, so it is drained first and the cursor
+    /// query behind the inline viewport is retried once.
+    ///
+    /// # Errors
+    ///
+    /// Fails if raw mode, the size/cursor queries or the entry writes fail.
+    pub fn reenter(&mut self) -> io::Result<()> {
+        use crossterm::event::PushKeyboardEnhancementFlags;
+        crossterm::terminal::enable_raw_mode()?;
+        let _ = crossterm::event::poll(std::time::Duration::ZERO);
+        let inline = || {
+            Terminal::with_options(
+                ShellBackend::new(),
+                TerminalOptions {
+                    viewport: Viewport::Inline(self.live_height),
+                },
+            )
+        };
+        let mut term = inline().or_else(|_| inline())?;
+        let mut entry = String::from(concat!("\x1b[?2004h", "\x1b[?1l\x1b>"));
+        match self.kitty {
+            KittyKeys::Pushed => entry.push_str(&cmd_ansi(&PushKeyboardEnhancementFlags(
+                kitty_push_flags(is_conpty_hosted(), false),
+            ))),
+            KittyKeys::ModifyOtherKeys => entry.push_str(MODIFY_OTHER_KEYS_ON),
+            KittyKeys::Inactive => {}
+        }
+        self.raw.raw(&entry)?;
+        self.screen = Rect::from((Position::ORIGIN, term.size()?));
+        term.clear()?;
+        self.term = term;
+        self.pending_resize = false;
+        Ok(())
+    }
+
     /// Restore the terminal: leave any fullscreen borrow, pop kitty /
     /// modifyOtherKeys, bracketed paste off, DECCKM normal, show cursor,
     /// raw mode off. Idempotent; safe on panic via the controller's hook.
