@@ -209,6 +209,11 @@ enum DialogKind {
         checked: Vec<Vec<usize>>,
         /// Buffer while typing a custom ("Other") answer for `current`.
         custom: Option<String>,
+        /// Saved option notes per question (option index -> text, TS
+        /// `#notes`); only notes on selected options are submitted.
+        notes: Vec<std::collections::BTreeMap<usize, String>>,
+        /// The note being edited on `current`: option index and buffer.
+        note_edit: Option<(usize, String)>,
     },
     /// Single-option-picker (`select`, and degraded ask flows).
     Select {
@@ -372,11 +377,13 @@ impl ActiveDialog {
                     .collect();
                 DialogKind::Ask {
                     answers: vec![None; questions.len()],
+                    notes: vec![std::collections::BTreeMap::new(); questions.len()],
                     questions,
                     current: 0,
                     cursors,
                     checked,
                     custom: None,
+                    note_edit: None,
                 }
             }
             "select" if approval::is_approval(params) => {
@@ -852,7 +859,7 @@ impl ExtensionUi {
             DialogKind::Confirm { .. } => Self::key_confirm(&mut dialog.kind, key),
             DialogKind::Input { .. } | DialogKind::Editor { .. } => Self::key_text(dialog, key),
             DialogKind::Select { .. } => Self::key_select(dialog, key),
-            DialogKind::Ask { .. } => Self::key_ask(dialog, key),
+            DialogKind::Ask { .. } => Self::key_ask(dialog, key, &self.keys),
         };
         match outcome {
             KeyResult::Consumed => true,
@@ -969,7 +976,7 @@ impl ExtensionUi {
         KeyResult::Consumed
     }
 
-    fn key_ask(dialog: &mut ActiveDialog, key: KeyEvent) -> KeyResult {
+    fn key_ask(dialog: &mut ActiveDialog, key: KeyEvent, keys: &KeybindingsManager) -> KeyResult {
         let DialogKind::Ask {
             questions,
             answers,
@@ -977,6 +984,8 @@ impl ExtensionUi {
             cursors,
             checked,
             custom,
+            notes,
+            note_edit,
         } = &mut dialog.kind
         else {
             return KeyResult::Consumed;
@@ -1011,7 +1020,7 @@ impl ExtensionUi {
                         selected_options: Vec::new(),
                         custom_input: Some(text),
                     });
-                    Self::ask_next(questions, answers, current)
+                    Self::ask_next(questions, answers, notes, current)
                 }
                 KeyCode::Backspace => {
                     buffer.pop();
@@ -1025,7 +1034,43 @@ impl ExtensionUi {
             };
         }
 
+        // An open option note (TS `#noteEditorInput`): Enter saves (blank
+        // removes), Esc closes keeping the saved note, other keys edit.
+        if let Some((option, buffer)) = note_edit {
+            match key.code {
+                KeyCode::Esc => *note_edit = None,
+                KeyCode::Enter => {
+                    let text = buffer.trim().to_owned();
+                    if text.is_empty() {
+                        notes[q].remove(option);
+                    } else {
+                        notes[q].insert(*option, text);
+                    }
+                    *note_edit = None;
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    buffer.push(c);
+                }
+                _ => {}
+            }
+            return KeyResult::Consumed;
+        }
+
         let options = question.options.len();
+        // `app.ask.note` on an option row opens its note prefilled with the
+        // saved text (TS `#startNote`; option lists take every note key).
+        if cursors[q] < options && keys.matches_event(&key, "app.ask.note") {
+            let row = cursors[q];
+            *note_edit = Some((row, notes[q].get(&row).cloned().unwrap_or_default()));
+            return KeyResult::Consumed;
+        }
         let last = questions.len() - 1;
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
@@ -1078,7 +1123,7 @@ impl ExtensionUi {
                             .collect(),
                         custom_input: None,
                     });
-                    return Self::ask_next(questions, answers, current);
+                    return Self::ask_next(questions, answers, notes, current);
                 }
                 if row == options {
                     // The Other row re-opens with the previous custom answer.
@@ -1097,7 +1142,7 @@ impl ExtensionUi {
                     selected_options: vec![question.options[row].label.clone()],
                     custom_input: None,
                 });
-                return Self::ask_next(questions, answers, current);
+                return Self::ask_next(questions, answers, notes, current);
             }
             _ => {}
         }
@@ -1111,6 +1156,7 @@ impl ExtensionUi {
     fn ask_next(
         questions: &[Question],
         answers: &[Option<AskAnswer>],
+        notes: &[std::collections::BTreeMap<usize, String>],
         current: &mut usize,
     ) -> KeyResult {
         if *current + 1 < questions.len() {
@@ -1121,7 +1167,29 @@ impl ExtensionUi {
             *current = open;
             return KeyResult::Consumed;
         }
-        let payload: Vec<Value> = answers.iter().flatten().map(AskAnswer::to_json).collect();
+        let payload: Vec<Value> = answers
+            .iter()
+            .zip(questions)
+            .zip(notes)
+            .filter_map(|((answer, question), notes)| {
+                let answer = answer.as_ref()?;
+                let mut json = answer.to_json();
+                // TS `optionNotes`: saved notes on selected options only.
+                let selected: Vec<Value> = answer
+                    .selected_options
+                    .iter()
+                    .filter_map(|label| {
+                        let index = question.options.iter().position(|o| o.label == *label)?;
+                        let text = notes.get(&index)?;
+                        Some(serde_json::json!({"option": label, "text": text}))
+                    })
+                    .collect();
+                if !selected.is_empty() {
+                    json["optionNotes"] = Value::Array(selected);
+                }
+                Some(json)
+            })
+            .collect();
         KeyResult::Answer(serde_json::json!({"answers": payload}))
     }
 
@@ -1233,6 +1301,34 @@ impl ExtensionUi {
                 searchable: true, ..
             }) => "type to search  ·  ↑/↓ navigate  ·  enter select  ·  esc cancel",
             Some(DialogKind::Select { .. }) => "↑/↓ navigate  ·  enter select  ·  esc cancel",
+            Some(DialogKind::Ask {
+                note_edit: Some((option, _)),
+                questions,
+                current,
+                checked,
+                answers,
+                ..
+            }) => {
+                let chosen = questions.get(*current).is_some_and(|q| {
+                    if q.multi {
+                        checked.get(*current).is_some_and(|c| c.contains(option))
+                    } else {
+                        answers
+                            .get(*current)
+                            .and_then(Option::as_ref)
+                            .is_some_and(|a| {
+                                q.options
+                                    .get(*option)
+                                    .is_some_and(|o| a.selected_options.contains(&o.label))
+                            })
+                    }
+                });
+                if chosen {
+                    "enter save  ·  blank removes  ·  esc keep"
+                } else {
+                    "enter save  ·  blank removes  ·  esc keep  ·  sent only if chosen"
+                }
+            }
             Some(DialogKind::Ask {
                 questions,
                 current,
@@ -1365,6 +1461,8 @@ impl ExtensionUi {
                 cursors,
                 checked,
                 custom,
+                notes,
+                note_edit,
             } => {
                 let Some(question) = questions.get(*current) else {
                     return lines;
@@ -1437,7 +1535,20 @@ impl ExtensionUi {
                         (false, false) => theme.symbol("radio.unselected"),
                     };
                     let style = if i == cursor { accent } else { text };
-                    lines.push(Line::styled(format!("{marker} {mark} {label}"), style));
+                    let mut row = vec![Span::styled(format!("{marker} {mark} {label}"), style)];
+                    // TS `#noteTag`: a submitted note, or a draft on an
+                    // unchosen option.
+                    if notes.get(*current).is_some_and(|n| n.contains_key(&i)) {
+                        row.push(if picked(i) {
+                            Span::styled("  ✎ note", success)
+                        } else {
+                            Span::styled("  ✎ draft", muted)
+                        });
+                    }
+                    lines.push(Line::from(row));
+                    if let Some((_, buffer)) = note_edit.as_ref().filter(|(o, _)| *o == i) {
+                        lines.push(Line::styled(format!("    ✎ {buffer}▏"), text));
+                    }
                     if let Some(description) =
                         question.options.get(i).and_then(|o| o.description.as_ref())
                     {
@@ -1856,6 +1967,67 @@ mod tests {
         assert!(log[0].contains(r#""selectedOptions":["SQLite"]"#));
         assert!(log[0].contains(r#""customInput":"mine""#));
         assert!(!ui.is_active());
+    }
+
+    #[test]
+    fn ask_note_key_saves_notes_and_sends_only_selected_ones() {
+        let mut ui = ExtensionUi::new();
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"ask-n","method":"ask",
+            "questions":[{"id":"db","question":"Storage?",
+                "options":[{"label":"SQLite"},{"label":"Postgres"}]}]}),
+        );
+        let port = FakePort::default();
+        let alt_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT);
+        // A draft on SQLite (left unchosen), then a note on Postgres.
+        ui.handle_key(alt_n, &port);
+        for c in "draft".chars() {
+            ui.handle_key(key(KeyCode::Char(c)), &port);
+        }
+        ui.handle_key(key(KeyCode::Enter), &port);
+        assert!(snapshot(&ui).join("\n").contains("✎ draft"));
+        ui.handle_key(key(KeyCode::Down), &port);
+        ui.handle_key(key(KeyCode::Char('n')), &port);
+        for c in "needs PITR".chars() {
+            ui.handle_key(key(KeyCode::Char(c)), &port); // 'n' types inside the note
+        }
+        ui.handle_key(key(KeyCode::Enter), &port);
+        assert!(port.log.lock().is_empty(), "saving a note does not answer");
+        // Reopening prefills; Esc keeps the saved text.
+        ui.handle_key(key(KeyCode::Char('n')), &port);
+        assert!(snapshot(&ui).join("\n").contains("✎ needs PITR▏"));
+        ui.handle_key(key(KeyCode::Esc), &port);
+        assert!(ui.is_active(), "esc closes the note, not the dialog");
+        ui.handle_key(key(KeyCode::Enter), &port);
+        let log = port.log.lock();
+        assert_eq!(log.len(), 1);
+        assert!(
+            log[0].contains(r#""selectedOptions":["Postgres"]"#),
+            "{log:?}"
+        );
+        assert!(
+            log[0].contains(r#""optionNotes":[{"option":"Postgres","text":"needs PITR"}]"#),
+            "{log:?}"
+        );
+        assert!(!log[0].contains("draft"), "unchosen drafts stay private");
+    }
+
+    #[test]
+    fn ask_note_blank_save_removes_the_note() {
+        let mut ui = ExtensionUi::new();
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"ask-b","method":"ask",
+            "questions":[{"id":"q","question":"Q?","options":[{"label":"a"}]}]}),
+        );
+        let port = FakePort::default();
+        ui.handle_key(key(KeyCode::Char('n')), &port);
+        ui.handle_key(key(KeyCode::Char('x')), &port);
+        ui.handle_key(key(KeyCode::Enter), &port);
+        ui.handle_key(key(KeyCode::Char('n')), &port);
+        ui.handle_key(key(KeyCode::Backspace), &port);
+        ui.handle_key(key(KeyCode::Enter), &port);
+        ui.handle_key(key(KeyCode::Enter), &port);
+        assert!(!port.log.lock()[0].contains("optionNotes"));
     }
 
     #[test]

@@ -199,6 +199,19 @@ async fn drive(cfg: RunConfig, port: impl RuntimePort, shell: &mut StdShell) -> 
             }
         }
 
+        if let Some(launch) = app.take_editor_launch() {
+            // TS `ctx.ui.stop()` / `ctx.ui.start()` around the editor: drop
+            // the input stream first so crossterm's reader thread cannot steal
+            // the editor's keystrokes, then restore the terminal for it.
+            drop(keys);
+            shell.leave().context("suspend terminal for the editor")?;
+            let result = run_editor(&launch).await;
+            shell
+                .reenter()
+                .context("resume terminal after the editor")?;
+            keys = EventStream::new();
+            app.editor_closed(&launch, result);
+        }
         paint(&mut app, shell)?;
     }
     // Teardown the terminal title (stops the spinner thread) before the
@@ -209,6 +222,34 @@ async fn drive(cfg: RunConfig, port: impl RuntimePort, shell: &mut StdShell) -> 
 }
 
 const RAW_GUARD_TICK: Duration = Duration::from_secs(1);
+
+/// TS `openEditorOnPath` + `resolveEditorSpawnCommand`: run the editor
+/// command through the shell on the real tty (stdio inherited) and return its
+/// exit code (a signal death counts as 1).
+async fn run_editor(launch: &crate::app::EditorLaunch) -> Result<i32, String> {
+    use std::process::Stdio;
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("cmd.exe");
+        c.args(["/d", "/s", "/c"])
+            .arg(format!("{} \"{}\"", launch.command, launch.path.display()));
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c")
+            .arg(format!("{} \"$1\"", launch.command))
+            .arg("sh")
+            .arg(&launch.path);
+        c
+    };
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = cmd.status().await.map_err(|e| e.to_string())?;
+    Ok(status.code().unwrap_or(1))
+}
 
 /// `true` when stdin is a tty in canonical (cooked) mode — raw mode the TUI
 /// and raw mode was re-applied. Windows consoles have no termios cooked/raw

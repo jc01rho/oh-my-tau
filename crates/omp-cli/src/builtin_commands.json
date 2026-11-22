@@ -984,7 +984,7 @@
  },
  {
   "name": "local",
-  "description": "Reserved upstream command (not implemented in this build)",
+  "description": "Open a session local:// file in $EDITOR (picker when no name given)",
   "source": "builtin"
  },
  {
@@ -1049,7 +1049,7 @@
  },
  {
   "name": "open",
-  "description": "Reserved upstream command (not implemented in this build)",
+  "description": "Open the last link from the conversation in your browser (or pick one with /copy)",
   "source": "builtin"
  },
  {

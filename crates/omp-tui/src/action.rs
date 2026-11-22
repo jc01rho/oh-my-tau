@@ -92,6 +92,12 @@ pub enum Action {
     },
     /// A one-line status for the transcript (TS `showStatus`).
     Status(String),
+    /// Open a picked `local://` file in the external editor (`/local`
+    /// picker, TS `revalidateLocalEditorEntry` then `openEditorOnPath`).
+    OpenLocalFile {
+        /// The file's exact name under the session's local root.
+        name: String,
+    },
     /// A `/settings` overlay edit (TS `cfg://` set): persist via the port
     /// and apply live where the TUI can (theme, thinking level).
     SettingChanged {

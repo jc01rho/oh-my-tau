@@ -1066,6 +1066,16 @@ pub static SETTING_DEFS: &[SettingDefMeta] = &[
         runtime: false, condition: "", ordered: false,
     },
     SettingDefMeta {
+        id: "btw.inject", kind: DefKind::Bool, schema: "boolean",
+        tab: "interaction", group: "Input",
+        label: "/btw Steering Inject",
+        description: "When you ask /btw for a steering prompt, it drafts one in <inject> tags, highlighted in the answer; Alt+I (app.btw.inject) sends it to the main session",
+        default_json: "false",
+        values: &[],
+        options: &[],
+        runtime: false, condition: "", ordered: false,
+    },
+    SettingDefMeta {
         id: "tui.vimMode", kind: DefKind::Bool, schema: "boolean",
         tab: "interaction", group: "Input",
         label: "Vim Editing Mode",

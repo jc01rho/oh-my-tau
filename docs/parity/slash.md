@@ -221,7 +221,7 @@ or a `commands/*.md` file can claim any of these today.
 | `/guided-goal` | modes | Distinct from `/goal`, which tau has. |
 | `/hotkeys` | session | Keybinding help overlay; blocked on the 9 missing binding ids (`tui.md` §1). |
 | `/git` | session | In tau, `/branch` and `/fork` are *conversation* forks — port `/git` subcommand-form only. |
-| `/local` | session | `/git local`. |
+| `/local` | session | **Ported (8b-2), TUI-only like TS `handleTui`**: picker over the session's `local://` files or `/local <name>`, opened in `$VISUAL`/`$EDITOR` with the TUI stopped (`app.local.open` runs the same flow); text-mode dispatch says it needs the TUI. |
 | `/hub` | session | `/git hub`. |
 | `/tree` | session | `/git tree`; no collision with tau's `/branch`. |
 | `/resume` | lifecycle | Session picker; tau has `/new` and `/pin`. |
@@ -236,7 +236,7 @@ or a `commands/*.md` file can claim any of these today.
 | `/forget-approvals` | control | |
 | `/join` | collaboration | Sub-command of `/collab` in tau's model, absent there anyway. |
 | `/leave` | collaboration | Same. |
-| `/open` | collaboration | |
+| `/open` | collaboration | **Ported (8b-2), TUI-only like TS**: opens the last http(s) link of the latest assistant message (`open`/`xdg-open`/`start`); `link`/`url` accepted, other args print the usage. The usage hint names `/copy link` instead of TS's block drill keys (no copy selector). |
 | `/tan`, `/omfg`, `/cleanse` | lifecycle | Easter-egg names; presence in the reference array is confirmed, semantics unread. |
 
 `/providers` did **not** appear at top level in this extraction (it is nested under

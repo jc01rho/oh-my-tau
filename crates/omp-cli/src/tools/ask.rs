@@ -739,6 +739,9 @@ struct QuestionResult {
     selected: Vec<String>,
     custom: Option<String>,
     timed_out: bool,
+    /// Notes the user saved on selected options: `(option label, text)`
+    /// (TS `OptionNote`, `app.ask.note`).
+    notes: Vec<(String, String)>,
 }
 
 /// The `ask` tool.
@@ -907,6 +910,7 @@ fn timed_out_results(questions: &[QuestionItem]) -> Vec<QuestionResult> {
                 },
                 custom: None,
                 timed_out: true,
+                notes: Vec::new(),
             }
         })
         .collect()
@@ -982,6 +986,7 @@ fn parse_answers(questions: &[QuestionItem], answers: &Value) -> Result<Vec<Ques
                     json!(question.id)
                 ));
             }
+            let notes = parse_option_notes(&question.id, &selected, answer.get("optionNotes"))?;
             Ok(QuestionResult {
                 id: question.id.clone(),
                 question: question.question.clone(),
@@ -993,9 +998,87 @@ fn parse_answers(questions: &[QuestionItem], answers: &Value) -> Result<Vec<Ques
                 selected,
                 custom,
                 timed_out: false,
+                notes,
             })
         })
         .collect()
+}
+
+/// An answer's `optionNotes` (`[{option, text}]`): every note names a
+/// selected option and carries non-blank text (TS `optionNotes()` only
+/// submits notes on selected options).
+fn parse_option_notes(
+    id: &str,
+    selected: &[String],
+    raw: Option<&Value>,
+) -> Result<Vec<(String, String)>> {
+    let items = match raw {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => {
+            return Err(anyhow!(
+                "Ask dialog answer {} optionNotes must be an array",
+                json!(id)
+            ))
+        }
+    };
+    items
+        .iter()
+        .map(|item| {
+            let option = item.get("option").and_then(Value::as_str);
+            let text = item
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty());
+            match (option, text) {
+                (Some(option), Some(text)) if selected.iter().any(|s| s == option) => {
+                    Ok((option.to_string(), text.to_string()))
+                }
+                _ => Err(anyhow!(
+                    "Ask dialog answer {} carries a note that is not on a selected option",
+                    json!(id)
+                )),
+            }
+        })
+        .collect()
+}
+
+/// TS `ask-result.md` "Option notes" block: one line per note, whitespace
+/// collapsed; empty when no answer carries a note.
+fn option_notes_text(results: &[QuestionResult]) -> String {
+    let lines: Vec<String> = results
+        .iter()
+        .flat_map(|r| {
+            r.notes.iter().map(move |(option, text)| {
+                format!(
+                    "- {}: {option} [{}={}] — {}",
+                    r.question,
+                    r.id,
+                    json!(option),
+                    text.split_whitespace().collect::<Vec<_>>().join(" ")
+                )
+            })
+        })
+        .collect();
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\nOption notes:\n{}", lines.join("\n"))
+    }
+}
+
+/// TS `AskToolDetails.notes`: `{name, question, option, value, text}` per note.
+fn option_notes_details(results: &[QuestionResult]) -> Option<Value> {
+    let notes: Vec<Value> = results
+        .iter()
+        .flat_map(|r| {
+            r.notes.iter().map(move |(option, text)| {
+                json!({"name": r.id, "question": r.question, "option": option, "value": option, "text": text})
+            })
+        })
+        .collect();
+    (!notes.is_empty()).then_some(Value::Array(notes))
 }
 
 /// Interprets the host's answer frame. `Ok(None)` = cancelled by the user.
@@ -1323,6 +1406,7 @@ impl AskTool {
                 selected: selection.selected,
                 custom: selection.custom,
                 timed_out: false,
+                notes: Vec::new(),
             });
         }
         render_results(&results)
@@ -1365,7 +1449,7 @@ fn render_results(results: &[QuestionResult]) -> Result<AgentToolResult> {
         {
             return Err(cancelled());
         }
-        let text = format_single_response(single);
+        let text = format_single_response(single) + &option_notes_text(results);
         let details = json!({
             "question": single.question,
             "options": single.options,
@@ -1373,18 +1457,23 @@ fn render_results(results: &[QuestionResult]) -> Result<AgentToolResult> {
             "selectedOptions": single.selected,
             "customInput": single.custom,
             "timedOut": single.timed_out.then_some(true),
+            "notes": option_notes_details(results),
         });
         return Ok(result_with_text(text, details));
     }
     let text = format!(
-        "User answers:\n{}",
+        "User answers:\n{}{}",
         results
             .iter()
             .map(format_question_result)
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"),
+        option_notes_text(results)
     );
-    let details = json!({"results": results.iter().map(result_json).collect::<Vec<_>>()});
+    let details = json!({
+        "results": results.iter().map(result_json).collect::<Vec<_>>(),
+        "notes": option_notes_details(results),
+    });
     Ok(result_with_text(text, details))
 }
 
@@ -1533,6 +1622,42 @@ mod tests {
                 "options": [{"label": "SQLite"}, {"label": "Postgres", "description": "shared"}],
                 "recommended": 0.0
             }])
+        );
+    }
+
+    #[tokio::test]
+    async fn option_notes_on_selected_options_reach_the_result() {
+        let (_, tool) = fake(Some(json!({"answers": [{
+            "id": "storage", "selectedOptions": ["Postgres"],
+            "optionNotes": [{"option": "Postgres", "text": "  needs\n PITR "}]
+        }]})));
+        let result = tool
+            .run(storage_args(), &AbortSignal::never())
+            .await
+            .unwrap();
+        let ToolResultContent::Text(text) = &result.content[0] else {
+            panic!("text result");
+        };
+        assert!(text
+            .text
+            .starts_with("User selected: Postgres\nOption notes:\n"));
+        assert!(text
+            .text
+            .ends_with(r#"- Database?: Postgres [storage="Postgres"] — needs PITR"#));
+        assert_eq!(result.details["notes"][0]["option"], json!("Postgres"));
+        assert_eq!(result.details["notes"][0]["name"], json!("storage"));
+
+        let (_, tool) = fake(Some(json!({"answers": [{
+            "id": "storage", "selectedOptions": ["SQLite"],
+            "optionNotes": [{"option": "Postgres", "text": "draft"}]
+        }]})));
+        let err = tool
+            .run(storage_args(), &AbortSignal::never())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not on a selected option"),
+            "{err}"
         );
     }
 

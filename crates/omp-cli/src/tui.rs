@@ -192,6 +192,16 @@ async fn navigate_and_announce(rt: &Arc<Runtime>, entry_id: &str, summarize: boo
     }
 }
 
+/// The `local://` context the tools write through: the published session
+/// file (`omp_urls::global_session_file`) and the session cwd.
+fn local_url_ctx(rt: &Runtime) -> omp_urls::UrlCtx {
+    omp_urls::UrlCtx {
+        session_file: omp_urls::global_session_file(),
+        cwd: Some(rt.cwd.clone()),
+        ..omp_urls::UrlCtx::default()
+    }
+}
+
 /// [`omp_tui::RuntimePort`] backed by the omp-cli [`Runtime`]; the async
 /// `Runtime` methods are spawned onto the tokio runtime from these sync hooks.
 struct Port {
@@ -726,6 +736,19 @@ impl omp_tui::RuntimePort for Port {
         let entries = self.rt.entries().ok()?;
         let leaf = self.rt.live_leaf(&entries);
         Some(omp_tui::port::SessionJournal { entries, leaf })
+    }
+
+    fn local_files(&self) -> Result<Vec<omp_tui::port::LocalFile>, String> {
+        crate::features::local_editor::list(&local_url_ctx(&self.rt))
+    }
+
+    fn resolve_local_file(&self, target: &str, picked: bool) -> Result<(String, PathBuf), String> {
+        let ctx = local_url_ctx(&self.rt);
+        if picked {
+            crate::features::local_editor::revalidate_entry(target, &ctx)
+        } else {
+            crate::features::local_editor::resolve_target(target, &ctx)
+        }
     }
 
     fn abort_compaction(&self) {

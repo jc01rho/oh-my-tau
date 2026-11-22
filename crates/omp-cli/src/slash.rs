@@ -863,6 +863,12 @@ async fn dispatch_ported(rt: &std::sync::Arc<Runtime>, name: &str, args: &str) -
         "pin" => Some(pin_command(rt, args).await),
         "unpin" => Some(unpin_command(rt, args)),
         "hotkeys" => Some(hotkeys_command(rt, args)),
+        // Upstream runs these only in the interactive TUI (`handleTui`), which
+        // handles them locally; text-mode dispatch says so.
+        "local" | "open" => Some(notice(
+            rt,
+            &format!("/{name} is only available in the interactive TUI."),
+        )),
         "skillful" => Some(setting_status_toggle(
             rt,
             args,
@@ -2828,34 +2834,18 @@ async fn modelpreset_command(rt: &Runtime, args: &str) -> Outcome {
 // /pin (session/session-pins.ts)
 // =============================================================================
 
-/// `~/.omp-rs/session-pins.json` — pinned session ids (keyed by id so pins
-/// survive moves), the omp-rs counterpart of TS `~/.omp/session-pins.json`.
-fn pins_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".omp-rs")
-            .join("session-pins.json"),
-    )
-}
-
+/// Pinned session ids from the shared store (`omp_session::pins`), the same
+/// file the resume picker's pin keys edit.
 fn load_pinned_sessions() -> HashSet<String> {
-    pins_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
-        .map(|v| v.into_iter().collect())
+    omp_session::pins::default_path()
+        .map(|p| omp_session::pins::load(&p))
         .unwrap_or_default()
 }
 
 fn store_pinned_sessions(pins: &HashSet<String>) -> Result<(), String> {
-    let path = pins_path().ok_or_else(|| "no HOME for pins file".to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let mut sorted: Vec<&String> = pins.iter().collect();
-    sorted.sort();
-    let text = serde_json::to_string_pretty(&sorted).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| e.to_string())
+    let path =
+        omp_session::pins::default_path().ok_or_else(|| "no HOME for pins file".to_string())?;
+    omp_session::pins::store(&path, pins).map_err(|e| e.to_string())
 }
 
 /// `/pin [session id]` — toggle this session's pin (TS `handle` in
@@ -3100,7 +3090,6 @@ const UNPORTED_RESERVED: &[&str] = &[
     "vibe",
     "guided-goal",
     "git",
-    "local",
     "hub",
     "tree",
     "resume",
@@ -3113,7 +3102,6 @@ const UNPORTED_RESERVED: &[&str] = &[
     "forget-approvals",
     "join",
     "leave",
-    "open",
     "tan",
     "omfg",
     "cleanse",
@@ -3299,14 +3287,45 @@ mod tests {
 
     #[test]
     fn every_upstream_builtin_name_is_reserved() {
-        for name in UNPORTED_RESERVED
-            .iter()
-            .copied()
-            .chain(["clear", "unpin", "hotkeys"])
-        {
+        // The 26 upstream names Phase 8b reserved; ported ones leave
+        // `UNPORTED_RESERVED` but must stay reserved.
+        const UPSTREAM_ONLY: [&str; 26] = [
+            "settings",
+            "setup",
+            "plan-review",
+            "vibe",
+            "guided-goal",
+            "git",
+            "local",
+            "hub",
+            "tree",
+            "resume",
+            "delete",
+            "exit",
+            "commit",
+            "live",
+            "record",
+            "pause",
+            "forget-approvals",
+            "join",
+            "leave",
+            "open",
+            "tan",
+            "omfg",
+            "cleanse",
+            "clear",
+            "unpin",
+            "hotkeys",
+        ];
+        for name in UPSTREAM_ONLY {
             assert!(is_reserved_builtin(name), "/{name} must be reserved");
         }
-        assert_eq!(UNPORTED_RESERVED.len() + 3, 26);
+        for name in UNPORTED_RESERVED {
+            assert!(
+                UPSTREAM_ONLY.contains(name),
+                "/{name} is not an upstream-only name"
+            );
+        }
     }
 
     #[test]

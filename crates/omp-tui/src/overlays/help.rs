@@ -114,7 +114,16 @@ pub fn hotkey_groups(keys: &KeybindingsManager, theme: &Theme) -> Vec<HotkeyGrou
                 ),
                 row(act("app.tools.expand"), "Toggle tool output expansion"),
                 row(act("app.ask.hide"), "Hide/show a pending dialog"),
+                row(act("app.ask.note"), "Add or edit a note on an ask option"),
+                row(
+                    act("app.btw.inject"),
+                    "Send a /btw answer's steering prompt to the main session",
+                ),
                 row(act("app.approval.approve"), "Approve a pending tool call"),
+                row(
+                    act("app.local.open"),
+                    "Open a local:// file in external editor",
+                ),
                 row(
                     act("app.clipboard.pasteImage"),
                     "Paste image or text from clipboard",
