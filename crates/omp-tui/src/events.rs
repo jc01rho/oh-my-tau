@@ -72,6 +72,14 @@ pub enum AppEvent {
     /// `{"type":"command_output", "text": "..."}` — slash-command output
     /// (omp-cli `slash::output`), shown as a system entry.
     CommandOutput(String),
+    /// A `/btw` answer whose `command_output` frame carries `btwInject`:
+    /// the steering prompt `app.btw.inject` can send (`btw.inject` on).
+    BtwAnswer {
+        /// The answer as shown (`btw: …`, tags included).
+        text: String,
+        /// The formatted `<inject>` block text.
+        inject: String,
+    },
     /// `{"type":"extension_ui_request", "id", "method", ...}` — an extension
     /// `ask` dialog the UI must answer with `Action::ExtensionUiResponse`.
     ExtensionUiRequest(Value),
@@ -202,13 +210,20 @@ pub fn parse_frame(frame: &Value) -> AppEvent {
                 .unwrap_or_default()
                 .to_owned(),
         },
-        "command_output" => AppEvent::CommandOutput(
-            frame
+        "command_output" => {
+            let text = frame
                 .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .to_string(),
-        ),
+                .to_string();
+            match frame.get("btwInject").and_then(Value::as_str) {
+                Some(inject) if !inject.trim().is_empty() => AppEvent::BtwAnswer {
+                    text,
+                    inject: inject.to_owned(),
+                },
+                _ => AppEvent::CommandOutput(text),
+            }
+        }
         "extension_ui_request" => AppEvent::ExtensionUiRequest(frame.clone()),
         "extension_ui_response" => AppEvent::ExtensionUiResponse(frame.clone()),
         "session_name_changed" => AppEvent::SessionNameChanged(

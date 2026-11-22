@@ -185,28 +185,9 @@ fn code_blocks(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `http(s)://` links of `text`, in order.
+/// `http(s)://` links of `text`, in order (shared with the TUI's `/open`).
 fn links(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(pos) = rest.find("http") {
-        let tail = &rest[pos..];
-        if tail.starts_with("https://") || tail.starts_with("http://") {
-            let end = tail
-                .find(|c: char| {
-                    c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'' | '`' | '<')
-                })
-                .unwrap_or(tail.len());
-            let url = tail[..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
-            if url.len() > "https://".len() {
-                out.push(url.to_string());
-            }
-            rest = &tail[end.max(1)..];
-        } else {
-            rest = &tail[4..];
-        }
-    }
-    out
+    omp_tui::chat::links::http_links(text)
 }
 
 /// The last `bash`/`eval` tool call's code: `(kind, code)`.

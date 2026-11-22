@@ -12,7 +12,12 @@
 //! first two lines are read — the fixed-width title slot (line 1) and the
 //! `session` header (line 2, for id/cwd) — so a directory of large journals
 //! costs O(files), not O(entries).
+//!
+//! Pinned sessions (`omp_session::pins`, shared with `/pin`) list first with
+//! the pin icon; `app.session.pin` / `app.session.unpin` (Alt+K /
+//! Alt+Shift+K) pin or unpin the selected row (TS `requestPin`).
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -25,6 +30,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::component::{Component, EventOutcome};
+use crate::keybindings::{format_key_hint, KeybindingsManager};
 use crate::keys::{KeyCode, KeyEvent, KeyModifiers};
 use crate::theme::Theme;
 
@@ -288,6 +294,13 @@ pub struct SessionPicker {
     pub allow_delete: bool,
     /// Allow the all-projects scope (TS `allowGlobalScope`, default on).
     pub allow_global_scope: bool,
+    /// Pinned session ids (TS `pinnedIds`), reloaded from `pins_path` on rescan.
+    pinned_ids: HashSet<String>,
+    /// The pins store; `None` disables the pin keys (TS: no `onSetPinned`).
+    pins_path: Option<PathBuf>,
+    keys: KeybindingsManager,
+    /// A failed pin write, shown in the footer until the next key.
+    error: Option<String>,
 }
 
 impl std::fmt::Debug for SessionPicker {
@@ -321,6 +334,10 @@ impl Default for SessionPicker {
             pending: None,
             allow_delete: true,
             allow_global_scope: true,
+            pinned_ids: HashSet::new(),
+            pins_path: None,
+            keys: KeybindingsManager::defaults(),
+            error: None,
         }
     }
 }
@@ -334,19 +351,32 @@ impl SessionPicker {
     }
 
     /// Build a picker over several stores (the native omp-rs dir plus TS
-    /// omp's dir for the same folder), merged newest first.
+    /// omp's dir for the same folder), merged newest first, with pins from
+    /// the shared `~/.omp-rs/session-pins.json`.
     #[must_use]
     pub fn load_sources(sources: &[SessionSource]) -> Self {
+        Self::load_sources_with_pins(sources, omp_session::pins::default_path())
+    }
+
+    /// [`Self::load_sources`] with an explicit pins store (`None` = no pins).
+    #[must_use]
+    pub fn load_sources_with_pins(sources: &[SessionSource], pins_path: Option<PathBuf>) -> Self {
         let mut picker = Self {
             folders: sources
                 .iter()
                 .filter(|s| !s.dir.as_os_str().is_empty())
                 .cloned()
                 .collect(),
+            pins_path,
             ..Default::default()
         };
         picker.rescan();
         picker
+    }
+
+    /// Use `keys` for the pin actions (the app's effective bindings).
+    pub fn set_keys(&mut self, keys: KeybindingsManager) {
+        self.keys = keys;
     }
 
     /// Render fullscreen (standalone `--resume` mode) instead of a centered
@@ -391,6 +421,14 @@ impl SessionPicker {
         };
         self.sessions = dirs.iter().flat_map(scan_source).collect();
         self.sessions.sort_by_key(|a| std::cmp::Reverse(a.modified));
+        self.pinned_ids = self
+            .pins_path
+            .as_deref()
+            .map(omp_session::pins::load)
+            .unwrap_or_default();
+        for s in &mut self.sessions {
+            s.pinned = self.pinned_ids.contains(&s.id);
+        }
         self.refilter();
     }
 
@@ -454,8 +492,68 @@ impl SessionPicker {
             });
             scored.into_iter().map(|(i, _)| i).collect()
         };
+        self.pinned_first();
         self.selected = 0;
         self.offset = 0;
+    }
+
+    /// Stable partition: pinned sessions first, each group in its incoming
+    /// order (TS `#pinnedFirst`).
+    fn pinned_first(&mut self) {
+        let (pinned, rest): (Vec<usize>, Vec<usize>) = self
+            .filtered
+            .iter()
+            .partition(|&&i| self.sessions[i].pinned);
+        self.filtered = pinned.into_iter().chain(rest).collect();
+    }
+
+    /// Pin keys: pin or unpin the selected session through the store; a no-op
+    /// when it is already in that state (TS `requestPin` + `#setPinned`). The
+    /// list re-partitions and the cursor follows the session.
+    fn request_pin(&mut self, pinned: bool) {
+        let Some(path) = self.pins_path.clone() else {
+            return;
+        };
+        let Some(selected) = self.selected_session() else {
+            return;
+        };
+        if selected.pinned == pinned {
+            return;
+        }
+        let id = selected.id.clone();
+        if let Err(e) = omp_session::pins::set_pinned(&path, &id, pinned) {
+            self.error = Some(format!("Failed to update pins: {e}"));
+            return;
+        }
+        if pinned {
+            self.pinned_ids.insert(id.clone());
+        } else {
+            self.pinned_ids.remove(&id);
+        }
+        for s in &mut self.sessions {
+            if s.id == id {
+                s.pinned = pinned;
+            }
+        }
+        self.refilter();
+        if let Some(row) = self
+            .filtered
+            .iter()
+            .position(|&i| self.sessions[i].id == id)
+        {
+            self.selected = row;
+        }
+    }
+
+    /// The pin action for the selected row: unpin when pinned, else pin
+    /// (TS `#pinAction`); `None` without a pins store.
+    fn pin_action(&self) -> Option<(&'static str, &'static str)> {
+        self.pins_path.as_ref()?;
+        Some(if self.selected_session().is_some_and(|s| s.pinned) {
+            ("app.session.unpin", "unpin")
+        } else {
+            ("app.session.pin", "pin")
+        })
     }
 
     /// Whether the selected row may be deleted: deletion enabled and the row
@@ -520,13 +618,20 @@ impl SessionPicker {
     /// plus a `[tag]` for sessions from a non-native store.
     fn row_spans<'a>(&self, s: &'a SessionSummary, theme: &Theme) -> Vec<Span<'a>> {
         let muted = Style::default().fg(theme.color("text_muted"));
-        let mut spans = vec![
+        let mut spans = Vec::new();
+        if s.pinned {
+            spans.push(Span::styled(
+                format!("{} ", theme.symbol("icon.pin")),
+                Style::default().fg(theme.color("accent")),
+            ));
+        }
+        spans.extend([
             Span::styled(s.display_title().to_owned(), Style::default()),
             Span::raw("  "),
             Span::styled(relative_time(s.modified), muted),
             Span::raw("  "),
             Span::styled(s.cwd.clone(), muted),
-        ];
+        ]);
         if let Some(tag) = &s.source {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(format!("[{tag}]"), muted));
@@ -534,8 +639,15 @@ impl SessionPicker {
         spans
     }
 
-    /// The footer hint (TS: `[delete/backspace delete · enter select · tab <scope> · esc cancel]`).
+    /// The footer hint (TS: `[delete/backspace delete · <pin key> pin|unpin ·
+    /// enter select · tab <scope> · esc cancel]`), or a failed pin write.
     fn hint_line(&self, theme: &Theme) -> Line<'static> {
+        if let Some(error) = &self.error {
+            return Line::from(Span::styled(
+                error.clone(),
+                Style::default().fg(theme.color("error")),
+            ));
+        }
         let dim = Style::default().fg(theme.color("text_muted"));
         let key = Style::default()
             .fg(theme.color("accent"))
@@ -544,9 +656,16 @@ impl SessionPicker {
             Span::styled("[", dim),
             Span::styled("delete/backspace", key),
             Span::styled(" delete · ", dim),
-            Span::styled("enter", key),
-            Span::styled(" select · ", dim),
         ];
+        if let Some((binding, label)) = self.pin_action() {
+            if let Some(pin_key) = self.keys.first_key(binding) {
+                spans.extend([
+                    Span::styled(format_key_hint(&pin_key, theme), key),
+                    Span::styled(format!(" {label} · "), dim),
+                ]);
+            }
+        }
+        spans.extend([Span::styled("enter", key), Span::styled(" select · ", dim)]);
         if self.allow_global_scope {
             spans.extend([
                 Span::styled("tab", key),
@@ -571,6 +690,17 @@ impl Component for SessionPicker {
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
             self.pending = Some(SessionPick::Cancelled);
             return EventOutcome::Consumed;
+        }
+        self.error = None;
+        if !self.confirm_delete {
+            if self.keys.matches_event(&key, "app.session.pin") {
+                self.request_pin(true);
+                return EventOutcome::Consumed;
+            }
+            if self.keys.matches_event(&key, "app.session.unpin") {
+                self.request_pin(false);
+                return EventOutcome::Consumed;
+            }
         }
         match key.code {
             KeyCode::Esc => {
@@ -783,6 +913,7 @@ pub fn select_session_standalone(sources: &[SessionSource], title: &str) -> Opti
     let mut terminal = ratatui::Terminal::new(backend).ok()?;
 
     let mut picker = SessionPicker::load_sources(sources);
+    picker.set_keys(crate::keybindings::load_default_manager());
     picker.set_standalone(true);
     picker.set_title(title);
     let theme = Theme::default();
@@ -1142,6 +1273,96 @@ mod tests {
         assert_eq!(relative_time(now - Duration::from_secs(120)), "2m ago");
         assert_eq!(relative_time(now - Duration::from_secs(7200)), "2h ago");
         assert_eq!(relative_time(now - Duration::from_secs(172_800)), "2d ago");
+    }
+
+    fn listed_ids(picker: &SessionPicker) -> Vec<String> {
+        picker
+            .filtered
+            .iter()
+            .map(|&i| picker.sessions[i].id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn pin_keys_persist_and_list_pinned_first() {
+        let root = fixture_root();
+        let dir = root.join("proj");
+        write_session(&dir, "old", "Old task", "/w");
+        let new = write_session(&dir, "new", "New task", "/w");
+        bump_mtime(&new);
+        let pins = root.join("agent").join("session-pins.json");
+        let sources = [SessionSource::new(&dir)];
+        let mut picker = SessionPicker::load_sources_with_pins(&sources, Some(pins.clone()));
+        assert_eq!(listed_ids(&picker), ["new", "old"]);
+        assert_eq!(picker.pin_action(), Some(("app.session.pin", "pin")));
+
+        let alt_k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT);
+        let alt_shift_k =
+            KeyEvent::new(KeyCode::Char('K'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+        picker.handle_key(key(KeyCode::Down));
+        assert!(picker.handle_key(alt_k).consumed());
+        assert_eq!(listed_ids(&picker), ["old", "new"], "pinned first");
+        assert_eq!(
+            picker.selected_session().unwrap().id,
+            "old",
+            "cursor follows"
+        );
+        assert_eq!(picker.pin_action(), Some(("app.session.unpin", "unpin")));
+        assert_eq!(
+            omp_session::pins::load(&pins),
+            HashSet::from(["old".to_owned()])
+        );
+        assert!(
+            picker.query.is_empty(),
+            "the pin chord is not typed into the filter"
+        );
+
+        picker.handle_key(alt_k);
+        assert_eq!(
+            omp_session::pins::load(&pins).len(),
+            1,
+            "pinning a pinned row is a no-op"
+        );
+
+        let reopened = SessionPicker::load_sources_with_pins(&sources, Some(pins.clone()));
+        assert_eq!(
+            listed_ids(&reopened),
+            ["old", "new"],
+            "pins reload from the store"
+        );
+        assert!(reopened.sessions.iter().any(|s| s.id == "old" && s.pinned));
+
+        picker.handle_key(alt_shift_k);
+        assert_eq!(listed_ids(&picker), ["new", "old"]);
+        assert_eq!(picker.selected_session().unwrap().id, "old");
+        assert!(omp_session::pins::load(&pins).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pin_keys_follow_user_bindings_and_need_a_store() {
+        let root = fixture_root();
+        let dir = root.join("proj");
+        write_session(&dir, "only", "Only task", "/w");
+        let sources = [SessionSource::new(&dir)];
+        let mut unstored = SessionPicker::load_sources_with_pins(&sources, None);
+        assert_eq!(unstored.pin_action(), None);
+        unstored.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT));
+        assert!(!unstored.sessions[0].pinned);
+
+        let pins = root.join("session-pins.json");
+        let mut picker = SessionPicker::load_sources_with_pins(&sources, Some(pins.clone()));
+        let mut user = crate::keybindings::UserBindings::new();
+        user.insert("app.session.pin".into(), vec!["f6".into()]);
+        picker.set_keys(KeybindingsManager::new(user));
+        picker.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT));
+        assert!(
+            omp_session::pins::load(&pins).is_empty(),
+            "the default chord is replaced"
+        );
+        picker.handle_key(key(KeyCode::F(6)));
+        assert!(omp_session::pins::load(&pins).contains("only"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

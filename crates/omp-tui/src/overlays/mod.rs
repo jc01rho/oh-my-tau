@@ -24,6 +24,7 @@ pub mod diff;
 pub mod help;
 pub mod large_paste;
 pub mod links;
+pub mod local_files;
 pub mod models;
 pub mod session_info;
 pub mod sessions;
@@ -84,6 +85,8 @@ pub enum OpenOverlay {
     LargePaste,
     /// Extension link picker (`app.links.hint`, TS `startLinkHints`).
     LinkHints,
+    /// `local://` file picker (`/local`, `app.local.open`).
+    LocalFiles,
 }
 
 impl OpenOverlay {
@@ -129,6 +132,7 @@ pub struct Overlays {
     thinking: thinking::ThinkingSelector,
     large_paste: large_paste::LargePasteMenu,
     links: links::LinkHints,
+    local_files: local_files::LocalFilePicker,
     stack: Vec<OpenOverlay>,
 }
 
@@ -172,8 +176,13 @@ impl Overlays {
 
     /// Open the embedded session picker (`/resume`): rescan `sources`, reset
     /// the query/selection and push the overlay (replacing a stale picker).
-    pub fn open_sessions(&mut self, sources: &[sessions::SessionSource]) {
+    pub fn open_sessions(
+        &mut self,
+        sources: &[sessions::SessionSource],
+        keys: &crate::keybindings::KeybindingsManager,
+    ) {
         let mut picker = sessions::SessionPicker::load_sources(sources);
+        picker.set_keys(keys.clone());
         picker.set_standalone(true); // TS mounts /resume fullscreen (selector-controller.ts)
         self.sessions = picker;
         if !self.stack.contains(&OpenOverlay::Sessions) {
@@ -245,6 +254,13 @@ impl Overlays {
         self.stack.push(OpenOverlay::LinkHints);
     }
 
+    /// Open the `local://` file picker over `files` (newest first).
+    pub fn open_local_files(&mut self, files: Vec<crate::port::LocalFile>) {
+        self.local_files.open(files);
+        self.close(OpenOverlay::LocalFiles);
+        self.stack.push(OpenOverlay::LocalFiles);
+    }
+
     /// Mutable access to the large-paste chooser (pick drain).
     pub fn large_paste_mut(&mut self) -> &mut large_paste::LargePasteMenu {
         &mut self.large_paste
@@ -299,6 +315,7 @@ impl Overlays {
             OpenOverlay::Thinking => &self.thinking,
             OpenOverlay::LargePaste => &self.large_paste,
             OpenOverlay::LinkHints => &self.links,
+            OpenOverlay::LocalFiles => &self.local_files,
         }
     }
 
@@ -315,6 +332,7 @@ impl Overlays {
             OpenOverlay::Thinking => &mut self.thinking,
             OpenOverlay::LargePaste => &mut self.large_paste,
             OpenOverlay::LinkHints => &mut self.links,
+            OpenOverlay::LocalFiles => &mut self.local_files,
         }
     }
 
@@ -391,6 +409,10 @@ impl Overlays {
         if let Some(level) = self.thinking.take_pick() {
             out.push(Action::SetThinkingLevel(level));
             self.close(OpenOverlay::Thinking);
+        }
+        if let Some(name) = self.local_files.take_pick() {
+            out.push(Action::OpenLocalFile { name });
+            self.close(OpenOverlay::LocalFiles);
         }
         for (id, value) in self.settings.take_previews() {
             out.push(Action::SettingPreview { id, value });

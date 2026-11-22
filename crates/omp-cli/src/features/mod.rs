@@ -4,6 +4,7 @@
 pub mod browser;
 pub mod btw;
 pub mod budget;
+pub mod local_editor;
 pub mod loop_mode;
 pub mod memory;
 pub mod modes;

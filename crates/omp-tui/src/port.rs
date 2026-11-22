@@ -36,6 +36,16 @@ pub struct SessionJournal {
     pub leaf: Option<String>,
 }
 
+/// One session `local://` file (TS `LocalFileEntry`), listed by the
+/// `/local` / `app.local.open` picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalFile {
+    /// Path under the session's local root, `/`-separated.
+    pub name: String,
+    /// Size in bytes.
+    pub size: u64,
+}
+
 /// Synchronous bridge to the agent runtime.
 pub trait RuntimePort: Send + Sync + 'static {
     /// Submit a prompt. `behavior` is `Some` when the agent is streaming
@@ -149,6 +159,30 @@ pub trait RuntimePort: Send + Sync + 'static {
     fn confirm_close(&self) -> Option<CloseGate> {
         None
     }
+
+    /// The session's `local://` files, newest first (TS `listLocalFiles`).
+    ///
+    /// # Errors
+    /// The listing failed, or the host has no session-scoped local root.
+    fn local_files(&self) -> Result<Vec<LocalFile>, String> {
+        Err("this host has no session local:// store".into())
+    }
+
+    /// Resolve a `local://` editor target to `(display url, real path)`:
+    /// a typed name or explicit `local://` URL (TS
+    /// `resolveLocalEditorTarget`), or with `picked` the exact name of a
+    /// listed file (TS `revalidateLocalEditorEntry`).
+    ///
+    /// # Errors
+    /// The user-facing reason the target cannot be opened.
+    fn resolve_local_file(
+        &self,
+        target: &str,
+        picked: bool,
+    ) -> Result<(String, std::path::PathBuf), String> {
+        let _ = (target, picked);
+        Err("this host has no session local:// store".into())
+    }
 }
 
 /// A pending `session_before_shutdown` gate ([`RuntimePort::confirm_close`]).
@@ -188,6 +222,7 @@ impl Drop for CloseGate {
             abort();
         }
     }
+
 }
 
 /// A recording fake for tests. Every call appends to [`Self::log`].
@@ -198,6 +233,9 @@ pub struct FakePort {
     /// The journal [`RuntimePort::session_journal`] serves; label edits append
     /// a `label` entry to it like the real session writer does.
     pub journal: parking_lot::Mutex<Option<SessionJournal>>,
+    /// Files [`RuntimePort::local_files`] lists and
+    /// [`RuntimePort::resolve_local_file`] resolves (under `/local/<name>`).
+    pub local_files: parking_lot::Mutex<Vec<LocalFile>>,
 }
 
 impl FakePort {
@@ -310,6 +348,25 @@ impl RuntimePort for FakePort {
     }
     fn request_usage(&self) {
         self.record("request_usage()".into());
+    }
+    fn local_files(&self) -> Result<Vec<LocalFile>, String> {
+        Ok(self.local_files.lock().clone())
+    }
+    fn resolve_local_file(
+        &self,
+        target: &str,
+        picked: bool,
+    ) -> Result<(String, std::path::PathBuf), String> {
+        self.record(format!("resolve_local_file({target:?}, picked={picked})"));
+        let name = target.trim().trim_start_matches("local://");
+        if self.local_files.lock().iter().any(|f| f.name == name) {
+            Ok((
+                format!("local://{name}"),
+                std::path::Path::new("/local").join(name),
+            ))
+        } else {
+            Err(format!("Local file not found: local://{name}"))
+        }
     }
 }
 

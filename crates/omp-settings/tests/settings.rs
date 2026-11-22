@@ -26,8 +26,9 @@ fn schema_covers_ts_registry() {
     // 531 register({...}) definitions extracted from TS v18.6.1, plus the 19
     // settings only the TS panel (`createSettingsHost`) lists, plus the omp-rs
     // gates `magicKeywords.ultracode`, `systemPrompt.compact` and
-    // `sandbox.enabled`.
-    assert_eq!(SETTINGS.len(), 553);
+    // `sandbox.enabled`, plus upstream's later `btw.inject`.
+    assert_eq!(SETTINGS.len(), 554);
+    assert!(lookup("btw.inject").is_some());
     assert!(lookup("magicKeywords.ultracode").is_some());
     assert!(lookup("sandbox.enabled").is_some());
     assert!(lookup("systemPrompt.compact").is_some());

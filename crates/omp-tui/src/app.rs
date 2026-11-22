@@ -94,6 +94,76 @@ const P0_BUILTINS: &[&str] = &[
 /// Bare-slash commands that require a confirming second Enter (§4.1 step 7).
 const CONFIRM_BARE: &[&str] = &["exit", "clear", "compact", "export"];
 
+/// TS `BTW_INJECT_LABEL` / `BTW_INJECTED_LABEL` (`btw-inject.ts`).
+const BTW_INJECT_LABEL: &str = "Inject into main session";
+const BTW_INJECTED_LABEL: &str = "Injected into main session";
+
+/// A `/btw` steering prompt and whether it was sent (TS `#injects` state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BtwInject {
+    text: String,
+    sent: bool,
+}
+
+/// TS `BtwInjectAnswer`: the answer with its last closed `<inject>` block
+/// drawn as a railed block plus the send label (and key) under it.
+fn btw_answer_display(text: &str, inject: &str, key: Option<&str>) -> String {
+    let Some(close) = text.rfind("</inject>") else {
+        return text.to_owned();
+    };
+    let Some(open) = text[..close].rfind("<inject>") else {
+        return text.to_owned();
+    };
+    let before = text[..open].trim_end();
+    let after = text[close + "</inject>".len()..].trim_start();
+    let mut out = String::new();
+    if !before.is_empty() {
+        out.push_str(before);
+        out.push_str("\n\n");
+    }
+    for line in inject.lines() {
+        out.push_str("┃ ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("┃ ");
+    out.push_str(BTW_INJECT_LABEL);
+    if let Some(key) = key {
+        out.push_str(&format!(" ({key})"));
+    }
+    if !after.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(after);
+    }
+    out
+}
+
+/// TS `openLocalFileInEditor` warning when no editor is configured.
+const NO_EDITOR: &str = "No editor configured. Set $VISUAL or $EDITOR environment variable.";
+
+/// An external-editor run the controller performs with the terminal handed
+/// over (TS `ctx.ui.stop()` → `openEditorOnPath` → `ctx.ui.start()`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorLaunch {
+    /// The `$VISUAL` / `$EDITOR` command line (run through `sh -c`).
+    pub command: String,
+    /// The file the editor opens and writes in place.
+    pub path: std::path::PathBuf,
+    /// The `local://` URL named in the closing status.
+    pub url: String,
+}
+
+/// TS `getEditorCommand`: `$VISUAL`, then `$EDITOR` (trimmed, non-empty),
+/// then `notepad` on Windows; `None` on POSIX without either.
+fn editor_command(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(env)
+        .map(|v| v.trim().to_owned())
+        .find(|v| !v.is_empty())
+        .or_else(|| cfg!(windows).then(|| "notepad".to_owned()))
+}
+
 /// TUI-local slash entries merged into the autocomplete catalog: commands
 /// the app handles itself and the runtime catalog does not announce (TS
 /// `/settings` is registered by the interactive host, not the agent).
@@ -320,6 +390,14 @@ pub struct App {
     last_ctrl_c: Option<Instant>,
     /// `/exit` requested a quit; surfaced by the next submit return.
     quit_requested: bool,
+    /// An external-editor launch waiting for the controller (`/local`).
+    pending_editor: Option<EditorLaunch>,
+    /// Environment lookup behind [`editor_command`] (tests pin it).
+    editor_env: fn(&str) -> Option<String>,
+    /// The latest `/btw` answer's steering prompt (`app.btw.inject`).
+    btw_inject: Option<BtwInject>,
+    /// System URL opener behind `/open` (tests pin it).
+    url_opener: fn(&str) -> std::io::Result<()>,
     /// Mirror of `tui.mouse` ("Mouse Click-to-Focus"): inline SGR mouse
     /// capture on the normal buffer while no overlay is open (TS
     /// `InteractiveMode#mouseCapture` → `setInlineMouseTrackingProvider`).
@@ -415,6 +493,10 @@ impl App {
             last_esc: None,
             last_ctrl_c: None,
             quit_requested: false,
+            pending_editor: None,
+            editor_env: |k| std::env::var(k).ok(),
+            btw_inject: None,
+            url_opener: crate::chat::links::open_external,
             mouse_capture: false,
             keys: KeybindingsManager::defaults(),
             title,
@@ -1162,6 +1244,17 @@ impl App {
                 self.autocomplete.set_commands(commands);
             }
             AppEvent::CommandOutput(text) => self.push_system(text.clone()),
+            AppEvent::BtwAnswer { text, inject } => {
+                let key = self
+                    .keys
+                    .first_key("app.btw.inject")
+                    .map(|k| crate::keybindings::format_key_hint(&k, &self.theme));
+                self.push_system(btw_answer_display(text, inject, key.as_deref()));
+                self.btw_inject = Some(BtwInject {
+                    text: inject.clone(),
+                    sent: false,
+                });
+            }
             AppEvent::Notice { level, message } => {
                 let glyph = match level.as_str() {
                     "warning" => self.theme.symbol("status.warning"),
@@ -1171,6 +1264,8 @@ impl App {
                 self.push_system(format!("{glyph} {message}"));
             }
             AppEvent::SessionLoaded { messages, name } => {
+                // A steering prompt drafted for the old session never goes to this one.
+                self.btw_inject = None;
                 // The resumed history replaces the transcript; rows already
                 // in terminal scrollback stay, the history is appended below.
                 self.journal.clear();
@@ -1217,6 +1312,7 @@ impl App {
                 );
             }
             AppEvent::SessionReset => {
+                self.btw_inject = None;
                 self.journal.clear();
                 self.status.streaming = false;
                 self.messages.rebuild(&[]);
@@ -1336,6 +1432,7 @@ impl App {
                 }
             }
             Action::Status(text) => self.push_system(text),
+            Action::OpenLocalFile { name } => self.launch_local_file(&name, true, port),
             Action::SetModel { provider, id } => port.set_model(provider, id),
             Action::SetThinkingLevel(level) => port.set_thinking_level(level),
             Action::Slash { name, args } => port.run_slash(name, args),
@@ -1479,6 +1576,19 @@ impl App {
         // Pending extension dialogs own keys before the editor (ExtUi
         // contract): they render modally above the live region.
         if self.extension_ui.handle_key_at(key, port, now) {
+            return Some(true);
+        }
+
+        // `app.btw.inject` (Alt+I): send the latest /btw steering prompt; with
+        // nothing ready the key falls through (TS custom key handler).
+        if self.keys.matches_event(&key, "app.btw.inject") && self.inject_btw(port) {
+            return Some(true);
+        }
+
+        // `app.local.open` (Alt+G): the `/local` picker (TS input-controller;
+        // overlays and dialogs took the key above when open).
+        if self.keys.matches_event(&key, "app.local.open") {
+            self.open_local("", port);
             return Some(true);
         }
 
@@ -2087,6 +2197,8 @@ impl App {
             "model" | "switch" => self.slash_model(name, args, port),
             "effort" if args.is_empty() => self.open_thinking_selector(),
             "resume" => self.slash_resume(),
+            "local" => self.open_local(args, port),
+            "open" => self.slash_open(args),
             "tree" => self.open_tree_view(TreeMode::Tree, port),
             "theme" => self.slash_theme(args),
             // TS `/session` (bare or `info`) opens the session info panel;
@@ -2160,6 +2272,111 @@ impl App {
         overlay.set_thinking_levels(port.available_thinking_levels());
     }
 
+    /// `app.btw.inject` (TS btw-controller `#inject`): send the latest /btw
+    /// answer's `<inject>` block to the main session as the user, a steer
+    /// while the agent runs, else a new turn; never expanded as a command.
+    /// Sent once: returns `false` (the key falls through) when nothing is
+    /// ready to send.
+    fn inject_btw(&mut self, port: &impl RuntimePort) -> bool {
+        let Some(inject) = self.btw_inject.as_mut().filter(|i| !i.sent) else {
+            return false;
+        };
+        inject.sent = true;
+        let text = inject.text.clone();
+        self.queue_message(text, SubmitBehavior::Steer, port);
+        self.push_system(format!(
+            "{} {BTW_INJECTED_LABEL}",
+            self.theme.symbol("nav.selected")
+        ));
+        true
+    }
+
+    /// `/open [link|url]` (TS builtin-collaboration `open`, TUI-only): open
+    /// the last http(s) link of the latest assistant message that has one.
+    fn slash_open(&mut self, args: &str) {
+        let arg = args.trim().to_lowercase();
+        if !arg.is_empty() && arg != "link" && arg != "url" {
+            self.push_system("Usage: /open [link]  (pick a specific link: /copy link)".into());
+            return;
+        }
+        let link = self.messages.entries().iter().rev().find_map(|entry| {
+            let crate::chat::ChatKind::Assistant(msg) = &entry.kind else {
+                return None;
+            };
+            let text: String = msg
+                .segments
+                .iter()
+                .filter_map(|s| match s {
+                    crate::chat::messages::AssistantSegment::Text { text } => Some(text.as_str()),
+                    crate::chat::messages::AssistantSegment::Thinking { .. } => None,
+                })
+                .collect();
+            crate::chat::links::http_links(&text).pop()
+        });
+        let Some(link) = link else {
+            self.push_system("No link to open.".into());
+            return;
+        };
+        match (self.url_opener)(&link) {
+            Ok(()) => self.push_system(format!("Opening {link}")),
+            Err(e) => self.push_system(format!("Failed to open {link}: {e}")),
+        }
+    }
+
+    /// `/local [target]` and `app.local.open` (TS `openLocalFileInEditor`):
+    /// the picker over the session's `local://` files when `target` is
+    /// blank, else open `target` directly.
+    fn open_local(&mut self, target: &str, port: &impl RuntimePort) {
+        if editor_command(&self.editor_env).is_none() {
+            self.push_system(NO_EDITOR.into());
+            return;
+        }
+        if !target.trim().is_empty() {
+            self.launch_local_file(target, false, port);
+            return;
+        }
+        match port.local_files() {
+            Err(e) => self.push_system(format!("Failed to list local:// files: {e}")),
+            Ok(files) if files.is_empty() => {
+                self.push_system("No local:// files in this session yet.".into());
+            }
+            Ok(files) => self.overlays.open_local_files(files),
+        }
+    }
+
+    /// Validate a `local://` target through the port and queue the editor
+    /// launch for the controller, which hands it the terminal.
+    fn launch_local_file(&mut self, target: &str, picked: bool, port: &impl RuntimePort) {
+        let Some(command) = editor_command(&self.editor_env) else {
+            self.push_system(NO_EDITOR.into());
+            return;
+        };
+        match port.resolve_local_file(target, picked) {
+            Ok((url, path)) => self.pending_editor = Some(EditorLaunch { command, path, url }),
+            Err(e) => self.push_system(e),
+        }
+    }
+
+    /// The queued external-editor launch, once (the controller stops the
+    /// TUI, runs it and reports through [`Self::editor_closed`]).
+    pub fn take_editor_launch(&mut self) -> Option<EditorLaunch> {
+        self.pending_editor.take()
+    }
+
+    /// Report how an editor launch ended (TS `openLocalFileInEditor` tail):
+    /// `Ok(code)` is the editor's exit code, `Err` a spawn failure.
+    pub fn editor_closed(&mut self, launch: &EditorLaunch, result: Result<i32, String>) {
+        let text = match result {
+            Ok(0) => format!("Closed {} in editor.", launch.url),
+            Ok(code) => format!(
+                "Editor exited with code {code}; {} keeps whatever it saved.",
+                launch.url
+            ),
+            Err(e) => format!("Failed to open external editor: {e}"),
+        };
+        self.push_system(text);
+    }
+
     /// `/resume`: open the embedded session picker (overlays-b P0 #10); the
     /// pick resolves to `Action::ResumeSession` via the overlay drain.
     fn slash_resume(&mut self) {
@@ -2167,7 +2384,8 @@ impl App {
             self.push_system("session storage is not available in this session".into());
             return;
         }
-        self.overlays.open_sessions(&self.session_sources);
+        self.overlays
+            .open_sessions(&self.session_sources, &self.keys);
     }
 
     /// Live half of a persisted settings edit: apply what omp-rs can right
@@ -3021,6 +3239,186 @@ mod tests {
             "{notice}"
         );
         assert!(log(&port).is_empty(), "nothing was activated");
+    }
+
+    // ---- /open -----------------------------------------------------------
+
+    #[test]
+    fn slash_open_opens_the_last_assistant_link() {
+        let mut app = app();
+        let port = port();
+        app.url_opener = |url| {
+            if url.contains("fail") {
+                Err(std::io::Error::other("no opener"))
+            } else {
+                Ok(())
+            }
+        };
+        app.execute_slash("open", "", &port);
+        assert_eq!(last_system(&app), "No link to open.");
+        app.apply_event(&AppEvent::MessageEnd(json!({"message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "See https://a.dev/x and [b](https://b.dev/y)."}]
+        }})));
+        app.execute_slash("open", "", &port);
+        assert_eq!(last_system(&app), "Opening https://b.dev/y");
+        app.execute_slash("open", "url", &port);
+        assert_eq!(last_system(&app), "Opening https://b.dev/y");
+        app.execute_slash("open", "bogus", &port);
+        assert!(last_system(&app).starts_with("Usage: /open [link]"));
+        assert!(log(&port).is_empty(), "/open stays in the TUI");
+    }
+
+    // ---- app.btw.inject ----------------------------------------------------
+
+    #[test]
+    fn alt_i_sends_the_btw_inject_once_and_falls_through_otherwise() {
+        let mut app = app();
+        let port = port();
+        let alt_i = CtKeyEvent::new(CtKeyCode::Char('i'), CtMods::ALT);
+        // Nothing drafted: the key is not consumed by the inject path.
+        assert!(!app.inject_btw(&port));
+        app.apply_event(&AppEvent::BtwAnswer {
+            text: "btw: Sure.\n<inject>Fix the build first.</inject>\nDone.".into(),
+            inject: "Fix the build first.".into(),
+        });
+        let shown = last_system(&app);
+        assert!(shown.contains("┃ Fix the build first."), "{shown}");
+        assert!(shown.contains("Inject into main session"), "{shown}");
+        assert!(!shown.contains("<inject>"), "{shown}");
+        press(&mut app, &port, alt_i);
+        assert_eq!(
+            log(&port),
+            vec!["submit(None, \"Fix the build first.\", None)".to_string()]
+        );
+        assert!(last_system(&app).ends_with("Injected into main session"));
+        assert!(!app.inject_btw(&port), "sent once");
+        assert_eq!(log(&port).len(), 1);
+    }
+
+    #[test]
+    fn btw_inject_steers_while_streaming_and_resets_with_the_session() {
+        let mut app = app();
+        let port = port();
+        app.apply_event(&AppEvent::BtwAnswer {
+            text: "btw: <inject>Stop and rerun tests.</inject>".into(),
+            inject: "Stop and rerun tests.".into(),
+        });
+        start_streaming(&mut app);
+        assert!(app.inject_btw(&port));
+        assert_eq!(
+            log(&port),
+            vec!["submit(None, \"Stop and rerun tests.\", Some(Steer))".to_string()]
+        );
+        app.apply_event(&AppEvent::BtwAnswer {
+            text: "btw: <inject>Again.</inject>".into(),
+            inject: "Again.".into(),
+        });
+        app.apply_event(&AppEvent::SessionReset);
+        assert!(!app.inject_btw(&port));
+    }
+
+    #[test]
+    fn command_output_with_btw_inject_becomes_a_btw_answer() {
+        let event = crate::events::parse_frame(
+            &json!({"type":"command_output","text":"btw: <inject>x</inject>","btwInject":"x"}),
+        );
+        assert!(matches!(event, AppEvent::BtwAnswer { ref inject, .. } if inject == "x"));
+        let plain = crate::events::parse_frame(&json!({"type":"command_output","text":"hi"}));
+        assert!(matches!(plain, AppEvent::CommandOutput(ref t) if t == "hi"));
+    }
+
+    // ---- /local + app.local.open ----------------------------------------
+
+    fn local_file(name: &str, size: u64) -> crate::port::LocalFile {
+        crate::port::LocalFile {
+            name: name.into(),
+            size,
+        }
+    }
+
+    fn last_system(app: &App) -> String {
+        app.messages
+            .entries()
+            .iter()
+            .rev()
+            .find(|e| e.role == ChatRole::System)
+            .map(|e| e.text.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn editor_command_prefers_visual_then_editor() {
+        assert_eq!(
+            editor_command(&|k| (k == "EDITOR").then(|| " vi ".into())).as_deref(),
+            Some("vi")
+        );
+        assert_eq!(
+            editor_command(&|k| Some(if k == "VISUAL" { "code -w" } else { "vi" }.into()))
+                .as_deref(),
+            Some("code -w")
+        );
+        assert_eq!(
+            editor_command(&|k| (k == "VISUAL").then(|| "  ".into())),
+            cfg!(windows).then(|| "notepad".to_owned())
+        );
+    }
+
+    #[test]
+    fn alt_g_picks_a_local_file_and_queues_the_editor() {
+        let mut app = app();
+        app.editor_env = |k| (k == "EDITOR").then(|| "vi".into());
+        let port = port();
+        *port.local_files.lock() = vec![local_file("plan.md", 2048), local_file("notes.md", 3)];
+        assert!(press(
+            &mut app,
+            &port,
+            CtKeyEvent::new(CtKeyCode::Char('g'), CtMods::ALT)
+        ));
+        assert_eq!(app.overlays.open(), Some(OpenOverlay::LocalFiles));
+        press(&mut app, &port, key(CtKeyCode::Down));
+        press(&mut app, &port, key(CtKeyCode::Enter));
+        assert_eq!(app.overlays.open(), None);
+        assert!(log(&port).contains(&"resolve_local_file(\"notes.md\", picked=true)".to_string()));
+        let launch = app.take_editor_launch().expect("editor queued");
+        assert_eq!(launch.url, "local://notes.md");
+        assert_eq!(launch.command, "vi");
+        assert_eq!(launch.path, std::path::Path::new("/local/notes.md"));
+        assert_eq!(app.take_editor_launch(), None);
+        app.editor_closed(&launch, Ok(0));
+        assert_eq!(last_system(&app), "Closed local://notes.md in editor.");
+        app.editor_closed(&launch, Ok(3));
+        assert!(last_system(&app).starts_with("Editor exited with code 3;"));
+    }
+
+    #[test]
+    fn slash_local_opens_named_targets_and_reports_gaps() {
+        let mut app = app();
+        let port = port();
+        app.editor_env = |_| None;
+        app.execute_slash("local", "", &port);
+        if cfg!(windows) {
+            assert_ne!(last_system(&app), NO_EDITOR);
+        } else {
+            assert_eq!(last_system(&app), NO_EDITOR);
+        }
+        app.editor_env = |k| (k == "VISUAL").then(|| "nano".into());
+        app.execute_slash("local", "", &port);
+        assert_eq!(last_system(&app), "No local:// files in this session yet.");
+        assert_eq!(app.overlays.open(), None);
+        *port.local_files.lock() = vec![local_file("a.md", 1)];
+        app.execute_slash("local", "missing.md", &port);
+        assert_eq!(
+            last_system(&app),
+            "Local file not found: local://missing.md"
+        );
+        assert_eq!(app.take_editor_launch(), None);
+        app.execute_slash("local", "a.md", &port);
+        let launch = app.take_editor_launch().expect("direct open");
+        assert_eq!(
+            (launch.url.as_str(), launch.command.as_str()),
+            ("local://a.md", "nano")
+        );
     }
 
     // ---- submit pipeline -------------------------------------------------
