@@ -1827,27 +1827,23 @@ pub async fn run_with(
                 let weak_rt = weak_rt.clone();
                 Box::new(move |message: String| {
                     let Some(rt) = weak_rt.upgrade() else { return };
-                    if Some(rt.switch_generation()) != asked_in {
-                        rt.emit_notice(
-                            "warning",
-                            "ask_user_question answer dropped: the session changed while it was pending",
-                            Some("ask_user_question"),
-                        );
-                        return;
-                    }
+                    let Some(asked_in) = asked_in else { return };
                     tokio::spawn(async move {
-                        if let Err(e) = rt
-                            .prompt(None, &message, Some("followUp"), Vec::new())
-                            .await
-                        {
-                            rt.emit_notice(
+                        match rt.prompt_in_generation(asked_in, &message, Some("followUp")).await {
+                            Some(Err(e)) => rt.emit_notice(
                                 "warning",
                                 &format!(
                                     "ask_user_question answer was not delivered: {}",
                                     e.message
                                 ),
                                 Some("ask_user_question"),
-                            );
+                            ),
+                            Some(Ok(())) => {}
+                            None => rt.emit_notice(
+                                "warning",
+                                "ask_user_question answer dropped: the session changed while it was pending",
+                                Some("ask_user_question"),
+                            ),
                         }
                     });
                 })
