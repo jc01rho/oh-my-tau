@@ -477,11 +477,38 @@ struct MonitorWakes {
     handle: tokio::runtime::Handle,
 }
 
+/// Bytes of monitor wakes kept queued while the lane is held; older wakes are dropped past it.
+const HELD_WAKE_MAX_BYTES: usize = 64 * 1024;
+
+/// Keep held monitor wakes within [`HELD_WAKE_MAX_BYTES`]: whole older wakes go first (each wake is
+/// one complete `<system-reminder>` block, so a cut at a block start keeps every block intact), and
+/// a note says how many were dropped.
+fn cap_held_wakes(mut joined: String) -> String {
+    const BLOCK: &str = "\n<system-reminder>";
+    let mut dropped = 0usize;
+    while joined.len() > HELD_WAKE_MAX_BYTES {
+        let Some(at) = joined[1..].find(BLOCK).map(|i| i + 1) else {
+            break;
+        };
+        joined.drain(..=at);
+        dropped += 1;
+    }
+    if dropped == 0 {
+        return joined;
+    }
+    format!(
+        "<system-reminder>\n{dropped} earlier monitor wake(s) were dropped while the session was held.\n</system-reminder>\n{joined}"
+    )
+}
+
 impl crate::tools::monitor::WakeSink for MonitorWakes {
     fn deliver(&self, text: String) {
         let Some(rt) = self.rt.upgrade() else { return };
+        // Pinned now, while the hub's epoch check still holds: a session switch before the task
+        // runs makes it a stale wake that is dropped instead of landing in the new session.
+        let generation = rt.switch_generation();
         self.handle
-            .spawn(async move { rt.inject_monitor_wake(&text).await });
+            .spawn(async move { rt.inject_monitor_wake_in(generation, &text).await });
     }
 
     fn active(&self, count: usize) {
@@ -2386,13 +2413,27 @@ impl Runtime {
             Some(prev) if self.remove_queued(&prev, "followUp") => format!("{prev}\n{text}"),
             _ => text.to_owned(),
         };
+        let joined = cap_held_wakes(joined);
         self.follow_up(&joined);
         *pending = Some(joined);
     }
 
     /// Put a `monitor` wake into the next turn: queued behind a live run, or the start of a turn
     /// on an idle session. A held lane (`interrupt stop`) only queues it: a monitor never lifts a hold.
+    #[cfg(test)]
     pub async fn inject_monitor_wake(self: &Arc<Self>, text: &str) {
+        let generation = self.switch_generation();
+        self.inject_monitor_wake_in(generation, text).await;
+    }
+
+    /// [`Self::inject_monitor_wake`] for a wake raised in session generation `generation`: dropped
+    /// when the session was replaced since. The check and the admission run under the switch lock,
+    /// so a replacement cannot slip between them.
+    pub async fn inject_monitor_wake_in(self: &Arc<Self>, generation: u64, text: &str) {
+        let _serial = self.switch_serial.lock().await;
+        if self.switch_generation() != generation {
+            return;
+        }
         let retry_pending = lock(&self.retry_task)
             .as_ref()
             .is_some_and(|task| !task.is_finished());

@@ -1386,6 +1386,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wake_from_a_replaced_session_is_dropped() {
+        let h = harness(&[], fast_cfg(&[], 1, 1)).await;
+        let stale = h.rt.switch_generation().wrapping_sub(1);
+        h.rt.inject_monitor_wake_in(stale, "old session event")
+            .await;
+        assert_eq!(h.rt.queued_count(), 0, "nothing queued");
+        assert!(!h.rt.agent.is_streaming().await, "no turn started");
+    }
+
+    #[test]
+    fn held_wakes_are_capped_by_bytes_and_keep_whole_blocks() {
+        let block = |i: usize| {
+            format!(
+                "<system-reminder>\nevent {i} {}\n</system-reminder>",
+                "x".repeat(4000)
+            )
+        };
+        let joined = (0..40).map(block).collect::<Vec<_>>().join("\n");
+        assert!(joined.len() > crate::runtime::HELD_WAKE_MAX_BYTES);
+        let capped = crate::runtime::cap_held_wakes(joined);
+        assert!(
+            capped.len() <= crate::runtime::HELD_WAKE_MAX_BYTES + 200,
+            "{}",
+            capped.len()
+        );
+        assert!(capped.starts_with("<system-reminder>\n"), "a note leads");
+        assert!(capped.contains("earlier monitor wake(s) were dropped"));
+        assert!(capped.contains("event 39 "), "the newest wake is kept");
+        assert!(!capped.contains("event 0 "), "the oldest wake is dropped");
+        assert_eq!(
+            capped.matches("<system-reminder>").count(),
+            capped.matches("</system-reminder>").count(),
+            "every kept block is whole"
+        );
+    }
+
+    #[tokio::test]
     async fn a_removed_held_wake_is_not_restored() {
         let h = harness(&[], fast_cfg(&[], 1, 1)).await;
         h.rt.set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
