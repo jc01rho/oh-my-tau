@@ -76,6 +76,18 @@ async function hostWith(source: string): Promise<Core> {
 
 const REPLY = { replyText: "side answer", assistantMessage: { role: "assistant", content: [{ type: "text", text: "side answer" }], stopReason: "stop" } };
 
+/** The host's side-turn id on the request it just sent (echoed back on `ephemeral_delta`). */
+const streamOf = (params: Json) => params.streamId as number;
+
+/** Stream `deltas` to a running side turn, in order, then settle it with `replyText`. */
+async function streamReply(core: Core, params: Json, deltas: string[], replyText: string): Promise<Json> {
+  for (const delta of deltas) {
+    const r = await core.call("ephemeral_delta", { streamId: streamOf(params), delta });
+    if (r.error) throw new Error(`ephemeral_delta failed: ${r.error.message}`);
+  }
+  return { replyText, assistantMessage: { ...REPLY.assistantMessage, content: [{ type: "text", text: replyText }] } };
+}
+
 test("runEphemeralTurn forwards options to the core and returns EphemeralTurnResult", async () => {
   const core = await hostWith(`export default (pi) => pi.registerCommand("side", { handler: async (_a, ctx) => {
     const deltas = []; const usage = [];
@@ -83,12 +95,51 @@ test("runEphemeralTurn forwards options to the core and returns EphemeralTurnRes
       onTextDelta: (d) => void deltas.push(d), onUsage: (m) => void usage.push(m.stopReason) });
     return { r, deltas, usage };
   } });`);
+  // The reply reaches the caller through the deltas the core streams; this core streams none.
   core.answer.run_ephemeral_turn = () => REPLY;
   const r = await core.call("call_command", { name: "side", args: "" });
-  expect(r.result).toEqual({ r: REPLY, deltas: ["side answer"], usage: ["stop"] });
+  expect(r.result).toEqual({ r: REPLY, deltas: [], usage: ["stop"] });
   const req = core.requests.find((m) => m.method === "run_ephemeral_turn")!;
-  // Callbacks and the signal never cross the wire.
-  expect(req.params).toEqual({ promptText: "why?", maxTokens: 32, tools: false, history: [] });
+  // Callbacks and the signal never cross the wire: only their announcement does.
+  const { streamId, ...rest } = req.params;
+  expect(rest).toEqual({ promptText: "why?", maxTokens: 32, tools: false, history: [], usageCallback: true });
+  expect(typeof streamId).toBe("number");
+});
+
+test("runEphemeralTurn streams onTextDelta deltas as the core produces them", async () => {
+  const core = await hostWith(`export default (pi) => pi.registerCommand("side", { handler: async (_a, ctx) => {
+    const deltas = [];
+    const r = await ctx.runEphemeralTurn({ promptText: "q", onTextDelta: async (d) => { await Promise.resolve(); deltas.push(d); } });
+    return { reply: r.replyText, deltas };
+  } });`);
+  core.answer.run_ephemeral_turn = (params) => streamReply(core, params, ["Hel", "lo, ", "world"], "Hello, world");
+  const r = await core.call("call_command", { name: "side", args: "" });
+  expect(r.result).toEqual({ reply: "Hello, world", deltas: ["Hel", "lo, ", "world"] });
+});
+
+test("runEphemeralTurn rejects the side turn when onTextDelta throws", async () => {
+  const core = await hostWith(`export default (pi) => pi.registerCommand("side", { handler: async (_a, ctx) => {
+    const deltas = [];
+    const outcome = await ctx.runEphemeralTurn({ promptText: "q", onTextDelta: (d) => {
+      deltas.push(d);
+      if (d === "boom") throw new Error("callback exploded");
+    } }).then(() => "resolved", (e) => e.message);
+    return { outcome, deltas };
+  } });`);
+  // The core sees the rejected delivery and must not report a settled reply.
+  core.answer.run_ephemeral_turn = async (params) => streamReply(core, params, ["ok", "boom"], "unused");
+  const r = await core.call("call_command", { name: "side", args: "" });
+  expect(r.result.deltas).toEqual(["ok", "boom"]);
+  expect(r.result.outcome).toContain("ephemeral_delta failed");
+});
+
+test("ephemeral_delta for a side turn that is not running is refused", async () => {
+  const core = await hostWith(`export default (pi) => pi.registerCommand("side", { handler: async (_a, ctx) =>
+    ctx.runEphemeralTurn({ promptText: "q" }) });`);
+  core.answer.run_ephemeral_turn = () => REPLY;
+  await core.call("call_command", { name: "side", args: "" });
+  const r = await core.call("ephemeral_delta", { streamId: 999, delta: "late" });
+  expect(r.error.message).toBe("ephemeral_delta: no running side turn 999");
 });
 
 test("runEphemeralTurn rejects with the core's error instead of a silent reply", async () => {
@@ -127,7 +178,7 @@ test("runEphemeralTurn cannot be started from inside a side turn's callbacks", a
     } });
     return nested;
   } });`);
-  core.answer.run_ephemeral_turn = () => REPLY;
+  core.answer.run_ephemeral_turn = (params) => streamReply(core, params, ["x"], "x");
   const r = await core.call("call_command", { name: "side", args: "" });
   expect(r.result).toBe("runEphemeralTurn cannot start inside a running side turn");
   expect(core.requests.filter((m) => m.method === "run_ephemeral_turn")).toHaveLength(1);
