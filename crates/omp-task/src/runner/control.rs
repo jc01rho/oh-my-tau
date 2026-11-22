@@ -850,10 +850,11 @@ async fn drive_rpc(
     let mut rpc = RpcRun::default();
     let mut killed = false;
     let mut finishing_at: Option<Instant> = None;
+    let mut prompt_written = true;
     for frame in rpc.open(&spec.prompt, opts) {
-        send(&mut stdin, &frame).await;
+        prompt_written &= send(&mut stdin, &frame).await;
     }
-    if rpc.prompt_sent {
+    if rpc.prompt_sent && prompt_written {
         shared.prompt_sent.store(true, Ordering::SeqCst);
     }
     publish_session(shared, &rpc);
@@ -878,11 +879,12 @@ async fn drive_rpc(
         tokio::select! {
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
+                    let mut wrote_all = true;
                     for frame in rpc.on_line(&line) {
-                        send(&mut stdin, &frame).await;
+                        wrote_all &= send(&mut stdin, &frame).await;
                     }
                     publish_session(shared, &rpc);
-                    if rpc.prompt_sent {
+                    if rpc.prompt_sent && wrote_all {
                         shared.prompt_sent.store(true, Ordering::SeqCst);
                         if !rpc.finishing {
                             for (message, ack) in held.drain(..) {

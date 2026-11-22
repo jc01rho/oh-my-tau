@@ -212,6 +212,36 @@ async fn reopen_deadline_kills_a_child_that_never_answers_the_switch() {
     assert_eq!(runner.available_permits(), 1, "permit released");
 }
 
+/// A resumed run whose prompt frame never reaches the child (stdin closed
+/// right after the reopen answer) must not report the prompt as sent: the
+/// registry keeps the task's completed result instead of failing it.
+#[tokio::test]
+async fn a_prompt_that_never_reached_the_child_is_not_reported_sent() {
+    let _env = ENV_LOCK.lock().await;
+    set_finishing_deadline("15000");
+    std::env::set_var("OMP_TASK_TEST_REOPEN_DEADLINE_MS", "15000");
+    let dir = tempfile::tempdir().unwrap();
+    let bin = fake_binary(
+        dir.path(),
+        r#"read -r switch
+exec 0<&-
+echo '{"type":"response","command":"switch_session","success":true,"data":{"cancelled":false}}'
+sleep 1"#,
+    );
+    let runner = TaskRunner::new(&bin, 1);
+    let opts = omp_task::StartOptions {
+        resume_session: Some(dir.path().join("old.jsonl")),
+        ..omp_task::StartOptions::default()
+    };
+    let (control, join) = runner.start_with(spec("again", dir.path()), ChildMode::Rpc, opts);
+    let out = tokio::time::timeout(Duration::from_secs(30), join)
+        .await
+        .expect("run settles");
+    std::env::remove_var("OMP_TASK_TEST_REOPEN_DEADLINE_MS");
+    assert_eq!(out.status, RunStatus::Failed, "{out:?}");
+    assert!(!control.prompt_sent(), "the prompt never went out");
+}
+
 /// Finding 4 (steer receipt): a steer sent while the prompt is still running
 /// is acknowledged once written; once the prompt settled (Finishing), the
 /// receipt reports failure instead of a silently dropped message.
