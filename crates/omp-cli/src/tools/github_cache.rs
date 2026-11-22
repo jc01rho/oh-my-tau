@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! SQLite cache for rendered `github` issue/PR/MR view output, plus the
 //! cache-aware lookup wrapper the `github` tool shares with the `issue://` /
 //! `pr://` / `mr://` internal-URL handlers.
@@ -1523,7 +1524,7 @@ mod tests {
         // Same snapshot again: same id, retention clock restarted.
         assert_eq!(retain_cached_generation(&input), Some(1_000));
         // A different snapshot on the same millisecond gets the next id.
-        let mut other = input.clone();
+        let mut other = input;
         other.rendered = "different".to_string();
         assert_eq!(retain_cached_generation(&other), Some(1_001));
 

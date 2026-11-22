@@ -1,3 +1,4 @@
+#![allow(dead_code, clippy::too_many_arguments)]
 //! Rollover plumbing for omp's experimental context management: the turn-local
 //! `new_context` request consumer, the rollover-only compaction entry, and the
 //! notebook reminder.

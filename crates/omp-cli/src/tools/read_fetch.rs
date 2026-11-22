@@ -708,17 +708,15 @@ fn handle_tag(out: &mut String, raw_tag: &str, state: &mut MdState) {
                 out.push('[');
             }
         }
-        "img" => {
-            if !closing {
-                let alt = attr(attrs, "alt").unwrap_or_default();
-                let src = attr(attrs, "src").unwrap_or_default();
-                if !src.is_empty() {
-                    out.push_str("![");
-                    out.push_str(&alt);
-                    out.push_str("](");
-                    out.push_str(&src);
-                    out.push(')');
-                }
+        "img" if !closing => {
+            let alt = attr(attrs, "alt").unwrap_or_default();
+            let src = attr(attrs, "src").unwrap_or_default();
+            if !src.is_empty() {
+                out.push_str("![");
+                out.push_str(&alt);
+                out.push_str("](");
+                out.push_str(&src);
+                out.push(')');
             }
         }
         _ => {}

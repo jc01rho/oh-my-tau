@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Security scan coordinator: the concrete [`SecurityScanBackend`] behind the
 //! `security_scan` tool, the canonical `security://` findings store, and the
 //! `/security` slash command.
@@ -851,7 +852,7 @@ impl SecurityCoordinator {
         );
 
         let plan = ScanPlan {
-            plan_id: plan_id.clone(),
+            plan_id,
             created_at,
             target_kind,
             include_paths,
@@ -918,7 +919,7 @@ impl SecurityCoordinator {
             ])
         );
         let op = Operation {
-            operation_id: operation_id.clone(),
+            operation_id,
             plan_id: plan_id.to_string(),
             state: "queued".to_string(),
             started_at,
@@ -1081,7 +1082,7 @@ impl SecurityCoordinator {
             .unwrap_or(now);
 
         let config = CloudConfiguration {
-            configuration_id: configuration_id.clone(),
+            configuration_id,
             repository_id: repository_id.to_string(),
             repository_url: Some(repository_url.to_string()),
             environment_id: Some(environment_id.to_string()),

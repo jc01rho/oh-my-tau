@@ -220,6 +220,7 @@ impl<'a> RecallEngine<'a> {
         Ok(fuse(voices, bounds))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_store(
         &self,
         store: &BankStore,

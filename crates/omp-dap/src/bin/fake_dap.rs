@@ -175,7 +175,7 @@ impl Server {
                     {
                         "id": 1,
                         "name": "main",
-                        "source": source.clone(),
+                        "source": source,
                         "line": line,
                         "column": 1,
                     },

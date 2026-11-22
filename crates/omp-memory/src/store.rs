@@ -394,7 +394,7 @@ impl BankStore {
             params![id, content, importance.map(|value| value.clamp(0.0, 1.0))],
         )?;
         if changed == 0 {
-            return Ok(ineligible(&transaction, id)?);
+            return ineligible(&transaction, id);
         }
         transaction.execute("DELETE FROM memory_embeddings WHERE memory_id = ?1", [id])?;
         transaction.execute(
@@ -418,7 +418,7 @@ impl BankStore {
         }
         let changed = transaction.execute("DELETE FROM working_memory WHERE id = ?1", [id])?;
         if changed == 0 {
-            return Ok(ineligible(&transaction, id)?);
+            return ineligible(&transaction, id);
         }
         transaction.execute("DELETE FROM memory_embeddings WHERE memory_id = ?1", [id])?;
         transaction.execute(
@@ -1389,6 +1389,7 @@ fn decode_vector(bytes: &[u8], dimensions: usize) -> Option<Vec<f32>> {
         return None;
     }
     let mut vector = Vec::with_capacity(dimensions);
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for chunk in bytes.chunks_exact(size_of::<f32>()) {
         let mut raw = [0u8; 4];
         raw.copy_from_slice(chunk);

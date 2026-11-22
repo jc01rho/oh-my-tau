@@ -249,6 +249,7 @@ pub struct EditOutcome {
 /// listing, or one record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum MemoryProjection {
     /// Scheme root summary.
     Root {

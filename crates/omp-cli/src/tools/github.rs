@@ -1,3 +1,4 @@
+#![allow(dead_code, clippy::question_mark)]
 //! `github`: omp's `gh` op wrapper — repos/files, pull requests, search,
 //! checkout, push, and Actions watch.
 //!
@@ -2594,10 +2595,7 @@ async fn file_read(
         bail!("path must be repository-relative");
     }
     let branch = normalize_optional_string(params.branch.as_deref());
-    let endpoint_path: Vec<String> = file_path
-        .split('/')
-        .map(|segment| urlencode_segment(segment))
-        .collect();
+    let endpoint_path: Vec<String> = file_path.split('/').map(urlencode_segment).collect();
     let endpoint_path = endpoint_path.join("/");
     let reference = parse_repo_ref(&repo);
     let mut args = vec!["api".to_string()];

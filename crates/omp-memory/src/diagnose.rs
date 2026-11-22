@@ -211,12 +211,8 @@ mod tests {
         let root = temp_root("remove");
         fs::create_dir_all(&root).expect("root");
         let path = root.join("mnemopi.db");
-        let store = BankStore::open(
-            &path,
-            BankId::configured("test").expect("bank"),
-            root.clone(),
-        )
-        .expect("store");
+        let store =
+            BankStore::open(&path, BankId::configured("test").expect("bank"), root).expect("store");
         store
             .save(NewMemory {
                 content: "row",

@@ -131,7 +131,7 @@ mod tests {
     fn never_cancel_never_cancels() {
         let cancel = NeverCancel;
         assert!(!cancel.is_cancelled());
-        let _ = cancel.cancelled();
+        drop(cancel.cancelled());
     }
 
     #[test]

@@ -617,8 +617,8 @@ pub fn is_auto_qa_enabled(settings: Option<&AutoQaSettings>) -> bool {
 /// Return values:
 ///   - `Some(true)`  — user agreed; record + ship for this run and persist.
 ///   - `Some(false)` — user declined; suppress for this run and persist.
-///   - `None`        — user dismissed the dialog without picking an option. The
-///                     decision is not cached, so the next invocation re-prompts.
+///   - `None` — user dismissed the dialog without picking an option. The
+///     decision is not cached, so the next invocation re-prompts.
 pub type ConsentFuture = Pin<Box<dyn Future<Output = Option<bool>> + Send>>;
 /// Handler wired by an interactive host (Yes/No popup).
 pub type ConsentHandler = Arc<dyn Fn() -> ConsentFuture + Send + Sync>;
@@ -1141,8 +1141,7 @@ fn mark_pushed(db: &Mutex<Connection>, ids: &[i64]) {
     if ids.is_empty() {
         return;
     }
-    let placeholders = std::iter::repeat("?")
-        .take(ids.len())
+    let placeholders = std::iter::repeat_n("?", ids.len())
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("UPDATE grievances SET pushed = 1 WHERE id IN ({placeholders})");

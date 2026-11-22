@@ -748,10 +748,10 @@ pub async fn compact_now(
         }
     }
     let mut data = json!({
-        "summary": result.summary.clone(),
-        "firstKeptEntryId": result.first_kept_entry_id.clone(),
+        "summary": result.summary,
+        "firstKeptEntryId": result.first_kept_entry_id,
         "tokensBefore": result.tokens_before,
-        "details": result.details.clone(),
+        "details": result.details,
     });
     if handoff_document.is_none() {
         data["shortSummary"] = json!(result.short_summary);

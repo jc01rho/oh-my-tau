@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! The `security_scan` tool (omp `SecurityScanTool`): OMP-native repository
 //! security scans — plan, start, inspect, cancel, validate, plus the Codex
 //! Security cloud actions.

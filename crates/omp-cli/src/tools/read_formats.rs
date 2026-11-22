@@ -688,7 +688,7 @@ fn table_master_sql(conn: &rusqlite::Connection, table: &str) -> Result<String> 
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name = ?",
     )?;
     let params: [&dyn rusqlite::ToSql; 1] = [&table];
-    let mut rows = stmt.query(&params)?;
+    let mut rows = stmt.query(params)?;
     let Some(row) = rows.next()? else {
         bail!("SQLite table '{table}' not found");
     };
@@ -827,12 +827,12 @@ pub fn build_ascii_table(columns: &[String], rows: &[Vec<String>]) -> String {
         })
         .collect();
     for row in rows {
-        for index in 0..columns.len() {
+        for (index, width_slot) in widths.iter_mut().enumerate().take(columns.len()) {
             let width = sanitize_cell(row.get(index).map_or("", String::as_str))
                 .chars()
                 .count()
                 .min(MAX_COLUMN_WIDTH);
-            widths[index] = widths[index].max(width);
+            *width_slot = (*width_slot).max(width);
         }
     }
 
@@ -1051,7 +1051,7 @@ pub fn sqlite_read(path: &Path, sub_path: &str, query_string: &str) -> Result<St
                 "SELECT * FROM {} WHERE {} = ? LIMIT 1",
                 quote_ident(&table),
                 if column.starts_with('"') {
-                    column.clone()
+                    column
                 } else {
                     quote_ident(&column)
                 }
@@ -1650,10 +1650,7 @@ pub fn parse_json_selector(query_string: &str) -> Option<JsonSelector> {
         (None, None) => None,
         (offset, limit) => Some(JsonPage {
             offset: offset.unwrap_or(0),
-            limit: limit
-                .unwrap_or(DEFAULT_JSON_LIMIT)
-                .min(MAX_JSON_LIMIT)
-                .max(1),
+            limit: limit.unwrap_or(DEFAULT_JSON_LIMIT).clamp(1, MAX_JSON_LIMIT),
         }),
     };
     Some(JsonSelector {
@@ -1792,7 +1789,7 @@ fn apply_steps(steps: &[PathStep], value: &Value) -> Result<Vec<Value>> {
                         bail!(
                             "cannot slice {} with [:{}]",
                             json_type(value),
-                            to.map_or(0, |v| v)
+                            to.unwrap_or(0)
                         );
                     };
                     let len = isize::try_from(array.len()).unwrap_or(isize::MAX);
@@ -2658,12 +2655,10 @@ fn pdf_extract_text(content: &[u8]) -> String {
                         }
                         in_text = false;
                     }
-                    b"T*" | b"Td" | b"TD" => {
-                        if in_text && !line.trim().is_empty() {
-                            out.push_str(line.trim_end());
-                            out.push('\n');
-                            line.clear();
-                        }
+                    b"T*" | b"Td" | b"TD" if in_text && !line.trim().is_empty() => {
+                        out.push_str(line.trim_end());
+                        out.push('\n');
+                        line.clear();
                     }
                     _ => {}
                 }

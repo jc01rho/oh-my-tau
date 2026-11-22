@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! `generate_image`: omp's image generation tool
 //! (`pi-coding-agent/src/tools/image-gen.ts`).
 //!
@@ -9,8 +10,8 @@
 //!
 //! Three transports cover the image-generation APIs the catalog names:
 //!
-//! * `openai-images`     - `POST {base}/images/generations`, or `/images/edits` (multipart) when
-//!                         reference images are supplied.
+//! * `openai-images` - `POST {base}/images/generations`, or `/images/edits` (multipart) when
+//!   reference images are supplied.
 //! * `openrouter-images` - `POST {base}/images/generations` with `input_references`.
 //! * `google-generative-ai` - `POST {base}/models/{id}:generateContent` with `IMAGE` modality.
 //!

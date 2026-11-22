@@ -1,3 +1,4 @@
+#![allow(dead_code, clippy::manual_noop_waker)]
 //! `retain`, `recall`, `reflect`, `memory_edit`, `learn`, `manage_skill`:
 //! omp's memory and self-improvement tools (`packages/coding-agent/src/tools/
 //! memory-*.ts`, `learn.ts`, `manage-skill.ts`).
@@ -882,7 +883,7 @@ fn yaml_quote(value: &str) -> String {
 
 /// Everything a memory tool needs, resolved once at construction.
 #[derive(Clone)]
-struct ToolContext {
+pub(crate) struct ToolContext {
     cwd: PathBuf,
     backend: Arc<dyn MemoryToolBackend>,
     skills: Arc<SkillStore>,
@@ -2154,7 +2155,7 @@ mod tests {
             .insert(memory("mem_a", "release tag workflow uses vX.Y.Z-seq", 0.5));
         h.backend
             .insert(memory("mem_b", "release notes are written in Korean", 0.5));
-        let tool = RecallTool::new(h.ctx.clone());
+        let tool = RecallTool::new(h.ctx);
         let out = tool.run(&json!({"query": "release tag workflow"})).unwrap();
         let text = text_of(&out);
         assert!(
@@ -2173,7 +2174,7 @@ mod tests {
         let h = harness();
         let long = "x".repeat(900);
         h.backend.insert(memory("mem_long", &long, 0.5));
-        let tool = RecallTool::new(h.ctx.clone());
+        let tool = RecallTool::new(h.ctx);
         let out = tool.run(&json!({"query": "xxx"})).unwrap();
         let text = text_of(&out);
         let preview = text.split("[mem_long] ").nth(1).unwrap();
@@ -2197,7 +2198,7 @@ mod tests {
                 0.5,
             ));
         }
-        let tool = RecallTool::new(h.ctx.clone());
+        let tool = RecallTool::new(h.ctx);
         let out = tool
             .run(&json!({"query": "budget filler", "token_budget": 100}))
             .unwrap();
@@ -2211,7 +2212,7 @@ mod tests {
     #[test]
     fn recall_says_so_when_nothing_matches() {
         let h = harness();
-        let tool = RecallTool::new(h.ctx.clone());
+        let tool = RecallTool::new(h.ctx);
         let out = tool.run(&json!({"query": "unheard of topic"})).unwrap();
         assert_eq!(text_of(&out), "No relevant memories found.");
         assert_eq!(out.details, json!({}));
@@ -2220,7 +2221,7 @@ mod tests {
     #[test]
     fn recall_rejects_a_blank_query() {
         let h = harness();
-        let tool = RecallTool::new(h.ctx.clone());
+        let tool = RecallTool::new(h.ctx);
         assert!(tool.run(&json!({"query": "  "})).is_err());
     }
 
@@ -2242,7 +2243,7 @@ mod tests {
         let h = harness();
         h.backend
             .insert(memory("mem_q", "the answer is forty two", 0.5));
-        let tool = ReflectTool::new(h.ctx.clone());
+        let tool = ReflectTool::new(h.ctx);
         let out = tool
             .run(&json!({"query": "what is the answer?", "context": "forty two"}))
             .unwrap();
@@ -2254,7 +2255,7 @@ mod tests {
     #[test]
     fn reflect_says_so_when_memory_is_empty() {
         let h = harness();
-        let tool = ReflectTool::new(h.ctx.clone());
+        let tool = ReflectTool::new(h.ctx);
         let out = tool.run(&json!({"query": "anything at all"})).unwrap();
         assert_eq!(
             text_of(&out),
@@ -2293,7 +2294,7 @@ mod tests {
     fn memory_edit_update_needs_content_or_importance() {
         let h = harness();
         h.backend.insert(memory("mem_u", "old text", 0.2));
-        let tool = MemoryEditTool::new(h.ctx.clone());
+        let tool = MemoryEditTool::new(h.ctx);
         let err = tool
             .run(&json!({"op": "update", "id": "mem_u"}))
             .unwrap_err()
@@ -2333,7 +2334,7 @@ mod tests {
         let h = harness();
         h.backend.insert(memory("mem_d", "dead", 0.5));
         h.backend.forget("mem_d").unwrap();
-        let tool = MemoryEditTool::new(h.ctx.clone());
+        let tool = MemoryEditTool::new(h.ctx);
 
         let missing = tool.run(&json!({"op": "forget", "id": "mem_zzz"})).unwrap();
         assert_eq!(text_of(&missing), "Memory mem_zzz was not found.");
@@ -2423,7 +2424,7 @@ mod tests {
     #[test]
     fn learn_rejects_an_empty_lesson_and_a_delete_skill_action() {
         let h = harness();
-        let tool = LearnTool::new(h.ctx.clone());
+        let tool = LearnTool::new(h.ctx);
         assert!(tool
             .run(&json!({"memory": "<memories>x</memories>"}))
             .is_err());
@@ -2477,7 +2478,7 @@ mod tests {
     #[test]
     fn manage_skill_requires_description_and_body_outside_delete() {
         let h = harness();
-        let tool = ManageSkillTool::new(h.ctx.clone());
+        let tool = ManageSkillTool::new(h.ctx);
         let err = tool
             .run(&json!({"action": "create", "name": "x", "description": "d"}))
             .unwrap_err()
@@ -2495,7 +2496,7 @@ mod tests {
     #[test]
     fn manage_skill_rejects_unsafe_names() {
         let h = harness();
-        let tool = ManageSkillTool::new(h.ctx.clone());
+        let tool = ManageSkillTool::new(h.ctx);
         // Names are lowercased and space-folded before the allowlist runs, so
         // only characters outside the allowlist are rejected.
         for name in [
@@ -2518,7 +2519,7 @@ mod tests {
     #[test]
     fn manage_skill_create_twice_is_an_error_and_update_of_a_missing_skill_too() {
         let h = harness();
-        let tool = ManageSkillTool::new(h.ctx.clone());
+        let tool = ManageSkillTool::new(h.ctx);
         let args = json!({
             "action": "create",
             "name": "dup",
@@ -2597,7 +2598,7 @@ mod tests {
         std::fs::create_dir_all(h.skills.managed_root()).unwrap();
         std::os::unix::fs::symlink(&outside, h.skills.managed_root().join("linked")).unwrap();
 
-        let tool = ManageSkillTool::new(h.ctx.clone());
+        let tool = ManageSkillTool::new(h.ctx);
         let err = tool
             .run(&json!({"action": "delete", "name": "linked"}))
             .unwrap_err()
@@ -2756,7 +2757,7 @@ mod tests {
         assert_eq!(ReflectTool::new(h.ctx.clone()).label(), "Reflect");
         assert_eq!(MemoryEditTool::new(h.ctx.clone()).label(), "Memory Edit");
         assert_eq!(LearnTool::new(h.ctx.clone()).label(), "Learn");
-        assert_eq!(ManageSkillTool::new(h.ctx.clone()).label(), "Manage Skill");
+        assert_eq!(ManageSkillTool::new(h.ctx).label(), "Manage Skill");
     }
 
     #[test]

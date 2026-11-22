@@ -1,3 +1,4 @@
+#![allow(dead_code, clippy::assertions_on_constants)]
 //! `context_notes` / `new_context`: omp's opt-in experimental context pair,
 //! ported from coding-agent `src/tools/context-notes.ts` and
 //! `src/session/context-notes.ts`.

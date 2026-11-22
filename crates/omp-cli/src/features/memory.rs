@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! `/memory` slash command backend.
 //!
 //! The slash entry point is deliberately thin: [`handle_memory_command`] parses

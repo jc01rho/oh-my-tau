@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Rule discovery and bucketing, ported from omp's `capability/rule.ts`,
 //! `capability/rule-buckets.ts`, and the rule half of `discovery/builtin.ts`.
 //!

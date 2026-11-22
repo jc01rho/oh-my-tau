@@ -1,3 +1,4 @@
+#![allow(dead_code, clippy::unnecessary_sort_by)]
 //! System prompt assembly, ported from omp's `system-prompt.ts` +
 //! `prompts/system/*.md`: base prompt selection (user/project `SYSTEM.md`
 //! override, `--system-prompt`/`--append-system-prompt` flags), project

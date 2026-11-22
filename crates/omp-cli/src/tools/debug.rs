@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! `debug`: Debug Adapter Protocol access. Port of omp `tools/debug.ts`:
 //! launch/attach, source/function/instruction/data breakpoints, stepping,
 //! evaluation, stack/scope/variable inspection, disassembly, memory access,

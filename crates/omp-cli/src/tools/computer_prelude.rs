@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! `computer`: omp's desktop-control eval prelude (`tools/computer.ts`,
 //! `tools/computer/prelude.{js,py}`, `tools/computer/call.ts`).
 //!

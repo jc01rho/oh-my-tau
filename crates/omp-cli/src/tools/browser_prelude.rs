@@ -1,3 +1,4 @@
+#![allow(dead_code, clippy::wrong_self_convention)]
 //! `browser`: omp's browser-control eval prelude (`tools/browser.ts`,
 //! `tools/browser/prelude.{js,py}`, `tools/browser/prelude-definition.ts`).
 //!

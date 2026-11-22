@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Vibe mode tools (`/vibe`): the director's entire non-read surface.
 //!
 //! Ported from omp's `packages/coding-agent/src/tools/vibe.ts` and its
@@ -1462,7 +1463,7 @@ impl VibeSpawnTool {
         insert_detail(
             &mut details,
             "spawned",
-            json!({"id": outcome.id.clone(), "cli": cli.as_str(), "jobId": outcome.job_id.clone()}),
+            json!({"id": outcome.id, "cli": cli.as_str(), "jobId": outcome.job_id}),
         );
         Ok(text_result(
             format!(
