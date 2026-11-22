@@ -5881,9 +5881,6 @@ mod ultra_tests {
         assert_eq!(parse_ultra_name("max"), None);
     }
 
-    /// Mode transitions run against the process-wide plan state, so the mode tests take turns.
-    static MODE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     fn bun_on_path() -> bool {
         std::env::var_os("PATH")
             .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("bun").is_file()))
@@ -5937,7 +5934,8 @@ mod ultra_tests {
     /// reported state as `previous`; a transition that moves nothing reports nothing.
     #[tokio::test]
     async fn mode_changed_reports_plan_enter_and_exit() {
-        let _guard = MODE_LOCK.lock().await;
+        // Plan state is process-wide: take the same lock as the plan tests.
+        let _guard = crate::features::plan::TEST_LOCK.lock().await;
         let Some((host, mut rx)) = mode_host().await else {
             return;
         };

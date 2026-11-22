@@ -314,6 +314,11 @@ pub fn resolve_review(
     true
 }
 
+/// Plan state is process-wide (`is_any_plan_active` looks at every session, `cancel_reviews` touches
+/// every session), so every test that enters plan mode or opens a review takes this lock.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 static PLAN_STATE: OnceLock<Mutex<HashMap<String, PlanSessionState>>> = OnceLock::new();
 
 fn state() -> &'static Mutex<HashMap<String, PlanSessionState>> {
@@ -660,9 +665,6 @@ mod review_tests {
         }
     }
 
-    /// `cancel_reviews` touches every session, so the review tests run one at a time.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
     fn open(rec: &Recorder, session: &str, plan: &str) -> PlanReviewRequest {
         set_session(session, true, "task");
         let request = review_request(session, plan);
@@ -672,9 +674,7 @@ mod review_tests {
 
     #[test]
     fn requested_payload_matches_ts_shape() {
-        let _g = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_LOCK.blocking_lock();
         let rec = Recorder::default();
         let req = open(&rec, "pr-shape", "intro\n# Migrate the auth layer\n- step");
         let events = rec.take();
@@ -728,9 +728,7 @@ mod review_tests {
 
     #[test]
     fn local_approve_and_off_resolve_locally() {
-        let _g = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_LOCK.blocking_lock();
         let rec = Recorder::default();
         let req = open(&rec, "pr-local", "# A");
         rec.take();
@@ -766,9 +764,7 @@ mod review_tests {
 
     #[test]
     fn replacing_review_and_cancel_close_unanswered() {
-        let _g = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_LOCK.blocking_lock();
         let rec = Recorder::default();
         let first = open(&rec, "pr-replace", "# One");
         let second = open(&rec, "pr-replace", "# Two");
@@ -790,9 +786,7 @@ mod review_tests {
 
     #[test]
     fn extension_answers_follow_resolve_plan_review_rules() {
-        let _g = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = TEST_LOCK.blocking_lock();
         let rec = Recorder::default();
         let req = open(&rec, "pr-ext", "# Ext");
         let id = req.review_id.as_str();
@@ -896,6 +890,7 @@ mod tests {
     /// `inactive` for any other, so a restored or switched-to session reports its own modes.
     #[test]
     fn plan_mode_is_reported_per_session() {
+        let _g = TEST_LOCK.blocking_lock();
         set_session("modes-test-entered", true, "");
         assert!(is_active("modes-test-entered"));
         assert!(!is_active("modes-test-other"));
