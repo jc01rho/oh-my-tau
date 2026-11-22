@@ -1365,6 +1365,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn held_monitor_wakes_coalesce_and_join_the_next_turn() {
+        let mut h = harness(&[Ok("noted")], fast_cfg(&[], 1, 1)).await;
+        h.rt.set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        h.rt.pause_for_stop().await.unwrap();
+        h.rt.inject_monitor_wake("wake A").await;
+        h.rt.inject_monitor_wake("wake B").await;
+        assert_eq!(h.rt.queued_count(), 1, "held wakes share one queue entry");
+        h.rt.release_pause("test");
+        h.rt.inject_monitor_wake("wake C").await;
+        until_settled(&mut h.rx).await;
+        let entries = session_entries(&h.session_file)
+            .iter()
+            .map(Value::to_string)
+            .collect::<String>();
+        for wake in ["wake A", "wake B", "wake C"] {
+            assert!(entries.contains(wake), "{wake} reached the turn");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_removed_held_wake_is_not_restored() {
+        let h = harness(&[], fast_cfg(&[], 1, 1)).await;
+        h.rt.set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        h.rt.pause_for_stop().await.unwrap();
+        h.rt.inject_monitor_wake("wake A").await;
+        assert!(h.rt.remove_queued("wake A", "followUp"));
+        h.rt.inject_monitor_wake("wake B").await;
+        let (_, follow) = h.rt.queued();
+        assert_eq!(follow, vec!["wake B".to_string()]);
+    }
+
+    #[tokio::test]
     async fn retry_saga_with_fallback_switch_orders_frames_and_entries() {
         let mut h = harness(
             &[

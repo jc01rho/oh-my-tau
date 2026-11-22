@@ -2381,14 +2381,11 @@ impl Runtime {
     /// entry.
     fn queue_monitor_wake(&self, text: &str) {
         let mut pending = lock(&self.monitor_wake);
-        let earlier = pending.take();
-        let joined = earlier
-            .as_deref()
-            .map_or_else(|| text.to_owned(), |prev| format!("{prev}\n{text}"));
-        if let Some(prev) = earlier {
-            // Queued batches read as one message: drop the superseded entry.
-            self.remove_queued(&prev, "followUp");
-        }
+        let joined = match pending.take() {
+            // Only a still-queued wake is folded in: one the user removed stays removed.
+            Some(prev) if self.remove_queued(&prev, "followUp") => format!("{prev}\n{text}"),
+            _ => text.to_owned(),
+        };
         self.follow_up(&joined);
         *pending = Some(joined);
     }
@@ -2405,10 +2402,13 @@ impl Runtime {
             self.queue_monitor_wake(text);
             return;
         }
-        if let Some(prev) = lock(&self.monitor_wake).take() {
-            // The turn about to start carries its own wake; a queued one would repeat it.
-            self.remove_queued(&prev, "followUp");
-        }
+        // A wake still queued behind the hold joins this turn, so it is not lost when the turn starts.
+        let pending = lock(&self.monitor_wake).take();
+        let text = match pending {
+            Some(prev) if self.remove_queued(&prev, "followUp") => format!("{prev}\n{text}"),
+            _ => text.to_owned(),
+        };
+        let text = text.as_str();
         if let Err(e) = self.prompt(None, text, Some("followUp"), Vec::new()).await {
             eprintln!(
                 "omt: monitor wake could not start a turn, queued instead: {}",
