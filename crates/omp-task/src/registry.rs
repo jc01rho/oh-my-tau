@@ -191,6 +191,11 @@ pub struct TaskRecord {
     pub owner_pid: u32,
     #[serde(default)]
     pub spawn: SpawnRecord,
+    /// The engine structure that owns this task (a workpool id): it takes
+    /// the task's results itself, so the parent gets no per-run
+    /// notification and a settled run never counts as an open child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// A record plus what the live run adds to it.
@@ -254,7 +259,7 @@ impl TaskView {
             return true;
         }
         let record = &self.record;
-        if record.dismissed {
+        if record.dismissed || record.owner.is_some() {
             return false;
         }
         match record.status {
@@ -285,6 +290,7 @@ impl TaskView {
     pub fn notification_pending(&self) -> bool {
         !self.live
             && !self.record.dismissed
+            && self.record.owner.is_none()
             && self.record.status.notifies()
             && self.record.notified_epoch < self.record.run_epoch
     }
@@ -308,6 +314,8 @@ pub struct SpawnRequest {
     pub root_session_id: String,
     /// Extra child environment, kept for revivals.
     pub env: Vec<(String, String)>,
+    /// See [`TaskRecord::owner`].
+    pub owner: Option<String>,
 }
 
 /// Result of resolving a task id or name for a caller.
@@ -529,6 +537,7 @@ impl SubagentRegistry {
             parent_session_id,
             root_session_id,
             env,
+            owner,
         } = request;
         let now = now_ms();
         let mut entries = self.lock();
@@ -585,6 +594,7 @@ impl SubagentRegistry {
                 schema_mode: spec.schema_mode,
                 model_route: spec.model_route.clone(),
             },
+            owner,
         };
         // A task the store cannot record could never be reconciled after a
         // restart: refuse it before anything starts.
@@ -797,6 +807,15 @@ impl SubagentRegistry {
                 view,
             },
         }
+    }
+
+    /// Revive a completed task with `message` as its next prompt, without a
+    /// caller scope: the engine structure that owns the task drives it.
+    ///
+    /// # Errors
+    /// The task is unknown, not completed, or has no session file to reopen.
+    pub fn revive_task(self: &Arc<Self>, task_id: &str, message: &str) -> Result<u64, String> {
+        self.revive(task_id, message).map(|(_, epoch)| epoch)
     }
 
     fn not_settled_yet(&self, view: TaskView) -> SendOutcome {
@@ -1332,6 +1351,7 @@ done
             parent_session_id: parent.to_string(),
             root_session_id: parent.to_string(),
             env: Vec::new(),
+            owner: None,
         }
     }
 
@@ -1666,6 +1686,7 @@ done
             run_stats: None,
             owner_pid: pid,
             spawn: SpawnRecord::default(),
+            owner: None,
         };
         write_record(
             &store,

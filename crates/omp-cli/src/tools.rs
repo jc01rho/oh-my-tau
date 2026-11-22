@@ -58,6 +58,7 @@ mod tree;
 mod util;
 mod wait;
 mod web_search;
+mod workpool;
 mod yield_tool;
 
 use std::path::{Path, PathBuf};
@@ -429,6 +430,12 @@ pub fn builtin_tools_with_env_and_jobs(
             task_control::cancel_schema(),
             Arc::new(|env, args, _| Box::pin(task_control::task_cancel(env, args))),
         ),
+        mk(
+            "workpool",
+            workpool::DESCRIPTION.to_string(),
+            workpool::schema(),
+            Arc::new(|env, args, _| Box::pin(workpool::workpool(env, args))),
+        ),
         wait::tool(env.clone()),
         mk(
             "bash_output",
@@ -575,9 +582,9 @@ pub fn enabled_by_settings(settings: &omp_settings::Settings, name: &str) -> boo
         }
         // `canSpawnAtDepth(task.maxRecursionDepth, taskDepth)`: a non-positive
         // ceiling disables spawning everywhere (the depth leg is session state).
-        // The background-task controls ride the same gate: without spawning
-        // there is nothing to steer, read or cancel.
-        "task" | "task_send" | "task_output" | "task_cancel" => {
+        // The background-task controls and workpools ride the same gate:
+        // without spawning there is nothing to steer, read, cancel or queue.
+        "task" | "task_send" | "task_output" | "task_cancel" | "workpool" => {
             settings.get_number("task.maxRecursionDepth").unwrap_or(2.0) > 0.0
         }
         _ => true,
@@ -914,7 +921,13 @@ mod tests {
         assert!(!no_wait.iter().any(|n| n == "wait"), "wait gate ignored");
         // `task.maxRecursionDepth: 0` disables spawning everywhere.
         let no_task = names("task:\n  maxRecursionDepth: 0\n");
-        for gated in ["task", "task_send", "task_output", "task_cancel"] {
+        for gated in [
+            "task",
+            "task_send",
+            "task_output",
+            "task_cancel",
+            "workpool",
+        ] {
             assert!(
                 !no_task.iter().any(|n| n == gated),
                 "{gated}: task depth gate ignored"
@@ -1035,6 +1048,7 @@ mod tests {
                 "task_send",
                 "task_output",
                 "task_cancel",
+                "workpool",
                 "wait",
                 "bash_output",
                 "kill_bash",

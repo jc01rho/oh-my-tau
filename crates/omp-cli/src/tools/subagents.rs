@@ -41,8 +41,10 @@ pub fn registry() -> Arc<SubagentRegistry> {
             let settings = omp_settings::Settings::load(&cwd);
             let slots =
                 TaskRunner::resolve_max_concurrency(settings.get_number("task.maxConcurrency"));
-            let registry =
-                SubagentRegistry::new(TaskRunner::new(binary, slots), Some(store_dir(&cwd)));
+            let registry = SubagentRegistry::new(
+                TaskRunner::new(binary, slots),
+                Some(senpi_task_dir(&cwd).join("tasks")),
+            );
             registry.load();
             let weak = Arc::downgrade(&registry);
             registry.set_listener(Arc::new(move |event| {
@@ -60,8 +62,9 @@ fn existing_registry() -> Option<Arc<SubagentRegistry>> {
 }
 
 /// The gateway's `senpi-task` fallback store layout under this engine's
-/// agent dir: `<agent dir>/projects/<name>-<sha256(realpath cwd)[:12]>/senpi-task/tasks`.
-fn store_dir(cwd: &Path) -> PathBuf {
+/// agent dir: `<agent dir>/projects/<name>-<sha256(realpath cwd)[:12]>/senpi-task`
+/// (task records in `tasks/`, workpools in `workpools/`).
+pub(crate) fn senpi_task_dir(cwd: &Path) -> PathBuf {
     let real = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let name = real
         .file_name()
@@ -86,7 +89,6 @@ fn store_dir(cwd: &Path) -> PathBuf {
         .join("projects")
         .join(format!("{name}-{hash}"))
         .join("senpi-task")
-        .join("tasks")
 }
 
 /// Bind the RPC runtime: background completions are delivered to it and its
@@ -126,10 +128,21 @@ pub(crate) fn root_session(caller: &str) -> String {
 }
 
 fn on_event(registry: &Arc<SubagentRegistry>, event: &RegistryEvent) {
-    let Some(rt) = attached_runtime() else {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+    // A workpool worker's run belongs to its pool, with or without a
+    // runtime to report to.
+    if let RegistryEvent::Settled(view) = event {
+        if view.record.owner.is_some() {
+            if let Some(engine) = super::workpool::existing_engine() {
+                let view = TaskView::clone(view);
+                handle.spawn(async move { engine.on_worker_settled(&view).await });
+            }
+            return;
+        }
+    }
+    let Some(rt) = attached_runtime() else {
         return;
     };
     let registry = Arc::clone(registry);
@@ -181,14 +194,17 @@ async fn deliver(rt: &Arc<Runtime>, registry: &SubagentRegistry, view: &TaskView
     }
 }
 
-/// Deliver every pending completion of the attached session (after a resume
-/// or a settle).
+/// Deliver every pending completion (and deferred workpool aggregate) of the
+/// attached session (after a resume or a settle).
 pub(crate) fn flush_pending() {
     let (Some(rt), Some(registry)) = (attached_runtime(), existing_registry()) else {
         return;
     };
-    let pending = registry.pending_notifications(&rt.session_id());
-    if pending.is_empty() {
+    let session = rt.session_id();
+    let pending = registry.pending_notifications(&session);
+    let engine = super::workpool::existing_engine()
+        .filter(|engine| engine.has_deferred_aggregates(&session));
+    if pending.is_empty() && engine.is_none() {
         return;
     }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -198,8 +214,46 @@ pub(crate) fn flush_pending() {
         for view in pending {
             deliver(&rt, &registry, &view).await;
         }
+        if let Some(engine) = engine {
+            engine.flush_aggregates(&session).await;
+        }
         publish_lifecycle(&rt, &registry).await;
     });
+}
+
+/// Hand a message (a workpool aggregate) to `session` the way completions
+/// go: an idle session is woken, a running turn takes it at its next turn
+/// boundary. A held, switched-away or unattached session defers it.
+pub(crate) async fn deliver_message(session: &str, message: &str) -> super::workpool::Delivery {
+    use super::workpool::Delivery;
+    let Some(rt) = attached_runtime() else {
+        return Delivery::Deferred;
+    };
+    if rt.session_id() != session || rt.is_paused() {
+        return Delivery::Deferred;
+    }
+    match rt.prompt(None, message, Some("steer"), Vec::new()).await {
+        Ok(()) => {
+            if let Some(registry) = existing_registry() {
+                publish_lifecycle(&rt, &registry).await;
+            }
+            Delivery::Delivered
+        }
+        Err(e) => Delivery::Failed(e.message),
+    }
+}
+
+/// Whether `session` has background work to report and how much of it is
+/// still open: its tasks plus its workpools' unfinished items and
+/// undelivered aggregates.
+fn session_work(registry: &SubagentRegistry, session: &str) -> Option<usize> {
+    let engine = super::workpool::existing_engine();
+    let pools = engine.as_ref().is_some_and(|e| e.has_pools(session));
+    if !registry.has_children(session) && !pools {
+        return None;
+    }
+    let pool_work = engine.map_or(0, |e| e.open_work(session));
+    Some(registry.open_children(session) + pool_work)
 }
 
 fn lifecycle_state(streaming: bool, children: usize) -> &'static str {
@@ -239,11 +293,10 @@ fn emit_lifecycle(rt: &Runtime, session: &str, state: &'static str, children: us
 
 async fn publish_lifecycle(rt: &Runtime, registry: &SubagentRegistry) {
     let session = rt.session_id();
-    if !registry.has_children(&session) {
+    let Some(children) = session_work(registry, &session) else {
         return;
-    }
+    };
     let streaming = rt.agent.is_streaming().await;
-    let children = registry.open_children(&session);
     emit_lifecycle(
         rt,
         &session,
@@ -265,10 +318,9 @@ pub(crate) fn on_session_settled(rt: &Runtime) {
         return;
     };
     let session = rt.session_id();
-    if !registry.has_children(&session) {
+    let Some(children) = session_work(&registry, &session) else {
         return;
-    }
-    let children = registry.open_children(&session);
+    };
     emit_lifecycle(
         rt,
         &session,
@@ -551,6 +603,7 @@ mod tests {
                 run_stats: None,
                 owner_pid: 1,
                 spawn: SpawnRecord::default(),
+                owner: None,
             },
             live: false,
         }
@@ -587,7 +640,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("my proj");
         std::fs::create_dir_all(&project).unwrap();
-        let store = store_dir(&project);
+        let store = senpi_task_dir(&project).join("tasks");
         let real = std::fs::canonicalize(&project).unwrap();
         let digest = Sha256::digest(real.display().to_string().as_bytes());
         let hash: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();

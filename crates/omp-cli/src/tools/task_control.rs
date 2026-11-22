@@ -652,6 +652,7 @@ done
                 parent_session_id: caller.to_string(),
                 root_session_id: caller.to_string(),
                 env: Vec::new(),
+                owner: None,
             })
             .unwrap()
             .id()
@@ -712,6 +713,7 @@ done
                     parent_session_id: caller.to_string(),
                     root_session_id: caller.to_string(),
                     env: Vec::new(),
+                    owner: None,
                 })
                 .unwrap()
                 .id()
@@ -784,6 +786,7 @@ done
                 parent_session_id: caller.to_string(),
                 root_session_id: caller.to_string(),
                 env: Vec::new(),
+                owner: None,
             })
             .unwrap()
             .id()
