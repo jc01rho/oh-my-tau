@@ -297,20 +297,39 @@ fn fits_budget(tokenizer: &dyn Tokenizer, text: &str, budget: u64) -> (bool, u64
 }
 
 /// `clampConversationToBudget`: truncate one oversized serialized window to its budget.
-fn clamp_conversation_to_budget(text: &str, budget: u64, tokens: u64) -> String {
+///
+/// The first cut assumes uniform token density with TS's 1024-unit floor; exact tokenizers are
+/// not uniform, so the cut is recounted and shrunk by the measured density (below the floor
+/// when needed) until it fits.
+fn clamp_conversation_to_budget(
+    tokenizer: &dyn Tokenizer,
+    text: &str,
+    budget: u64,
+    tokens: u64,
+) -> String {
     if tokens <= budget {
         return text.to_owned();
     }
     let len = utf16_len(text);
-    let keep = 1024.max(((len as f64 * budget as f64 * 0.95) / tokens as f64).floor() as usize);
+    let ratio = |units: usize, counted: u64| {
+        ((units as f64 * budget as f64 * 0.95) / counted as f64).floor() as usize
+    };
+    let mut keep = 1024.max(ratio(len, tokens));
     if keep >= len {
-        return text.to_owned();
+        keep = ratio(len, tokens);
     }
-    format!(
-        "{}\n\n[... {} more characters truncated]",
-        utf16_prefix(text, keep),
-        len - keep
-    )
+    loop {
+        let clamped = format!(
+            "{}\n\n[... {} more characters truncated]",
+            utf16_prefix(text, keep),
+            len - keep
+        );
+        let counted = tokenizer.count_text(&clamped);
+        if counted <= budget || keep == 0 {
+            return clamped;
+        }
+        keep = ratio(keep, counted).min(keep - 1);
+    }
 }
 
 /// `planSummaryWindows`: partition `messages` into windows that each fit `budget`.
@@ -382,7 +401,7 @@ pub async fn generate_summary(
         let text = if fits {
             text
         } else {
-            clamp_conversation_to_budget(&text, budget, tokens)
+            clamp_conversation_to_budget(params.tokenizer, &text, budget, tokens)
         };
         let request = build_summary_request(&text, carried.as_deref(), params);
         let reply = completer.complete(request).await?;
@@ -495,4 +514,47 @@ pub async fn compact(
                 .map(|archive| serde_json::json!({ "snapcompact": archive.clone() }))
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_conversation_to_budget, Tokenizer};
+
+    /// One token per space: dense where words are, free over long runs.
+    struct Spaces;
+
+    impl Tokenizer for Spaces {
+        fn count_text(&self, text: &str) -> u64 {
+            text.bytes().filter(|b| *b == b' ').count() as u64
+        }
+    }
+
+    #[test]
+    fn clamp_recounts_a_dense_prefix_until_it_fits() {
+        let text = format!("{}{}", "a ".repeat(5_000), "x".repeat(100_000));
+        let tokens = Spaces.count_text(&text);
+        let clamped = clamp_conversation_to_budget(&Spaces, &text, 2_000, tokens);
+        assert!(Spaces.count_text(&clamped) <= 2_000);
+        assert!(clamped.starts_with("a a "));
+    }
+
+    #[test]
+    fn clamp_shrinks_below_the_floor_when_the_floor_overflows() {
+        let text = " ".repeat(2_000);
+        let clamped = clamp_conversation_to_budget(&Spaces, &text, 1_024, 2_000);
+        assert!(Spaces.count_text(&clamped) <= 1_024);
+    }
+
+    #[test]
+    fn clamp_cuts_text_shorter_than_the_floor() {
+        let text = " ".repeat(800);
+        let clamped = clamp_conversation_to_budget(&Spaces, &text, 100, 800);
+        assert!(Spaces.count_text(&clamped) <= 100);
+    }
+
+    #[test]
+    fn clamp_keeps_text_that_already_fits() {
+        let text = "a ".repeat(10);
+        assert_eq!(clamp_conversation_to_budget(&Spaces, &text, 100, 10), text);
+    }
 }
