@@ -232,12 +232,16 @@ pub(crate) async fn deliver_message(session: &str, message: &str) -> super::work
     if rt.session_id() != session || rt.is_paused() {
         return Delivery::Deferred;
     }
-    match rt.prompt(None, message, Some("steer"), Vec::new()).await {
+    match rt.prompt_in_session(session, message, Some("steer")).await {
         Ok(()) => {
             if let Some(registry) = existing_registry() {
                 publish_lifecycle(&rt, &registry).await;
             }
             Delivery::Delivered
+        }
+        // A switch or a hold that landed meanwhile: the message waits.
+        Err(e) if matches!(e.code, Some("session_mismatch" | "session_paused")) => {
+            Delivery::Deferred
         }
         Err(e) => Delivery::Failed(e.message),
     }

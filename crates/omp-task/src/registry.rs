@@ -815,7 +815,8 @@ impl SubagentRegistry {
     /// # Errors
     /// The task is unknown, not completed, or has no session file to reopen.
     pub fn revive_task(self: &Arc<Self>, task_id: &str, message: &str) -> Result<u64, String> {
-        self.revive(task_id, message).map(|(_, epoch)| epoch)
+        self.revive(task_id, message)
+            .map(|revived| revived.run_epoch)
     }
 
     fn not_settled_yet(&self, view: TaskView) -> SendOutcome {

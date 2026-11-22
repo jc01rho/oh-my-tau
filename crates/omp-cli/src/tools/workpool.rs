@@ -22,9 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use anyhow::Result;
 use omp_task::params::SchemaMode;
-use omp_task::registry::{
-    Listener, RegistryEvent, SpawnRequest, SubagentRegistry, TaskStatus, TaskView,
-};
+use omp_task::registry::{SpawnRequest, SubagentRegistry, TaskStatus, TaskView};
 use omp_task::{TaskRunner, TaskSpec};
 use pa_agent::types::AgentToolResult;
 use serde::{Deserialize, Serialize};
@@ -390,10 +388,13 @@ impl WorkpoolEngine {
         })
     }
 
-    /// A registry listener that routes pool workers' settled runs here (the
-    /// process registry's own listener does this in production).
+    /// A registry listener that routes pool workers' settled runs here. In
+    /// production the process registry's listener does this through
+    /// [`super::subagents`]; tests wire it directly.
+    #[cfg(test)]
     #[must_use]
-    pub fn settle_forwarder(self: &Arc<Self>) -> Listener {
+    pub fn settle_forwarder(self: &Arc<Self>) -> omp_task::registry::Listener {
+        use omp_task::registry::RegistryEvent;
         let weak = Arc::downgrade(self);
         Arc::new(move |event| {
             let RegistryEvent::Settled(view) = event else {
@@ -411,6 +412,7 @@ impl WorkpoolEngine {
         })
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
@@ -1052,6 +1054,16 @@ pub(crate) fn worker_yield(assignment: &Path, results: &[Value]) -> Result<Value
     })?;
     let assignment: Assignment = serde_json::from_str(&text)
         .map_err(|e| wp_error("store_corrupt", format!("Bad workpool assignment: {e}")))?;
+    if !assignment
+        .items
+        .iter()
+        .all(|item| is_item_id(&item.item_id))
+    {
+        return Err(wp_error(
+            "store_corrupt",
+            "Bad workpool assignment: malformed item id.",
+        ));
+    }
     let mut parsed = Vec::with_capacity(results.len());
     for result in results {
         let obj = result.as_object().ok_or_else(invalid_input)?;
@@ -1184,8 +1196,25 @@ fn write_atomic(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
         std::process::id(),
         TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&temp, text)?;
+    // Owner-only: pool records and yields carry worker input and output.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    std::io::Write::write_all(&mut options.open(&temp)?, text.as_bytes())?;
     std::fs::rename(&temp, dir.join(name))
+}
+
+fn is_item_id(value: &str) -> bool {
+    value.strip_prefix("wi_").is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 fn write_assignment(file: &Path, assignment: &Assignment) -> std::io::Result<()> {
@@ -1703,12 +1732,13 @@ done
     #[test]
     fn worker_yield_records_assigned_keys_and_refuses_conflicts() {
         let dir = tempfile::tempdir().unwrap();
+        let item_id = format!("wi_{}", "1".repeat(32));
         let assignment = Assignment {
             pool_id: format!("wp_{}", "a".repeat(32)),
             generation: 1,
             yields_dir: dir.path().join("yields").display().to_string(),
             items: vec![AssignedItem {
-                item_id: "wi_1".to_string(),
+                item_id: item_id.clone(),
                 key: "a".to_string(),
             }],
         };
@@ -1722,7 +1752,7 @@ done
             ],
         )
         .unwrap();
-        assert_eq!(out["accepted"][0]["item_id"], "wi_1");
+        assert_eq!(out["accepted"][0]["item_id"], item_id.as_str());
         assert_eq!(out["refused"][0]["code"], "worker_unassigned");
         let same = worker_yield(&file, &[json!({"key": "a", "data": {"n": 1}})]).unwrap();
         assert_eq!(
@@ -1742,7 +1772,7 @@ done
         );
         assert_eq!(both.unwrap_err().code, "invalid_input");
         let stored: YieldRecord = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("yields/wi_1.json")).unwrap(),
+            &std::fs::read_to_string(dir.path().join(format!("yields/{item_id}.json"))).unwrap(),
         )
         .unwrap();
         assert_eq!(stored.result["data"], json!({"n": 1}));
