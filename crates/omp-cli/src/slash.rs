@@ -3357,6 +3357,11 @@ mod tests {
                 // `:`-suffixed aliases (`force:`) are split off by
                 // `parse_slash_command` and dispatched under the base name.
                 let name = name.strip_suffix(':').unwrap_or(name);
+                // Reserved-but-unported names share one guard arm
+                // (`name if UNPORTED_RESERVED.contains(&name)`), not a literal one.
+                if UNPORTED_RESERVED.contains(&name) {
+                    continue;
+                }
                 let arm = regex::Regex::new(&format!(
                     r#"(?m)(^\s*"{}"\s*(=>|\|)|\|\s*"{}"\s*(=>|\|))"#,
                     regex::escape(name),
