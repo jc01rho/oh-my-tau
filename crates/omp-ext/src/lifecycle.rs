@@ -755,6 +755,12 @@ pub trait HostResponder: Send + Sync {
     fn model_complete(&self, _request: Value) -> BoxFuture<'_, Result<Value, String>> {
         Box::pin(async move { Err("model_complete is not supported by the core".into()) })
     }
+    /// `ctx.runEphemeralTurn(options)` -> `{replyText, assistantMessage}`: one tool-less side turn
+    /// that never enters the session history. The default is an explicit rejection, so an
+    /// extension sees an error instead of a silent empty reply.
+    fn run_ephemeral_turn(&self, _request: Value) -> BoxFuture<'_, Result<Value, String>> {
+        Box::pin(async move { Err("runEphemeralTurn is not supported by the core".into()) })
+    }
     /// `pi.setModel(model)`; `false` = model not applied (no UI/credentials to switch with).
     fn set_model(&self, _model: Value) -> BoxFuture<'_, bool> {
         Box::pin(async { false })
@@ -852,6 +858,7 @@ pub async fn answer(
             .await
             .map(|()| Value::Null),
         "model_complete" => responder.model_complete(params.clone()).await,
+        "run_ephemeral_turn" => responder.run_ephemeral_turn(params.clone()).await,
         other => Err(format!("{other} is not supported by the core")),
     }
 }

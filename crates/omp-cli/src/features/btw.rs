@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use pa_types::ai::{AssistantContentBlock, Context, Message, StopReason, UserContent, UserMessage};
+use pa_types::ai::{
+    AssistantContentBlock, AssistantMessage, Context, Message, StopReason, UserContent, UserMessage,
+};
 
 use crate::rpc::slash::Outcome;
 use crate::runtime::Runtime;
@@ -50,15 +52,70 @@ pub async fn command(rt: &Arc<Runtime>, args: &str) -> Outcome {
         rest: serde_json::Map::default(),
     }));
 
-    let live = match crate::compact::LiveCompleter::from_target(&rt.provider_target()) {
-        Ok(live) => live,
-        Err(e) => {
-            rt.send(serde_json::json!({"type": "command_output", "text": format!("btw: no model available: {e}")}));
-            return Outcome::Handled {
-                agent_invoked: false,
-            };
+    let answer = match complete_side_turn(rt, context_messages, BTW_MAX_TOKENS).await {
+        Ok(SideTurn::Done(response)) => {
+            let text = reply_text(&response);
+            if text.is_empty() {
+                "btw: the model returned an empty answer.".to_string()
+            } else {
+                format!("btw: {text}")
+            }
         }
+        Ok(SideTurn::Failed(_)) => "btw: the side question was aborted or failed.".to_string(),
+        Err(SideTurnError::NoModel(e)) => format!("btw: no model available: {e}"),
+        Err(SideTurnError::Request(e)) => format!("btw: request failed: {e}"),
     };
+    // Neither the question nor the answer enters the transcript: we never
+    // `set_messages`/`append_messages`, and the outcome is `Handled`, not a
+    // prompt.
+    rt.send(serde_json::json!({"type": "command_output", "text": answer}));
+    Outcome::Handled {
+        agent_invoked: false,
+    }
+}
+
+/// Outcome of one tool-less side turn that reached the provider.
+pub(crate) enum SideTurn {
+    /// The provider settled with a usable reply.
+    Done(AssistantMessage),
+    /// The provider settled the turn as aborted or failed.
+    Failed(AssistantMessage),
+}
+
+/// A side turn that never reached a settled provider reply.
+pub(crate) enum SideTurnError {
+    NoModel(String),
+    Request(String),
+}
+
+/// Trimmed concatenation of the reply's text blocks.
+pub(crate) fn reply_text(response: &AssistantMessage) -> String {
+    let text: String = response
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            AssistantContentBlock::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    text.trim().to_string()
+}
+
+/// The live conversation as provider messages (`/btw`'s read-only context).
+pub(crate) async fn conversation(rt: &Arc<Runtime>) -> anyhow::Result<Vec<Message>> {
+    rt.wait_settled().await;
+    convert_messages(rt.agent.messages_snapshot().await.into_vec()).await
+}
+
+/// Run one side turn over `messages` on the session's current model, without
+/// tools; nothing is appended to the session or the agent transcript.
+pub(crate) async fn complete_side_turn(
+    rt: &Arc<Runtime>,
+    messages: Vec<Message>,
+    max_tokens: u64,
+) -> Result<SideTurn, SideTurnError> {
+    let live = crate::compact::LiveCompleter::from_target(&rt.provider_target())
+        .map_err(|e| SideTurnError::NoModel(e.to_string()))?;
     let (api_key, _) = crate::adapter::fresh_stored_key(
         &live.model.provider,
         live.credential_id,
@@ -67,7 +124,7 @@ pub async fn command(rt: &Arc<Runtime>, args: &str) -> Outcome {
     .await;
     let options = pa_ai::types::SimpleStreamOptions {
         base: pa_ai::types::StreamOptions {
-            max_tokens: Some(BTW_MAX_TOKENS),
+            max_tokens: Some(max_tokens),
             api_key,
             headers: live.headers.clone().map(|h| h.into_iter().collect()),
             ..pa_ai::types::StreamOptions::default()
@@ -82,40 +139,20 @@ pub async fn command(rt: &Arc<Runtime>, args: &str) -> Outcome {
     };
     let context = Context {
         system_prompt: Some(BTW_SYSTEM_PROMPT.to_string()),
-        messages: context_messages,
+        messages,
         tools: None,
     };
-    let answer = match pa_ai::complete_simple(&live.model, &context, Some(options)).await {
+    match pa_ai::complete_simple(&live.model, &context, Some(options)).await {
         Ok(response)
-            if !matches!(
+            if matches!(
                 response.stop_reason,
                 StopReason::Aborted | StopReason::Error
             ) =>
         {
-            let text: String = response
-                .content
-                .iter()
-                .filter_map(|b| match b {
-                    AssistantContentBlock::Text(t) => Some(t.text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            let text = text.trim().to_string();
-            if text.is_empty() {
-                "btw: the model returned an empty answer.".to_string()
-            } else {
-                format!("btw: {text}")
-            }
+            Ok(SideTurn::Failed(response))
         }
-        Ok(_) => "btw: the side question was aborted or failed.".to_string(),
-        Err(e) => format!("btw: request failed: {e:?}"),
-    };
-    // Neither the question nor the answer enters the transcript: we never
-    // `set_messages`/`append_messages`, and the outcome is `Handled`, not a
-    // prompt.
-    rt.send(serde_json::json!({"type": "command_output", "text": answer}));
-    Outcome::Handled {
-        agent_invoked: false,
+        Ok(response) => Ok(SideTurn::Done(response)),
+        Err(e) => Err(SideTurnError::Request(format!("{e:?}"))),
     }
 }
 

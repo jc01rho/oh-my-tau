@@ -427,6 +427,107 @@ impl omp_ext::lifecycle::HostResponder for RuntimeResponder {
             serde_json::to_value(response).map_err(|e| format!("completion encoding failed: {e}"))
         })
     }
+
+    fn run_ephemeral_turn(
+        &self,
+        request: Value,
+    ) -> omp_ext::lifecycle::BoxFuture<'_, Result<Value, String>> {
+        Box::pin(async move {
+            let turn = EphemeralTurn::parse(&request)?;
+            let rt = self
+                .rt
+                .upgrade()
+                .ok_or_else(|| "runEphemeralTurn: the session has ended".to_string())?;
+            let mut messages = crate::features::btw::conversation(&rt)
+                .await
+                .map_err(|e| format!("runEphemeralTurn: failed to read the conversation: {e}"))?;
+            messages.extend(turn.tail);
+            use crate::features::btw::{SideTurn, SideTurnError};
+            match crate::features::btw::complete_side_turn(&rt, messages, turn.max_tokens).await {
+                Ok(SideTurn::Done(response)) => Ok(ephemeral_result(&response)),
+                Ok(SideTurn::Failed(response)) => Err(format!(
+                    "runEphemeralTurn: the side turn {}: {}",
+                    if response.stop_reason == pa_types::ai::StopReason::Aborted {
+                        "was aborted"
+                    } else {
+                        "failed"
+                    },
+                    response
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("no error message")
+                )),
+                Err(SideTurnError::NoModel(e)) => {
+                    Err(format!("runEphemeralTurn: no model available: {e}"))
+                }
+                Err(SideTurnError::Request(e)) => {
+                    Err(format!("runEphemeralTurn: request failed: {e}"))
+                }
+            }
+        })
+    }
+}
+
+/// Output-token cap of a side turn whose caller set none (the `/btw` ceiling).
+const EPHEMERAL_DEFAULT_MAX_TOKENS: u64 = 4096;
+
+/// A validated `run_ephemeral_turn` request (TS `EphemeralTurnOptions`, wire form from `host.ts`).
+#[derive(Debug)]
+struct EphemeralTurn {
+    /// `history` copies followed by the prompt; appended after the live conversation.
+    tail: Vec<pa_types::ai::Message>,
+    max_tokens: u64,
+}
+
+impl EphemeralTurn {
+    /// Validate before inference, as TS rejects bad options before any provider call.
+    fn parse(request: &Value) -> Result<Self, String> {
+        let prompt = request
+            .get("promptText")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "runEphemeralTurn: promptText must be a non-empty string".to_string())?;
+        let max_tokens = match request.get("maxTokens") {
+            None | Some(Value::Null) => EPHEMERAL_DEFAULT_MAX_TOKENS,
+            Some(v) => v
+                .as_u64()
+                .filter(|n| (1..=(1u64 << 53) - 1).contains(n))
+                .ok_or_else(|| {
+                    "runEphemeralTurn: maxTokens must be a positive safe integer".to_string()
+                })?,
+        };
+        match request.get("tools") {
+            None | Some(Value::Null | Value::Bool(false)) => {}
+            Some(_) => return Err("runEphemeralTurn: tools may only be false".into()),
+        }
+        let mut tail: Vec<pa_types::ai::Message> = match request.get("history") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(h) => serde_json::from_value(h.clone())
+                .map_err(|e| format!("runEphemeralTurn: invalid history: {e}"))?,
+        };
+        let mut content = vec![json!({"type": "text", "text": prompt})];
+        match request.get("promptImages") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(images)) => content.extend(images.iter().cloned()),
+            Some(_) => return Err("runEphemeralTurn: promptImages must be an array".into()),
+        }
+        let user = serde_json::from_value(json!({
+            "role": "user",
+            "content": content,
+            "timestamp": pa_agent::now_ms().cast_unsigned(),
+        }))
+        .map_err(|e| format!("runEphemeralTurn: invalid promptImages: {e}"))?;
+        tail.push(user);
+        Ok(Self { tail, max_tokens })
+    }
+}
+
+/// TS `EphemeralTurnResult`.
+fn ephemeral_result(response: &pa_types::ai::AssistantMessage) -> Value {
+    json!({
+        "replyText": crate::features::btw::reply_text(response),
+        "assistantMessage": response,
+    })
 }
 
 /// TS `normalizeCustomMessagePayload` + the `#promptAgent` wrapper: a `before_agent_start` message
@@ -1800,6 +1901,100 @@ mod tests {
         "  fi\n",
         "done\n",
     );
+
+    /// `run_ephemeral_turn` contract: options are validated before inference
+    /// (TS `EphemeralTurnOptions`), the prompt follows the detached history.
+    #[test]
+    fn ext_ephemeral_turn_validates_options_before_inference() {
+        let err = |v: Value| EphemeralTurn::parse(&v).unwrap_err();
+        assert!(err(json!({})).contains("promptText"));
+        assert!(err(json!({"promptText": "  "})).contains("promptText"));
+        assert!(err(json!({"promptText": "q", "maxTokens": 0})).contains("maxTokens"));
+        assert!(err(json!({"promptText": "q", "maxTokens": 1.5})).contains("maxTokens"));
+        assert!(
+            err(json!({"promptText": "q", "maxTokens": 9_007_199_254_740_992_u64}))
+                .contains("maxTokens")
+        );
+        assert!(err(json!({"promptText": "q", "tools": true})).contains("tools"));
+        assert!(err(json!({"promptText": "q", "history": "x"})).contains("history"));
+        assert!(err(json!({"promptText": "q", "promptImages": {}})).contains("promptImages"));
+
+        let bare = EphemeralTurn::parse(&json!({"promptText": "why?", "tools": false})).unwrap();
+        assert_eq!(bare.max_tokens, EPHEMERAL_DEFAULT_MAX_TOKENS);
+        assert_eq!(bare.tail.len(), 1);
+
+        let full = EphemeralTurn::parse(&json!({
+            "promptText": "and now?",
+            "maxTokens": 64,
+            "history": [
+                {"role": "user", "content": "first", "timestamp": 1},
+            ],
+            "promptImages": [{"type": "image", "data": "AAAA", "mimeType": "image/png"}],
+        }))
+        .unwrap();
+        assert_eq!(full.max_tokens, 64);
+        assert_eq!(full.tail.len(), 2, "history first, prompt last");
+        let prompt = serde_json::to_value(&full.tail[1]).unwrap();
+        assert_eq!(prompt["role"], "user");
+        assert_eq!(
+            prompt["content"][0],
+            json!({"type": "text", "text": "and now?"})
+        );
+        assert_eq!(prompt["content"][1]["mimeType"], "image/png");
+        let first = serde_json::to_value(&full.tail[0]).unwrap();
+        assert_eq!(first["content"], "first");
+    }
+
+    /// `EphemeralTurnResult`: `replyText` is the trimmed text of the reply's text blocks.
+    #[test]
+    fn ext_ephemeral_turn_result_shape() {
+        let response: pa_types::ai::AssistantMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": " it is "},
+                {"type": "text", "text": "fine "},
+            ],
+            "api": "anthropic-messages",
+            "provider": "anthropic",
+            "model": "m",
+            "usage": {"input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 3,
+                      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+            "stopReason": "stop",
+            "timestamp": 5,
+        }))
+        .unwrap();
+        let result = ephemeral_result(&response);
+        assert_eq!(result["replyText"], "it is fine");
+        assert_eq!(result["assistantMessage"]["model"], "m");
+        assert_eq!(result["assistantMessage"]["stopReason"], "stop");
+    }
+
+    /// A core without a side-turn implementation answers with an explicit error,
+    /// never a silent empty reply.
+    #[tokio::test]
+    async fn ext_ephemeral_turn_headless_core_rejects_explicitly() {
+        let reply = omp_ext::lifecycle::answer(
+            &omp_ext::lifecycle::HeadlessResponder,
+            "run_ephemeral_turn",
+            &json!({"promptText": "q"}),
+        )
+        .await;
+        assert_eq!(
+            reply.unwrap_err(),
+            "runEphemeralTurn is not supported by the core"
+        );
+        let gone = RuntimeResponder {
+            rt: std::sync::Weak::new(),
+            mode: ExtMode::Print,
+        };
+        let reply =
+            omp_ext::lifecycle::answer(&gone, "run_ephemeral_turn", &json!({"promptText": "q"}))
+                .await;
+        assert!(reply.unwrap_err().contains("session has ended"));
+        let reply = omp_ext::lifecycle::answer(&gone, "run_ephemeral_turn", &json!({})).await;
+        assert!(reply.unwrap_err().contains("promptText"));
+    }
 
     #[test]
     fn stop_continuation_text_matches_ts_rules() {
