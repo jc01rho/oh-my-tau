@@ -80,9 +80,23 @@ pub struct Goal {
     pub time_used_seconds: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Why the goal is blocked on the user (omomeow `update_goal` status
+    /// `blocked`). A blocked goal is a paused goal that carries its reason.
+    pub blocked_reason: Option<String>,
 }
 
 impl Goal {
+    /// Status word omomeow's gateway reads (`active|paused|blocked|complete`):
+    /// a paused goal with a reason, or one that ran out of budget, is `blocked`.
+    #[must_use]
+    pub fn wire_status(&self) -> &'static str {
+        match self.status {
+            GoalStatus::Paused if self.blocked_reason.is_some() => "blocked",
+            GoalStatus::BudgetLimited => "blocked",
+            other => other.as_str(),
+        }
+    }
+
     /// omp `remainingTokens`.
     #[must_use]
     pub fn remaining_tokens(&self) -> Option<i64> {
@@ -107,7 +121,7 @@ impl Goal {
 
 /// omp `completionBudgetReport` (goals/runtime.ts).
 #[must_use]
-fn completion_budget_report(goal: &Goal) -> Option<String> {
+pub(super) fn completion_budget_report(goal: &Goal) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(budget) = goal.token_budget {
         parts.push(format!("tokens used: {} of {}", goal.tokens_used, budget));
@@ -185,6 +199,7 @@ impl GoalRuntime {
             time_used_seconds: 0,
             created_at: now,
             updated_at: now,
+            blocked_reason: None,
         };
         self.mark_active();
         self.goal = Some(goal.clone());
@@ -204,6 +219,7 @@ impl GoalRuntime {
         self.flush_time();
         if let Some(goal) = self.goal.as_mut() {
             goal.status = GoalStatus::Active;
+            goal.blocked_reason = None;
             goal.updated_at = now;
         }
         self.mark_active();
@@ -227,8 +243,34 @@ impl GoalRuntime {
         self.flush_time();
         let goal = self.goal.as_mut()?;
         goal.status = GoalStatus::Paused;
+        goal.blocked_reason = None;
         goal.updated_at = now;
         Some(goal.clone())
+    }
+
+    /// Block a live goal on the user (omomeow `update_goal` status `blocked`):
+    /// continuation stops like a pause, and `reason` stays on the goal until
+    /// it is resumed or completed.
+    pub fn block_goal(&mut self, reason: &str) -> Result<Goal> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            anyhow::bail!("reason is required when status is blocked");
+        }
+        match self.goal.as_ref().map(|g| g.status) {
+            None => anyhow::bail!("cannot block goal because no goal is active"),
+            Some(GoalStatus::Complete) => anyhow::bail!("cannot block a complete goal"),
+            Some(GoalStatus::Dropped) => anyhow::bail!("cannot block a dropped goal"),
+            Some(_) => {}
+        }
+        let now = Self::now_millis();
+        self.flush_time();
+        let Some(goal) = self.goal.as_mut() else {
+            anyhow::bail!("cannot block goal because no goal is active");
+        };
+        goal.status = GoalStatus::Paused;
+        goal.blocked_reason = Some(reason.to_string());
+        goal.updated_at = now;
+        Ok(goal.clone())
     }
 
     /// omp `GoalRuntime.dropGoal`.
@@ -261,6 +303,7 @@ impl GoalRuntime {
             anyhow::bail!("cannot complete goal because no goal is active");
         };
         goal.status = GoalStatus::Complete;
+        goal.blocked_reason = None;
         goal.updated_at = now;
         Ok(goal.clone())
     }
