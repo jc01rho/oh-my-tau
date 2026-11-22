@@ -1,7 +1,7 @@
 //! omomeow-compatible tool names beside tau's own `ask` and `goal`:
 //! `ask_user_question` and `create_goal` / `get_goal` / `update_goal`.
 //!
-//! The model-facing schemas are the ones the OmOMeow engine (mhc) advertises, so a
+//! The model-facing schemas are the ones the `OmOMeow` engine (mhc) advertises, so a
 //! prompt written for it runs unchanged. The tools reuse tau's machinery instead of
 //! duplicating it: questions that the host cannot show as a gateway `question` dialog
 //! run through the `ask` tool, and goals live in the same [`GoalRuntime`] the `goal`
@@ -250,6 +250,16 @@ enum Outcome {
     },
 }
 
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
 fn nonempty(value: Option<&Value>) -> Option<String> {
     value
         .and_then(Value::as_str)
@@ -298,17 +308,6 @@ fn parse_response(questions: &[AskQuestion], response: Option<Value>) -> Outcome
         return Outcome::Cancelled;
     }
     let comment = nonempty(frame.get("comment"));
-    let strings = |value: Option<&Value>| -> Vec<String> {
-        value
-            .and_then(Value::as_array)
-            .map(|list| {
-                list.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
     let entry_of = |id: &str| -> Option<Value> {
         match frame.get("answers") {
             Some(Value::Object(map)) => map.get(id).cloned(),
@@ -328,9 +327,9 @@ fn parse_response(questions: &[AskQuestion], response: Option<Value>) -> Outcome
         .map(|(index, question)| {
             if let Some(entry) = entry_of(&question_id(index)) {
                 let picked = if entry.get("selected").is_some() {
-                    strings(entry.get("selected"))
+                    string_list(entry.get("selected"))
                 } else {
-                    strings(entry.get("selectedOptions"))
+                    string_list(entry.get("selectedOptions"))
                 };
                 let text = nonempty(entry.get("text").or_else(|| entry.get("customInput")));
                 return split_picked(question, picked, text);
@@ -354,16 +353,7 @@ fn parse_response(questions: &[AskQuestion], response: Option<Value>) -> Outcome
 /// directly, several carry `results[]` in question order.
 fn outcome_from_ask_details(questions: &[AskQuestion], details: &Value) -> Outcome {
     let one = |entry: &Value| Answer {
-        selected: entry
-            .get("selectedOptions")
-            .and_then(Value::as_array)
-            .map(|list| {
-                list.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        selected: string_list(entry.get("selectedOptions")),
         other: nonempty(entry.get("customInput")),
     };
     let answers = match details.get("results").and_then(Value::as_array) {
@@ -604,7 +594,7 @@ fn result_text(result: &AgentToolResult) -> String {
         .iter()
         .filter_map(|c| match c {
             pa_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
-            _ => None,
+            pa_agent::types::ToolResultContent::Image(_) => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1417,11 +1407,9 @@ mod tests {
     fn the_session_registry_lists_the_compat_tools() {
         let dir = tempfile::tempdir().unwrap();
         let settings = omp_settings::Settings::load(dir.path());
-        let names: Vec<_> =
-            crate::tools::session_builtin_tools(dir.path(), pi_edit::EditMode::Replace, &settings)
-                .iter()
-                .map(|t| t.name())
-                .collect();
+        let tools =
+            crate::tools::session_builtin_tools(dir.path(), pi_edit::EditMode::Replace, &settings);
+        let names: Vec<_> = tools.iter().map(|t| t.name()).collect();
         for name in [
             "ask_user_question",
             "create_goal",

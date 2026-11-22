@@ -487,7 +487,7 @@ pub fn enabled_by_settings(settings: &omp_settings::Settings, name: &str) -> boo
     match name {
         // `goal.enabled` and no goal record / enabled / dropped goal. The
         // `restrictToolNames` and goal-state legs need session state.
-        "goal" => flag("goal.enabled", true),
+        "goal" | "create_goal" | "get_goal" | "update_goal" => flag("goal.enabled", true),
         // `enableLsp && lsp.enabled`; `enableLsp` is the host's LSP availability.
         "lsp" => flag("lsp.enabled", true),
         // `edit.mode === "none"` hides `edit`. The ported `edit.mode` enum has no
@@ -527,8 +527,6 @@ pub fn enabled_by_settings(settings: &omp_settings::Settings, name: &str) -> boo
         // `generate_image.enabled`; off by default.
         "generate_image" => flag("generate_image.enabled", false),
         "ask" | "ask_user_question" => flag("ask.enabled", true),
-        // omomeow's goal tools follow the same gate as tau's own `goal`.
-        "create_goal" | "get_goal" | "update_goal" => flag("goal.enabled", true),
         // Inert until the context-management tools land (they need the session
         // journal as a `ContextNotesHost`).
         "context_notes" | "new_context" => flag("compaction.experimentalContextManagement", false),
@@ -1011,6 +1009,7 @@ mod tests {
                 "ast_grep",
                 "ast_edit",
                 "ask",
+                "ask_user_question",
                 "todo",
                 "web_search",
                 "lsp",
@@ -1019,7 +1018,10 @@ mod tests {
                 "debug",
                 "github",
                 "tts",
-                "generate_image"
+                "generate_image",
+                "create_goal",
+                "get_goal",
+                "update_goal"
             ]
         );
         let edit = tools.iter().find(|t| t.name() == "edit").unwrap();
