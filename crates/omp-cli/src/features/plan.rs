@@ -420,6 +420,12 @@ fn set_session(session_id: &str, enabled: bool, task: &str) {
     }
 }
 
+/// Whether `session_id` is in plan mode (the `plan` half of `mode_changed`).
+#[must_use]
+pub fn is_active(session_id: &str) -> bool {
+    lock_state().get(session_id).is_some_and(|p| p.enabled)
+}
+
 /// The TS plan-mode instruction, prefixing the submitted planning task.
 fn instruction(task: &str) -> String {
     format!(
@@ -443,8 +449,10 @@ async fn enter_and_plan(rt: &Arc<Runtime>, task: String) -> Outcome {
         return handled();
     }
     set_session(&session_id, true, &task);
+    crate::features::modes::notify(rt);
     if let Err(message) = plan_turn(rt, &session_id, &task, &instruction(&task)).await {
         set_session(&session_id, false, "");
+        crate::features::modes::notify(rt);
         output(rt, &format!("plan: failed to start planning: {message}"));
     }
     handled()
@@ -531,6 +539,7 @@ async fn approve(rt: &Arc<Runtime>) -> Outcome {
         return handled();
     }
     set_session(&session_id, false, &task);
+    crate::features::modes::notify(rt);
     close_review(
         sink(),
         &session_id,
@@ -558,6 +567,7 @@ fn leave(rt: &Arc<Runtime>) -> Outcome {
         }
         was
     };
+    crate::features::modes::notify(rt);
     close_review(sink(), &session_id, None, PlanReviewBy::Local);
     output(
         rt,
@@ -606,6 +616,7 @@ fn toggle(rt: &Arc<Runtime>) -> Outcome {
         return handled();
     }
     set_session(&session_id, true, "");
+    crate::features::modes::notify(rt);
     output(
         rt,
         "Plan mode: ON. Submit a task to plan, or /plan off to disable.",
@@ -820,7 +831,8 @@ mod review_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_plan_tool, parse_args, PlanCommand};
+    use super::{is_active, is_plan_tool, parse_args, set_session, PlanCommand};
+    use omp_ext::lifecycle::ModeStatus;
 
     #[test]
     fn parses_subcommands() {
@@ -878,5 +890,28 @@ mod tests {
         ] {
             assert!(!is_plan_tool(name), "{name} should be blocked in plan mode");
         }
+    }
+
+    /// Plan mode is per session: entering it for one session reports `active` for that session and
+    /// `inactive` for any other, so a restored or switched-to session reports its own modes.
+    #[test]
+    fn plan_mode_is_reported_per_session() {
+        set_session("modes-test-entered", true, "");
+        assert!(is_active("modes-test-entered"));
+        assert!(!is_active("modes-test-other"));
+        assert_eq!(
+            crate::features::modes::snapshot("modes-test-entered")
+                .plan
+                .status,
+            ModeStatus::Active
+        );
+        assert_eq!(
+            crate::features::modes::snapshot("modes-test-other")
+                .plan
+                .status,
+            ModeStatus::Inactive
+        );
+        set_session("modes-test-entered", false, "");
+        assert!(!is_active("modes-test-entered"));
     }
 }

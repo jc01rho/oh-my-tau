@@ -662,6 +662,17 @@ async fn run_agent(_env: &Arc<Env>, args: &Value, ctx: &OpCtx) -> Result<Value, 
     let mut spec = omp_task::runner::TaskSpec::from_item(&item, None, ctx.cwd.clone());
     apply_child_policy(&mut spec);
     super::task::apply_agent_model(&mut spec);
+    // `before_subagent_spawn` (TS `applySpawnHook`, `invocationKind: "eval"`):
+    // a handler's `block` refuses the spawn before any handle exists.
+    if let Some(ext) = crate::rpc::slash::extensions() {
+        super::task::apply_subagent_spawn(
+            &ext.host,
+            &mut spec,
+            omp_ext::lifecycle::SubagentInvocationKind::Eval,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
 
     let handle = Handle::new("agent", id.clone());
     AGENT_HANDLES
@@ -2202,6 +2213,7 @@ fn start_turns(pool: &Arc<WorkPool>, starts: Vec<TurnStart>) {
             output_schema: None,
             schema_mode: omp_task::SchemaMode::Permissive,
             model: None,
+            model_route: None,
             tools: None,
             depth: 0,
             extra_args: Vec::new(),
@@ -2239,12 +2251,49 @@ fn start_turns(pool: &Arc<WorkPool>, starts: Vec<TurnStart>) {
             start_turns(pool, next);
             continue;
         }
-        let run = launch_agent(&handle, spec, &*pool.launcher);
         let pool = pool.clone();
         let batch = start.batch;
+        let host = crate::rpc::slash::extensions()
+            .map(|ext| Arc::clone(&ext.host))
+            .filter(|host| host.has_handlers("before_subagent_spawn"));
+        let Some(host) = host else {
+            // No subscriber: the turn launches synchronously, so `push` returns
+            // with its runs registered.
+            let run = launch_agent(&handle, spec, &*pool.launcher);
+            tokio::spawn(async move {
+                let output = run.await;
+                settle_agent(&handle, &output, omp_task::SchemaMode::Permissive, false);
+                handle.mark_run_finished();
+                let (status, text) = turn_outcome(&handle);
+                let next = pool.state.lock().expect("workpool lock").finish_turn(
+                    batch,
+                    status,
+                    text,
+                    &agent_id_taken,
+                );
+                start_turns(&pool, next);
+            });
+            continue;
+        };
+        let launcher = pool.launcher.clone();
         tokio::spawn(async move {
-            let output = run.await;
-            settle_agent(&handle, &output, omp_task::SchemaMode::Permissive, false);
+            // `before_subagent_spawn` (TS `applySpawnHook`, `invocationKind:
+            // "eval"`): a blocked worker turn settles failed with the reason.
+            match super::task::apply_subagent_spawn(
+                &host,
+                &mut spec,
+                omp_ext::lifecycle::SubagentInvocationKind::Eval,
+            )
+            .await
+            {
+                Ok(()) => {
+                    let output = launch_agent(&handle, spec, &*launcher).await;
+                    settle_agent(&handle, &output, omp_task::SchemaMode::Permissive, false);
+                }
+                Err(error) => {
+                    handle.settle(HandleStatus::Failed, None, None, Some(error.to_string()))
+                }
+            }
             handle.mark_run_finished();
             let (status, text) = turn_outcome(&handle);
             let next = pool.state.lock().expect("workpool lock").finish_turn(
@@ -2519,6 +2568,7 @@ mod tests {
             schema: omp_task::SchemaValidation::NoSchema,
             duration: Duration::ZERO,
             truncated: false,
+            resolved_model_route: None,
         }
     }
 
@@ -2613,6 +2663,7 @@ mod tests {
             output_schema: None,
             schema_mode: omp_task::SchemaMode::Permissive,
             model: None,
+            model_route: None,
             tools: None,
             depth: 0,
             extra_args: Vec::new(),

@@ -2,10 +2,11 @@
 const OBSERVED = [
   "session_start", "agent_start", "agent_end", "turn_start", "turn_end", "message_start", "message_update", "message_end",
   "tool_execution_start", "tool_execution_update", "tool_execution_end", "session_compact", "session_switch",
-  "session_branch", "session_tree", "session_shutdown",
+  "session_branch", "session_tree", "session_clear", "session_shutdown",
   "assistant_message", "auto_compaction_start", "auto_compaction_end", "auto_retry_start", "auto_retry_end",
   "retry_fallback_applied", "retry_fallback_succeeded", "ttsr_triggered", "todo_reminder", "goal_updated",
-  "tool_approval_requested", "tool_approval_resolved", "plan_review_requested", "plan_review_resolved",
+  "tool_approval_requested", "tool_approval_resolved", "mode_changed", "after_provider_response", "session.compacting", "resources_discover",
+  "plan_review_requested", "plan_review_resolved",
 ];
 const RESULTS: Record<string, unknown> = {
   before_agent_start: { message: { customType: "fx", content: "hello", display: false }, systemPrompt: ["sys-a", "sys-b"] },
@@ -15,9 +16,12 @@ const RESULTS: Record<string, unknown> = {
   session_before_branch: { cancel: false },
   session_before_tree: { cancel: true },
   session_stop: { continue: true, additionalContext: "keep going" },
+  before_subagent_spawn: { model: ["fx/one:high", "fx/two"], note: "fixture route" },
   user_bash: { result: { output: "handled", exitCode: 0 } },
   user_python: { result: { output: "py", exitCode: 0 } },
+  "session.compacting": { context: ["ctx line"], prompt: "CUSTOM PROMPT", preserveData: { keep: 1 } },
 };
+  resources_discover: { skillPaths: ["skills/ext-a"], promptPaths: ["prompts/ext-b.md"], themePaths: ["themes/ext-c.json"] },
 
 export default function lifecycle(pi: any): void {
   for (const type of [...OBSERVED, ...Object.keys(RESULTS)]) {

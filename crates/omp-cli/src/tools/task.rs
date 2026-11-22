@@ -272,6 +272,72 @@ pub(crate) fn apply_agent_model(spec: &mut TaskSpec) {
     spec.model = effective_model(spec.model.as_deref(), agent_model.as_deref());
 }
 
+/// The role a selector names before expansion (`@smol:high` → `smol`), reported
+/// as the event's `modelRole` (TS `resolveExplicitModelRole`). The child's own
+/// resolver takes the bare role name (`model_candidates`), so the `@` and any
+/// `:level` drop here; a plain `provider/id` names no role.
+fn role_reference(selector: &str) -> Option<String> {
+    let name = selector.trim().strip_prefix('@')?;
+    let name = name.split(':').next().unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// `before_subagent_spawn` (TS `applySpawnHook`): fired once per actual child
+/// dispatch, after the spawn's model chain is resolved and before the child
+/// runs. A handler may refuse the spawn, or replace the model patterns with a
+/// `note` recorded as the run's `resolvedModelRoute`.
+///
+/// # Errors
+/// A handler blocked the spawn (its `reason`), or the host transport failed.
+pub(crate) async fn apply_subagent_spawn(
+    host: &omp_ext::ExtHost,
+    spec: &mut TaskSpec,
+    invocation_kind: omp_ext::lifecycle::SubagentInvocationKind,
+) -> Result<()> {
+    if !host.has_handlers("before_subagent_spawn") {
+        return Ok(());
+    }
+    let patterns: Vec<String> = spec
+        .model
+        .as_deref()
+        .map(|chain| {
+            chain
+                .split(',')
+                .map(str::trim)
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let model_role = patterns.iter().find_map(|pattern| role_reference(pattern));
+    let outcome = host
+        .emit_before_subagent_spawn(
+            spec.agent.clone(),
+            invocation_kind,
+            model_role,
+            patterns,
+            spec.id.clone(),
+            None,
+        )
+        .await?;
+    if outcome.block {
+        bail!(
+            "{}",
+            outcome
+                .reason
+                .unwrap_or_else(|| "Subagent spawn blocked by extension.".to_string())
+        );
+    }
+    let Some(model) = outcome.model else {
+        return Ok(());
+    };
+    // The child expands `@role` aliases and `:level` suffixes in its `--model`
+    // chain itself, exactly as it does for the spawn's original patterns.
+    spec.model = Some(model.join(","));
+    spec.model_route = outcome.note;
+    Ok(())
+}
+
 /// One `tasks[]` item as the wire delivers it (`solutionSpace` required by
 /// the schema; `outputSchema` kept raw for [`omp_task::schema`]).
 #[derive(Debug, Deserialize)]
@@ -478,6 +544,19 @@ pub async fn task(env: std::sync::Arc<Env>, args: Value) -> Result<AgentToolResu
         // The agent definition's `model` chain applies when the item gave no
         // selector (TS `resolveEffectiveAgentModelSelection`).
         apply_agent_model(spec);
+    }
+    // `before_subagent_spawn` (TS `applySpawnHook`): one event per child, after
+    // the model chain is resolved and before anything spawns. A handler's
+    // `block` refuses the call before any child runs.
+    if let Some(ext) = crate::rpc::slash::extensions() {
+        for spec in &mut specs {
+            apply_subagent_spawn(
+                &ext.host,
+                spec,
+                omp_ext::lifecycle::SubagentInvocationKind::Task,
+            )
+            .await?;
+        }
     }
 
     let binary = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("omt"));
@@ -791,6 +870,7 @@ mod tests {
             schema: omp_task::SchemaValidation::NoSchema,
             duration: std::time::Duration::ZERO,
             truncated: false,
+            resolved_model_route: None,
         }
     }
 
@@ -889,5 +969,180 @@ mod tests {
         }))
         .unwrap();
         assert!(params.tasks.is_empty() && params.task.is_some());
+    }
+
+    /// `@role` names a role before expansion; the `@` and any `:level` drop, and
+    /// a plain `provider/id` names no role at all.
+    #[test]
+    fn role_reference_strips_prefix_and_level() {
+        assert_eq!(role_reference("@smol").as_deref(), Some("smol"));
+        assert_eq!(role_reference("@smol:high").as_deref(), Some("smol"));
+        assert_eq!(role_reference(" @slow ").as_deref(), Some("slow"));
+        assert_eq!(role_reference("zz/m1:low"), None);
+        assert_eq!(role_reference("smol"), None);
+        assert_eq!(role_reference("@"), None);
+    }
+
+    /// Fake extension host: `body` answers the JSON-RPC lines it reads.
+    async fn sh_host(
+        dir: &std::path::Path,
+        body: &str,
+        env: Vec<(String, String)>,
+    ) -> std::sync::Arc<omp_ext::ExtHost> {
+        let script = dir.join("fake-host.sh");
+        std::fs::write(&script, body).unwrap();
+        omp_ext::ExtHost::spawn(&omp_ext::HostConfig {
+            bun: "/bin/sh".into(),
+            host_script: script,
+            trace: None,
+            handler_timeout_ms: None,
+            env,
+            shared_socket: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    fn spawn_spec() -> TaskSpec {
+        TaskSpec {
+            id: Some("agent-7".to_string()),
+            agent: "task".to_string(),
+            prompt: "p".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            output_schema: None,
+            schema_mode: SchemaMode::Permissive,
+            model: Some("zz/m1".to_string()),
+            model_route: None,
+            tools: None,
+            depth: 0,
+            extra_args: Vec::new(),
+        }
+    }
+
+    /// A host that subscribes to `before_subagent_spawn` and answers with `$ANSWER`.
+    const SPAWN_HOST: &str = concat!(
+        "while IFS= read -r line; do\n",
+        "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+        "  [ -n \"$id\" ] || continue\n",
+        "  case \"$line\" in\n",
+        "    *'\"method\":\"load\"'*)\n",
+        "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"loaded\":[{\"path\":\"p\",\"name\":\"n\",\"handlers\":{\"before_subagent_spawn\":1}}],\"errors\":[]}}\\n' \"$id\";;\n",
+        "    *'\"method\":\"emit\"'*)\n",
+        "      printf '%s\\n' \"$line\" >> \"$LOG\"\n",
+        "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":%s,\"handlers\":[],\"errors\":[]}}\\n' \"$id\" \"$ANSWER\";;\n",
+        "  esac\n",
+        "done\n",
+    );
+
+    /// A handler's `block` refuses the spawn with its reason and leaves the
+    /// spec untouched (TS `applySpawnHook`).
+    #[tokio::test]
+    async fn subagent_spawn_block_refuses_the_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("emit.log");
+        let host = sh_host(
+            dir.path(),
+            SPAWN_HOST,
+            vec![
+                (
+                    "ANSWER".into(),
+                    r#"{"block":true,"reason":"no capacity"}"#.into(),
+                ),
+                ("LOG".into(), log.display().to_string()),
+            ],
+        )
+        .await;
+        host.load(None, None, "/tmp", None).await.unwrap();
+        let mut spec = spawn_spec();
+        let error = apply_subagent_spawn(
+            &host,
+            &mut spec,
+            omp_ext::lifecycle::SubagentInvocationKind::Task,
+        )
+        .await
+        .expect_err("a blocking handler must refuse the spawn");
+        assert_eq!(error.to_string(), "no capacity");
+        assert_eq!(spec.model.as_deref(), Some("zz/m1"));
+        // The event carried the resolved spawn facts.
+        let emitted = std::fs::read_to_string(&log).unwrap();
+        for expected in [
+            r#""type":"before_subagent_spawn""#,
+            r#""agent":"task""#,
+            r#""invocationKind":"task""#,
+            r#""patterns":["zz/m1"]"#,
+            r#""spawnKey":"agent-7""#,
+        ] {
+            assert!(emitted.contains(expected), "{expected} not in {emitted}");
+        }
+        // No `@role` in `zz/m1`, so the event carries no model role.
+        assert!(!emitted.contains("modelRole"), "{emitted}");
+        host.shutdown().await.unwrap();
+    }
+
+    /// A handler's `model` replaces the spawn's patterns and its `note`
+    /// becomes the run's routing note.
+    #[tokio::test]
+    async fn subagent_spawn_model_replacement_and_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("emit.log");
+        let host = sh_host(
+            dir.path(),
+            SPAWN_HOST,
+            vec![
+                (
+                    "ANSWER".into(),
+                    r#"{"model":["zz/m2:high","zz/m3"],"note":"cheap route"}"#.into(),
+                ),
+                ("LOG".into(), log.display().to_string()),
+            ],
+        )
+        .await;
+        host.load(None, None, "/tmp", None).await.unwrap();
+        let mut spec = spawn_spec();
+        apply_subagent_spawn(
+            &host,
+            &mut spec,
+            omp_ext::lifecycle::SubagentInvocationKind::Eval,
+        )
+        .await
+        .unwrap();
+        assert_eq!(spec.model.as_deref(), Some("zz/m2:high,zz/m3"));
+        assert_eq!(spec.model_route.as_deref(), Some("cheap route"));
+        host.shutdown().await.unwrap();
+    }
+
+    /// With no subscriber the spawn is untouched and nothing is emitted.
+    #[tokio::test]
+    async fn subagent_spawn_skips_without_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("emit.log");
+        // Subscribed to a different event only.
+        let body = SPAWN_HOST.replace("\"before_subagent_spawn\":1", "\"agent_start\":1");
+        let host = sh_host(
+            dir.path(),
+            &body,
+            vec![
+                ("ANSWER".into(), r#"{"block":true}"#.into()),
+                ("LOG".into(), log.display().to_string()),
+            ],
+        )
+        .await;
+        host.load(None, None, "/tmp", None).await.unwrap();
+        assert!(!host.has_handlers("before_subagent_spawn"));
+        let mut spec = spawn_spec();
+        apply_subagent_spawn(
+            &host,
+            &mut spec,
+            omp_ext::lifecycle::SubagentInvocationKind::Task,
+        )
+        .await
+        .unwrap();
+        assert_eq!(spec.model.as_deref(), Some("zz/m1"));
+        assert_eq!(spec.model_route, None);
+        assert!(
+            !log.exists() || std::fs::read_to_string(&log).unwrap().is_empty(),
+            "no emit without a subscriber"
+        );
+        host.shutdown().await.unwrap();
     }
 }

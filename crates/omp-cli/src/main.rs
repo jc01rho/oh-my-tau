@@ -454,7 +454,13 @@ async fn async_main() -> Result<()> {
         // binary ships without the bun ext-host).
         if ext::has_extensions(&extra) {
             match ext::Extensions::start(&cwd, &extra).await {
-                Ok(e) => extensions = Some(e),
+                Ok(e) => {
+                    // Extension-contributed resources (`resources_discover`, startup) must be
+                    // registered before the session's system prompt is assembled below.
+                    e.resources_discover(omp_ext::lifecycle::ResourcesDiscoverReason::Startup)
+                        .await;
+                    extensions = Some(e);
+                }
                 Err(e) => eprintln!("omt: extensions disabled: {e:#}"),
             }
         }

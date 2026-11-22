@@ -19,6 +19,7 @@ omp-settings = { path = "../omp-settings" }
 libc = "0.2"
 base64 = "0.22"
 rusqlite = { version = "0.32", features = ["bundled"] }
+regex.workspace = true
 omp-stats = { path = "../omp-stats" }
 
 [build-dependencies]
