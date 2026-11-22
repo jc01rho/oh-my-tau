@@ -298,9 +298,9 @@ fn fits_budget(tokenizer: &dyn Tokenizer, text: &str, budget: u64) -> (bool, u64
 
 /// `clampConversationToBudget`: truncate one oversized serialized window to its budget.
 ///
-/// The first cut assumes uniform token density (TS); exact tokenizers are not uniform, so the
-/// cut is recounted and shrunk by the measured density until it fits (or reaches the 1024-unit
-/// floor).
+/// The first cut assumes uniform token density with TS's 1024-unit floor; exact tokenizers are
+/// not uniform, so the cut is recounted and shrunk by the measured density (below the floor
+/// when needed) until it fits.
 fn clamp_conversation_to_budget(
     tokenizer: &dyn Tokenizer,
     text: &str,
@@ -311,24 +311,24 @@ fn clamp_conversation_to_budget(
         return text.to_owned();
     }
     let len = utf16_len(text);
-    let shrink = |units: usize, counted: u64| {
-        1024.max(((units as f64 * budget as f64 * 0.95) / counted as f64).floor() as usize)
+    let ratio = |units: usize, counted: u64| {
+        ((units as f64 * budget as f64 * 0.95) / counted as f64).floor() as usize
     };
-    let mut keep = shrink(len, tokens);
+    let mut keep = 1024.max(ratio(len, tokens));
+    if keep >= len {
+        keep = ratio(len, tokens);
+    }
     loop {
-        if keep >= len {
-            return text.to_owned();
-        }
         let clamped = format!(
             "{}\n\n[... {} more characters truncated]",
             utf16_prefix(text, keep),
             len - keep
         );
         let counted = tokenizer.count_text(&clamped);
-        if counted <= budget || keep <= 1024 {
+        if counted <= budget || keep == 0 {
             return clamped;
         }
-        keep = shrink(keep, counted).min(keep - 1);
+        keep = ratio(keep, counted).min(keep - 1);
     }
 }
 
@@ -536,6 +536,20 @@ mod tests {
         let clamped = clamp_conversation_to_budget(&Spaces, &text, 2_000, tokens);
         assert!(Spaces.count_text(&clamped) <= 2_000);
         assert!(clamped.starts_with("a a "));
+    }
+
+    #[test]
+    fn clamp_shrinks_below_the_floor_when_the_floor_overflows() {
+        let text = " ".repeat(2_000);
+        let clamped = clamp_conversation_to_budget(&Spaces, &text, 1_024, 2_000);
+        assert!(Spaces.count_text(&clamped) <= 1_024);
+    }
+
+    #[test]
+    fn clamp_cuts_text_shorter_than_the_floor() {
+        let text = " ".repeat(800);
+        let clamped = clamp_conversation_to_budget(&Spaces, &text, 100, 800);
+        assert!(Spaces.count_text(&clamped) <= 100);
     }
 
     #[test]

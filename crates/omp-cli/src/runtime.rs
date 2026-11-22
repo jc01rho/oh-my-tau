@@ -3370,6 +3370,14 @@ impl Runtime {
         let trace = std::env::var_os("OMP_RS_TURN_TRACE").is_some();
         turn_trace!("[turn-trace] compact-begin rss={}kB", rss_kb());
         let summarizer = self.summarizer()?;
+        // The summary budget counts for the model the request goes to: the live
+        // summarizer's pinned snapshot, not a re-read the model switch could race.
+        let (window, tokenizer) = match &summarizer {
+            crate::compact::Summarizer::Live(live) => {
+                (live.model.context_window, live.model.resolved_tokenizer())
+            }
+            crate::compact::Summarizer::Injected(_) => self.live_window_and_tokenizer(),
+        };
         // Only the prompt overhead and the model id are needed from the state:
         // release the snapshot (a full copy of the live context) before the
         // summarization, which is the compaction's memory peak.
@@ -3382,7 +3390,6 @@ impl Runtime {
             )
         };
         let settings = lock(&self.compaction).clone();
-        let (window, tokenizer) = self.live_window_and_tokenizer();
         let hooks = lock(&self.compaction_hooks).clone();
         // Handoff builds its own oneshot context from the live prompt + history
         // (`SessionHandoff.generateDocument`), so it is assembled here, before the
