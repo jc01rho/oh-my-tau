@@ -47,6 +47,7 @@ mod todo;
 pub(crate) mod tts;
 pub(crate) mod vibe;
 pub mod wasm;
+pub(crate) use jobs::JobRegistry;
 pub(crate) use read::url_registry;
 pub use todo::{phases_from_entries, TodoPhase, TodoTool};
 #[cfg(test)]
@@ -83,6 +84,9 @@ static SESSION_ENV: std::sync::Mutex<Option<Weak<Env>>> = std::sync::Mutex::new(
 /// capture right after (before anything else builds a throwaway set).
 #[must_use]
 pub fn take_last_jobs() -> Option<jobs::JobRegistry> {
+    if let Some(scope) = crate::scope::current() {
+        return crate::scope::lock(&scope.last_jobs).clone();
+    }
     LAST_JOBS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -91,6 +95,10 @@ pub fn take_last_jobs() -> Option<jobs::JobRegistry> {
 
 /// Publish the agent session's job registry (`ctx.getAsyncJobSnapshot()`).
 pub fn set_session_jobs(jobs: Option<jobs::JobRegistry>) {
+    if let Some(scope) = crate::scope::current() {
+        *crate::scope::lock(&scope.jobs) = jobs;
+        return;
+    }
     *SESSION_JOBS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = jobs;
@@ -99,6 +107,9 @@ pub fn set_session_jobs(jobs: Option<jobs::JobRegistry>) {
 /// The agent session's job registry, once published.
 #[must_use]
 pub fn session_jobs() -> Option<jobs::JobRegistry> {
+    if let Some(scope) = crate::scope::current() {
+        return crate::scope::lock(&scope.jobs).clone();
+    }
     SESSION_JOBS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -108,6 +119,10 @@ pub fn session_jobs() -> Option<jobs::JobRegistry> {
 /// Publish the tool [`Env`] of the agent session, so callers that rebuild the
 /// tool list can refresh its `dyn` snapshot (see [`republish_dyn_tools`]).
 pub fn set_session_env(env: &Arc<Env>) {
+    if let Some(scope) = crate::scope::current() {
+        *crate::scope::lock(&scope.env) = Some(Arc::downgrade(env));
+        return;
+    }
     *SESSION_ENV
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(env));
@@ -116,6 +131,11 @@ pub fn set_session_env(env: &Arc<Env>) {
 /// The agent session's tool [`Env`], while the session's tools keep it alive.
 #[must_use]
 pub fn session_env() -> Option<Arc<Env>> {
+    if let Some(scope) = crate::scope::current() {
+        return crate::scope::lock(&scope.env)
+            .as_ref()
+            .and_then(Weak::upgrade);
+    }
     SESSION_ENV
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -304,9 +324,14 @@ pub fn builtin_tools_with_env_and_jobs(
     jobs: jobs::JobRegistry,
 ) -> (Arc<Env>, Vec<Arc<dyn AgentTool>>) {
     let env = Arc::new(Env::with_mode_and_jobs(cwd, edit_mode, jobs));
-    *LAST_JOBS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(env.jobs.clone());
+    match crate::scope::current() {
+        Some(scope) => *crate::scope::lock(&scope.last_jobs) = Some(env.jobs.clone()),
+        None => {
+            *LAST_JOBS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(env.jobs.clone());
+        }
+    }
     let mk = |name: &'static str,
               description: String,
               schema: Value,
@@ -329,7 +354,7 @@ pub fn builtin_tools_with_env_and_jobs(
         Arc::new(move |env, args, signal| {
             Box::pin(async move {
                 pa_agent::abort::throw_if_aborted(&signal)?;
-                let result = tokio::task::spawn_blocking(move || f(&env, &args))
+                let result = crate::scope::spawn_blocking(move || f(&env, &args))
                     .await
                     .map_err(|e| anyhow::anyhow!("tool task failed: {e}"))?;
                 // A cancelled turn must not surface stale output.

@@ -634,6 +634,18 @@ pub enum LifecycleEvent {
     /// [`ExtHost::emit_session_before_shutdown`]).
     #[serde(rename = "session_before_shutdown")]
     SessionBeforeShutdown,
+    /// A moving session's out-of-folder state: handlers write what must follow the session into
+    /// `dir` while its runtime is live (the host hands each handler an `AbortSignal` as `signal`).
+    #[serde(rename = "session_move_export", rename_all = "camelCase")]
+    SessionMoveExport { move_id: String, dir: String },
+    /// A moved session's extension state, delivered once its new runtime started; `redelivered`
+    /// when an earlier delivery of the same state did not complete.
+    #[serde(rename = "session_move_import", rename_all = "camelCase")]
+    SessionMoveImport {
+        move_id: String,
+        dir: String,
+        redelivered: bool,
+    },
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -951,6 +963,11 @@ impl ExtHost {
         emit_session_tree(new_leaf_id: Option<String>, old_leaf_id: Option<String>, summary_entry: Option<Value>, from_extension: Option<bool>) => LifecycleEvent::SessionTree { new_leaf_id, old_leaf_id, summary_entry, from_extension };
         /// `session_shutdown`: process exit (handlers run in parallel, 2 s cap in the host).
         emit_session_shutdown() => LifecycleEvent::SessionShutdown;
+        /// `session_move_export`: a failed or timed-out handler is reported in `errors`, and the
+        /// move must not go ahead without its state.
+        emit_session_move_export(move_id: String, dir: String) => LifecycleEvent::SessionMoveExport { move_id, dir };
+        /// `session_move_import`: moved extension state handed to the session's extensions.
+        emit_session_move_import(move_id: String, dir: String, redelivered: bool) => LifecycleEvent::SessionMoveImport { move_id, dir, redelivered };
         /// `auto_compaction_start`.
         emit_auto_compaction_start(reason: CompactionReason, action: CompactionAction) => LifecycleEvent::AutoCompactionStart { reason, action };
         /// `auto_compaction_end`.

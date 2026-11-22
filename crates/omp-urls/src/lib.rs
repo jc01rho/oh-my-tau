@@ -60,14 +60,37 @@ impl UrlCtx {
 
 static SESSION_FILE: RwLock<Option<PathBuf>> = RwLock::new(None);
 
+/// A process hosting several sessions answers for the session the caller runs in.
+pub trait SessionFileScope: Send + Sync {
+    /// `Some(file)` when the caller runs inside a hosted session (whose file may be `None`).
+    fn get(&self) -> Option<Option<PathBuf>>;
+    /// Store `path` for the caller's hosted session; `false` when the caller is not in one.
+    fn set(&self, path: Option<PathBuf>) -> bool;
+}
+
+static SESSION_SCOPE: std::sync::OnceLock<Box<dyn SessionFileScope>> = std::sync::OnceLock::new();
+
+/// Resolve the session file through `scope` first (once per process; later calls are ignored).
+pub fn install_session_file_scope(scope: Box<dyn SessionFileScope>) {
+    let _ = SESSION_SCOPE.set(scope);
+}
+
 /// Install the process-global session file so tools can default to it
 /// (TS `AgentRegistry` first-main-session fallback).
 pub fn set_global_session_file(path: Option<PathBuf>) {
+    if let Some(scope) = SESSION_SCOPE.get() {
+        if scope.set(path.clone()) {
+            return;
+        }
+    }
     *SESSION_FILE.write().expect("session file lock") = path;
 }
 
 /// The installed global session file, if any.
 pub fn global_session_file() -> Option<PathBuf> {
+    if let Some(file) = SESSION_SCOPE.get().and_then(|scope| scope.get()) {
+        return file;
+    }
     SESSION_FILE.read().expect("session file lock").clone()
 }
 

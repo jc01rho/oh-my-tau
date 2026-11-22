@@ -69,6 +69,36 @@ impl From<anyhow::Error> for CmdError {
 /// `Ok(None)` = success without `data`; `Ok(Some(Value::Null))` = `data: null`.
 pub type CmdResult = Result<Option<Value>, CmdError>;
 
+/// User input a release took out of a session, by queue: putting it back keeps a steering prompt
+/// steering, and a follow-up a follow-up.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct QueuedInput {
+    pub steering: Vec<String>,
+    pub follow_up: Vec<String>,
+}
+
+impl QueuedInput {
+    /// Every queued text, steering first (what a moved session owes the machine that continues it).
+    #[must_use]
+    pub fn user_messages(&self) -> Vec<String> {
+        self.steering
+            .iter()
+            .chain(&self.follow_up)
+            .cloned()
+            .collect()
+    }
+
+    /// Put the input back where it was queued, in order.
+    pub fn restore(&self, rt: &Runtime) {
+        for text in &self.steering {
+            rt.steer(text);
+        }
+        for text in &self.follow_up {
+            rt.follow_up(text);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct RunOutcome {
     status: &'static str,
@@ -723,6 +753,52 @@ impl Runtime {
     pub fn queued_count(&self) -> usize {
         let (a, b) = self.queued();
         a.len() + b.len()
+    }
+
+    /// What still runs in this session, by the names `release_session` reports: a turn, queued
+    /// user input, a user shell, a compaction or an open retry.
+    pub async fn busy_signals(&self) -> Vec<&'static str> {
+        let mut signals = Vec::new();
+        if self.agent.is_streaming().await {
+            signals.push("turn");
+        }
+        if self.queued_count() > 0 {
+            signals.push("queued");
+        }
+        if lock(&self.settings).running_bash.is_some() {
+            signals.push("bash");
+        }
+        if self.compacting.load(std::sync::atomic::Ordering::SeqCst) {
+            signals.push("compaction");
+        }
+        if lock(&self.recovery).saga_open() {
+            signals.push("session_work");
+        }
+        // A title request outlives the turn that launched it and appends a `title_change` when it
+        // returns; sealing the file under it would write after the seal.
+        if lock(&self.title_task)
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+            || lock(&self.post_turn_task)
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+        {
+            signals.push("session_work");
+        }
+        signals
+    }
+
+    /// Take the user input still queued here out of the session (one text per queued batch); a
+    /// moving session hands it to the machine that continues it.
+    pub fn take_queued_input(&self) -> QueuedInput {
+        let (steering, follow_up) = self.queued();
+        self.agent.clear_steering_queue();
+        self.agent.clear_follow_up_queue();
+        self.emit_queue_update();
+        QueuedInput {
+            steering,
+            follow_up,
+        }
     }
 
     fn emit_queue_update(&self) {
@@ -2198,6 +2274,9 @@ impl Runtime {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.abort_retry();
         self.abort_compaction();
+        if let Some(task) = lock(&self.title_task).take() {
+            task.abort();
+        }
         self.agent.abort();
         self.agent.wait_for_idle().await;
     }
@@ -2962,6 +3041,13 @@ impl Runtime {
         // Todo phases (TS `getLatestTodoPhasesFromEntries(getBranch())`).
         let phases = latest_todo_phases(&index, path, &branch)?;
         rss_trace!("loaded");
+        // A session another machine owns is refused before the live session is torn down, so a
+        // failed switch leaves the current session as it was.
+        if !fork {
+            if let Some(error) = crate::persist::moved_away(path) {
+                anyhow::bail!("{error}");
+            }
+        }
         self.agent.abort();
         self.agent.wait_for_idle().await;
         self.agent.reset().await;

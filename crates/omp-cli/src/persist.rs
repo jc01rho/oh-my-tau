@@ -515,6 +515,9 @@ impl Persistence {
         leaf: Option<&str>,
     ) -> Result<()> {
         let old = self.path();
+        if let Some(error) = moved_away(path) {
+            anyhow::bail!("{error}");
+        }
         let opened = SessionWriter::open(path, leaf)?;
         *self.writer.lock().unwrap() = opened;
         if let Some(id) = session_id {
@@ -532,6 +535,26 @@ impl Persistence {
     /// forked copy).
     pub fn discard_pristine(&self) {
         discard_if_preamble_only(&self.path());
+    }
+}
+
+/// A session file another machine now owns (released for a move, or already moved) is not
+/// resumed here: writing it would append to a transcript that lives elsewhere. The byte scan keeps
+/// an ordinary open from parsing the journal.
+pub(crate) fn moved_away(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let named = |needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+    if !(named("session_moved_in") || named("session_released") || named("session_moved")) {
+        return None;
+    }
+    let entries = omp_session::read_values(path).ok()?;
+    match omp_session::move_bundle::session_ownership(&entries) {
+        omp_session::move_bundle::Ownership::Writable => None,
+        omp_session::move_bundle::Ownership::Moving { target, .. }
+        | omp_session::move_bundle::Ownership::Moved { target, .. } => Some(format!(
+            "This session was moved to {target}; it is read-only here. Open it there, or make a copy. ({})",
+            path.display()
+        )),
     }
 }
 

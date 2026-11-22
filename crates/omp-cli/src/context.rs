@@ -59,6 +59,10 @@ static LIVE: std::sync::RwLock<Option<Live>> = std::sync::RwLock::new(None);
 
 /// Install (or clear) the live strategy `convert_to_llm` reads per request.
 pub fn set_live(shared: Option<Arc<Shared>>, by_ultra: bool) {
+    if let Some(scope) = crate::scope::current() {
+        *crate::scope::write(&scope.context_live) = shared.map(|shared| (shared, by_ultra));
+        return;
+    }
     *LIVE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -68,6 +72,11 @@ pub fn set_live(shared: Option<Arc<Shared>>, by_ultra: bool) {
 /// The live strategy, `None` for `append`.
 #[must_use]
 pub fn live() -> Option<Arc<Shared>> {
+    if let Some(scope) = crate::scope::current() {
+        return crate::scope::read(&scope.context_live)
+            .as_ref()
+            .map(|(shared, _)| shared.clone());
+    }
     LIVE.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
@@ -78,6 +87,11 @@ pub fn live() -> Option<Arc<Shared>> {
 /// context themselves (`context-slim`) must stand aside.
 #[must_use]
 pub fn ultra_owned() -> bool {
+    if let Some(scope) = crate::scope::current() {
+        return crate::scope::read(&scope.context_live)
+            .as_ref()
+            .is_some_and(|(_, by_ultra)| *by_ultra);
+    }
     LIVE.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
