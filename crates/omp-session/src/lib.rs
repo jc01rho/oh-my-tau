@@ -7,6 +7,7 @@
 
 pub mod entries;
 pub mod index;
+pub mod pins;
 pub mod scan;
 pub mod tree;
 

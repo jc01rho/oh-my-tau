@@ -2123,7 +2123,8 @@ impl App {
             self.push_system("session storage is not available in this session".into());
             return;
         }
-        self.overlays.open_sessions(&self.session_sources);
+        self.overlays
+            .open_sessions(&self.session_sources, &self.keys);
     }
 
     /// Live half of a persisted settings edit: apply what omp-rs can right

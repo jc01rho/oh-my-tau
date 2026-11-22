@@ -168,8 +168,13 @@ impl Overlays {
 
     /// Open the embedded session picker (`/resume`): rescan `sources`, reset
     /// the query/selection and push the overlay (replacing a stale picker).
-    pub fn open_sessions(&mut self, sources: &[sessions::SessionSource]) {
+    pub fn open_sessions(
+        &mut self,
+        sources: &[sessions::SessionSource],
+        keys: &crate::keybindings::KeybindingsManager,
+    ) {
         let mut picker = sessions::SessionPicker::load_sources(sources);
+        picker.set_keys(keys.clone());
         picker.set_standalone(true); // TS mounts /resume fullscreen (selector-controller.ts)
         self.sessions = picker;
         if !self.stack.contains(&OpenOverlay::Sessions) {

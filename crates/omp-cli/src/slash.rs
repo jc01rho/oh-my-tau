@@ -2828,34 +2828,18 @@ async fn modelpreset_command(rt: &Runtime, args: &str) -> Outcome {
 // /pin (session/session-pins.ts)
 // =============================================================================
 
-/// `~/.omp-rs/session-pins.json` — pinned session ids (keyed by id so pins
-/// survive moves), the omp-rs counterpart of TS `~/.omp/session-pins.json`.
-fn pins_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".omp-rs")
-            .join("session-pins.json"),
-    )
-}
-
+/// Pinned session ids from the shared store (`omp_session::pins`), the same
+/// file the resume picker's pin keys edit.
 fn load_pinned_sessions() -> HashSet<String> {
-    pins_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
-        .map(|v| v.into_iter().collect())
+    omp_session::pins::default_path()
+        .map(|p| omp_session::pins::load(&p))
         .unwrap_or_default()
 }
 
 fn store_pinned_sessions(pins: &HashSet<String>) -> Result<(), String> {
-    let path = pins_path().ok_or_else(|| "no HOME for pins file".to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let mut sorted: Vec<&String> = pins.iter().collect();
-    sorted.sort();
-    let text = serde_json::to_string_pretty(&sorted).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| e.to_string())
+    let path =
+        omp_session::pins::default_path().ok_or_else(|| "no HOME for pins file".to_string())?;
+    omp_session::pins::store(&path, pins).map_err(|e| e.to_string())
 }
 
 /// `/pin [session id]` — toggle this session's pin (TS `handle` in
