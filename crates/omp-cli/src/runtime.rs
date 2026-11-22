@@ -2066,11 +2066,6 @@ impl Runtime {
         }
     }
 
-    /// The pause half of `get_state`.
-    pub fn pause_view(&self) -> Value {
-        crate::pause::view(&lock(&self.pause))
-    }
-
     pub fn steer(&self, message: &str) {
         self.agent.steer(user_message(message));
         self.emit_queue_update();

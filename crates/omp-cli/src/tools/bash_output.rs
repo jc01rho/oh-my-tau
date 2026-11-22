@@ -3,8 +3,6 @@
 //! A job's output is a rolling buffer, so the read cursor is shared state: without it a second
 //! call would replay the whole buffer instead of the delta.
 
-use std::sync::Mutex;
-
 use anyhow::Result;
 use pa_agent::types::AgentToolResult;
 use serde_json::{json, Value};
@@ -153,8 +151,8 @@ pub fn kill_bash(env: &Env, args: &Value) -> Result<AgentToolResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::jobs::{Job, JobRegistry};
-    use std::sync::Arc;
+    use crate::tools::jobs::Job;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     fn env_with_job(chunks: &[&str], status: JobStatus) -> (Env, String) {

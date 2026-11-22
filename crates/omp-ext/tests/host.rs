@@ -1260,6 +1260,9 @@ async fn failed_load_restores_provider_it_only_unregistered() {
 
 #[tokio::test]
 async fn rpc_handle_roundtrip() {
+    if common::bun_missing("rpc_handle_roundtrip") {
+        return;
+    }
     let host = ExtHost::spawn(&config()).await.unwrap();
     let _rx = host.take_incoming().unwrap();
     let r = host
@@ -1269,7 +1272,7 @@ async fn rpc_handle_roundtrip() {
     assert_eq!(r.loaded.len(), 1, "{r:?}");
     assert!(r.loaded[0].rpc.iter().any(|n| n == "fx.rpc"), "{r:?}");
     assert!(host.has_rpc_handler("fx.rpc"));
-    assert!(host.has_rpc_handler("omomeow.move-readiness") == false);
+    assert!(!host.has_rpc_handler("omomeow.move-readiness"));
 
     let budget = Duration::from_secs(5);
     let v = host
@@ -1303,6 +1306,9 @@ async fn rpc_handle_roundtrip() {
 
 #[tokio::test]
 async fn rpc_timeout_releases_the_waiter() {
+    if common::bun_missing("rpc_timeout_releases_the_waiter") {
+        return;
+    }
     let host = ExtHost::spawn(&config()).await.unwrap();
     let _rx = host.take_incoming().unwrap();
     host.load(Some(&[fixture("rpc.ts")]), None, "/tmp", None)
@@ -1325,6 +1331,9 @@ async fn rpc_timeout_releases_the_waiter() {
 
 #[tokio::test]
 async fn duplicate_rpc_name_fails_the_second_load() {
+    if common::bun_missing("duplicate_rpc_name_fails_the_second_load") {
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("omp-rpc-dup-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let body = |name: &str| {

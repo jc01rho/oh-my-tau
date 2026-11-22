@@ -16,15 +16,6 @@ pub enum InterruptIntent {
     Abort,
 }
 
-impl InterruptIntent {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Stop => "stop",
-            Self::Abort => "abort",
-        }
-    }
-}
-
 /// The capabilities that pin a connection's role.
 const ROLE_CAPABILITIES: [&str; 2] = ["interactive_user", "task_parent"];
 
