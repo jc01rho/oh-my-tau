@@ -127,6 +127,8 @@ pub(crate) async fn complete_side_turn(
             max_tokens: Some(max_tokens),
             api_key,
             headers: live.headers.clone().map(|h| h.into_iter().collect()),
+            // A side turn is a provider request too: extensions see it (upstream `onPayload`).
+            on_payload: rt.ext_host().map(crate::ext::ai_payload_hook),
             ..pa_ai::types::StreamOptions::default()
         },
         reasoning: live

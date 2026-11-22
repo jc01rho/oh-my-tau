@@ -3207,9 +3207,13 @@ impl Runtime {
         if let Some(f) = lock(&self.summarizer).clone() {
             return Ok(crate::compact::Summarizer::Injected(f));
         }
-        Ok(crate::compact::Summarizer::Live(Arc::new(
-            crate::compact::LiveCompleter::from_target(&self.target)?,
-        )))
+        Ok(crate::compact::Summarizer::Live(Arc::new({
+            let mut live = crate::compact::LiveCompleter::from_target(&self.target)?;
+            // The summary is a provider request like any other: extensions see it
+            // (upstream `onPayload` on the compaction path).
+            live.payload = self.ext_host().map(crate::ext::ai_payload_hook);
+            live
+        })))
     }
 
     /// The handoff oneshot context (`SessionHandoff.generateDocument`): the base

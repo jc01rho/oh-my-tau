@@ -231,6 +231,41 @@ pub struct ExtHost {
     closing: std::sync::atomic::AtomicBool,
 }
 
+/// Process-lifetime runtime for one connection's IO tasks (writer, reader, stderr).
+///
+/// They stay off the caller's runtime so a caller that blocks on the connection
+/// cannot stall the reader that would answer it: [`ExtHost::emit_blocking`] runs
+/// on the request path, where the provider's payload hook is synchronous.
+fn host_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("omp-ext-host")
+            .build()
+            .expect("extension host runtime")
+    });
+    &RUNTIME
+}
+
+/// Create a connection's endpoints on [`host_runtime`].
+///
+/// tokio registers a child's pipes and a socket with the reactor of the runtime
+/// that creates them, and readiness for that reactor is what wakes the reader. So
+/// they are created on the runtime that also drives the connection, never on the
+/// caller's: [`ExtHost::emit_blocking`] blocks the calling thread, and a reactor
+/// nobody polls would leave the reader asleep with the answer still unread.
+async fn on_host_runtime<F, T>(create: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    host_runtime()
+        .spawn(create)
+        .await
+        .expect("extension host runtime is process-lifetime")
+}
+
 /// Writer task: coalesces every queued line into one buffered write and
 /// flushes only when the queue drains. A write failure closes the queue
 /// (later sends error), then fails every waiter of this connection and
@@ -238,7 +273,7 @@ pub struct ExtHost {
 fn spawn_writer(mut w: BoxedWriter, pending: Pending) -> mpsc::UnboundedSender<Vec<u8>> {
     const MAX_BATCH: usize = 256 * 1024;
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    tokio::spawn(async move {
+    host_runtime().spawn(async move {
         while let Some(mut buf) = rx.recv().await {
             while buf.len() < MAX_BATCH {
                 match rx.try_recv() {
@@ -311,7 +346,7 @@ fn spawn_reader(
     pending: Pending,
     host: Weak<ExtHost>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    host_runtime().spawn(async move {
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(msg) = serde_json::from_str::<Value>(&line) else {
@@ -324,7 +359,7 @@ fn spawn_reader(
 }
 
 fn spawn_stderr(stderr: tokio::process::ChildStderr) {
-    tokio::spawn(async move {
+    host_runtime().spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             eprintln!("[ext-host] {line}");
@@ -349,8 +384,11 @@ impl ExtHost {
                 bail!("shared ext host requires unix sockets; unset OMP_RS_EXT_SHARED on this platform");
             }
         }
-        let mut child = private_command(cfg)
-            .spawn()
+        // The pipes are registered with the reactor of the runtime that spawns the
+        // child, and `host_runtime` is the one that reads them (see `on_host_runtime`).
+        let create = cfg.clone();
+        let mut child = on_host_runtime(async move { private_command(&create).spawn() })
+            .await
             .with_context(|| format!("spawn {} {}", cfg.bun, cfg.host_script.display()))?;
         let stdin = child.stdin.take().context("host stdin")?;
         let stdout = child.stdout.take().context("host stdout")?;
@@ -627,6 +665,27 @@ impl ExtHost {
         Ok(())
     }
 
+    /// [`emit`](Self::emit) driven from synchronous code.
+    ///
+    /// The provider's payload hook (`pa_ai::types::OnPayloadHook`) runs inside the
+    /// request build, where nothing can be awaited, so the round trip to the host
+    /// is bridged here: the emit runs on [`host_runtime`] — which also owns the
+    /// connection's pipes, so its reader keeps running — and the calling thread
+    /// waits for the outcome. Blocking this thread is safe precisely because no
+    /// part of the round trip needs the caller's runtime.
+    ///
+    /// # Errors
+    /// Transport failure (host exited or the connection was closed).
+    pub fn emit_blocking(self: &Arc<Self>, event: Value, ctx: Option<Value>) -> Result<EmitResult> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let host = Arc::clone(self);
+        host_runtime().spawn(async move {
+            let _ = tx.send(host.emit(event, ctx).await);
+        });
+        rx.recv()
+            .map_err(|_| anyhow!("extension host emit task dropped"))?
+    }
+
     /// # Errors
     /// Transport failure.
     pub async fn list_tools(&self) -> Result<Vec<ToolInfo>> {
@@ -734,7 +793,11 @@ impl ExtHost {
                 cfg.bun
             );
         }
-        let stream = Self::connect_daemon(cfg, sock).await?;
+        // Same rule as the private host: the socket must belong to the runtime that
+        // reads it, so it is connected there too (see `on_host_runtime`).
+        let (create, socket) = (cfg.clone(), sock.to_path_buf());
+        let stream =
+            on_host_runtime(async move { Self::connect_daemon(&create, &socket).await }).await?;
 
         let (read_half, write_half) = stream.into_split();
         let conn = Conn::new(Box::new(write_half));
@@ -796,7 +859,7 @@ impl ExtHost {
     /// session ctx.
     fn watch_daemon(host: &Arc<Self>, reader: tokio::task::JoinHandle<()>) {
         let weak = Arc::downgrade(host);
-        tokio::spawn(async move {
+        host_runtime().spawn(async move {
             let _ = reader.await;
             if let Some(host) = weak.upgrade().filter(|h| !h.closing.load(Ordering::SeqCst)) {
                 match host.reconnect_after_daemon_death().await {
@@ -830,7 +893,10 @@ impl ExtHost {
         if let Some(sock) = &self.config.shared_socket {
             #[cfg(unix)]
             if self.generation() < MAX_SHARED_RECONNECTS {
-                match Self::connect_daemon(&self.config, sock).await {
+                let (create, sock) = (self.config.clone(), sock.to_path_buf());
+                match on_host_runtime(async move { Self::connect_daemon(&create, &sock).await })
+                    .await
+                {
                     Ok(stream) => {
                         let (r, w) = stream.into_split();
                         let reader = self.install(Box::new(w), r, None).await;
@@ -846,13 +912,16 @@ impl ExtHost {
                 let _ = sock;
             }
         }
-        let mut child = private_command(&self.config).spawn().with_context(|| {
-            format!(
-                "reconnect: spawn {} {}",
-                self.config.bun,
-                self.config.host_script.display()
-            )
-        })?;
+        let create = self.config.clone();
+        let mut child = on_host_runtime(async move { private_command(&create).spawn() })
+            .await
+            .with_context(|| {
+                format!(
+                    "reconnect: spawn {} {}",
+                    self.config.bun,
+                    self.config.host_script.display()
+                )
+            })?;
         let stdin = child.stdin.take().context("reconnect: host stdin")?;
         let stdout = child.stdout.take().context("reconnect: host stdout")?;
         let stderr = child.stderr.take().context("reconnect: host stderr")?;
@@ -1030,7 +1099,7 @@ impl ExtHost {
             .with_context(|| format!("spawn {} {}", cfg.bun, shard.display()))?;
         // The daemon logs to stderr; forward it like the per-session host's.
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
+            host_runtime().spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     eprintln!("[ext-shard] {line}");

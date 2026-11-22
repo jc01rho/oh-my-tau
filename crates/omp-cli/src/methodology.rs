@@ -107,12 +107,14 @@ fn audit(context: &LlmContext) {
     }
 }
 
-/// Apply the provider-only core projection and then audit the exact LLM context.
+/// Apply the provider-only core projection and then audit the exact LLM context,
+/// and hang the extension payload hook on the request so the payload the provider
+/// sends is the one `before_provider_request` handlers left behind.
 #[must_use]
 pub fn wrap_stream(
     base: StreamFn,
     core: bool,
-    extensions: Option<Arc<crate::ext::Extensions>>,
+    payload_hook: Option<pa_agent::stream::OnPayloadHook>,
 ) -> StreamFn {
     // The provider's HTTP response lands before its stream body is read: the extension host
     // observes it (`after_provider_response`, TS `sdk.ts` `onResponse`). The loop passes no
@@ -124,20 +126,17 @@ pub fn wrap_stream(
         ),
         None => base,
     };
-    Arc::new(move |model: Model, mut context: LlmContext, options| {
-        let extensions = extensions.clone();
+    Arc::new(move |model: Model, mut context: LlmContext, mut options| {
         let base = base.clone();
+        let payload_hook = payload_hook.clone();
         Box::pin(async move {
             if core {
                 project_core(&mut context.tools);
             }
             audit(&context);
-            if std::env::var("METHOD_PROVIDER_EVENTS").is_ok_and(|v| v == "1") {
-                if let Some(ext) = extensions {
-                    if let Err(error) = ext.before_provider_request().await {
-                        eprintln!("omt: before_provider_request: {error:#}");
-                    }
-                }
+            if payload_hook.is_some() {
+                options.on_payload =
+                    crate::adapter::chain_agent_payload_hooks(options.on_payload, payload_hook);
             }
             base(model, context, options).await
         })

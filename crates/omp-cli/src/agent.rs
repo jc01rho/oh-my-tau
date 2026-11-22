@@ -290,7 +290,7 @@ pub fn build_agent(
         stream_fn: Some(crate::methodology::wrap_stream(
             switchable_stream_fn(target.clone()),
             core_profile,
-            ext_hooks.cloned(),
+            ext_hooks.map(crate::ext::Extensions::payload_hook),
         )),
         transform_context,
         before_tool_call: Some(crate::features::plan::gate(
