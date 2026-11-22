@@ -217,6 +217,8 @@ struct NotifyState {
     overflowed: bool,
     /// A streaming watch: a window of the overflowing line matched the filter.
     window_hit: bool,
+    /// A streaming watch: the current line has non-blank text somewhere, including a dropped head.
+    nonblank: bool,
 }
 
 impl Notify {
@@ -277,6 +279,7 @@ impl Notify {
         let mut rest = text;
         let mut hits: Vec<String> = Vec::new();
         while let Some(i) = rest.find('\n') {
+            st.nonblank |= !rest[..i].trim().is_empty();
             st.partial.push_str(&rest[..i]);
             rest = &rest[i + 1..];
             let line = std::mem::take(&mut st.partial);
@@ -294,6 +297,7 @@ impl Notify {
                 window.push_str(rest);
                 st.window_hit = self.re.is_match(&window);
             }
+            st.nonblank |= !rest.trim().is_empty();
             st.partial.push_str(rest);
             if st.partial.len() > STREAM_LINE_BYTES {
                 if !st.overflowed {
@@ -324,13 +328,13 @@ impl Notify {
     fn stream_hit(&self, st: &mut NotifyState, line: &str) -> bool {
         let overflowed = std::mem::take(&mut st.overflowed);
         let window_hit = std::mem::take(&mut st.window_hit);
-        if line.trim().is_empty() {
-            return false;
-        }
+        let nonblank = std::mem::take(&mut st.nonblank);
         if overflowed {
-            (window_hit && !self.anchored) || self.re.is_match(line)
+            // The head is gone: blankness is the whole line's, and an anchored filter cannot be
+            // judged on the tail (it no longer starts where the line did).
+            nonblank && !self.anchored && (window_hit || self.re.is_match(line))
         } else {
-            self.re.is_match(line)
+            !line.trim().is_empty() && self.re.is_match(line)
         }
     }
 
@@ -2125,6 +2129,29 @@ mod tests {
         assert!(
             rx2.try_recv().is_err(),
             "an anchored filter cannot judge a line whose head is gone"
+        );
+
+        let (tx3, mut rx3) = tokio::sync::mpsc::unbounded_channel();
+        let spaced =
+            Notify::streaming("ERROR", super::super::monitor::WatchSink::for_test(tx3)).unwrap();
+        spaced.feed("ERROR");
+        spaced.feed(&" ".repeat(STREAM_LINE_BYTES + 10));
+        spaced.feed("\n");
+        assert!(
+            rx3.try_recv().is_ok(),
+            "a blank tail does not make the whole line blank"
+        );
+
+        let (tx4, mut rx4) = tokio::sync::mpsc::unbounded_channel();
+        let tail =
+            Notify::streaming("^ERROR", super::super::monitor::WatchSink::for_test(tx4)).unwrap();
+        tail.feed(&"p".repeat(20));
+        tail.feed("ERROR");
+        tail.feed(&"q".repeat(STREAM_LINE_BYTES - 5));
+        tail.feed("\n");
+        assert!(
+            rx4.try_recv().is_err(),
+            "a truncated tail starting with ERROR is not ^ERROR"
         );
     }
 
