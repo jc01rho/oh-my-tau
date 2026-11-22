@@ -2820,6 +2820,13 @@ pub static SETTINGS: &[SettingDef] = &[
         credential: false,
     },
     SettingDef {
+        id: "skills.disabled",
+        ty: crate::SettingType::Array,
+        env: None,
+        default_yaml: Some("[]"),
+        credential: false,
+    },
+    SettingDef {
         id: "skills.enableAgentsProject",
         ty: crate::SettingType::Boolean,
         env: None,
@@ -3252,6 +3259,13 @@ pub static SETTINGS: &[SettingDef] = &[
         credential: false,
     },
     SettingDef {
+        id: "task.globalConcurrency",
+        ty: crate::SettingType::Number,
+        env: None,
+        default_yaml: Some("0"),
+        credential: false,
+    },
+    SettingDef {
         id: "task.isolation.apply",
         ty: crate::SettingType::Boolean,
         env: None,
@@ -3342,6 +3356,27 @@ pub static SETTINGS: &[SettingDef] = &[
         ty: crate::SettingType::Boolean,
         env: None,
         default_yaml: Some("true"),
+        credential: false,
+    },
+    SettingDef {
+        id: "task.wait.defaultMs",
+        ty: crate::SettingType::Number,
+        env: None,
+        default_yaml: Some("60000"),
+        credential: false,
+    },
+    SettingDef {
+        id: "task.wait.maxMs",
+        ty: crate::SettingType::Number,
+        env: None,
+        default_yaml: Some("600000"),
+        credential: false,
+    },
+    SettingDef {
+        id: "task.wait.minMs",
+        ty: crate::SettingType::Number,
+        env: None,
+        default_yaml: Some("5000"),
         credential: false,
     },
     SettingDef {

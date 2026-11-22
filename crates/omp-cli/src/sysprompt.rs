@@ -32,7 +32,7 @@ fn home_dir() -> PathBuf {
 
 /// omp's agent dir (`getAgentDir()` for the default profile).
 fn agent_dir() -> PathBuf {
-    home_dir().join(".omp/agent")
+    omp_settings::resolve_agent_dir().unwrap_or_else(|| home_dir().join(".omp/agent"))
 }
 
 /// Settings the prompt renders from.
@@ -862,6 +862,9 @@ fn load_skills_dir(dir: &Path, skills: &mut Vec<Skill>) {
             || entry.file_name().to_string_lossy().into_owned(),
             Into::into,
         );
+        if skills.iter().any(|s| s.name == name) {
+            continue;
+        }
         let description = meta
             .get("description")
             .and_then(Value::as_str)
@@ -911,7 +914,8 @@ pub fn load_skills(agent: &Path, cwd: &Path, enabled: bool) -> Vec<Skill> {
             }
         }
     }
-    skills.retain(|s| !s.hide);
+    let disabled = settings_string_array(agent, "skills.disabled");
+    skills.retain(|s| !s.hide && !disabled.contains(&s.name));
     skills
 }
 
@@ -1462,6 +1466,371 @@ pub struct Options {
     /// Generated append blocks (e.g. MCP server instructions), joined like
     /// `composeAppendPrompt`.
     pub generated_append: Vec<String>,
+    pub prompt: Option<String>,
+}
+
+pub const ULTRAWORK_DIRECTIVE_OPEN_TAG: &str = "<omo-ultrawork-directive>";
+pub const ULTRAWORK_DIRECTIVE_CLOSE_TAG: &str = "</omo-ultrawork-directive>";
+pub const ULTRAWORK_BOOTSTRAP: &str = concat!(
+    "<omo-ultrawork-directive>\n",
+    "# Ultrawork Execution Contract\n\n",
+    "Binding ultrawork mode directive. When the `ultrawork` skill (`skill://ultrawork` or `skills/ultrawork/SKILL.md`) is available, read the whole file and follow every rule in it for the rest of the task.\n\n",
+    "- **Real Surface Verification**: Validate changes directly through their genuine runtime execution surfaces and tests; static inspection or unit mocks alone are insufficient.\n",
+    "- **Full Blast-Radius Remediation**: Fix every regression, failing test, compiler error, or lint diagnostic introduced by your changes before claiming completion.\n",
+    "- **Prohibition of Verification Sabotage**: Never delete assertions, skip failing tests, or suppress diagnostics to go green.\n",
+    "- **State Tracking & Event Monitoring**: Keep the `todo` checklist synchronized in real time and wait on long-running work via event-driven monitors rather than polling loops.\n",
+    "- **Mandatory Intent Gate & Handoffs**: Open every turn with `I read this as [intent] - [plan]. I'll stop when [observable condition].` and report milestone transitions with `Ask`, `wanted`, `For you`, `Now`, `Next`.\n",
+    "</omo-ultrawork-directive>"
+);
+
+const ULTRAWORK_CHAIN_WORDS: &[&str] = &["loop", "plan", "research", "execute", "mass"];
+
+#[must_use]
+pub fn ultrawork_bootstrap() -> String {
+    ULTRAWORK_BOOTSTRAP.to_string()
+}
+
+#[must_use]
+pub fn ultrawork_bootstrap_for_prompt(prompt: &str) -> Option<String> {
+    contains_ultrawork(prompt).then(ultrawork_bootstrap)
+}
+
+#[must_use]
+pub fn apply_ultrawork_hook(prompt: &str, system_prompt: &str) -> String {
+    if contains_ultrawork(prompt) && !system_prompt.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG) {
+        if system_prompt.trim().is_empty() {
+            return ultrawork_bootstrap();
+        }
+        return format!("{}\n\n{}", system_prompt.trim_end(), ULTRAWORK_BOOTSTRAP);
+    }
+    system_prompt.to_string()
+}
+
+#[must_use]
+pub fn strip_ultrawork_hook(system_prompt: &str) -> String {
+    let Some(start) = system_prompt.find(ULTRAWORK_DIRECTIVE_OPEN_TAG) else {
+        return system_prompt.to_string();
+    };
+    let Some(rel_end) = system_prompt[start..].find(ULTRAWORK_DIRECTIVE_CLOSE_TAG) else {
+        return system_prompt.to_string();
+    };
+    let end = start + rel_end + ULTRAWORK_DIRECTIVE_CLOSE_TAG.len();
+    let before = system_prompt[..start].trim_end();
+    let after = system_prompt[end..].trim_start();
+    match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => before.to_string(),
+        (true, false) => after.to_string(),
+        (false, false) => format!("{before}\n\n{after}"),
+    }
+}
+
+#[must_use]
+pub fn contains_ultrawork(prompt: &str) -> bool {
+    let lower_probe = prompt.to_ascii_lowercase();
+    if !lower_probe.contains("ulw") && !lower_probe.contains("ultrawork") {
+        return false;
+    }
+    let masked = mask_ultrawork_non_prose(prompt);
+    let lower = masked.to_ascii_lowercase();
+    for needle in ["ultrawork", "ulw"] {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(needle) {
+            let start = from + pos;
+            let end = start + needle.len();
+            from = end;
+            if valid_ultrawork_before(&masked[..start]) && valid_ultrawork_after(&masked[end..]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn valid_ultrawork_before(before: &str) -> bool {
+    let Some(prev) = before.chars().next_back() else {
+        return true;
+    };
+    if prev.is_ascii_alphanumeric() || matches!(prev, '/' | '\\') {
+        return false;
+    }
+    if matches!(prev, '_' | '-' | '.') {
+        let prefix = &before[..before.len() - prev.len_utf8()];
+        if matches!(prev, '_' | '-') && ends_with_standalone_mass(prefix) {
+            return true;
+        }
+        if prefix
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn ends_with_standalone_mass(prefix: &str) -> bool {
+    if prefix.len() < 4 || !prefix.is_char_boundary(prefix.len() - 4) {
+        return false;
+    }
+    let tail = &prefix[prefix.len() - 4..];
+    if !tail.eq_ignore_ascii_case("mass") {
+        return false;
+    }
+    prefix[..prefix.len() - 4]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+}
+
+fn valid_ultrawork_after(after: &str) -> bool {
+    let Some(next) = after.chars().next() else {
+        return true;
+    };
+    if next.is_ascii_alphanumeric() || matches!(next, '/' | '\\') {
+        return false;
+    }
+    if next == '.' {
+        if after[1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+        return true;
+    }
+    if matches!(next, '-' | '_') {
+        let rest = &after[1..];
+        for chain in ULTRAWORK_CHAIN_WORDS {
+            if rest.len() >= chain.len()
+                && rest.is_char_boundary(chain.len())
+                && rest[..chain.len()].eq_ignore_ascii_case(chain)
+            {
+                let tail = &rest[chain.len()..];
+                let tail_next = tail.chars().next();
+                let is_file_name = tail
+                    .strip_prefix('.')
+                    .and_then(|s| s.chars().next())
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !is_file_name
+                    && tail_next.is_none_or(|c| {
+                        !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-' | '/' | '\\')
+                    })
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    true
+}
+
+fn mask_ultrawork_non_prose(text: &str) -> String {
+    let mut out = omp_tui::magic::mask_non_prose(text);
+    mask_blockquotes(&mut out);
+    mask_urls(&mut out);
+    mask_quoted_literals(&mut out);
+    mask_negated_clauses(&mut out);
+    out
+}
+
+fn blank_range(buf: &mut [u8], range: std::ops::Range<usize>) {
+    for b in &mut buf[range] {
+        if *b != b'\n' {
+            *b = b' ';
+        }
+    }
+}
+
+fn mask_blockquotes(text: &mut String) {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut line_start = 0;
+    while line_start < bytes.len() {
+        let line_end = bytes[line_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |p| line_start + p);
+        let line = &bytes[line_start..line_end];
+        let spaces = line.iter().take_while(|&&b| b == b' ').count();
+        if spaces <= 3 && line.get(spaces) == Some(&b'>') {
+            ranges.push(line_start..line_end);
+        }
+        line_start = line_end + 1;
+    }
+    if !ranges.is_empty() {
+        let mut owned = std::mem::take(text).into_bytes();
+        for r in ranges {
+            blank_range(&mut owned, r);
+        }
+        *text = String::from_utf8(owned).unwrap_or_default();
+    }
+}
+
+fn mask_urls(text: &mut String) {
+    let lower = text.to_ascii_lowercase();
+    let mut ranges = Vec::new();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find("://") {
+        let scheme_end = from + pos;
+        let mut scheme_start = scheme_end;
+        while scheme_start > 0 {
+            let b = lower.as_bytes()[scheme_start - 1];
+            if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-') {
+                scheme_start -= 1;
+            } else {
+                break;
+            }
+        }
+        if scheme_start < scheme_end && lower.as_bytes()[scheme_start].is_ascii_alphabetic() {
+            let mut url_end = scheme_end + 3;
+            while url_end < lower.len() {
+                let b = lower.as_bytes()[url_end];
+                if b.is_ascii_whitespace() || matches!(b, b'<' | b'>' | b'"' | b'\'' | b'`') {
+                    break;
+                }
+                url_end += 1;
+            }
+            ranges.push(scheme_start..url_end);
+            from = url_end;
+        } else {
+            from = scheme_end + 3;
+        }
+    }
+    if !ranges.is_empty() {
+        let mut owned = std::mem::take(text).into_bytes();
+        for r in ranges {
+            blank_range(&mut owned, r);
+        }
+        *text = String::from_utf8(owned).unwrap_or_default();
+    }
+}
+
+fn mask_quoted_literals(text: &mut String) {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let q = bytes[i];
+        if q == b'"' || q == b'\'' {
+            if q == b'\'' && i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')
+            {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut j = i + 1;
+            let mut closed = None;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                if bytes[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if bytes[j] == q {
+                    if q == b'\''
+                        && j + 1 < bytes.len()
+                        && (bytes[j + 1].is_ascii_alphanumeric() || bytes[j + 1] == b'_')
+                    {
+                        j += 1;
+                        continue;
+                    }
+                    closed = Some(j + 1);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(end) = closed {
+                ranges.push(start..end);
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if !ranges.is_empty() {
+        let mut owned = std::mem::take(text).into_bytes();
+        for r in ranges {
+            blank_range(&mut owned, r);
+        }
+        *text = String::from_utf8(owned).unwrap_or_default();
+    }
+}
+
+fn mask_negated_clauses(text: &mut String) {
+    const NEGATIONS: &[&str] = &["do not ", "don't ", "dont ", "never "];
+    const VERBS: &[&str] = &[
+        "load", "use", "run", "invoke", "start", "trigger", "arm", "enable",
+    ];
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !lower.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let prev_word = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if !prev_word {
+            let rest = &lower[i..];
+            if let Some(neg) = NEGATIONS.iter().find(|&&n| rest.starts_with(n)) {
+                let mut after_neg = i + neg.len();
+                while after_neg < bytes.len() && bytes[after_neg] == b' ' {
+                    after_neg += 1;
+                }
+                let verb_rest = &lower[after_neg..];
+                let matched_verb = VERBS.iter().find(|&&v| {
+                    verb_rest.starts_with(v)
+                        && verb_rest
+                            .as_bytes()
+                            .get(v.len())
+                            .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                });
+                if matched_verb.is_some() {
+                    let clause_end = find_negated_clause_end(&lower, after_neg);
+                    ranges.push(i..clause_end);
+                    i = clause_end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if !ranges.is_empty() {
+        let mut owned = std::mem::take(text).into_bytes();
+        for r in ranges {
+            blank_range(&mut owned, r);
+        }
+        *text = String::from_utf8(owned).unwrap_or_default();
+    }
+}
+
+fn find_negated_clause_end(lower: &str, from: usize) -> usize {
+    let bytes = lower.as_bytes();
+    let mut j = from;
+    while j < bytes.len() {
+        if matches!(bytes[j], b'.' | b';' | b':' | b'!' | b'?' | b'\n') {
+            return j;
+        }
+        if bytes[j].is_ascii_whitespace() {
+            let rest = &lower[j + 1..];
+            for conj in ["but", "then", "instead", "however"] {
+                if rest.starts_with(conj)
+                    && rest
+                        .as_bytes()
+                        .get(conj.len())
+                        .is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b',' | b';'))
+                {
+                    return j;
+                }
+            }
+        }
+        j += 1;
+    }
+    bytes.len()
 }
 
 /// Prompt-input knobs that only the assembly step needs, so [`Options`] keeps
@@ -1484,7 +1853,20 @@ pub struct ContextOptions {
 /// Settings layered over the agent dir's `config.yml` (no project layer).
 fn load_settings(agent: &Path) -> omp_settings::Settings {
     let project_none = agent.join(".no-project-layer");
-    omp_settings::Settings::load_from(Some(&agent.join("config.yml")), &project_none)
+    let omo_global = agent.parent().and_then(|parent| {
+        omp_settings::find_omo_config(parent).or_else(|| {
+            parent
+                .parent()
+                .and_then(|home| omp_settings::find_omo_config(&home.join(".omo")))
+        })
+    });
+    let profile = omp_settings::active_profile_from_env();
+    omp_settings::Settings::load_from_with_omo(
+        Some(&agent.join("config.yml")),
+        omo_global.as_deref(),
+        profile.as_deref(),
+        &project_none,
+    )
 }
 
 /// A string-array setting from the agent config, empty when unset.
@@ -1704,7 +2086,25 @@ pub fn build_full(
         .append_system_prompt
         .as_deref()
         .map(resolve_prompt_input);
-    let append = compose_append(&opts.generated_append, user_append.as_deref());
+    let mut generated = opts.generated_append.clone();
+    let already_has_directive = custom_prompt
+        .as_deref()
+        .is_some_and(|s| s.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG))
+        || template
+            .as_deref()
+            .is_some_and(|s| s.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG))
+        || user_append
+            .as_deref()
+            .is_some_and(|s| s.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG))
+        || generated
+            .iter()
+            .any(|g| g.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG));
+    if let Some(prompt_text) = opts.prompt.as_deref() {
+        if !already_has_directive && contains_ultrawork(prompt_text) {
+            generated.push(ultrawork_bootstrap());
+        }
+    }
+    let append = compose_append(&generated, user_append.as_deref());
 
     // Tool surface: explicit list > the full registry. `--tools` entries that
     // match no registered tool are ignored (omp `normalizeToolNames`).
@@ -2375,6 +2775,161 @@ mod tests {
         std::fs::write(&f, "from file\n").unwrap();
         assert_eq!(resolve_prompt_input(f.to_str().unwrap()), "from file\n");
         assert_eq!(resolve_prompt_input("no such file"), "no such file");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ultrawork_keyword_detection_boundaries_and_masking() {
+        for positive in [
+            "ulw",
+            "ultrawork",
+            "ULW",
+            "Ultrawork",
+            "subtask (요청 장비: linux5) ulw ultrawork.",
+            "ulw-loop로 이 저장소 리팩터링해줘",
+            "ulw-plan 세워줘",
+            "ulw-research",
+            "ulw-execute",
+            "ulw-mass",
+            "ulw-loop.",
+            "mass ulw",
+            "mass-ulw",
+            "mass_ulw",
+            "ulw해",
+            "ulw로 처리해",
+            "do not use mocks, but run ulw now",
+        ] {
+            assert!(
+                contains_ultrawork(positive),
+                "expected ultrawork match for: {positive}"
+            );
+        }
+
+        for negative in [
+            "",
+            "plain task without magic word",
+            "mulw",
+            "ulw2",
+            "ultraworking",
+            "foo-ulw",
+            "foo_ulw",
+            "ulw-foo",
+            "ulw_bar",
+            "ulw.md",
+            "ulw-loop.md",
+            "ulw-plan.rs",
+            "ultrawork.rs",
+            "/path/to/ulw",
+            "ulw/SKILL.md",
+            "run `ulw` in terminal",
+            "```\nulw\n```",
+            "~~~\nultrawork\n~~~",
+            "> ulw quoted line",
+            "he said \"ulw\" yesterday",
+            "he said 'ultrawork' yesterday",
+            "see https://example.com/ulw/docs",
+            "<omo-ultrawork-directive>ultrawork</omo-ultrawork-directive>",
+            "do not use ulw for this",
+            "don't run ultrawork on this task",
+            "never enable ulw",
+        ] {
+            assert!(
+                !contains_ultrawork(negative),
+                "unexpected ultrawork match for: {negative}"
+            );
+        }
+    }
+
+    #[test]
+    fn ultrawork_bootstrap_injected_into_sysprompt_and_idempotent() {
+        let root = tempdir("ulw-hook");
+        let agent = root.join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+
+        let plain = build_with(&root, &root, &agent, &Options::default(), &[]);
+        let plain_joined = plain.blocks.join("\n\n");
+        assert!(!plain_joined.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG));
+
+        let ulw_opts = Options {
+            prompt: Some("subtask: ulw fix the profile loader".into()),
+            ..Options::default()
+        };
+        let built = build_with(&root, &root, &agent, &ulw_opts, &[]);
+        let joined = built.blocks.join("\n\n");
+        assert!(joined.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG), "{joined}");
+        assert!(
+            joined.contains("# Ultrawork Execution Contract"),
+            "{joined}"
+        );
+        assert!(joined.contains("skill://ultrawork"), "{joined}");
+        assert_eq!(joined.matches(ULTRAWORK_DIRECTIVE_OPEN_TAG).count(), 1);
+
+        let reapplied = apply_ultrawork_hook("ultrawork again", &joined);
+        assert_eq!(reapplied.matches(ULTRAWORK_DIRECTIVE_OPEN_TAG).count(), 1);
+
+        let hooked_from_plain = apply_ultrawork_hook("please ulw this", &plain_joined);
+        assert_eq!(
+            hooked_from_plain
+                .matches(ULTRAWORK_DIRECTIVE_OPEN_TAG)
+                .count(),
+            1
+        );
+        let stripped = strip_ultrawork_hook(&hooked_from_plain);
+        assert!(!stripped.contains(ULTRAWORK_DIRECTIVE_OPEN_TAG));
+        assert_eq!(stripped, plain_joined);
+
+        let custom_with_directive = Options {
+            system_prompt: Some(format!("custom\n\n{}", ultrawork_bootstrap())),
+            prompt: Some("ulw run".into()),
+            ..Options::default()
+        };
+        let built_custom = build_with(&root, &root, &agent, &custom_with_directive, &[]);
+        assert_eq!(
+            built_custom
+                .blocks
+                .join("\n\n")
+                .matches(ULTRAWORK_DIRECTIVE_OPEN_TAG)
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skills_dedupe_by_priority_and_respect_disabled_list() {
+        let root = tempdir("skills-disabled");
+        let agent = root.join("agent");
+        let proj_sk = root.join(".omp/skills/ultrawork");
+        let agent_sk = agent.join("skills/ultrawork");
+        let blocked_sk = agent.join("skills/blocked");
+        std::fs::create_dir_all(&proj_sk).unwrap();
+        std::fs::create_dir_all(&agent_sk).unwrap();
+        std::fs::create_dir_all(&blocked_sk).unwrap();
+        std::fs::write(
+            proj_sk.join("SKILL.md"),
+            "---\nname: ultrawork\ndescription: Project override.\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent_sk.join("SKILL.md"),
+            "---\nname: ultrawork\ndescription: Agent fallback.\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            blocked_sk.join("SKILL.md"),
+            "---\nname: blocked\ndescription: Should be disabled.\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("config.yml"),
+            "skills:\n  enabled: true\n  disabled:\n    - blocked\n",
+        )
+        .unwrap();
+
+        let skills = load_skills(&agent, &root, true);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "ultrawork");
+        assert_eq!(skills[0].description, "Project override.");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
