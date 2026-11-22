@@ -1,0 +1,28 @@
+{"dir":"out","frame":{"type":"move_session","op":"prepare","moveId":"m1","id":"gw-1"}}
+{"dir":"in","frame":{"id":"gw-1","type":"response","command":"move_session","success":true,"data":{"state":"ready","expires_at":"<TIMESTAMP>"}}}
+{"dir":"out","frame":{"type":"move_session","op":"import","bundleDir":"<BUNDLE_DIR>","cwd":"<CWD>","from":"desk","id":"gw-2"}}
+{"dir":"in","frame":{"id":"gw-2","type":"response","command":"move_session","success":true,"data":{"session_id":"<SESSION_ID>","session_path":"<SESSION_PATH>"}}}
+{"dir":"out","frame":{"type":"move_session","op":"status","moveId":"m1","sessionPath":"<SESSION_PATH>","id":"gw-3"}}
+{"dir":"in","frame":{"id":"gw-3","type":"response","command":"move_session","success":true,"data":{"state":"accepted"}}}
+{"dir":"out","frame":{"type":"move_session","op":"prepare","moveId":"m2","id":"gw-4"}}
+{"dir":"in","frame":{"id":"gw-4","type":"response","command":"move_session","success":true,"data":{"state":"ready","expires_at":"<TIMESTAMP>"}}}
+{"dir":"out","frame":{"type":"move_session","op":"cancel","moveId":"m2","id":"gw-5"}}
+{"dir":"in","frame":{"id":"gw-5","type":"response","command":"move_session","success":true,"data":{"state":"declined","reason":"cancelled"}}}
+{"dir":"out","frame":{"type":"move_session","op":"prepare","moveId":"m2","id":"gw-6"}}
+{"dir":"in","frame":{"id":"gw-6","type":"response","command":"move_session","success":false,"error":"move_fenced: Move m2 can no longer be imported here: it was already answered (declined).","code":"move_fenced","errorCode":"move_fenced"}}
+{"dir":"out","frame":{"type":"move_session","op":"status","moveId":"m9","id":"gw-7"}}
+{"dir":"in","frame":{"id":"gw-7","type":"response","command":"move_session","success":true,"data":{"state":"declined","reason":"no_record"}}}
+{"dir":"out","frame":{"type":"move_session","op":"status","moveId":"m2","id":"gw-8"}}
+{"dir":"in","frame":{"id":"gw-8","type":"response","command":"move_session","success":true,"data":{"state":"declined","reason":"cancelled"}}}
+{"dir":"out","frame":{"type":"move_session","op":"prepare","id":"gw-9"}}
+{"dir":"in","frame":{"id":"gw-9","type":"response","command":"move_session","success":false,"error":"invalid_move_request: moveId must be a plain id: a letter or digit, then letters, digits, '.', '_' or '-', at most 128 characters.","code":"invalid_move_request","errorCode":"invalid_move_request"}}
+{"dir":"out","frame":{"type":"move_session","op":"prepare","moveId":"../escape","id":"gw-10"}}
+{"dir":"in","frame":{"id":"gw-10","type":"response","command":"move_session","success":false,"error":"invalid_move_request: moveId must be a plain id: a letter or digit, then letters, digits, '.', '_' or '-', at most 128 characters.","code":"invalid_move_request","errorCode":"invalid_move_request"}}
+{"dir":"out","frame":{"type":"move_session","op":"teleport","moveId":"m3","id":"gw-11"}}
+{"dir":"in","frame":{"id":"gw-11","type":"response","command":"move_session","success":false,"error":"invalid_move_request: invalid move operation","code":"invalid_move_request","errorCode":"invalid_move_request"}}
+{"dir":"out","frame":{"type":"move_session","op":"export","moveId":"m3","sessionPath":"<SESSION_PATH>","id":"gw-12"}}
+{"dir":"in","frame":{"id":"gw-12","type":"response","command":"move_session","success":false,"error":"invalid_move_request: target must be a non-empty string","code":"invalid_move_request","errorCode":"invalid_move_request"}}
+{"dir":"out","frame":{"type":"move_session","op":"finish","moveId":"m3","sessionPath":"<SESSION_PATH>","answer":{"state":"ready"},"id":"gw-13"}}
+{"dir":"in","frame":{"id":"gw-13","type":"response","command":"move_session","success":false,"error":"invalid_move_request: finish needs the receiver's answer from status.","code":"invalid_move_request","errorCode":"invalid_move_request"}}
+{"dir":"out","frame":{"type":"move_session","op":"import","bundleDir":"<BUNDLE_DIR>","cwd":"<CWD>","id":"gw-14"}}
+{"dir":"in","frame":{"id":"gw-14","type":"response","command":"move_session","success":false,"error":"invalid_move_request: import needs bundleDir and cwd as absolute paths.","code":"invalid_move_request","errorCode":"invalid_move_request"}}

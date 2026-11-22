@@ -660,6 +660,11 @@ async fn session_main(
                         break;
                     }
                     Err(e) => {
+                        // A refused release leaves the session as it found it: commands route to
+                        // it again before the refusal is answered, so a retry is not turned away.
+                        if let Some(hosted) = host.get(&request.id) {
+                            hosted.closing.store(false, Ordering::SeqCst);
+                        }
                         session.rt.send(response(cmd.get("id"), "release_session", Err(e)));
                     }
                 }
