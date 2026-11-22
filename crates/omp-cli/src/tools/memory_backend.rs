@@ -328,16 +328,20 @@ fn shared_runtime_in(
     Ok(Some(runtime))
 }
 
-/// The memory tool set for one session: empty while `memory.backend` is off or
-/// unset (or names an engine the store cannot serve), otherwise the tools
-/// gated by `settings` over the session's shared engine ([`shared_runtime`]).
+/// The memory tool set for one session: the gateway's git-repo `memory` and
+/// `memory_apply_patch` when `MEMORY_DIR` names a repository, plus - unless
+/// `memory.backend` is off or unset (or names an engine the store cannot
+/// serve) - the tools gated by `settings` over the session's shared engine
+/// ([`shared_runtime`]).
 #[must_use]
 pub fn session_tools(
     env: &Arc<Env>,
     cwd: &Path,
     settings: &omp_settings::Settings,
 ) -> Vec<Arc<dyn AgentTool>> {
-    session_tools_in(env, cwd, settings, &default_data_dir())
+    let mut tools = super::memory::session_tools();
+    tools.extend(session_tools_in(env, cwd, settings, &default_data_dir()));
+    tools
 }
 
 /// [`session_tools`] with an explicit memory data directory.
