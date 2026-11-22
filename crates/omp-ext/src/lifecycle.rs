@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -34,6 +34,71 @@ pub enum BranchReason {
     Branch,
     Fork,
     Btw,
+}
+
+/// How a prompt-cache refresh reaches the provider (TS `CacheWarmingRentMethod`):
+/// `prewarm` sends the request with `max_tokens: 0`, `replay` re-sends it under a
+/// one-token output cap and cuts generation off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheWarmingRentMethod {
+    Prewarm,
+    Replay,
+}
+
+/// What the warmer does with a decision: `warm` sends a refresh, `compact`
+/// bridges the wait with compaction, `stop` lets the entry expire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheWarmingAction {
+    Warm,
+    Compact,
+    Stop,
+}
+
+impl CacheWarmingAction {
+    fn from_wire(value: &Value) -> Option<Self> {
+        match value.as_str()? {
+            "warm" => Some(Self::Warm),
+            "compact" => Some(Self::Compact),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// Payload of `cache_warming_decision` (TS `CacheWarmingDecisionEvent`): the warmer's economics for
+/// one decision, plus the action it took. Field order and names follow the TS interface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheWarmingDecisionEvent {
+    /// How the refresh would be sent; `None` when the request cannot be refreshed safely.
+    pub method: Option<CacheWarmingRentMethod>,
+    /// Price of this refresh: a cache read of the prompt, plus the expected billed output for a replay.
+    pub warm_cost: f64,
+    /// Extra price of the next real request if the entry is lost.
+    pub miss_cost: f64,
+    /// Price of bridging the wait with compaction; `None` when compaction is not an option.
+    pub compact_cost: Option<f64>,
+    /// Refresh spend since the last real request.
+    pub spent_cost: f64,
+    /// Estimated chance that a real request arrives before the entry expires.
+    pub continuation_probability: f64,
+    /// The warmer's own decision.
+    pub action: CacheWarmingAction,
+}
+
+/// Outcome of `cache_warming_decision`: the last handler's `action` override, if any.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheWarmingOutcome {
+    pub action: Option<CacheWarmingAction>,
+}
+
+impl CacheWarmingOutcome {
+    fn from_value(v: &Value) -> Self {
+        Self {
+            action: v.get("action").and_then(CacheWarmingAction::from_wire),
+        }
+    }
 }
 
 /// Origin of an `input` event.
@@ -374,6 +439,21 @@ pub enum LifecycleEvent {
         exclude_from_context: bool,
         cwd: String,
     },
+    /// Prompt-cache warming decision, with the warmer's own economics filled in
+    /// (`CacheWarmingDecisionEvent`). A handler's `action` overrides it.
+    #[serde(rename = "cache_warming_decision", rename_all = "camelCase")]
+    CacheWarmingDecision {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        method: Option<CacheWarmingRentMethod>,
+        warm_cost: f64,
+        miss_cost: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compact_cost: Option<f64>,
+        spent_cost: f64,
+        continuation_probability: f64,
+        action: CacheWarmingAction,
+    },
+
     /// The auth store automatically soft-disabled a credential (TS `CredentialDisabledEvent`):
     /// a definitive OAuth refresh failure (`invalid_grant`, `revoked`, ...) or an auth-broker
     /// disable. A user-initiated removal, a logout and the duplicate-credential purge stay
@@ -855,6 +935,29 @@ impl ExtHost {
             messages,
         };
         Ok(CompactingOutcome::from_value(
+            &self.emit_event(&ev, ctx).await?.result,
+        ))
+    }
+
+    /// `cache_warming_decision`: a handler may override the warmer's action (the last one wins).
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_cache_warming_decision(
+        &self,
+        event: &CacheWarmingDecisionEvent,
+        ctx: Option<Value>,
+    ) -> Result<CacheWarmingOutcome> {
+        let ev = LifecycleEvent::CacheWarmingDecision {
+            method: event.method,
+            warm_cost: event.warm_cost,
+            miss_cost: event.miss_cost,
+            compact_cost: event.compact_cost,
+            spent_cost: event.spent_cost,
+            continuation_probability: event.continuation_probability,
+            action: event.action,
+        };
+        Ok(CacheWarmingOutcome::from_value(
             &self.emit_event(&ev, ctx).await?.result,
         ))
     }

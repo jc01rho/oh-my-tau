@@ -3,6 +3,7 @@
 mod adapter;
 mod agent;
 mod approval;
+mod cache_warmer;
 mod cli;
 mod compact;
 mod context;
@@ -487,6 +488,12 @@ async fn async_main() -> Result<()> {
         &cwd,
         extensions.as_ref(),
     );
+    crate::cache_warmer::set_mode(crate::cache_warmer::Mode::parse(
+        omp_settings::Settings::load(&cwd)
+            .get_string("providers.cacheWarming")
+            .as_deref()
+            .unwrap_or("off"),
+    ));
     let (agent, target) = agent::build_agent(
         &cwd,
         selected,
@@ -499,6 +506,7 @@ async fn async_main() -> Result<()> {
     // completion()/judge() need the live provider target.
     crate::tools::eval_bridge::set_session_tools(agent.tools().await);
     crate::tools::eval_agents::set_runtime_hooks(target.clone());
+    let _cache_warming_settle = crate::cache_warmer::watch_settle(&agent).await;
 
     let session = persist::attach_with(&agent, &cwd, args.no_session).await;
     // Resolve internal URLs (local://, artifact://, agent://, history://)

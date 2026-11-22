@@ -22,8 +22,8 @@ use serde_json::{json, Value};
 
 use omp_ext::hooks::ExtHooks;
 use omp_ext::lifecycle::{
-    self, CompactingOutcome, DiscoveredPath, InputSource, LifecycleEvent, ResourcesDiscoverOutcome,
-    ResourcesDiscoverReason, SwitchReason,
+    self, CacheWarmingDecisionEvent, CacheWarmingOutcome, CompactingOutcome, DiscoveredPath,
+    InputSource, LifecycleEvent, ResourcesDiscoverOutcome, ResourcesDiscoverReason, SwitchReason,
 };
 use omp_ext::{ExtHost, HostConfig, HostMessage, ToolInfo};
 use omp_providers::auth::{
@@ -1253,6 +1253,24 @@ impl Extensions {
     /// actually sent (TS `emitBeforeProviderRequest`). `None` keeps it unchanged.
     pub fn before_provider_request(&self, payload: Value) -> Option<Value> {
         provider_payload(&self.host, payload)
+    }
+
+    /// Whether any loaded extension subscribes to `cache_warming_decision`: the warmer emits
+    /// nothing otherwise.
+    #[must_use]
+    pub fn cache_warming_handlers(&self) -> bool {
+        self.host.has_handlers("cache_warming_decision")
+    }
+
+    /// Emit `cache_warming_decision`; the last handler's `action` overrides the warmer's own.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn cache_warming_decision(
+        &self,
+        event: &CacheWarmingDecisionEvent,
+    ) -> Result<CacheWarmingOutcome> {
+        self.host.emit_cache_warming_decision(event, None).await
     }
 
     /// Extension tools as `AgentTool` wrappers (`list_tools` -> `call_tool`).
