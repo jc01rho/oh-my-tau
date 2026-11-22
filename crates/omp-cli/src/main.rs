@@ -26,6 +26,7 @@ mod slash_extra;
 pub mod subcmd;
 mod sysprompt;
 mod title;
+mod tool_choice;
 mod tools;
 mod tree;
 mod tui;

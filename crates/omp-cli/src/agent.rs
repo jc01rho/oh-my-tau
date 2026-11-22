@@ -288,7 +288,7 @@ pub fn build_agent(
             })
         }),
         stream_fn: Some(crate::methodology::wrap_stream(
-            switchable_stream_fn(target.clone()),
+            crate::tool_choice::wrap_stream(switchable_stream_fn(target.clone())),
             core_profile,
             ext_hooks.cloned(),
         )),

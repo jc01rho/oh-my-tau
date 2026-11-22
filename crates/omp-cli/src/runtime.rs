@@ -2439,6 +2439,8 @@ impl Runtime {
         self.agent.abort();
         self.agent.wait_for_idle().await;
         self.agent.reset().await;
+        // A forced tool choice belongs to the session it was set in.
+        crate::tool_choice::clear();
         self.persist.start_new(&self.cwd, dir)?;
         self.bump_generation();
         self.publish_session_file();

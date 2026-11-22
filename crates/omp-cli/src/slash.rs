@@ -795,7 +795,26 @@ async fn dispatch_builtin_more(
             if tool.is_empty() {
                 return Some(usage(rt, "Usage: /force:<tool-name> [prompt]"));
             }
-            output(rt, &force_unsupported(tool, !prompt.is_empty()));
+            // TS `setForcedToolChoice`: the next model call must call `tool`,
+            // the call after it gets `none` (`tool_choice::wrap_stream`).
+            let active: Vec<String> = rt
+                .agent
+                .tools()
+                .await
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect();
+            let model = rt
+                .provider_target()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|target| serde_json::to_value(&target.model).ok())
+                .unwrap_or(Value::Null);
+            if let Err(e) = crate::tool_choice::force(tool, &active, &model) {
+                return Some(usage(rt, &e));
+            }
+            output(rt, &format!("Next turn forced to use {tool}."));
             if prompt.is_empty() {
                 Some(Handled {
                     agent_invoked: false,
@@ -3130,19 +3149,6 @@ fn unported_reserved_notice(name: &str) -> String {
 /// and has no hot-reload path, so say that instead of claiming a reload.
 const RELOAD_PLUGINS_UNSUPPORTED: &str = "Plugin hot reload is not supported: plugins and extensions load when the session starts. Run /restart to pick up plugin changes.";
 
-/// `/force:<tool>`: the agent loop sends no forced `tool_choice`, so the tool
-/// cannot be pinned; the prompt (if any) still runs as a normal turn.
-fn force_unsupported(tool: &str, has_prompt: bool) -> String {
-    let tail = if has_prompt {
-        " Sending the prompt as a normal turn."
-    } else {
-        ""
-    };
-    format!(
-        "Cannot force {tool}: forcing a tool choice for the next turn is not supported yet.{tail}"
-    )
-}
-
 /// Names (including aliases) reserved by text-mode builtins
 /// (TS `ACP_BUILTIN_RESERVED_NAMES`, from `builtin_commands.json`).
 fn is_reserved_builtin(name: &str) -> bool {
@@ -3344,8 +3350,6 @@ mod tests {
     #[test]
     fn stub_notices_do_not_claim_success() {
         assert!(!RELOAD_PLUGINS_UNSUPPORTED.contains("reloaded"));
-        assert!(force_unsupported("bash", true).starts_with("Cannot force bash"));
-        assert!(!force_unsupported("bash", false).contains("forced to use"));
     }
 
     #[test]
