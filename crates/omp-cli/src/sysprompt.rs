@@ -1467,6 +1467,10 @@ pub struct Options {
     /// `composeAppendPrompt`.
     pub generated_append: Vec<String>,
     pub prompt: Option<String>,
+    /// Workspace directories beyond `cwd` (TS `additionalWorkspaceRoots`:
+    /// `--add-dir`, `workspace.additionalDirectories`, `/add-dir`): listed in
+    /// `<workspace-roots>` and searched for context files like `cwd`.
+    pub additional_workspace_roots: Vec<String>,
 }
 
 pub const ULTRAWORK_DIRECTIVE_OPEN_TAG: &str = "<omo-ultrawork-directive>";
@@ -2134,6 +2138,21 @@ pub fn build_full(
         ctx_opts.extra_context_names.clone()
     };
     let mut discovered = context_files_with(cwd, home, agent, &extra_context_names);
+    // TS also discovers context files (AGENTS.md, rules, ...) for each
+    // additional workspace root; a file reached from two roots loads once.
+    let additional_roots: Vec<&String> = opts
+        .additional_workspace_roots
+        .iter()
+        .filter(|root| Path::new(root.as_str()) != cwd)
+        .collect();
+    for root in &additional_roots {
+        for file in context_files_with(Path::new(root.as_str()), home, agent, &extra_context_names)
+        {
+            if !discovered.iter().any(|known| known.path == file.path) {
+                discovered.push(file);
+            }
+        }
+    }
     // Task subagents never receive AGENTS.md (`withoutAgentsMd`).
     if ctx_opts.exclude_agents_md {
         discovered = without_agents_md(discovered);
@@ -2215,7 +2234,7 @@ pub fn build_full(
         "rules": rulebook,
         "alwaysApplyRules": always_apply,
         "cwd": cwd.to_string_lossy(),
-        "additionalWorkspaceRoots": [],
+        "additionalWorkspaceRoots": additional_roots,
         "model": if cfg.include_model_in_prompt { opts.model.clone() } else { String::new() },
         "delegationTier": "balanced",
         "delegationBias": "balanced",
@@ -2691,6 +2710,38 @@ mod tests {
         std::fs::write(agent.join("config.yml"), "systemPrompt:\n  compact: true\n").unwrap();
         let built = build_with(&root, &root, &agent, &Options::default(), &[]);
         assert!(built.blocks[0].contains("Edit discipline"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Additional workspace roots reach the project block's `<workspace-roots>`
+    /// and contribute their own context files.
+    #[test]
+    fn additional_workspace_roots_are_listed_and_searched() {
+        let _guard = lock_skill_paths();
+        let root = tempdir("workspace-roots");
+        let agent = root.join("agent");
+        let cwd = root.join("repo");
+        let extra = root.join("lib");
+        for dir in [&agent, &cwd, &extra] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(extra.join("AGENTS.md"), "p8b2-extra-root-marker").unwrap();
+        let without = build_with(&cwd, &root, &agent, &Options::default(), &[]);
+        assert!(!without.blocks.join("\n").contains("<workspace-roots>"));
+        let opts = Options {
+            additional_workspace_roots: vec![extra.to_string_lossy().into_owned()],
+            ..Options::default()
+        };
+        let built = build_with(&cwd, &root, &agent, &opts, &[])
+            .blocks
+            .join("\n");
+        let roots = built
+            .split("<workspace-roots>")
+            .nth(1)
+            .and_then(|tail| tail.split("</workspace-roots>").next())
+            .expect("workspace-roots block");
+        assert!(roots.contains(&format!("- {}", extra.display())));
+        assert!(built.contains("p8b2-extra-root-marker"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

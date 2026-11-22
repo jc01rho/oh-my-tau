@@ -105,6 +105,8 @@ impl Launch {
                 model: args.model.clone().unwrap_or_default(),
                 generated_append: Vec::new(),
                 prompt: args.prompt.clone(),
+                // Each hosted runtime binds its roots when its session opens.
+                additional_workspace_roots: Vec::new(),
             },
             extensions: args
                 .extension

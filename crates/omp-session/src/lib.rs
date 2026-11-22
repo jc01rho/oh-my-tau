@@ -26,6 +26,25 @@ pub use pa_types::session;
 
 pub const SESSION_VERSION: u32 = 3;
 
+/// The header's `additionalDirectories` (multi-root workspace) of the session
+/// file at `path`; empty when the file, the header or the key is missing.
+#[must_use]
+pub fn header_additional_directories(path: &Path) -> Vec<String> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut first = String::new();
+    if BufReader::new(file).read_line(&mut first).is_err() {
+        return Vec::new();
+    }
+    serde_json::from_str::<Value>(&first)
+        .ok()
+        .filter(|h| h.get("type").and_then(Value::as_str) == Some("session"))
+        .and_then(|h| h.get("additionalDirectories").cloned())
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+        .unwrap_or_default()
+}
+
 /// One line of a session file: the parsed entry plus the raw text it came from.
 pub struct Line {
     pub raw: String,
@@ -314,6 +333,44 @@ impl SessionWriter {
     /// I/O failure.
     pub fn sync(&self) -> Result<()> {
         self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Set the header's `additionalDirectories` (TS `SessionManager`
+    /// `#header.additionalDirectories` + `#rewriteAtomically`): an empty list
+    /// drops the key. The file is rewritten through a sibling temp file and a
+    /// rename, then reopened for append; the entry chain is untouched.
+    ///
+    /// # Errors
+    /// The first line is not a session header, or I/O failure.
+    pub fn set_additional_directories(&mut self, directories: &[String]) -> Result<()> {
+        let text = std::fs::read_to_string(&self.path)
+            .with_context(|| format!("read {}", self.path.display()))?;
+        let (first, rest) = text.split_once('\n').unwrap_or((text.as_str(), ""));
+        let mut header: Map<String, Value> = serde_json::from_str(first)
+            .ok()
+            .filter(|h: &Map<String, Value>| {
+                h.get("type").and_then(Value::as_str) == Some("session")
+            })
+            .with_context(|| format!("no session header in {}", self.path.display()))?;
+        if directories.is_empty() {
+            header.remove("additionalDirectories");
+        } else {
+            header.insert("additionalDirectories".into(), json!(directories));
+        }
+        let tmp = self.path.with_extension("jsonl.tmp");
+        {
+            let mut out =
+                File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            out.write_all(format!("{}\n{rest}", Value::Object(header)).as_bytes())?;
+            out.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("replace {}", self.path.display()))?;
+        self.file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("open {}", self.path.display()))?;
         Ok(())
     }
 
@@ -1161,6 +1218,33 @@ mod tests {
         for l in &lines {
             assert_eq!(round_trip(l), RoundTrip::Exact, "{}", l.raw);
         }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn additional_directories_rewrite_the_header_and_keep_appending() {
+        let dir = tmp();
+        let mut w = writer(&dir);
+        let msg: AgentMessage = serde_json::from_value(
+            json!({"role": "user", "content": [{"type": "text", "text": "hi"}], "timestamp": 1}),
+        )
+        .unwrap();
+        let first = w.append_message(&msg, T1).unwrap();
+        let dirs = vec!["/srv/a".to_owned(), "/srv/b".to_owned()];
+        w.set_additional_directories(&dirs).unwrap();
+        assert_eq!(header_additional_directories(w.path()), dirs);
+        // The handle points at the renamed file: the next entry lands in it, chained.
+        let second = w.append_message(&msg, T1).unwrap();
+        let lines = read(w.path()).unwrap();
+        assert_eq!(lines.len(), 3);
+        let v: Value = serde_json::from_str(&lines[2].raw).unwrap();
+        assert_eq!(v["id"], json!(second));
+        assert_eq!(v["parentId"], json!(first));
+        w.set_additional_directories(&[]).unwrap();
+        assert!(header_additional_directories(w.path()).is_empty());
+        let header: Value = serde_json::from_str(&raws(&w)[0]).unwrap();
+        assert!(header.get("additionalDirectories").is_none());
+        assert_eq!(header["cwd"], json!("/tmp"));
         std::fs::remove_dir_all(dir).ok();
     }
 

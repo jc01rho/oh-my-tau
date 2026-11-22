@@ -58,10 +58,11 @@ gaps in §1); `/local`, `/open`, `/settings`, `/tree`, `/resume` and `/exit` run
 the TUI and answer as TUI-only elsewhere; `/goal` is reclassified STUB (goal mode
 has no runtime) and `/session` PARTIAL. Still not ported, each with its reason in
 §3/§4: `/security` verbs `scan scans show import export compare disposition`,
-`/ratchet`, `/add-dir` `/remove-dir` `/dirs`, `/guided-goal`, `/pause`,
+`/ratchet`, `/guided-goal`, `/pause`,
 `/forget-approvals`, `/join` `/leave`, `/tan` `/omfg` `/cleanse`, `/setup`,
 `/plan-review`, `/vibe`, `/git`, `/hub`, `/commit`, `/live`, `/record`. The
-counts above are the Phase 1 measurement.
+counts above are the Phase 1 measurement. **Phase 8b-2 follow-up:** `/add-dir`,
+`/remove-dir` and `/dirs` (plus `--add-dir`) are ported — see rows 39-41.
 
 Mechanism parity, not just the name table:
 
@@ -129,9 +130,9 @@ tau-only names. `Handler` is the function that actually runs.
 | 36 | `/rename` | PORTED | `dispatch_builtin` | Rename, or generate a title. |
 | 37 | `/move` | PARTIAL | `move_command` | Validates the path and streaming state for real, then reports the relocation gap instead of re-scoping the session. |
 | 38 | `/wt` (`/worktree`) | PORTED | `features::worktree::command` | Move session into a new worktree, changes included. |
-| 39 | `/add-dir` | STUB | `notice` (`slash.rs:890`) | No per-session workspace-dir store. |
-| 40 | `/remove-dir` | STUB | `notice` (same arm) | Same. |
-| 41 | `/dirs` | STUB | `notice` (same arm) | Cannot even list roots. |
+| 39 | `/add-dir` | PORTED | `features::workspace_dirs::add_command` | TS validation and messages (streaming guard, missing / not-a-directory, already present, cwd refused). The list lives in the session header's `additionalDirectories` (`SessionWriter::set_additional_directories` rewrites the header atomically and keeps appending); the base prompt is reassembled so `<workspace-roots>` and each root's context files reach the next turn. Seeded from `--add-dir` + `workspace.additionalDirectories` merged with a resumed header; `/new` starts from the setting only, as TS `newSession`. Divergence: `--add-dir` is re-merged on every in-process resume, and a live edit of the setting is not diffed into the running session. |
+| 40 | `/remove-dir` | PORTED | `features::workspace_dirs::remove_command` | Refuses the cwd ("use /move"), reports a non-root; the header key is dropped when the list empties. |
+| 41 | `/dirs` | PORTED | `features::workspace_dirs::dirs_command` | TS `formatWorkspaceDirectories`. |
 | 42 | `/marketplace` | PORTED | `features::skills::marketplace_command` | 10 subcommands. |
 | 43 | `/plugins` (`/plugin`) | PORTED | `plugins_command` | `list enable disable`. |
 | 44 | `/reload-plugins` | PARTIAL | `Runtime::reload_plugins` | 8b-2: WASM plugin registry re-discovered and its tools swapped into the live tool list, base system prompt reassembled (skills re-read), slash catalog (WASM commands, `commands/*.md`) refreshed and re-announced; reports counts and load errors. Extension hosts and MCP connections are not reloaded live (the report says to /restart); `/plugins enable|disable` and marketplace installs do not trigger it. |
@@ -196,10 +197,8 @@ All 11 are honest about the gap except the four flagged below.
 | `/ratchet` | `"/ratchet needs the ratchet eval-harness subsystem (eval preludes + hill-climb runner), which is not ported to omt."` | honest; 8b-2: still not ported (the ratchet prelude for omp-rs's eval kernel and the kickoff flow) |
 | `/handoff` | ~~not wired~~ — **ported** (handoff document + compact in place, §1 #32) | resolved |
 | `/prewalk` | ~~startup-only notice~~ — **partial**: arm/off/restart and the handoff at the first edit/write (§1 #11) | resolved (8b-2) |
-| `/add-dir` | `"Multi-root workspace directories are not tracked per-session in omt; …"` | honest; 8b-2: still not ported — TS persists the list in the session header, and the omp-rs writer has no header rewrite (it keeps an append handle on the file); the prompt would also need per-root context files |
-| `/remove-dir` | same notice | honest |
-| `/dirs` | same notice | honest |
 | `/memory` | ~~canned strings~~ — **ported** on the session's shared engine (§1 #35) | resolved (8b-2) |
+| `/add-dir` `/remove-dir` `/dirs` | ~~no workspace-dir store~~ — **ported**: session-header roots, `<workspace-roots>` and per-root context files (§1 #39-41) | resolved (8b-2 follow-up) |
 | `/advisor` | ~~always inactive~~ — **partial**: a real advisor agent reviews and advises (§1 #13) | resolved (8b-2) |
 | `/force` | ~~pins nothing~~ — **ported**: the next model call is forced (§1 #45) | resolved (8b-2) |
 | `/reload-plugins` | ~~claimed a reload~~ — **partial**: WASM tools, prompt/skills and the slash catalog reload live; extensions/MCP need /restart (§1 #44) | resolved (8b-2) |
