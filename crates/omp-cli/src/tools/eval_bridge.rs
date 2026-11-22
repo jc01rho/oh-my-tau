@@ -61,6 +61,14 @@ pub fn set_session_tools(tools: Vec<Arc<dyn AgentTool>>) {
     *slot.write().expect("session tools lock") = tools;
 }
 
+/// Update `SESSION_TOOLS` only when a live runtime already installed one, so unit tests that
+/// do not invoke `main` keep their `builtin_tools` fallback intact.
+pub fn refresh_session_tools(tools: &[Arc<dyn AgentTool>]) {
+    if let Some(slot) = SESSION_TOOLS.get() {
+        *slot.write().expect("session tools lock") = tools.to_vec();
+    }
+}
+
 fn session_tools(env: &Env) -> Vec<Arc<dyn AgentTool>> {
     if let Some(slot) = SESSION_TOOLS.get() {
         let tools = slot.read().expect("session tools lock").clone();

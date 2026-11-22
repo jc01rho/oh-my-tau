@@ -357,17 +357,11 @@ static GLOBAL: std::sync::LazyLock<Option<Arc<Herdr>>> = std::sync::LazyLock::ne
 /// integration). Any failure (spawn, timeout, parse) returns false so the
 /// reporter keeps its previous behaviour outside that one known-conflict case.
 fn pane_foreground_is_ts_omp(bin: &Path, pane: &str) -> bool {
-    let mut child = match Command::new(bin)
-        .args(["pane", "process-info", "--pane", pane])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    let mut child = match spawn_probe(bin, pane, deadline) {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -397,6 +391,33 @@ fn pane_foreground_is_ts_omp(bin: &Path, pane: &str) -> bool {
                     .is_some_and(|name| name == "omp" || name.ends_with("/omp"))
             })
         })
+}
+
+/// Spawn the `pane process-info` probe. While another thread's fork briefly holds a write fd of a
+/// binary that was just written or replaced in place, `exec` fails with `ETXTBSY`; that clears
+/// within moments, so retry it until `deadline` instead of reading it as "not the TS agent".
+fn spawn_probe(
+    bin: &Path,
+    pane: &str,
+    deadline: std::time::Instant,
+) -> std::io::Result<std::process::Child> {
+    loop {
+        match Command::new(bin)
+            .args(["pane", "process-info", "--pane", pane])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Process-wide reporter (env-detected once); `None` outside Herdr.
@@ -532,6 +553,34 @@ mod tests {
         assert!(!pane_foreground_is_ts_omp(&bin, "w1:p1"));
         std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
         assert!(!pane_foreground_is_ts_omp(&bin, "w1:p1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stub that is momentarily open for writing (`ETXTBSY` on exec, what a concurrent fork in
+    /// another test thread causes) is retried, not read as "not the TS agent".
+    #[test]
+    fn foreground_ts_omp_probe_retries_while_the_binary_is_busy() {
+        let dir = tmp("probe-busy");
+        let bin = dir.join("herdr");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nprintf '%s' '{\"result\":{\"process_info\":{\"foreground_processes\":[{\"name\":\"omp\"}]}}}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&bin, {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::Permissions::from_mode(0o755)
+        })
+        .unwrap();
+        // Holding the file open for writing makes every exec fail with ETXTBSY until it closes.
+        let busy = std::fs::OpenOptions::new().append(true).open(&bin).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(busy);
+        });
+        assert!(pane_foreground_is_ts_omp(&bin, "w1:p1"));
+        closer.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -63,6 +63,27 @@ impl PauseState {
     pub fn paused(&self) -> bool {
         !self.holds.is_empty()
     }
+
+    /// Clear session-owned pause fields (`seq`, `holds`) on a session switch while keeping
+    /// the connection-scoped [`ClientInfo`].
+    pub fn reset_session(&mut self) {
+        self.seq = 0;
+        self.holds.clear();
+    }
+
+    /// Restore session-owned pause state from a resumed branch's latest `session-hold`
+    /// entry while keeping the connection-scoped [`ClientInfo`].
+    pub fn restore_from_journal(&mut self, seq: u64, hold_since: Option<String>) {
+        self.seq = seq;
+        self.holds = hold_since
+            .map(|since| HoldRecord {
+                kind: "session_hold",
+                key: format!("session_hold:{seq}"),
+                since,
+            })
+            .into_iter()
+            .collect();
+    }
 }
 
 /// Parse `interrupt`'s `intent`; an absent field is [`InterruptIntent::Abort`].
@@ -187,14 +208,14 @@ pub fn release(state: &mut PauseState) -> u64 {
 
 /// The `session_paused` frame.
 #[must_use]
-pub fn paused_frame(seq: u64, at: &str) -> Value {
+pub fn paused_frame(seq: u64, at: &str, persisted: bool) -> Value {
     json!({
         "type": "session_paused",
         "pauseSeq": seq,
         "kind": "session_hold",
         "at": at,
         "noticeCount": 0,
-        "persisted": true,
+        "persisted": persisted,
     })
 }
 
@@ -316,5 +337,28 @@ mod tests {
         let mut s = PauseState::default();
         set_client_info(&mut s, &info(80, Some(&["bogus"]))).unwrap();
         assert!(!s.client.is_interactive());
+    }
+
+    #[test]
+    fn session_reset_and_restore_preserve_client_info_and_paused_frame_persisted_flag() {
+        let mut s = PauseState::default();
+        set_client_info(&mut s, &info(100, Some(&["interactive_user"]))).unwrap();
+        assert_eq!(hold(&mut s, "t1"), 1);
+        assert!(s.paused());
+
+        s.reset_session();
+        assert!(!s.paused());
+        assert_eq!(s.seq, 0);
+        assert!(s.client.is_interactive());
+        assert_eq!(s.client.width, 100);
+
+        s.restore_from_journal(3, Some("t3".into()));
+        assert!(s.paused());
+        assert_eq!(s.seq, 3);
+        assert_eq!(s.holds[0].key, "session_hold:3");
+        assert!(s.client.is_interactive());
+
+        assert_eq!(paused_frame(3, "t3", false)["persisted"], json!(false));
+        assert_eq!(paused_frame(3, "t3", true)["persisted"], json!(true));
     }
 }

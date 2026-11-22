@@ -443,7 +443,8 @@ impl TurnRecovery {
 
     /// A user-selected model replaces the chain and ends fallback ownership; cooldowns of other
     /// selectors survive (the caller clears the selected model's own).
-    pub fn reconfigure(&mut self, cfg: RecoveryConfig) {
+    pub fn reconfigure(&mut self, mut cfg: RecoveryConfig) {
+        cfg.model_fallback_disabled |= self.cfg.model_fallback_disabled;
         self.cfg = cfg;
         self.state.clear_active();
     }
