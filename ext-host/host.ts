@@ -224,6 +224,39 @@ async function runEphemeralTurn(options: Json): Promise<{ replyText: string; ass
     if (onAbort) signal?.removeEventListener("abort", onAbort);
   }
 }
+// `ctx.resolvePlanReview` / `ctx.getPendingPlanReview` (TS ExtensionContext). The core owns the plan
+// review and mirrors the open one into `state.pendingPlanReview` (the `plan_review_*` emits carry it).
+// TS answers synchronously, so the same acceptance rules run here against that mirror; an accepted
+// answer is forwarded to the core (`resolve_plan_review`), which re-checks it against the live review
+// and closes it with `by: "extension"`. Should the core have closed the review in the meantime it
+// refuses the answer, which is logged.
+const PLAN_APPROVALS = new Set(["execute", "compact", "keep"]);
+function getPendingPlanReview(): Json | undefined {
+  const pending = state.pendingPlanReview as Json | null | undefined;
+  return pending ? structuredClone(pending) : undefined;
+}
+function resolvePlanReview(reviewId: string, choice: string, input?: { feedback?: string; role?: string }): boolean {
+  const pending = state.pendingPlanReview as Json | null | undefined;
+  if (!pending || pending.reviewId !== reviewId) return false;
+  const option = ((pending.options as Json[] | undefined) ?? []).find((o) => o.id === choice);
+  if (!option) return false;
+  if (choice === "refine" && !(typeof input?.feedback === "string" && input.feedback.trim())) return false;
+  if (input?.role !== undefined) {
+    const tiers = (pending.tiers as Json[] | undefined) ?? [];
+    if (!PLAN_APPROVALS.has(choice) || !tiers.some((t) => t.role === input.role)) return false;
+  } else if (option.disabled) {
+    return false;
+  }
+  // Answered: the review takes no second answer (the core's `plan_review_resolved` clears it too).
+  state = { ...state, pendingPlanReview: null };
+  void request("resolve_plan_review", { reviewId, choice, input: { feedback: input?.feedback, role: input?.role } }).then(
+    (accepted) => {
+      if (accepted !== true) log("warn", `resolvePlanReview(${reviewId}, ${choice}): the core refused the answer`);
+    },
+    (e) => log("warn", `resolvePlanReview(${reviewId}, ${choice}) failed: ${e instanceof Error ? e.message : e}`),
+  );
+  return true;
+}
 function makeCtx() {
   const noop = () => {};
   return {
@@ -295,6 +328,9 @@ function makeCtx() {
     isProjectTrusted: () => true,
     getSystemPrompt: () => (state.systemPrompt as string[]) ?? [],
     runEphemeralTurn: (options: Json) => runEphemeralTurn(options),
+    resolvePlanReview: (reviewId: string, choice: string, input?: { feedback?: string; role?: string }) =>
+      resolvePlanReview(reviewId, choice, input),
+    getPendingPlanReview: () => getPendingPlanReview(),
     setInterval: (cb: (...a: unknown[]) => void, ms?: number, ...a: unknown[]) => {
       const t = setInterval(() => safe(cb, a), ms);
       t.unref?.();

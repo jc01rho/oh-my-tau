@@ -180,3 +180,52 @@ test("before_subagent_spawn: block short-circuits, otherwise last model wins", a
   expect(r.result.result).toEqual({ block: true, reason: "no" });
   expect(r.result.handlers).toHaveLength(1);
 });
+
+const REVIEW = {
+  type: "plan_review_requested", reviewId: "r1", sessionId: "s1", title: "T", planFilePath: "local://T-plan.md", planContent: "# T",
+  options: [
+    { id: "execute", label: "Approve and execute", disabled: false },
+    { id: "compact", label: "Approve and compact context", disabled: true },
+    { id: "refine", label: "Refine plan", disabled: false },
+  ],
+};
+const REVIEW_PROBE = `export default (pi) => pi.registerCommand("review", { handler: async (args, ctx) => {
+  const pending = ctx.getPendingPlanReview();
+  if (pending) pending.options[0].disabled = true; // a copy: cannot change the host's review
+  const refused = [
+    ctx.resolvePlanReview("other", "execute"),
+    ctx.resolvePlanReview("r1", "save"),
+    ctx.resolvePlanReview("r1", "compact"),
+    ctx.resolvePlanReview("r1", "refine"),
+    ctx.resolvePlanReview("r1", "refine", { feedback: "  " }),
+    ctx.resolvePlanReview("r1", "execute", { role: "smol" }),
+  ];
+  const ok = args === "refine" ? ctx.resolvePlanReview("r1", "refine", { feedback: "add tests" }) : ctx.resolvePlanReview("r1", "execute");
+  return { pending: pending ?? null, refused, ok, again: ctx.resolvePlanReview("r1", "execute"), after: ctx.getPendingPlanReview() ?? null };
+} });`;
+
+test("getPendingPlanReview mirrors the core's open review; resolvePlanReview forwards an accepted answer", async () => {
+  const core = await hostWith(REVIEW_PROBE);
+  core.answer.resolve_plan_review = () => true;
+  expect((await core.call("call_command", { name: "review", args: "" })).result.pending).toBeNull();
+  await core.call("set_ctx", { ctx: { pendingPlanReview: REVIEW } });
+  const r = (await core.call("call_command", { name: "review", args: "" })).result;
+  expect(r.pending).toEqual({ ...REVIEW, options: [{ ...REVIEW.options[0], disabled: true }, ...REVIEW.options.slice(1)] });
+  expect(r.refused).toEqual([false, false, false, false, false, false]);
+  expect(r).toMatchObject({ ok: true, again: false, after: null });
+  const reqs = core.requests.filter((m) => m.method === "resolve_plan_review");
+  expect(reqs.map((m) => m.params)).toEqual([{ reviewId: "r1", choice: "execute", input: {} }]);
+});
+
+test("resolvePlanReview refine carries the feedback; the resolved emit clears the pending review", async () => {
+  const core = await hostWith(REVIEW_PROBE);
+  core.answer.resolve_plan_review = () => true;
+  await core.call("emit", { event: REVIEW, ctx: { pendingPlanReview: REVIEW } });
+  const r = (await core.call("call_command", { name: "review", args: "refine" })).result;
+  expect(r.ok).toBe(true);
+  const req = core.requests.find((m) => m.method === "resolve_plan_review")!;
+  expect(req.params).toEqual({ reviewId: "r1", choice: "refine", input: { feedback: "add tests" } });
+  await core.call("emit", { event: REVIEW, ctx: { pendingPlanReview: REVIEW } });
+  await core.call("emit", { event: { type: "plan_review_resolved", reviewId: "r1", sessionId: "s1", by: "local" }, ctx: { pendingPlanReview: null } });
+  expect((await core.call("call_command", { name: "review", args: "" })).result.pending).toBeNull();
+});

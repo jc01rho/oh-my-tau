@@ -81,6 +81,81 @@ pub enum ApprovalMode {
     Yolo,
 }
 
+/// Stable ids of the interactive plan review's choices (`types.ts` `PlanReviewChoice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanReviewChoice {
+    Execute,
+    Compact,
+    Keep,
+    Refine,
+    Save,
+}
+
+impl PlanReviewChoice {
+    /// Parse a wire id (`"execute"`, ...).
+    #[must_use]
+    pub fn parse(id: &str) -> Option<Self> {
+        Some(match id {
+            "execute" => Self::Execute,
+            "compact" => Self::Compact,
+            "keep" => Self::Keep,
+            "refine" => Self::Refine,
+            "save" => Self::Save,
+            _ => return None,
+        })
+    }
+
+    /// Whether the choice approves the plan (the only choices an execution tier applies to).
+    #[must_use]
+    pub fn approves(self) -> bool {
+        matches!(self, Self::Execute | Self::Compact | Self::Keep)
+    }
+}
+
+/// Who answered a plan review (`plan_review_resolved.by`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanReviewBy {
+    Local,
+    Extension,
+}
+
+/// One plan-review choice as `plan_review_requested` reports it (`PlanReviewOption`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlanReviewOption {
+    pub id: PlanReviewChoice,
+    pub label: String,
+    pub disabled: bool,
+}
+
+/// An execution tier of the plan review's model slider (`PlanReviewTier`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanReviewTier {
+    pub role: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+}
+
+/// `plan_review_requested` payload (`PlanReviewRequestedEvent` minus `type`), field order as in
+/// `interactive-mode.ts` `handlePlanApproval`. Also the value of `ctx.getPendingPlanReview()`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanReviewRequest {
+    pub review_id: String,
+    pub session_id: String,
+    pub title: String,
+    pub plan_file_path: String,
+    pub plan_content: String,
+    pub options: Vec<PlanReviewOption>,
+    /// Omitted when fewer than two tiers resolve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<PlanReviewTier>>,
+}
+
 /// An omp extension event. Message/entry payloads are opaque omp JSON (`AgentMessage`, `SessionEntry`, ...).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type")]
@@ -302,6 +377,18 @@ pub enum LifecycleEvent {
         exclude_from_context: bool,
         cwd: String,
     },
+    /// The plan review opened (a plan awaits approval).
+    #[serde(rename = "plan_review_requested")]
+    PlanReviewRequested(PlanReviewRequest),
+    /// The plan review closed: a choice, or none when dismissed/cancelled.
+    #[serde(rename = "plan_review_resolved", rename_all = "camelCase")]
+    PlanReviewResolved {
+        review_id: String,
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        choice: Option<PlanReviewChoice>,
+        by: PlanReviewBy,
+    },
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -522,6 +609,10 @@ impl ExtHost {
         emit_tool_approval_requested(session_id: String, tool_name: String, tool_call_id: String, reason: Option<String>, approval_mode: ApprovalMode) => LifecycleEvent::ToolApprovalRequested { session_id, tool_name, tool_call_id, reason, approval_mode };
         /// `tool_approval_resolved`.
         emit_tool_approval_resolved(session_id: String, tool_name: String, tool_call_id: String, approved: bool, reason: Option<String>) => LifecycleEvent::ToolApprovalResolved { session_id, tool_name, tool_call_id, approved, reason };
+        /// `plan_review_requested`.
+        emit_plan_review_requested(request: PlanReviewRequest) => LifecycleEvent::PlanReviewRequested(request);
+        /// `plan_review_resolved`.
+        emit_plan_review_resolved(review_id: String, session_id: String, choice: Option<PlanReviewChoice>, by: PlanReviewBy) => LifecycleEvent::PlanReviewResolved { review_id, session_id, choice, by };
     }
 
     /// `assistant_message`: a handler may rewrite the text of the finalized message (text blocks only).
@@ -773,6 +864,17 @@ pub trait HostResponder: Send + Sync {
     fn set_session_name(&self, _name: String) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
+    /// `ctx.resolvePlanReview(reviewId, choice, {feedback, role})`; `false` when that review is not
+    /// open or the answer is refused. Without a plan review (the runner default) always `false`.
+    fn resolve_plan_review<'a>(
+        &'a self,
+        _review_id: &'a str,
+        _choice: &'a str,
+        _feedback: Option<&'a str>,
+        _role: Option<&'a str>,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
 }
 
 /// `hasUI=false` answers only.
@@ -859,6 +961,20 @@ pub async fn answer(
             .map(|()| Value::Null),
         "model_complete" => responder.model_complete(params.clone()).await,
         "run_ephemeral_turn" => responder.run_ephemeral_turn(params.clone()).await,
+        "resolve_plan_review" => {
+            let input = params.get("input");
+            let field = |k: &str| input.and_then(|i| i.get(k)).and_then(Value::as_str);
+            Ok(json!(
+                responder
+                    .resolve_plan_review(
+                        s("reviewId"),
+                        s("choice"),
+                        field("feedback"),
+                        field("role"),
+                    )
+                    .await
+            ))
+        }
         other => Err(format!("{other} is not supported by the core")),
     }
 }
