@@ -7,9 +7,10 @@
 //! compaction entry's `preserveData` and replayed onto the summary message. The
 //! commit side (running the remote / Anthropic-native compaction request) is
 //! harness work and stays out of scope. Snapcompact frame payloads are
-//! persisted as `blob:sha256:` references; without a blob-store resolver every
-//! referenced frame replays as an "unavailable" gap marker, exactly like TS
-//! called without `resolveFrameData`.
+//! persisted as `blob:sha256:` references; resolve them first with
+//! [`crate::snapcompact::resolve_archive`], otherwise every referenced frame
+//! replays as an "unavailable" gap marker, exactly like TS called without
+//! `resolveFrameData`.
 
 use std::sync::LazyLock;
 

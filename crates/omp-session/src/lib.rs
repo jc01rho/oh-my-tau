@@ -552,6 +552,60 @@ impl SessionWriter {
         })
     }
 
+    /// Append `label` (omp `appendLabelChange`): sets the tree label of `target_id`, or clears it
+    /// when `label` is `None`/empty (the key is then omitted, like TS `undefined`).
+    ///
+    /// # Errors
+    /// `target_id` is not an entry of this session file, or I/O failure.
+    pub fn append_label(
+        &mut self,
+        target_id: &str,
+        label: Option<&str>,
+        timestamp_iso: &str,
+    ) -> Result<String> {
+        anyhow::ensure!(self.ids.contains(target_id), "Entry {target_id} not found");
+        let mut obj = self.base_fields("label", timestamp_iso);
+        obj.insert("targetId".into(), Value::String(target_id.into()));
+        if let Some(label) = label.filter(|l| !l.is_empty()) {
+            obj.insert("label".into(), Value::String(label.into()));
+        }
+        self.push_object(obj)
+    }
+
+    /// Append `session_info` (omp `appendSessionInfo`): the session display name, trimmed.
+    ///
+    /// # Errors
+    /// Serialization or I/O failure.
+    pub fn append_session_info(&mut self, name: &str, timestamp_iso: &str) -> Result<String> {
+        let mut obj = self.base_fields("session_info", timestamp_iso);
+        obj.insert("name".into(), Value::String(name.trim().into()));
+        self.push_object(obj)
+    }
+
+    /// `{type, id, parentId, timestamp}` with a fresh id chained to the current leaf.
+    fn base_fields(&self, kind: &str, timestamp_iso: &str) -> Map<String, Value> {
+        let mut obj = Map::new();
+        obj.insert("type".into(), Value::String(kind.into()));
+        obj.insert("id".into(), Value::String(self.fresh_id()));
+        obj.insert(
+            "parentId".into(),
+            self.leaf.clone().map_or(Value::Null, Value::String),
+        );
+        obj.insert("timestamp".into(), Value::String(timestamp_iso.into()));
+        obj
+    }
+
+    fn push_object(&mut self, obj: Map<String, Value>) -> Result<String> {
+        let id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let line = entries::to_js_string(&Value::Object(obj))?;
+        self.push_line(&line, &id)?;
+        Ok(id)
+    }
+
     /// Append `model_usage` for a call outside the transcript. `entry.id`/`parent_id`/`timestamp` are
     /// overwritten with generated values.
     ///

@@ -228,6 +228,34 @@ impl Persistence {
             .inspect(|_| self.clear_nav())
     }
 
+    /// `label {targetId, label?}` (`SessionManager.appendLabelChange`); `None` clears the label.
+    ///
+    /// # Errors
+    /// `target_id` is not an entry of this session, or serialization/I/O errors.
+    #[allow(dead_code)]
+    pub fn append_label(&self, target_id: &str, label: Option<&str>) -> Result<()> {
+        self.writer
+            .lock()
+            .unwrap()
+            .append_label(target_id, label, &now_iso())
+            .map(|_| ())
+            .inspect(|_| self.clear_nav())
+    }
+
+    /// `session_info {name}` (`SessionManager.appendSessionInfo`, name trimmed).
+    ///
+    /// # Errors
+    /// Fails on serialization or I/O errors.
+    #[allow(dead_code)]
+    pub fn append_session_info(&self, name: &str) -> Result<()> {
+        self.writer
+            .lock()
+            .unwrap()
+            .append_session_info(name, &now_iso())
+            .map(|_| ())
+            .inspect(|_| self.clear_nav())
+    }
+
     /// Append a finished conversation message.
     ///
     /// # Errors
@@ -654,4 +682,57 @@ pub(crate) fn is_empty_aborted(message: &pa_agent::types::AgentMessage) -> bool 
     matches!(message, AgentMessage::Standard(Message::Assistant(a))
         if a.stop_reason == StopReason::Aborted
             && a.content.iter().all(|c| matches!(c, AssistantContent::Text(t) if t.text.trim().is_empty())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries(p: &Persistence) -> Vec<serde_json::Value> {
+        omp_session::read_values(&p.path())
+            .unwrap()
+            .into_iter()
+            .filter(|e| !matches!(e["type"].as_str(), Some("title" | "session")))
+            .collect()
+    }
+
+    #[test]
+    fn label_and_session_info_are_journaled_as_v3_entries() {
+        let dir = std::env::temp_dir().join(format!("omt-persist-label-{}", uuid_v7()));
+        let p = Persistence::for_test(&dir).unwrap();
+        p.append_entry("custom", serde_json::json!({"customType": "x"}))
+            .unwrap();
+        let target = entries(&p)[0]["id"].as_str().unwrap().to_owned();
+        p.append_label(&target, Some("keep")).unwrap();
+        p.append_session_info(" Renamed ").unwrap();
+        assert!(p.append_label("nope", Some("x")).is_err());
+
+        let all = entries(&p);
+        assert_eq!(all[1]["type"], "label");
+        assert_eq!(all[1]["targetId"], target.as_str());
+        assert_eq!(all[1]["parentId"], target.as_str());
+        assert_eq!(all[2]["type"], "session_info");
+        assert_eq!(all[2]["parentId"], all[1]["id"]);
+        assert_eq!(
+            omp_session::tree::build_tree(&all)[0].label.as_deref(),
+            Some("keep")
+        );
+        assert_eq!(
+            omp_session::tree::session_name(&all).as_deref(),
+            Some("Renamed")
+        );
+        for e in &all[1..] {
+            let typed: pa_types::session::FileEntry = serde_json::from_value(e.clone()).unwrap();
+            assert!(!matches!(
+                typed,
+                pa_types::session::FileEntry::Unknown { .. }
+            ));
+        }
+
+        p.append_label(&target, None).unwrap();
+        let all = entries(&p);
+        assert!(all.last().unwrap().get("label").is_none());
+        assert_eq!(omp_session::tree::build_tree(&all)[0].label, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

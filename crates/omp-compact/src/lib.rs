@@ -39,6 +39,7 @@ pub mod native;
 pub mod prompts;
 pub mod serialize;
 pub mod settings;
+pub mod snapcompact;
 pub mod summary;
 pub mod tokens;
 
@@ -66,6 +67,10 @@ pub use native::{
     history_blocks_for_context, openai_remote_payload, Archive, Frame, FRAME_DATA_BYTES_BUDGET,
 };
 pub use settings::{should_compact, CompactionSettings};
+pub use snapcompact::{
+    blob_reference, externalize_frames, normalize_blob_reference, render_frames, resolve_archive,
+    BlobStore, MemoryBlobStore, RenderedFrame, Shape,
+};
 pub use summary::{
     build_short_summary_request, build_summary_request, build_turn_prefix_request, compact,
     generate_summary, CompactionResult, Completer, SummaryKind, SummaryParams, SummaryRequest,
