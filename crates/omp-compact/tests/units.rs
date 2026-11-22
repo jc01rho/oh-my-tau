@@ -346,8 +346,23 @@ fn owned_rebuild_matches_borrowed() {
 }
 
 #[test]
-fn rollover_compaction_is_still_rejected() {
+fn rollover_compaction_replays_as_plain_summary() {
+    // A rollover compaction is an ordinary compaction entry (summary = the
+    // static rollover prompt), so the rebuild must replay it, not refuse it.
     let mut entries = session();
-    entries.push(json!({"type":"compaction","id":"k1","parentId":"a2","timestamp":"2026-01-01T00:00:05.000Z","summary":"S","firstKeptEntryId":"u2","tokensBefore":1,"details":{"kind":"experimental-context-rollover"}}));
-    assert!(omp_compact::build_session_context(&entries, omp_compact::Leaf::Last).is_err());
+    entries.push(json!({"type":"compaction","id":"k1","parentId":"a2","timestamp":"2026-01-01T00:00:05.000Z","summary":"S","firstKeptEntryId":"u2","tokensBefore":1,"details":{"kind":"experimental-context-rollover","version":1}}));
+    let ctx = omp_compact::build_session_context(&entries, omp_compact::Leaf::Last).unwrap();
+    assert_eq!(ctx.messages[0]["role"], "compactionSummary");
+    assert_eq!(ctx.messages[0]["summary"], "S");
+    assert!(ctx.messages[0].get("providerPayload").is_none());
+    let roles: Vec<&str> = ctx
+        .messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["compactionSummary", "user", "assistant"]);
+
+    // The owned (resume) rebuild must agree.
+    let owned = omp_compact::build_session_context_owned(entries, omp_compact::Leaf::Last).unwrap();
+    assert_eq!(ctx, owned);
 }

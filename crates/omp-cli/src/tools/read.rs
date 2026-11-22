@@ -2,6 +2,11 @@
 //! `:raw`, `a-b,c-d`). Text files render as a `[path#TAG]` hashline snapshot
 //! header followed by `N:line` rows (omp `read.ts`, hashline display mode);
 //! directories render as omp's workspace tree.
+//!
+//! Dispatch: `proc://` and the internal URL registry first, then HTTP(S)/`www.`
+//! URLs through [`super::read_fetch`], then the non-plain-text shapes through
+//! [`super::read_formats`] (SQLite selectors, archives, JSON `?q=`, `.ipynb`,
+//! PDF, binary metadata), and only then the plain text/image pipeline.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -46,6 +51,17 @@ const TRAILING_CONTEXT: usize = 3;
 const MAX_COLUMNS: usize = 768;
 const DIR_MAX_DEPTH: usize = 2;
 const DIR_CHILD_LIMIT: usize = 12;
+
+/// Bytes sampled for format sniffing (magic bytes + text/binary sample).
+const FORMAT_HEAD_BYTES: usize = 8192;
+/// omp `MAX_SUMMARY_BYTES`: larger files skip the structural summary.
+const MAX_SUMMARY_BYTES: usize = 2 * 1024 * 1024;
+/// omp `MAX_SUMMARY_LINES`.
+const MAX_SUMMARY_LINES: usize = 20_000;
+/// `read.summarize.minTotalLines` schema default.
+const DEFAULT_MIN_TOTAL_LINES: u32 = 100;
+/// `read.summarize.unfoldUntil` schema default.
+const DEFAULT_UNFOLD_UNTIL: u32 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineRange {
@@ -260,6 +276,15 @@ pub fn read(env: &Env, args: &serde_json::Value) -> Result<AgentToolResult> {
     if let Some(result) = read_internal_url(env, raw_path)? {
         return Ok(result);
     }
+    // omp `read.ts` fetches HTTP(S)/`www.` targets instead of opening them.
+    if super::read_fetch::is_fetch_url(raw_path) {
+        return read_fetch_url(raw_path);
+    }
+    // Shapes whose target is not a plain path (`db.sqlite:table`, `a.zip:memb`,
+    // `file.json?q=…`) peel before selector splitting would eat their suffix.
+    if let Some(result) = read_peeled_format(env, raw_path)? {
+        return Ok(result);
+    }
     let (path_part, sel) = split_path_and_sel(raw_path, &env.cwd)?;
     let absolute = resolve_to_cwd(&path_part, &env.cwd);
     let meta = std::fs::metadata(&absolute)
@@ -297,23 +322,38 @@ pub fn read(env: &Env, args: &serde_json::Value) -> Result<AgentToolResult> {
             is_error: None,
         });
     }
+    // Non-plain-text formats (SQLite, archives, notebooks, PDF) render through
+    // `read_formats` before the text pipeline sees their bytes.
+    let head = read_head(&absolute, FORMAT_HEAD_BYTES);
+    let format = super::read_formats::detect_format(&absolute, &head);
+    if let Some(result) = read_detected_format(env, &absolute, &path_part, format, &sel)? {
+        return Ok(result);
+    }
     let bytes = std::fs::read(&absolute).with_context(|| format!("cannot read {path_part}"))?;
     if bytes.contains(&0) {
-        bail!(
-            "Cannot read '{path_part}': binary file ({}).",
-            format_bytes(bytes.len())
-        );
+        // Binary content: on-disk metadata/strings/hexdump (omp `read-binary`)
+        // instead of a bare "binary file" error. `:raw` still refuses to shape
+        // the bytes, keeping that escape hatch byte-verbatim.
+        if is_raw(&sel) {
+            bail!(
+                "Cannot read '{path_part}': binary file ({}).",
+                format_bytes(bytes.len())
+            );
+        }
+        let display = display_path(&absolute, &env.cwd);
+        let text = super::read_formats::binary_read(&display, &bytes, "")?;
+        return format_converted(env, &text, &path_part, &display, &sel);
     }
     let text = String::from_utf8_lossy(&bytes);
     let (_, without_bom) = strip_bom(&text);
     let normalized = normalize_to_lf(without_bom);
     let selector_base = path_part;
-    let display = format_path_relative_to_cwd(&absolute, &env.cwd, false);
-    let display = if Path::new(&display).is_absolute() {
-        shorten_path(&display)
-    } else {
-        display
-    };
+    let display = display_path(&absolute, &env.cwd);
+    // `read.summarize.*`: a pi-ast structural summary may replace a whole-file
+    // code read (opt-in; see `summarize_enabled`).
+    if let Some(summary) = maybe_summarize(env, &absolute, &normalized, &display, &sel) {
+        return Ok(summary);
+    }
     let result = format_read_output(
         env,
         &normalized,
@@ -323,6 +363,7 @@ pub fn read(env: &Env, args: &serde_json::Value) -> Result<AgentToolResult> {
         env.hashline,
         Some(&absolute),
     )?;
+    let result = with_block_context(env, result, &normalized, &absolute, &sel);
     Ok(relevance_spill(env, result, save_artifact))
 }
 
@@ -542,6 +583,342 @@ fn format_read_output(
     Ok(AgentToolResult::text(out))
 }
 
+// --------------------------------------------------------- format dispatch
+
+/// Workspace-relative display path, shortened when it falls outside `cwd`.
+fn display_path(absolute: &Path, cwd: &Path) -> String {
+    let display = format_path_relative_to_cwd(absolute, cwd, false);
+    if Path::new(&display).is_absolute() {
+        shorten_path(&display)
+    } else {
+        display
+    }
+}
+
+/// Leading bytes for format sniffing.
+fn read_head(path: &Path, limit: usize) -> Vec<u8> {
+    use std::io::Read as _;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut head = vec![0u8; limit];
+    let mut filled = 0usize;
+    while filled < limit {
+        match file.read(&mut head[filled..]) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => filled += read,
+        }
+    }
+    head.truncate(filled);
+    head
+}
+
+/// Peel a trailing `:raw` from a URL (`https://x/y:raw`), case-insensitively.
+fn split_url_raw(raw: &str) -> (&str, bool) {
+    let trimmed = raw.trim_end();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() > 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b":raw") {
+        return (&trimmed[..trimmed.len() - 4], true);
+    }
+    (trimmed, false)
+}
+
+/// Fetch an HTTP(S)/`www.` read through [`super::read_fetch`].
+///
+/// `read` runs on the blocking pool (`tools.rs`), so a current-thread runtime
+/// is built only when no reactor is installed (unit tests), like `edit`'s
+/// `agent://` delivery.
+fn read_fetch_url(raw_path: &str) -> Result<AgentToolResult> {
+    let (target, raw) = split_url_raw(raw_path);
+    let options = super::read_fetch::FetchOptions {
+        raw,
+        ..super::read_fetch::FetchOptions::default()
+    };
+    let fetched = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(super::read_fetch::fetch_url(target, &options)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("read URL runtime")?
+            .block_on(super::read_fetch::fetch_url(target, &options)),
+    }?;
+    Ok(AgentToolResult::text(
+        super::read_fetch::render_url_read_output(&fetched, raw),
+    ))
+}
+
+/// `db.sqlite[:table[:key]]` as `(file, sub-path)`, when the left side of a
+/// `:` names an existing SQLite file.
+fn sqlite_target(raw: &str, cwd: &Path) -> Option<(std::path::PathBuf, String)> {
+    for (index, _) in raw.match_indices(':') {
+        // `C:/dir` is a drive letter, not a sub-path separator.
+        if index == 1 {
+            continue;
+        }
+        let (path, rest) = raw.split_at(index);
+        let absolute = resolve_to_cwd(path, cwd);
+        if !absolute.is_file() {
+            continue;
+        }
+        let head = read_head(&absolute, FORMAT_HEAD_BYTES);
+        if super::read_formats::detect_format(&absolute, &head)
+            == super::read_formats::Format::Sqlite
+        {
+            return Some((absolute, rest[1..].to_string()));
+        }
+    }
+    None
+}
+
+/// Render already-converted (non-source) text in the read display: paging and
+/// continuation hints, never hashline anchors.
+fn format_converted(
+    env: &Env,
+    text: &str,
+    selector_base: &str,
+    display: &str,
+    sel: &Selector,
+) -> Result<AgentToolResult> {
+    format_read_output(env, text, sel, selector_base, display, false, None)
+}
+
+/// Non-plain-text targets whose path is not a plain filesystem path: SQLite
+/// selectors, JSON `?q=` queries and archive members. `Ok(None)` leaves the
+/// input to the path/selector pipeline.
+///
+/// # Errors
+/// A malformed SQLite/JSON/archive selector or a read failure.
+fn read_peeled_format(env: &Env, raw_path: &str) -> Result<Option<AgentToolResult>> {
+    use super::read_formats;
+
+    if let Some((absolute, sub_path)) = sqlite_target(raw_path, &env.cwd) {
+        let text = read_formats::sqlite_read(&absolute, &sub_path, "")?;
+        let display = display_path(&absolute, &env.cwd);
+        return format_converted(env, &text, raw_path, &display, &Selector::None).map(Some);
+    }
+
+    if let Some((path, query)) = read_formats::split_json_query_target(raw_path) {
+        let absolute = resolve_to_cwd(&path, &env.cwd);
+        if absolute.is_file() && !crate::images::looks_like_image(&absolute) {
+            let head = read_head(&absolute, FORMAT_HEAD_BYTES);
+            let display = display_path(&absolute, &env.cwd);
+            // `db.sqlite?q=SELECT …` addresses rows; `?q=` on JSON is a filter.
+            if read_formats::detect_format(&absolute, &head) == read_formats::Format::Sqlite {
+                let text = read_formats::sqlite_read(&absolute, "", &query)?;
+                return format_converted(env, &text, raw_path, &display, &Selector::None).map(Some);
+            }
+            if let Some(selector) = read_formats::parse_json_selector(&query) {
+                let text = read_formats::json_read(&absolute, &selector)?;
+                return format_converted(env, &text, raw_path, &display, &Selector::None).map(Some);
+            }
+        }
+    }
+
+    if let Some((archive, member)) = read_formats::split_archive_member(raw_path) {
+        let absolute = resolve_to_cwd(&archive, &env.cwd);
+        if absolute.is_file() {
+            if let Some(kind) = read_formats::archive_kind_for_path(&archive) {
+                let text = read_formats::archive_read(&absolute, kind, Some(&member))?;
+                let display = display_path(&absolute, &env.cwd);
+                return format_converted(env, &text, raw_path, &display, &Selector::None).map(Some);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Render one detected non-plain-text format, or `None` for the formats the
+/// text/image pipeline owns (`Format::Binary` is only reachable here for a
+/// future sniffer; NUL-containing files are caught after the byte read).
+///
+/// # Errors
+/// Format-specific read failures (corrupt archive, unsafe SQL, bad notebook).
+fn read_detected_format(
+    env: &Env,
+    absolute: &Path,
+    selector_base: &str,
+    format: super::read_formats::Format,
+    sel: &Selector,
+) -> Result<Option<AgentToolResult>> {
+    use super::read_formats::{self, ArchiveKind, Format};
+
+    let display = display_path(absolute, &env.cwd);
+    let rendered = match format {
+        Format::Text | Format::Json | Format::JsonLines | Format::Image => return Ok(None),
+        Format::Sqlite => read_formats::sqlite_read(absolute, "", "")?,
+        Format::Zip | Format::Tar | Format::TarGz => {
+            let kind = match format {
+                Format::Zip => ArchiveKind::Zip,
+                Format::Tar => ArchiveKind::Tar,
+                _ => ArchiveKind::TarGz,
+            };
+            read_formats::archive_read(absolute, kind, None)?
+        }
+        Format::Notebook => {
+            let text = std::fs::read_to_string(absolute)
+                .with_context(|| format!("cannot read {selector_base}"))?;
+            read_formats::format_notebook(&text)?
+        }
+        Format::Pdf => read_formats::pdf_read(
+            &std::fs::read(absolute).with_context(|| format!("cannot read {selector_base}"))?,
+        ),
+        Format::Binary | Format::Gzip => {
+            let bytes =
+                std::fs::read(absolute).with_context(|| format!("cannot read {selector_base}"))?;
+            read_formats::binary_read(&display, &bytes, "")?
+        }
+    };
+    format_converted(env, &rendered, selector_base, &display, sel).map(Some)
+}
+
+// ------------------------------------------------------- pi-ast summaries
+
+/// Whether `read.summarize.*` applies for this workspace: the setting is
+/// registered with a TS default of `true`, but a summary replaces the file body
+/// — and with it the hashline anchors a code edit copies from the read. So the
+/// summary runs only when the user actually opts in (`enabled: true` in the
+/// global/project/env layer, not the registry default); unset, defaulted or
+/// `false` keeps the plain text read.
+fn summarize_enabled(settings: &omp_settings::Settings) -> bool {
+    settings.get_bool("read.summarize.enabled") == Some(true)
+        && !matches!(
+            settings.provenance("read.summarize.enabled"),
+            None | Some(omp_settings::Provenance::Default)
+        )
+}
+
+/// A prose file (Markdown/plain text) skips code summarization unless
+/// `read.summarize.prose` opts in (omp `isProseSummaryPath`).
+fn is_prose_path(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .map_or_else(String::new, |e| e.to_string_lossy().to_ascii_lowercase());
+    matches!(
+        extension.as_str(),
+        "md" | "markdown" | "mdx" | "txt" | "rst" | "adoc"
+    )
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to u32::MAX
+fn number_setting(settings: &omp_settings::Settings, id: &str, default: u32) -> u32 {
+    settings
+        .get_number(id)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map_or(default, |value| value.min(f64::from(u32::MAX)) as u32)
+}
+
+/// Structural summary for a whole-file code read (`read.summarize.*`), or
+/// `None` for the plain text read: summarization off, not a whole-file read,
+/// prose without `read.summarize.prose`, under `read.summarize.minTotalLines`,
+/// over the summary caps, or nothing to elide.
+fn maybe_summarize(
+    env: &Env,
+    absolute: &Path,
+    normalized: &str,
+    display: &str,
+    sel: &Selector,
+) -> Option<AgentToolResult> {
+    if !matches!(sel, Selector::None) {
+        return None;
+    }
+    if normalized.len() > MAX_SUMMARY_BYTES {
+        return None;
+    }
+    let lines = normalized.lines().count();
+    if lines > MAX_SUMMARY_LINES {
+        return None;
+    }
+    let settings = omp_settings::Settings::load(&env.cwd);
+    if !summarize_enabled(&settings) {
+        return None;
+    }
+    if is_prose_path(absolute) && settings.get_bool("read.summarize.prose") != Some(true) {
+        return None;
+    }
+    let total = u32::try_from(lines).unwrap_or(u32::MAX);
+    if total
+        < number_setting(
+            &settings,
+            "read.summarize.minTotalLines",
+            DEFAULT_MIN_TOTAL_LINES,
+        )
+    {
+        return None;
+    }
+    let unfold = number_setting(
+        &settings,
+        "read.summarize.unfoldUntil",
+        DEFAULT_UNFOLD_UNTIL,
+    );
+    let summary =
+        super::read_formats::summarize_source(normalized, absolute, Some(unfold)).ok()??;
+    if summary.elided_lines == 0 {
+        return None;
+    }
+    Some(AgentToolResult::text(format!(
+        "[summary: {display} · {total} lines · {} elided · {}]\n{}",
+        summary.elided_lines,
+        summary.language.as_deref().unwrap_or("unknown"),
+        summary.rendered,
+    )))
+}
+
+/// Append the enclosing block boundary lines a single-range read leaves out
+/// (`buildLineEntriesWithBlockContext`, gated like the summarizer).
+fn with_block_context(
+    env: &Env,
+    result: AgentToolResult,
+    normalized: &str,
+    absolute: &Path,
+    sel: &Selector,
+) -> AgentToolResult {
+    if !summarize_enabled(&omp_settings::Settings::load(&env.cwd)) || is_prose_path(absolute) {
+        return result;
+    }
+    let ranges = match sel {
+        Selector::Lines { ranges, raw } if !*raw => ranges,
+        _ => return result,
+    };
+    let [range] = ranges.as_slice() else {
+        return result;
+    };
+    let Some(end) = range.end else {
+        return result;
+    };
+    let (Ok(start), Ok(end)) = (u32::try_from(range.start), u32::try_from(end)) else {
+        return result;
+    };
+    let Ok(Some(boundaries)) =
+        super::read_formats::enclosing_boundaries(normalized, absolute, &[(start, end)])
+    else {
+        return result;
+    };
+    let mut outside: Vec<u32> = boundaries
+        .into_iter()
+        .filter(|line| *line < start || *line > end)
+        .collect();
+    outside.sort_unstable();
+    outside.dedup();
+    if outside.is_empty() {
+        return result;
+    }
+    let mut result = result;
+    let [pa_agent::types::ToolResultContent::Text(block)] = result.content.as_mut_slice() else {
+        return result;
+    };
+    let _ = write!(
+        block.text,
+        "\n\n[block boundaries: {}]",
+        outside
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    result
+}
+
 // ------------------------------------------------------------- internal URLs
 
 /// Process-global scheme registry (TS `InternalUrlRouter.instance()`).
@@ -575,6 +952,7 @@ pub(crate) fn url_ctx(env: &Env) -> UrlCtx {
         session_file,
         cwd: Some(env.cwd.clone()),
         skip_directory_listing: false,
+        ..UrlCtx::default()
     }
 }
 
@@ -1269,5 +1647,154 @@ mod tests {
         // Not a registered scheme: the existing path pipeline answers.
         let out = text_of(&read(&env, &serde_json::json!({"path": "f.txt"})).unwrap());
         assert!(out.contains("plain"));
+    }
+
+    #[test]
+    fn url_dispatch_recognizes_http_and_www() {
+        assert!(crate::tools::read_fetch::is_fetch_url(
+            "https://example.com/x"
+        ));
+        assert!(crate::tools::read_fetch::is_fetch_url("www.example.com/x"));
+        assert!(!crate::tools::read_fetch::is_fetch_url("/tmp/x.txt"));
+        assert_eq!(
+            split_url_raw("https://example.com/x:raw"),
+            ("https://example.com/x", true)
+        );
+        assert_eq!(
+            split_url_raw("https://example.com/x"),
+            ("https://example.com/x", false)
+        );
+        assert_eq!(
+            split_url_raw("https://example.com/x:RAW"),
+            ("https://example.com/x", true)
+        );
+    }
+
+    #[test]
+    fn reads_notebook_format() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nb.ipynb"),
+            r##"{"nbformat":4,"nbformat_minor":5,"metadata":{"kernelspec":{"language":"python"}},"cells":[{"cell_type":"markdown","source":["# Title\n"]},{"cell_type":"code","source":["print(1)\n"],"outputs":[],"execution_count":1}]}"##,
+        )
+        .unwrap();
+        let out =
+            text_of(&read(&env(dir.path()), &serde_json::json!({"path": "nb.ipynb"})).unwrap());
+        assert!(out.contains("# Notebook v4.5"), "{out}");
+        assert!(out.contains("# Title"), "{out}");
+        assert!(out.contains("print(1)"), "{out}");
+    }
+
+    #[test]
+    fn reads_sqlite_listing_and_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n             INSERT INTO users (name) VALUES ('ada');",
+        )
+        .unwrap();
+        drop(conn);
+        let e = env(dir.path());
+        let out = text_of(&read(&e, &serde_json::json!({"path": "app.sqlite"})).unwrap());
+        assert!(out.contains("users"), "{out}");
+        let out = text_of(&read(&e, &serde_json::json!({"path": "app.sqlite:users"})).unwrap());
+        assert!(out.contains("ada"), "{out}");
+    }
+
+    #[test]
+    fn reads_json_query_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("data.json"),
+            r#"{"users":[{"name":"ada"},{"name":"lin"}]}"#,
+        )
+        .unwrap();
+        let out = text_of(
+            &read(
+                &env(dir.path()),
+                &serde_json::json!({"path": "data.json?q=.users"}),
+            )
+            .unwrap(),
+        );
+        assert!(out.contains("ada"), "{out}");
+        // A query-less JSON read stays a plain text read.
+        let out =
+            text_of(&read(&env(dir.path()), &serde_json::json!({"path": "data.json"})).unwrap());
+        assert!(out.contains("\"users\""), "{out}");
+    }
+
+    #[test]
+    fn reads_pdf_and_binary_without_a_bare_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("doc.pdf"),
+            b"%PDF-1.4\n1 0 obj\n<</Type/Page>>\nendobj\ntrailer\n%%EOF\n",
+        )
+        .unwrap();
+        let out =
+            text_of(&read(&env(dir.path()), &serde_json::json!({"path": "doc.pdf"})).unwrap());
+        assert!(out.to_lowercase().contains("pdf"), "{out}");
+
+        let mut elf = b"\x7fELF\x02\x01\x01\x00".to_vec();
+        elf.extend_from_slice(&[0u8; 64]);
+        elf.extend_from_slice(b"main\0");
+        std::fs::write(dir.path().join("prog.bin"), &elf).unwrap();
+        let out =
+            text_of(&read(&env(dir.path()), &serde_json::json!({"path": "prog.bin"})).unwrap());
+        assert!(!out.is_empty(), "binary read produced no content");
+        assert!(!out.contains("binary file"), "{out}");
+        // `:raw` still refuses to shape binary bytes.
+        let err = read(
+            &env(dir.path()),
+            &serde_json::json!({"path": "prog.bin:raw"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("binary file"), "{err}");
+    }
+
+    #[test]
+    fn summarization_is_opt_in() {
+        assert!(is_prose_path(Path::new("notes.md")));
+        assert!(!is_prose_path(Path::new("main.rs")));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".omp")).unwrap();
+        std::fs::write(
+            dir.path().join(".omp/config.yml"),
+            "read:\n  summarize:\n    enabled: true\n",
+        )
+        .unwrap();
+        assert!(summarize_enabled(&omp_settings::Settings::load(dir.path())));
+        assert!(!summarize_enabled(&omp_settings::Settings::load(
+            tempfile::tempdir().unwrap().path()
+        )));
+    }
+
+    #[test]
+    fn whole_file_code_read_keeps_its_head_with_summarize_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (0..40)
+            .map(|i| {
+                format!(
+                    "pub fn f{i}() {{\n    let a = {i};\n    let b = a + 1;\n    let c = a + b;\n    let d = c * 2;\n    println!(\"{{d}}\");\n}}\n"
+                )
+            })
+            .collect();
+        std::fs::write(dir.path().join("lib.rs"), &body).unwrap();
+        let e = env(dir.path());
+        // Default (unset): the plain hashline read.
+        let out = text_of(&read(&e, &serde_json::json!({"path": "lib.rs"})).unwrap());
+        assert!(out.starts_with("[lib.rs#"), "{out}");
+        assert!(out.contains("pub fn f0()"), "{out}");
+        // Summarization on: whatever pi-ast elides, the head survives.
+        std::fs::create_dir_all(dir.path().join(".omp")).unwrap();
+        std::fs::write(
+            dir.path().join(".omp/config.yml"),
+            "read:\n  summarize:\n    enabled: true\n",
+        )
+        .unwrap();
+        let out = text_of(&read(&e, &serde_json::json!({"path": "lib.rs"})).unwrap());
+        assert!(out.contains("pub fn f0()"), "{out}");
     }
 }

@@ -6,10 +6,11 @@
 //! Ported: local compactions, provider-native lanes (`OpenAI` remote replacement history,
 //! Anthropic native compaction with `historyRewriteAt`, snapcompact frame-archive blocks),
 //! `branch_summary`, `custom_message`, `reset_boundary`, mode / model / thinking-level state,
-//! context notes, dangling-tool-call stripping, error-turn dropping. Compactions with
-//! `experimental-context-rollover` details are rejected with [`ContextError::Unsupported`]
-//! rather than rebuilt incorrectly (rollover request recovery is not ported). The
-//! transcript/display variants of the TS function are not ported.
+//! context notes, dangling-tool-call stripping, error-turn dropping. A compaction carrying
+//! `experimental-context-rollover` details replays as an ordinary compaction summary (its
+//! summary is the static rollover prompt and the notebook carries the state); only the
+//! rollover request recovery - re-asking the discarded turn prefix from the branch journal -
+//! is not ported. The transcript/display variants of the TS function are not ported.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -30,6 +31,11 @@ pub const CONTEXT_NOTES_ENTRY_TYPE: &str = "experimental_context_notes";
 const MAX_CONTEXT_NOTES_BYTES: usize = 16_384;
 
 /// Why a context could not be rebuilt faithfully.
+///
+/// No builder constructs this today: every compaction payload a journal can hold now replays,
+/// including an `experimental-context-rollover` one (as a plain summary). The type stays in the
+/// builders' signatures so a payload that genuinely cannot be replayed is still refusable
+/// without an API break.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextError {
     /// The latest compaction depends on a payload this port does not replay.
@@ -185,7 +191,8 @@ fn context_notes<'a>(path: &[&'a Value]) -> Option<(&'a str, &'a Value)> {
 /// `entries` are the session entries in file order, header and `title` slot excluded.
 ///
 /// # Errors
-/// [`ContextError::Unsupported`] when the latest compaction is an `experimental-context-rollover`.
+/// None today: every compaction payload replays (a rollover one as a plain summary). The
+/// `Result` keeps [`ContextError`] in the public signature.
 // TS `buildSessionContext` is one function; the compaction emission block is kept inline for parity.
 #[allow(clippy::too_many_lines)]
 pub fn build_session_context(
@@ -202,7 +209,8 @@ pub fn build_session_context(
 /// duplicates the whole entry list.
 ///
 /// # Errors
-/// [`ContextError::Unsupported`] when the latest compaction is an `experimental-context-rollover`.
+/// None today: every compaction payload replays (a rollover one as a plain summary). The
+/// `Result` keeps [`ContextError`] in the public signature.
 #[allow(clippy::too_many_lines)] // one sequential context-derivation pass (was build_session_context)
 pub fn build_session_context_path(path: &[&Value]) -> Result<SessionContext, ContextError> {
     let mut ctx = SessionContext {
@@ -294,13 +302,11 @@ pub fn build_session_context_path(path: &[&Value]) -> Result<SessionContext, Con
         let r = reset_idx.unwrap_or(0);
         messages.extend(path[r + 1..].iter().filter_map(|e| context_message(e)));
     } else if let (Some(compaction), Some(compaction_idx)) = (compaction, compaction_idx) {
-        // Rollover recovery (re-asking the discarded turn prefix from the
-        // branch journal) is not ported.
-        if compaction.get("details").and_then(|d| str_field(d, "kind"))
-            == Some("experimental-context-rollover")
-        {
-            return Err(ContextError::Unsupported("experimental-context-rollover"));
-        }
+        // A rollover compaction replays like any other summary: its `summary`
+        // is the static rollover prompt and the notebook (re-injected below)
+        // carries the state. Re-asking the discarded turn prefix from the
+        // branch journal is the one part of rollover that is not ported, so
+        // the pre-rollover prefix simply stays summarized.
         let remote = native::openai_remote_payload(compaction);
         let anthropic = native::anthropic_compaction_payload(compaction);
         let provider_payload = remote.clone().or_else(|| anthropic.clone());
@@ -425,7 +431,8 @@ pub fn build_session_context_path(path: &[&Value]) -> Result<SessionContext, Con
 /// entry DOM and the rebuilt context never coexist.
 ///
 /// # Errors
-/// [`ContextError::Unsupported`] when the latest compaction is an `experimental-context-rollover`.
+/// None today: every compaction payload replays (a rollover one as a plain summary). The
+/// `Result` keeps [`ContextError`] in the public signature.
 #[allow(clippy::too_many_lines)]
 pub fn build_session_context_owned(
     entries: Vec<Value>,
@@ -519,13 +526,11 @@ pub fn build_session_context_owned(
             take_context_message(e, &mut messages);
         }
     } else if let Some(ci) = compaction_idx {
-        // Rollover recovery (re-asking the discarded turn prefix from the
-        // branch journal) is not ported.
-        if path[ci].get("details").and_then(|d| str_field(d, "kind"))
-            == Some("experimental-context-rollover")
-        {
-            return Err(ContextError::Unsupported("experimental-context-rollover"));
-        }
+        // A rollover compaction replays like any other summary: its `summary`
+        // is the static rollover prompt and the notebook (re-injected below)
+        // carries the state. Re-asking the discarded turn prefix from the
+        // branch journal is the one part of rollover that is not ported, so
+        // the pre-rollover prefix simply stays summarized.
         let remote = native::openai_remote_payload(&path[ci]);
         let anthropic = native::anthropic_compaction_payload(&path[ci]);
         let provider_payload = remote.clone().or_else(|| anthropic.clone());

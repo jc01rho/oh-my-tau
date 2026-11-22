@@ -215,6 +215,43 @@ async fn recover_one(cwd: &Path, authored: &str) -> Option<Resolved> {
     })
 }
 
+/// Model attribution recorded with a grievance. The `write` tool has no model
+/// binding of its own, so the session advertises it through the environment.
+fn report_issue_model() -> String {
+    ["PI_MODEL", "OMP_MODEL"]
+        .iter()
+        .find_map(|name| std::env::var(*name).ok().filter(|v| !v.trim().is_empty()))
+        .unwrap_or_default()
+}
+
+/// `write xd://report_issue`: parse the body, pass the consent gate, and queue
+/// the grievance in the local SQLite store (never in the read-only `xd://`
+/// output store). Parse failures surface the device usage text to the model.
+fn write_report_issue(content: &str) -> Result<AgentToolResult> {
+    use crate::features::report_issue::{
+        parse_report_issue_body, AutoQa, AutoQaSettings, ToolCatalog,
+    };
+
+    // Validate first so a malformed body always gets the device usage text back,
+    // whether or not recording is enabled and consented.
+    parse_report_issue_body(content).map_err(|error| anyhow!(error.to_string()))?;
+    let auto_qa = AutoQa::new(AutoQaSettings::default(), report_issue_model());
+    let dispatch = async { auto_qa.dispatch(&ToolCatalog::default(), content).await };
+    // `write` is a sync tool on a `spawn_blocking` thread, so drive the future
+    // to completion on the current runtime (or a throwaway one in tests).
+    let outcome = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(dispatch),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("write report_issue runtime")
+            .block_on(dispatch),
+    };
+    outcome
+        .map(|outcome| AgentToolResult::text(outcome.message))
+        .map_err(|error| anyhow!(error.to_string()))
+}
+
 /// omp `EditToolDetails`: the numbered `diff` (+ `firstChangedLine`, `op`,
 /// `path`) the transcript card renders; several files add `perFileResults`.
 fn edit_details(outcome: &pi_edit::session::ApplyOutcome) -> Value {
@@ -263,6 +300,15 @@ pub fn write(env: &Env, args: &Value) -> Result<AgentToolResult> {
     let registry = super::read::url_registry();
     let normalized = registry.normalize(raw);
     if registry.can_handle(&normalized) {
+        // `xd://report_issue` is the auto-QA device: the body is a grievance,
+        // not a file. `xd://` declares no write policy (read-only store), so it
+        // must be dispatched here (TS `report-tool-issue.ts`).
+        if crate::features::report_issue::is_report_issue_tool_call(
+            "write",
+            Some(normalized.as_str()),
+        ) {
+            return write_report_issue(content);
+        }
         // `agent://<id>` / `agent://all` writes are peer messages (TS
         // `AgentProtocolHandler.write` → `executeSend`): steer a running eval
         // subagent instead of hitting the read-only output store.
@@ -544,6 +590,42 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
             "héllo"
         );
+    }
+
+    #[test]
+    fn write_report_issue_url_dispatches_instead_of_failing_read_only() {
+        use crate::features::report_issue::{
+            auto_qa_state_guard, reset_auto_qa_consent_for_tests, set_persisted_consent, Consent,
+        };
+
+        // Consent state is process-global; hold the shared lock and pin it to a
+        // denial so the gate drops the grievance deterministically instead of
+        // touching a real database or racing report_issue's own tests.
+        let _guard = auto_qa_state_guard();
+        reset_auto_qa_consent_for_tests();
+        set_persisted_consent(Consent::Denied);
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::new(dir.path(), true);
+        // A well-formed grievance reaches the device and gets its acknowledgement
+        // instead of the read-only scheme error, and writes no file.
+        let ok = write(
+            &env,
+            &json!({"path": "xd://report_issue", "content": "read: dropped a line"}),
+        )
+        .unwrap();
+        assert_eq!(text_of(&ok), "Noted, thanks!");
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        // A malformed body surfaces the device usage text, not the read-only
+        // scheme error.
+        let err = write(
+            &env,
+            &json!({"path": "xd://report_issue", "content": "   "}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.starts_with("Empty report. "), "{err}");
+        assert!(err.contains("xd://report_issue"), "{err}");
+        reset_auto_qa_consent_for_tests();
     }
 
     #[test]

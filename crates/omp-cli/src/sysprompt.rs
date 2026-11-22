@@ -1,17 +1,23 @@
+#![allow(dead_code, clippy::unnecessary_sort_by)]
 //! System prompt assembly, ported from omp's `system-prompt.ts` +
 //! `prompts/system/*.md`: base prompt selection (user/project `SYSTEM.md`
 //! override, `--system-prompt`/`--append-system-prompt` flags), project
-//! context discovery (`AGENTS.md`/`CLAUDE.md` walk-up), skills listing, the
-//! tool inventory section, and the workstation environment block.
+//! context discovery (`.omp/AGENTS.md`, `AGENTS.md`/`CLAUDE.md` walk-up,
+//! Copilot, Gemini, `contextFiles.extra`), skills listing, the rule buckets,
+//! the tool inventory section, and the workstation environment block.
 //!
 //! Rendering uses a small Handlebars-subset interpreter that covers exactly
 //! the helpers omp's bundled templates use (`if`, `unless`, `each`, `list`,
 //! `ifAny`, `has`, `when`, `includes`, `not`, `else`). The templates ship in
 //! `omp-cli/prompts/` (copied verbatim from the TS distribution).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde_json::{json, Map, Value};
+
+use crate::rules;
 
 const CUSTOM_TEMPLATE: &str = include_str!("../prompts/custom-system-prompt.md");
 const BUNDLED_TEMPLATE: &str = include_str!("../prompts/system-prompt.md");
@@ -139,18 +145,66 @@ fn scan_boundary(cwd: &Path, home: &Path) -> (PathBuf, bool, bool) {
     (boundary, include_boundary, scan_to_home)
 }
 
-/// One discovered project context file (`AGENTS.md`/`CLAUDE.md`), ordered
-/// farthest-from-cwd first per the TS depth-descending sort.
+/// One discovered project context file, ordered farthest-from-cwd first per
+/// the TS depth-descending sort (`ContextFile`).
+#[derive(Debug, Clone)]
 pub struct ContextFile {
     pub path: PathBuf,
     pub content: String,
     pub depth: usize,
+    /// `user` for user-scope files, `project` otherwise.
+    pub level: Level,
+    /// Additive files (`contextFiles.extra`) load beside a same-depth file
+    /// instead of claiming its slot.
+    pub additive: bool,
+}
+
+/// Which scope a context file came from (`SourceMeta.level`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    User,
+    Project,
+}
+
+impl Level {
+    fn as_str(self) -> &'static str {
+        match self {
+            Level::User => "user",
+            Level::Project => "project",
+        }
+    }
+}
+
+/// `calculateDepth`: directory levels from `cwd` up to `dir` (0 = `cwd`).
+fn calculate_depth(cwd: &Path, dir: &Path) -> usize {
+    cwd.components()
+        .count()
+        .saturating_sub(dir.components().count())
+}
+
+/// `resolveCopilotHome`: `COPILOT_HOME` override, else `<home>/.copilot`.
+fn copilot_home(home: &Path) -> PathBuf {
+    match std::env::var("COPILOT_HOME") {
+        Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
+        _ => home.join(".copilot"),
+    }
+}
+
+/// Directories from `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` (path-list separated by
+/// the platform separator, as Copilot CLI documents).
+fn copilot_custom_instruction_dirs() -> Vec<PathBuf> {
+    let Ok(raw) = std::env::var("COPILOT_CUSTOM_INSTRUCTIONS_DIRS") else {
+        return Vec::new();
+    };
+    std::env::split_paths(&raw)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .collect()
 }
 
 /// `loadStandaloneContextFiles` for `AGENTS.md` then `CLAUDE.md`: at each
 /// directory from `cwd` up to the boundary, the first non-empty file claims
 /// that depth scope. Hidden directories (`.foo/AGENTS.md`) are skipped.
-pub fn context_files(cwd: &Path, home: &Path) -> Vec<ContextFile> {
+pub fn standalone_context_files(cwd: &Path, home: &Path) -> Vec<ContextFile> {
     let (boundary, include_boundary, exclude_home) = scan_boundary(cwd, home);
     let mut out: Vec<ContextFile> = Vec::new();
     let mut current = cwd.to_path_buf();
@@ -166,14 +220,12 @@ pub fn context_files(cwd: &Path, home: &Path) -> Vec<ContextFile> {
                             .file_name()
                             .is_some_and(|n| n.to_string_lossy().starts_with('.'))
                     {
-                        let depth = cwd
-                            .ancestors()
-                            .position(|a| a == current.as_path())
-                            .unwrap_or(0);
                         out.push(ContextFile {
                             path: candidate,
                             content,
-                            depth,
+                            depth: calculate_depth(cwd, &current),
+                            level: Level::Project,
+                            additive: false,
                         });
                         break; // one file per depth scope
                     }
@@ -188,8 +240,526 @@ pub fn context_files(cwd: &Path, home: &Path) -> Vec<ContextFile> {
             None => break,
         }
     }
-    out.sort_by_key(|f| std::cmp::Reverse(f.depth));
     out
+}
+
+/// Push a context file unless an earlier, more authoritative provider already
+/// claimed its dedupe key (`contextFileCapability` first-wins semantics).
+fn push_scoped(out: &mut Vec<ContextFile>, claimed: &mut HashSet<String>, file: ContextFile) {
+    let key = if file.additive {
+        format!("additive:{}", file.path.display())
+    } else {
+        match file.level {
+            Level::User => "user".to_string(),
+            Level::Project => format!("project:{}", file.depth),
+        }
+    };
+    if claimed.insert(key) {
+        out.push(file);
+    }
+}
+
+/// Read `path` as a context file, if it exists and is non-empty.
+///
+/// `scope_dir` is the directory whose depth the file competes at: a file inside
+/// a config subdirectory (`.omp/`, `.github/`, `.gemini/`) is same-scope as the
+/// project directory holding it, per the capability's dedupe key
+/// ("files inside config subdirectories of an ancestor … are same-scope as the
+/// ancestor itself").
+fn read_context_file(
+    path: &Path,
+    scope_dir: &Path,
+    cwd: &Path,
+    level: Level,
+    additive: bool,
+) -> Option<ContextFile> {
+    let content = std::fs::read_to_string(path).ok()?;
+    if content.is_empty() {
+        return None;
+    }
+    Some(ContextFile {
+        path: path.to_path_buf(),
+        content,
+        depth: calculate_depth(cwd, scope_dir),
+        level,
+        additive,
+    })
+}
+
+/// Every context file for `cwd`, from every provider, in capability priority
+/// order: `.omp/`-native (priority 100), standalone `AGENTS.md`/`CLAUDE.md`
+/// (90), GitHub Copilot (30), Gemini CLI (60), then additive
+/// `contextFiles.extra` (9).
+///
+/// Content is `@path`-expanded and the result is containment-deduped, matching
+/// `loadProjectContextFiles`.
+#[must_use]
+pub fn context_files(cwd: &Path, home: &Path) -> Vec<ContextFile> {
+    context_files_with(cwd, home, &agent_dir(), &[])
+}
+
+/// [`context_files`] with an explicit agent dir and `contextFiles.extra` names.
+#[must_use]
+pub fn context_files_with(
+    cwd: &Path,
+    home: &Path,
+    agent: &Path,
+    extra_names: &[String],
+) -> Vec<ContextFile> {
+    let mut out: Vec<ContextFile> = Vec::new();
+    let mut claimed: HashSet<String> = HashSet::new();
+
+    // 1. `.omp/`-native: user `<agent>/AGENTS.md`, then the nearest project
+    //    `.omp/AGENTS.md` (`discovery/builtin.ts`).
+    if let Some(file) = read_context_file(&agent.join("AGENTS.md"), agent, cwd, Level::User, false)
+    {
+        push_scoped(&mut out, &mut claimed, file);
+    }
+    if let Some(config_dir) = nearest_project_config_dir(cwd, home) {
+        let scope = config_dir.parent().unwrap_or(cwd);
+        if let Some(file) = read_context_file(
+            &config_dir.join("AGENTS.md"),
+            scope,
+            cwd,
+            Level::Project,
+            false,
+        ) {
+            push_scoped(&mut out, &mut claimed, file);
+        }
+    }
+
+    // 2. Standalone walk-up providers.
+    for file in standalone_context_files(cwd, home) {
+        push_scoped(&mut out, &mut claimed, file);
+    }
+
+    // 3. GitHub Copilot: project `.github/copilot-instructions.md`, user
+    //    `~/.copilot/copilot-instructions.md`, then each
+    //    `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` entry's `AGENTS.md`.
+    if let Some(file) = read_context_file(
+        &cwd.join(".github/copilot-instructions.md"),
+        cwd,
+        cwd,
+        Level::Project,
+        false,
+    ) {
+        push_scoped(&mut out, &mut claimed, file);
+    }
+    if let Some(file) = read_context_file(
+        &copilot_home(home).join("copilot-instructions.md"),
+        home,
+        cwd,
+        Level::User,
+        false,
+    ) {
+        push_scoped(&mut out, &mut claimed, file);
+    }
+    for dir in copilot_custom_instruction_dirs() {
+        if let Some(file) = read_context_file(&dir.join("AGENTS.md"), &dir, cwd, Level::User, false)
+        {
+            push_scoped(&mut out, &mut claimed, file);
+        }
+    }
+
+    // 4. Gemini CLI: project `.gemini/GEMINI.md`, user `~/.gemini/GEMINI.md`.
+    if let Some(file) = read_context_file(
+        &cwd.join(".gemini/GEMINI.md"),
+        cwd,
+        cwd,
+        Level::Project,
+        false,
+    ) {
+        push_scoped(&mut out, &mut claimed, file);
+    }
+    if let Some(file) = read_context_file(
+        &home.join(".gemini/GEMINI.md"),
+        home,
+        cwd,
+        Level::User,
+        false,
+    ) {
+        push_scoped(&mut out, &mut claimed, file);
+    }
+
+    // 5. `contextFiles.extra`: additive names, never taking another file's slot.
+    for name in extra_names {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        for file in standalone_named_context_files(cwd, home, name) {
+            push_scoped(&mut out, &mut claimed, file);
+        }
+        if let Some(file) = read_context_file(&agent.join(name), agent, cwd, Level::User, true) {
+            push_scoped(&mut out, &mut claimed, file);
+        }
+    }
+
+    // `@path` imports expand against the importing file's own directory.
+    for file in &mut out {
+        file.content = expand_at_imports(&file.content, &file.path, home);
+    }
+
+    // Depth-descending: farther from cwd first, closer last (more prominent).
+    out.sort_by_key(|f| std::cmp::Reverse(f.depth));
+    dedupe_contained_context_files(out)
+}
+
+/// Nearest ancestor whose `.omp` directory exists, never the home directory
+/// (the user config root is not a project).
+fn nearest_project_config_dir(cwd: &Path, home: &Path) -> Option<PathBuf> {
+    let root = git_root(cwd, home);
+    for dir in cwd.ancestors() {
+        if dir == home {
+            break;
+        }
+        let config_dir = dir.join(".omp");
+        if config_dir.is_dir() {
+            return Some(config_dir);
+        }
+        if root.as_deref() == Some(dir) {
+            break;
+        }
+    }
+    None
+}
+
+/// Walk-up discovery for one extra filename (`loadStandaloneContextFiles`
+/// reused by `contextFiles.extra`), marking every hit additive.
+fn standalone_named_context_files(cwd: &Path, home: &Path, name: &str) -> Vec<ContextFile> {
+    let (boundary, include_boundary, exclude_home) = scan_boundary(cwd, home);
+    let mut out = Vec::new();
+    let mut current = cwd.to_path_buf();
+    loop {
+        let at_boundary = current == boundary;
+        let at_home = exclude_home && current == home;
+        if !at_home && (!at_boundary || include_boundary) {
+            if let Some(file) =
+                read_context_file(&current.join(name), &current, cwd, Level::Project, true)
+            {
+                out.push(file);
+            }
+        }
+        if at_boundary {
+            break;
+        }
+        match current.parent() {
+            Some(p) => current = p.to_path_buf(),
+            None => break,
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Context-file content transforms (`at-imports.ts`, `system-prompt.ts`)
+// ---------------------------------------------------------------------------
+
+/// Maximum recursive `@`-import hops (Claude Code's documented cap).
+pub const MAX_AT_IMPORT_DEPTH: usize = 5;
+
+/// Maximum expanded imports in one top-level document.
+pub const MAX_AT_IMPORT_EXPANSIONS: usize = 256;
+
+/// Expand `@path/to/file` includes in `content`, resolving relative paths
+/// against `file_path`'s directory (`expandAtImports`).
+///
+/// `@` must sit at the start of a line or after whitespace, so `git@github.com`
+/// survives; imports inside fenced blocks and inline code spans stay verbatim;
+/// `\ ` is a literal space; `~/` resolves to `home`; an unreadable target leaves
+/// the original token untouched; cycles in the current chain are broken.
+#[must_use]
+pub fn expand_at_imports(content: &str, file_path: &Path, home: &Path) -> String {
+    let base = file_path.parent().unwrap_or(Path::new("."));
+    let chain = vec![file_path.to_path_buf()];
+    let mut budget = MAX_AT_IMPORT_EXPANSIONS;
+    expand_at_depth(content, base, 0, home, &chain, &mut budget)
+}
+
+fn expand_at_depth(
+    content: &str,
+    base_dir: &Path,
+    depth: usize,
+    home: &Path,
+    chain: &[PathBuf],
+    budget: &mut usize,
+) -> String {
+    if depth >= MAX_AT_IMPORT_DEPTH {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut in_fence = false;
+    for line in content.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = body.trim_start();
+        let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if fence {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence {
+            out.push_str(line);
+            continue;
+        }
+        let expanded = expand_line(line, base_dir, depth, home, chain, budget);
+        out.push_str(&expanded);
+    }
+    out
+}
+
+/// Expand the `@`-imports of one line, leaving inline code spans alone.
+fn expand_line(
+    line: &str,
+    base_dir: &Path,
+    depth: usize,
+    home: &Path,
+    chain: &[PathBuf],
+    budget: &mut usize,
+) -> String {
+    if !line.contains('@') {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_inline_code = false;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '`' {
+            in_inline_code = !in_inline_code;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let boundary = i == 0 || matches!(c_prev(bytes, i), Some(' ') | Some('\t'));
+        if c == '@' && boundary && !in_inline_code {
+            let rest = &line[i + 1..];
+            let mut token_len = 0;
+            let mut chars = rest.char_indices().peekable();
+            while let Some((idx, ch)) = chars.next() {
+                match ch {
+                    // `\ ` is an escaped space inside the path.
+                    '\\' if chars.peek().is_some_and(|(_, next)| *next == ' ') => {
+                        token_len = idx + 2;
+                        chars.next();
+                    }
+                    ch if ch.is_whitespace() => break,
+                    _ => token_len = idx + ch.len_utf8(),
+                }
+            }
+            let raw = &rest[..token_len];
+            let token =
+                raw.trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
+            let path_like = token.starts_with('/')
+                || token.starts_with('.')
+                || token.starts_with('~')
+                || token
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric());
+            if !token.is_empty() && path_like {
+                if let Some(expanded) =
+                    resolve_at_import(token, base_dir, depth, home, chain, budget)
+                {
+                    out.push_str(&expanded);
+                    i += 1 + token.len();
+                    continue;
+                }
+            }
+        }
+        // Copy one whole char (the byte index may sit mid-codepoint).
+        let ch_len = line[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&line[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+fn c_prev(bytes: &[u8], i: usize) -> Option<char> {
+    (i > 0).then(|| bytes[i - 1] as char)
+}
+
+/// Resolve and recursively expand one import; `None` keeps the token verbatim.
+fn resolve_at_import(
+    token: &str,
+    base_dir: &Path,
+    depth: usize,
+    home: &Path,
+    chain: &[PathBuf],
+    budget: &mut usize,
+) -> Option<String> {
+    if *budget == 0 {
+        return None;
+    }
+    let unescaped = token.replace("\\ ", " ");
+    let resolved = if unescaped == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = unescaped.strip_prefix("~/") {
+        home.join(rest)
+    } else if Path::new(&unescaped).is_absolute() {
+        PathBuf::from(&unescaped)
+    } else {
+        base_dir.join(&unescaped)
+    };
+    // Only an ancestor in the current chain is a cycle; a file imported twice
+    // from unrelated places expands twice.
+    if chain.contains(&resolved) {
+        return None;
+    }
+    let content = std::fs::read_to_string(&resolved).ok()?;
+    *budget -= 1;
+    let mut next_chain = chain.to_vec();
+    next_chain.push(resolved.clone());
+    let next_base = resolved.parent().unwrap_or(base_dir).to_path_buf();
+    Some(expand_at_depth(
+        &content,
+        &next_base,
+        depth + 1,
+        home,
+        &next_chain,
+        budget,
+    ))
+}
+
+/// `prompt.format(content, {renderPhase: "post-render"}).trim()`.
+fn normalize_prompt_block(content: &str) -> String {
+    format_post_render(content).trim().to_string()
+}
+
+/// Split content into comparable paragraphs, keeping fenced blocks intact
+/// (`splitComparablePromptBlocks`).
+fn split_comparable_prompt_blocks(content: &str) -> Vec<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let rendered = normalize_prompt_block(trimmed);
+    let mut blocks = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    for line in rendered.split('\n') {
+        let fence = {
+            let t = line.trim_start();
+            t.starts_with("```") || t.starts_with("~~~")
+        };
+        if fence {
+            in_fence = !in_fence;
+            current.push(line);
+            continue;
+        }
+        let ends_block = !in_fence
+            && line.trim().is_empty()
+            && !current.is_empty()
+            && current.last().is_some_and(|last| !last.trim().is_empty());
+        if ends_block {
+            let block = current.join("\n");
+            let block = block.trim();
+            if !block.is_empty() {
+                blocks.push(block.to_string());
+            }
+            current.clear();
+            continue;
+        }
+        current.push(line);
+    }
+    let tail = current.join("\n");
+    let tail = tail.trim();
+    if !tail.is_empty() {
+        blocks.push(tail.to_string());
+    }
+    blocks
+}
+
+/// Whether `rule_blocks` is a contiguous run inside `source_blocks`.
+fn prompt_blocks_contain(source_blocks: &[String], rule_blocks: &[String]) -> bool {
+    if source_blocks.is_empty() || rule_blocks.is_empty() || rule_blocks.len() > source_blocks.len()
+    {
+        return false;
+    }
+    (0..=source_blocks.len() - rule_blocks.len()).any(|start| {
+        rule_blocks
+            .iter()
+            .enumerate()
+            .all(|(offset, block)| &source_blocks[start + offset] == block)
+    })
+}
+
+/// Drop a context file whose whole paragraph sequence already appears in a
+/// closer-to-cwd file (`dedupeContainedContextFiles`).
+///
+/// Containment is exact after normalization, not fuzzy: paraphrased or
+/// interleaved content is kept.
+#[must_use]
+pub fn dedupe_contained_context_files(mut files: Vec<ContextFile>) -> Vec<ContextFile> {
+    // Depth-descending so a file is only omitted when a more authoritative
+    // (closer-to-cwd) file contains it. Stable, so equal depths keep caller order.
+    files.sort_by(|a, b| b.depth.cmp(&a.depth));
+    let blocks: Vec<Vec<String>> = files
+        .iter()
+        .map(|file| split_comparable_prompt_blocks(&file.content))
+        .collect();
+    let mut kept = Vec::with_capacity(files.len());
+    for (index, file) in files.into_iter().enumerate() {
+        let contained = blocks
+            .iter()
+            .enumerate()
+            .any(|(candidate, candidate_blocks)| {
+                candidate > index && prompt_blocks_contain(candidate_blocks, &blocks[index])
+            });
+        if !contained {
+            kept.push(file);
+        }
+    }
+    kept
+}
+
+/// Drop context files named `AGENTS.md` (any case): task subagents never
+/// receive them (`withoutAgentsMd`).
+#[must_use]
+pub fn without_agents_md(files: Vec<ContextFile>) -> Vec<ContextFile> {
+    files
+        .into_iter()
+        .filter(|file| {
+            !file
+                .path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().to_lowercase() == "agents.md")
+        })
+        .collect()
+}
+
+/// Close a code fence a context file leaves open, so it never leaves the rest
+/// of the prompt unformatted (`prompt.closeCodeFence`).
+#[must_use]
+pub fn close_code_fence(content: &str) -> String {
+    let mut fence: Option<(char, usize)> = None;
+    for line in content.split('\n') {
+        let trimmed = line.trim_start();
+        let Some(marker) = trimmed.chars().next().filter(|c| matches!(c, '`' | '~')) else {
+            continue;
+        };
+        let len = trimmed.chars().take_while(|c| *c == marker).count();
+        if len < 3 {
+            continue;
+        }
+        match fence {
+            None => fence = Some((marker, len)),
+            Some((open, open_len)) if open == marker && len >= open_len => fence = None,
+            Some(_) => {}
+        }
+    }
+    match fence {
+        Some((marker, len)) => {
+            let mut out = content.to_string();
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&marker.to_string().repeat(len));
+            out
+        }
+        None => content.to_string(),
+    }
 }
 
 /// A discovered system prompt override (SYSTEM.md text or `SYSTEM_TEMPLATE.md`
@@ -524,6 +1094,17 @@ fn lookup(ctx: &[&Value], path: &str) -> Value {
     if path == "this" || path == "." || path.is_empty() {
         return ctx.last().copied().cloned().unwrap_or(Value::Null);
     }
+    // Handlebars loop metadata inside `each`: `@first` / `@last`.
+    if path == "@first" || path == "@last" {
+        return LOOP_FLAGS.with(|flags| {
+            flags
+                .borrow()
+                .last()
+                .map_or(Value::Bool(false), |(first, last)| {
+                    Value::Bool(if path == "@first" { *first } else { *last })
+                })
+        });
+    }
     // `a.length` on arrays.
     if let Some((base, "length")) = path.rsplit_once('.') {
         if let Value::Array(a) = lookup(ctx, base) {
@@ -551,6 +1132,12 @@ fn lookup(ctx: &[&Value], path: &str) -> Value {
         }
     }
     Value::Null
+}
+
+thread_local! {
+    /// `@first`/`@last` for the innermost active `each`/`list` iteration.
+    static LOOP_FLAGS: std::cell::RefCell<Vec<(bool, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn truthy(v: &Value) -> bool {
@@ -677,11 +1264,17 @@ fn render_nodes(nodes: &[Node], ctx: &mut Vec<&Value>, out: &mut String) {
                         .map_or("", |(_, v)| v.as_str());
                     let rendered: Vec<String> = items
                         .iter()
-                        .map(|item| {
+                        .enumerate()
+                        .map(|(index, item)| {
                             let mut s = String::new();
                             let mut sub: Vec<&Value> = ctx.clone();
                             sub.push(item);
+                            let flags = (index == 0, index + 1 == items.len());
+                            LOOP_FLAGS.with(|f| f.borrow_mut().push(flags));
                             render_nodes(body, &mut sub, &mut s);
+                            LOOP_FLAGS.with(|f| {
+                                f.borrow_mut().pop();
+                            });
                             s
                         })
                         .collect();
@@ -851,6 +1444,124 @@ pub struct Options {
     pub generated_append: Vec<String>,
 }
 
+/// Prompt-input knobs that only the assembly step needs, so [`Options`] keeps
+/// the shape its callers already construct (`main.rs`, `runtime.rs`).
+///
+/// The session wiring fills `disabled_rules` from `ttsr.disabledRules`, sets
+/// `exclude_agents_md` for task subagents, and honours `--no-rules`.
+#[derive(Debug, Default, Clone)]
+pub struct ContextOptions {
+    /// `--no-rules`: skip rule discovery so no rule reaches the prompt.
+    pub no_rules: bool,
+    /// Rule names dropped entirely (`ttsr.disabledRules`).
+    pub disabled_rules: Vec<String>,
+    /// Drop `AGENTS.md` context files (task subagents never receive them).
+    pub exclude_agents_md: bool,
+    /// `contextFiles.extra` names; empty reads the setting from the agent config.
+    pub extra_context_names: Vec<String>,
+}
+
+/// Settings layered over the agent dir's `config.yml` (no project layer).
+fn load_settings(agent: &Path) -> omp_settings::Settings {
+    let project_none = agent.join(".no-project-layer");
+    omp_settings::Settings::load_from(Some(&agent.join("config.yml")), &project_none)
+}
+
+/// A string-array setting from the agent config, empty when unset.
+fn settings_string_array(agent: &Path, id: &str) -> Vec<String> {
+    load_settings(agent).get_string_array(id)
+}
+
+/// `includeWorkspaceTree`: the project layout block is opt-in.
+fn include_workspace_tree(agent: &Path) -> bool {
+    load_settings(agent)
+        .get_bool("includeWorkspaceTree")
+        .unwrap_or(false)
+}
+
+/// `PERSONALITY.md` from the project or agent dir (`loadPersonality`).
+///
+/// oh-my-tau ships no bundled personality presets, so an unset file leaves the
+/// block empty rather than inventing preset prose.
+fn personality_block(cwd: &Path, agent: &Path) -> String {
+    for path in [cwd.join("PERSONALITY.md"), agent.join("PERSONALITY.md")] {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Context files the workspace tree knows about but did not load, so the
+/// prompt can point at directories whose rules apply once the agent works
+/// there (`workspaceTree.agentsMdFiles`, capped at 200).
+fn agents_md_search_files(cwd: &Path, home: &Path, agent: &Path) -> Vec<String> {
+    const CAP: usize = 200;
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut files: Vec<String> = Vec::new();
+    let loaded: HashSet<PathBuf> = context_files_with(cwd, home, agent, &[])
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    let mut walk = vec![cwd.to_path_buf()];
+    while let Some(dir) = walk.pop() {
+        if files.len() >= CAP {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                // Skip build output; it never holds hand-written rules.
+                if !matches!(name.as_ref(), "node_modules" | "target" | "dist" | "build") {
+                    walk.push(path);
+                }
+                continue;
+            }
+            if !matches!(name.as_ref(), "AGENTS.md" | "CLAUDE.md") {
+                continue;
+            }
+            if loaded.contains(&path) || !seen.insert(path.clone()) {
+                continue;
+            }
+            files.push(path.to_string_lossy().into_owned());
+            if files.len() >= CAP {
+                break;
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// `internalUrls` (prompt docs) and `internalUrlReference` (the `xd://read/urls`
+/// body) from the scheme registry.
+///
+/// No oh-my-tau provider implements the TS `promptReference` hook, so the
+/// reference list mirrors the doc lines: the template only consults it in the
+/// branch where the `read` tool is unavailable, where it is the only way to
+/// name the schemes at all.
+fn internal_url_docs() -> (Vec<String>, Vec<String>) {
+    static REGISTRY: OnceLock<omp_urls::Registry> = OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| {
+        let mut registry = omp_urls::Registry::new();
+        omp_urls::schemes::register_all(&mut registry).expect("scheme registration");
+        registry
+    });
+    let urls = registry.describe();
+    (urls.clone(), urls)
+}
+
 /// Result of building the provider-facing system prompt blocks.
 pub struct Built {
     /// Ordered blocks; providers preserve them as distinct messages.
@@ -858,6 +1569,37 @@ pub struct Built {
     /// Tool names enabled after the `--tools` restriction.
     #[allow(dead_code)] // read by tests and prompt debug dumps; kept with `Built`
     pub tool_names: Vec<String>,
+}
+
+/// The discovered rules as `omp-urls` entries (the `rule://` resolution shape).
+///
+/// The prompt layer's [`rules::Rule`] carries the same fields, so this is a
+/// plain projection.
+#[must_use]
+pub fn rule_entries(cwd: &Path, agent: &Path, home: &Path) -> Vec<omp_urls::schemes::RuleEntry> {
+    rules::load_rules_with_home(cwd, agent, home)
+        .into_iter()
+        .map(|rule| omp_urls::schemes::RuleEntry {
+            name: rule.name,
+            path: rule.path.to_string_lossy().into_owned(),
+            content: rule.content,
+            description: rule.description,
+            globs: rule.globs,
+            always_apply: rule.always_apply,
+        })
+        .collect()
+}
+
+/// Install the process-global `rule://` book for `cwd` (TS `setActiveRules`),
+/// using the process home/agent dirs. Session start, session switches and
+/// `--dump-system-prompt` all call this so `rule://<name>` resolves.
+pub fn install_active_rules(cwd: &Path) {
+    install_active_rules_with(cwd, &home_dir(), &agent_dir());
+}
+
+/// [`install_active_rules`] with explicit dirs (tests, relocated agent dirs).
+pub fn install_active_rules_with(cwd: &Path, home: &Path, agent: &Path) {
+    omp_urls::schemes::rule::set_active_rules(rule_entries(cwd, agent, home));
 }
 
 /// A tool's prompt metadata: internal name plus display label.
@@ -890,6 +1632,26 @@ pub fn build_with(
     home: &Path,
     agent: &Path,
     opts: &Options,
+    available_tools: &[ToolMeta],
+) -> Built {
+    build_full(
+        cwd,
+        home,
+        agent,
+        opts,
+        &ContextOptions::default(),
+        available_tools,
+    )
+}
+
+/// [`build_with`] with the context/rule knobs spelled out.
+#[allow(clippy::too_many_lines)] // sequential prompt assembly; mirrors omp's buildSystemPrompt order
+pub fn build_full(
+    cwd: &Path,
+    home: &Path,
+    agent: &Path,
+    opts: &Options,
+    ctx_opts: &ContextOptions,
     available_tools: &[ToolMeta],
 ) -> Built {
     let cfg = load_config(agent);
@@ -946,16 +1708,58 @@ pub fn build_with(
         .into_iter()
         .map(|(label, value)| json!({ "label": label, "value": value }))
         .collect();
-    let files: Vec<Value> = context_files(cwd, home)
+    let extra_context_names = if ctx_opts.extra_context_names.is_empty() {
+        settings_string_array(agent, "contextFiles.extra")
+    } else {
+        ctx_opts.extra_context_names.clone()
+    };
+    let mut discovered = context_files_with(cwd, home, agent, &extra_context_names);
+    // Task subagents never receive AGENTS.md (`withoutAgentsMd`).
+    if ctx_opts.exclude_agents_md {
+        discovered = without_agents_md(discovered);
+    }
+    let agents_md_search = agents_md_search_files(cwd, home, agent);
+    let files: Vec<Value> = discovered
         .into_iter()
         .map(|f| {
             json!({
                 "path": f.path.to_string_lossy(),
-                "content": f.content,
+                "content": close_code_fence(&f.content),
                 "depth": f.depth,
+                "level": f.level.as_str(),
             })
         })
         .collect();
+
+    // Rules: sticky `RULES.md` bodies ride along; described rules become the
+    // `rule://` rulebook. `--no-rules` empties both buckets.
+    let (rulebook, always_apply) = if ctx_opts.no_rules {
+        (Vec::new(), Vec::new())
+    } else {
+        let discovered_rules = rules::load_rules_with_home(cwd, agent, home);
+        let buckets = rules::bucket_rules(
+            discovered_rules,
+            &rules::BucketOptions {
+                disabled_rules: &ctx_opts.disabled_rules,
+                agent_name: Some(if opts.subagent { "sub" } else { "main" }),
+            },
+        );
+        let rulebook: Vec<Value> = buckets
+            .rulebook
+            .iter()
+            .map(rules::Rule::to_rulebook_entry)
+            .collect();
+        let always: Vec<Value> = buckets
+            .always_apply
+            .iter()
+            .map(rules::Rule::to_always_apply_entry)
+            .collect();
+        (rulebook, always)
+    };
+
+    // Internal URL docs come from the live scheme registry (TS
+    // `InternalUrlRouter.instance().describe/reference()`).
+    let (internal_urls, internal_url_reference) = internal_url_docs();
     let tool_refs: Map<String, Value> = tool_names
         .iter()
         .map(|n| (n.clone(), Value::String(n.clone())))
@@ -982,18 +1786,20 @@ pub fn build_with(
         "toolRefs": Value::Object(tool_refs),
         "environment": env,
         "contextFiles": files,
-        "agentsMdSearch": { "files": [] },
+        "agentsMdSearch": { "files": agents_md_search },
         "workspaceTree": { "rootPath": cwd, "rendered": "", "truncated": false },
         "hasSkillUriAccess": has_skill_uri_access,
-        "internalUrls": [],
+        "internalUrls": internal_urls,
+        "internalUrlReference": internal_url_reference,
         "skills": skill_values,
-        "rules": [],
-        "alwaysApplyRules": [],
+        "rules": rulebook,
+        "alwaysApplyRules": always_apply,
         "cwd": cwd.to_string_lossy(),
         "additionalWorkspaceRoots": [],
         "model": if cfg.include_model_in_prompt { opts.model.clone() } else { String::new() },
-        "delegationBias": "eager",
-        "personality": "",
+        "delegationTier": "balanced",
+        "delegationBias": "balanced",
+        "personality": personality_block(cwd, agent),
         "intentTracing": false,
         "intentField": "",
         "eagerTasks": false,
@@ -1008,14 +1814,21 @@ pub fn build_with(
         "computerEnabled": false,
     });
     let more = json!({
-        "includeWorkspaceTree": false,
+        "includeWorkspaceTree": include_workspace_tree(agent),
         "renderMermaid": true,
+        "renderSvg": false,
+        "renderEmbeds": false,
+        "autoGraph": false,
         "reactions": cfg.reactions,
         "xdevTools": [],
         "hasDynamicXdevTools": false,
         "xdevDocs": "",
         "autoQaEnabled": false,
         "writeTransportOnly": false,
+        "encourageEdits": tool_names.iter().any(|n| n == "edit"),
+        "ovnfs": "",
+        "intentGuidance": "",
+        "resultShaping": "",
         "subagent": opts.subagent,
         "activeRepoContext": "",
     });
@@ -1047,6 +1860,24 @@ pub fn build_with(
     Built { blocks, tool_names }
 }
 
+/// [`build`] with the context/rule knobs spelled out.
+#[must_use]
+pub fn build_contextual(
+    cwd: &Path,
+    opts: &Options,
+    ctx_opts: &ContextOptions,
+    available_tools: &[ToolMeta],
+) -> Built {
+    build_full(
+        cwd,
+        &home_dir(),
+        &agent_dir(),
+        opts,
+        ctx_opts,
+        available_tools,
+    )
+}
+
 /// Build the system prompt using the process home/agent dirs.
 #[must_use]
 pub fn build(cwd: &Path, opts: &Options, available_tools: &[ToolMeta]) -> Built {
@@ -1063,6 +1894,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Write a file, creating its parent directories.
+    fn write(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
     }
 
     /// Project SYSTEM.md beats user-level, mirroring
@@ -1100,7 +1939,7 @@ mod tests {
         std::fs::write(cwd.join("CLAUDE.md"), "cwd rules").unwrap();
         let home = root.join("home");
         std::fs::create_dir_all(&home).unwrap();
-        let files = context_files(&cwd, &home);
+        let files = context_files_with(&cwd, &home, &root.join("agent"), &[]);
         let names: Vec<String> = files
             .iter()
             .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
@@ -1108,6 +1947,166 @@ mod tests {
         assert_eq!(names, vec!["AGENTS.md", "CLAUDE.md"]);
         assert!(files[0].depth > files[1].depth);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Priority decides the dedupe slots, presence does not: `.omp/AGENTS.md`
+    /// (100) takes `project:0` and the single `user` slot away from Copilot,
+    /// Gemini and the standalone walk-up, while a standalone `AGENTS.md` one
+    /// depth farther and an additive `contextFiles.extra` still land.
+    #[test]
+    fn context_files_all_providers() {
+        let root = tempdir("providers");
+        let repo = root.join("repo");
+        let cwd = repo.join("pkg");
+        let home = root.join("home");
+        let agent = home.join(".omp/agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write(&repo.join(".git"), "gitdir: x");
+        write(&agent.join("AGENTS.md"), "user agents");
+        write(&cwd.join(".omp/AGENTS.md"), "project agents");
+        write(&repo.join("AGENTS.md"), "repo root agents");
+        write(&cwd.join(".github/copilot-instructions.md"), "copilot");
+        write(&cwd.join(".gemini/GEMINI.md"), "gemini project");
+        write(&home.join(".gemini/GEMINI.md"), "gemini user");
+        write(&cwd.join("AGENTS.local.md"), "additive local");
+
+        let files = context_files_with(&cwd, &home, &agent, &["AGENTS.local.md".into()]);
+        let paths: Vec<String> = files
+            .iter()
+            .map(|f| {
+                f.path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        for expected in [
+            "home/.omp/agent/AGENTS.md",
+            "repo/pkg/.omp/AGENTS.md",
+            "repo/AGENTS.md",
+            "repo/pkg/AGENTS.local.md",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == expected),
+                "missing {expected} in {paths:?}"
+            );
+        }
+        // `.omp/AGENTS.md` owns `project:0`, so every lower-priority provider
+        // at that depth is shadowed rather than merged; the native user file
+        // owns the single `user` slot the same way.
+        for shadowed in [
+            "repo/pkg/.github/copilot-instructions.md",
+            "repo/pkg/.gemini/GEMINI.md",
+            "home/.gemini/GEMINI.md",
+        ] {
+            assert!(
+                !paths.iter().any(|p| p == shadowed),
+                "unexpected {shadowed} in {paths:?}"
+            );
+        }
+        // `.omp/AGENTS.md` is not hidden-dir-skipped and stays project scope.
+        let project_agents = files
+            .iter()
+            .find(|f| f.path.ends_with("pkg/.omp/AGENTS.md"))
+            .unwrap();
+        assert_eq!(project_agents.level, Level::Project);
+        assert_eq!(project_agents.depth, 0);
+        let additive = files
+            .iter()
+            .find(|f| f.path.ends_with("AGENTS.local.md"))
+            .unwrap();
+        assert!(additive.additive);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A same-depth standalone file loses its scope slot to the higher-priority
+    /// `.omp/AGENTS.md`, matching the capability's first-wins dedupe.
+    #[test]
+    fn native_agents_md_shadows_same_depth_claude_md() {
+        let root = tempdir("shadow");
+        let repo = root.join("repo");
+        let home = root.join("home");
+        let agent = home.join(".omp/agent");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        write(&repo.join(".git"), "gitdir: x");
+        write(&repo.join(".omp/AGENTS.md"), "native");
+        write(&repo.join("CLAUDE.md"), "claude");
+        let files = context_files_with(&repo, &home, &agent, &[]);
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["AGENTS.md"]);
+        assert_eq!(files[0].content, "native");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `@path` imports expand against the importing file's directory, skip
+    /// fenced/inline code, break cycles, and leave missing targets verbatim.
+    #[test]
+    fn at_import_expansion() {
+        let root = tempdir("atimport");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("shared.md"), "shared body").unwrap();
+        let doc = root.join("AGENTS.md");
+        std::fs::write(root.join("child.md"), "child body").unwrap();
+        let content = "start\n@child.md\n@~/shared.md\n@missing.md\n```\n@child.md\n```\nmail me@example.com\n@child.md.\n";
+        let out = expand_at_imports(content, &doc, &home);
+        assert!(out.contains("start\nchild body\nshared body"));
+        // Missing target keeps its token.
+        assert!(out.contains("@missing.md"));
+        // Fenced code is untouched.
+        assert!(out.contains("```\n@child.md\n```"));
+        // Email-ish `@` after a word char is not an import.
+        assert!(out.contains("me@example.com"));
+        // Trailing sentence period is not part of the path.
+        assert!(out.contains("child body.\n"));
+
+        // A file importing itself does not loop.
+        std::fs::write(root.join("self.md"), "x\n@self.md\n").unwrap();
+        let out = expand_at_imports("@self.md", &doc, &home);
+        assert!(out.contains("@self.md"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Containment dedupe drops a farther file only when a closer one already
+    /// carries its whole paragraph run; `without_agents_md` drops AGENTS.md.
+    #[test]
+    fn containment_dedupe_and_agents_md_strip() {
+        let file = |name: &str, content: &str, depth: usize| ContextFile {
+            path: PathBuf::from(name),
+            content: content.to_string(),
+            depth,
+            level: Level::Project,
+            additive: false,
+        };
+        let files = vec![
+            file("far/AGENTS.md", "alpha\n\nbeta\n", 3),
+            file("near/AGENTS.md", "beta\n\ngamma\n", 1),
+            file("mid/AGENTS.md", "beta\n", 2),
+        ];
+        let kept = dedupe_contained_context_files(files);
+        let names: Vec<&str> = kept.iter().map(|f| f.path.to_str().unwrap()).collect();
+        // `mid` is contained by `near`; `far` is not (alpha/beta run absent).
+        assert_eq!(names, vec!["far/AGENTS.md", "near/AGENTS.md"]);
+
+        let stripped =
+            without_agents_md(vec![file("AGENTS.md", "a", 0), file("CLAUDE.md", "b", 0)]);
+        assert_eq!(stripped.len(), 1);
+        assert_eq!(stripped[0].path, PathBuf::from("CLAUDE.md"));
+    }
+
+    /// An unclosed fence in a context file is closed at its end so it cannot
+    /// swallow the rest of the prompt.
+    #[test]
+    fn close_code_fence_closes_unterminated_block() {
+        assert_eq!(close_code_fence("text"), "text");
+        assert_eq!(close_code_fence("```\nx\n"), "```\nx\n```");
+        assert_eq!(close_code_fence("````\nx\n"), "````\nx\n````");
+        assert_eq!(close_code_fence("```\nx\n```\n"), "```\nx\n```\n");
     }
 
     /// Skills: `enabled: false` in config.yml suppresses the listing; hide:
@@ -1246,6 +2245,104 @@ mod tests {
             render(nested, &json!({"scout": true, "bias": "gated"})),
             "."
         );
+    }
+
+    /// `@first`/`@last` inside `each` drive separator-free list rendering and
+    /// the custom-prompt skill block's blank-line guard.
+    #[test]
+    fn each_first_and_last_metadata() {
+        let tmpl = "{{#each items}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}";
+        assert_eq!(
+            render(tmpl, &json!({"items": ["read", "bash", "edit"]})),
+            "read, bash, edit"
+        );
+        let tmpl = "{{#each items}}{{#unless @first}}|{{/unless}}{{this}}{{/each}}";
+        assert_eq!(render(tmpl, &json!({"items": ["a", "b"]})), "a|b");
+        // Nested `each` restores the outer iteration flags.
+        let nested = "{{#each rows}}{{#each this}}{{#if @first}}[{{/if}}{{this}}{{#if @last}}]{{/if}}{{/each}}{{/each}}";
+        assert_eq!(
+            render(nested, &json!({"rows": [["a", "b"], ["c"]]})),
+            "[ab][c]"
+        );
+        // Empty array still takes the else branch.
+        assert_eq!(
+            render(
+                "{{#each items}}x{{else}}none{{/each}}",
+                &json!({"items": []})
+            ),
+            "none"
+        );
+    }
+
+    /// Rules and `internalUrls` reach the rendered prompt: sticky `RULES.md`
+    /// bodies land in `<generic-rules>`, described rulebook entries in
+    /// `<domain-rules>`, and the scheme docs in the Internal URLs block.
+    #[test]
+    fn rules_and_internal_urls_render() {
+        let root = tempdir("rulesrender");
+        let repo = root.join("repo");
+        let agent = root.join("agent");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&agent).unwrap();
+        write(&repo.join(".git"), "gitdir: x");
+        write(&repo.join(".omp/RULES.md"), "Always run the linter.");
+        write(
+            &repo.join(".omp/rules/tdd.md"),
+            "---\ndescription: Test first.\nglobs:\n  - src/**\n---\nbody\n",
+        );
+        let tools: Vec<ToolMeta> = [("read", "read"), ("task", "task")]
+            .into_iter()
+            .map(|(a, b)| (a.into(), b.into()))
+            .collect();
+        let built = build_with(&repo, &root, &agent, &Options::default(), &tools);
+        let prompt = &built.blocks[0];
+        assert!(prompt.contains("Always run the linter."), "{prompt}");
+        assert!(prompt.contains("- tdd (src/**): Test first."), "{prompt}");
+        assert!(prompt.contains("# Internal URLs"), "{prompt}");
+        // `--no-rules` drops both buckets.
+        let opts = Options::default();
+        let ctx_opts = ContextOptions {
+            no_rules: true,
+            ..ContextOptions::default()
+        };
+        let built = build_full(&repo, &root, &agent, &opts, &ctx_opts, &tools);
+        assert!(!built.blocks[0].contains("Always run the linter."));
+        assert!(!built.blocks[0].contains("<domain-rules>"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Context files reach `<repo-rules>`; a standalone `CLAUDE.md` one depth
+    /// closer than `.omp/AGENTS.md` keeps its own slot (no dedupe collision),
+    /// and subagent sessions drop AGENTS.md only.
+    #[test]
+    fn context_files_render_and_subagents_drop_agents_md() {
+        let root = tempdir("ctxrender");
+        let repo = root.join("repo");
+        let cwd = repo.join("pkg");
+        let agent = root.join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        write(&repo.join(".git"), "gitdir: x");
+        write(&repo.join(".omp/AGENTS.md"), "project convention");
+        write(&cwd.join("CLAUDE.md"), "claude convention");
+
+        let built = build_with(&cwd, &root, &agent, &Options::default(), &[]);
+        let project = &built.blocks[1];
+        assert!(project.contains("project convention"), "{project}");
+        assert!(project.contains("claude convention"), "{project}");
+        assert!(
+            project.contains("NEVER `grep`/`glob` for `AGENTS.md`"),
+            "{project}"
+        );
+
+        let ctx_opts = ContextOptions {
+            exclude_agents_md: true,
+            ..ContextOptions::default()
+        };
+        let built = build_full(&cwd, &root, &agent, &Options::default(), &ctx_opts, &[]);
+        let project = &built.blocks[1];
+        assert!(!project.contains("project convention"), "{project}");
+        assert!(project.contains("claude convention"), "{project}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `resolvePromptInput`: multi-line stays literal; an existing path is

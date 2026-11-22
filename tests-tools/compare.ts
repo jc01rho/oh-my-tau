@@ -50,9 +50,11 @@ const MODULE_TOOL_ALIAS: Record<string, string> = { yield_tool: "yield" };
 /**
  * Tools whose parameter diff is structural and owned by
  * scripts/check-tools-parity.ts (precise, per-property allowances). A blanket
- * canonical-JSON line here would hide which property actually differs.
+ * canonical-JSON line here would hide which property actually differs. Empty
+ * since Phase 3: `ask` and `todo` schemas now match the golden byte-for-byte, so
+ * their canonical-JSON comparison runs like every other strict tool.
  */
-const PRECISE_PARAM_TOOLS = new Set(["ask", "todo"]);
+const PRECISE_PARAM_TOOLS = new Set<string>([]);
 
 /** Recursively sort object keys so JSON equality ignores key order. */
 function canonical(value: unknown): unknown {
@@ -130,6 +132,28 @@ function rustInlineTool(src: string, name: string): string {
 	return jsonLiteralAt(src, at);
 }
 
+/**
+ * Rust expressions that stand where a JSON value would be. `eval` builds its
+ * schema per session (`build_eval_schema`), so the literal carries code the
+ * literal parser cannot read; substitute the values `schema()` renders for the
+ * default session before parsing. Only property names, types and `required` take
+ * part in the diff for a non-strict tool, so the placeholders cannot mask one.
+ */
+const RUST_EXPR_DEFAULTS: Record<string, Array<[RegExp, string]>> = {
+	eval: [
+		[/"enum": names\.clone\(\),/, `"enum": ["py", "js"],`],
+		[/"description": describe_language_field\(&names\),/, `"description": "py/js",`],
+		[/"description": eval_timeout_description\(max_timeout\)/, `"description": "timeout"`],
+	],
+};
+
+/** Replace Rust expressions in a module's schema literal with their default render. */
+function resolveRustExprs(name: string, src: string): string {
+	const subs = RUST_EXPR_DEFAULTS[name];
+	if (!subs) return src;
+	return subs.reduce((text, [pattern, value]) => text.replace(pattern, value), src);
+}
+
 function parseRustTools(): ToolDef[] {
 	const toolsSrc = readFileSync(RUST_TOOLS, "utf8");
 	const editSrc = readFileSync(RUST_EDIT, "utf8");
@@ -156,7 +180,7 @@ function parseRustTools(): ToolDef[] {
 	// task: `schema()` delegates to `base_schema()` with a conditional rubric `json!`
 	// in between, so anchor at `base_schema()` to compare the actual wire schema.
 	for (const [name, file] of [["task", "crates/omp-cli/src/tools/task.rs"], ["eval", "crates/omp-cli/src/tools/eval.rs"], ["web_search", "crates/omp-cli/src/tools/web_search.rs"]] as const) {
-		const mod = readFileSync(join(ROOT, file), "utf8");
+		const mod = resolveRustExprs(name, readFileSync(join(ROOT, file), "utf8"));
 		const at = name === "task" ? mod.indexOf("fn base_schema()") : mod.indexOf("pub fn schema()");
 		defs.push({
 			name,

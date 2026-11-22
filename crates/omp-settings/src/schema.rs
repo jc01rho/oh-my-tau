@@ -1283,6 +1283,13 @@ pub static SETTINGS: &[SettingDef] = &[
         credential: false,
     },
     SettingDef {
+        id: "hindsight.globalScope",
+        ty: crate::SettingType::Boolean,
+        env: None,
+        default_yaml: Some("false"),
+        credential: false,
+    },
+    SettingDef {
         id: "hindsight.mentalModelAutoSeed",
         ty: crate::SettingType::Boolean,
         env: None,
@@ -1937,9 +1944,23 @@ pub static SETTINGS: &[SettingDef] = &[
         credential: false,
     },
     SettingDef {
+        id: "mnemopi.embeddingInputType",
+        ty: crate::SettingType::Boolean,
+        env: Some("MNEMOPI_EMBEDDING_INPUT_TYPE"),
+        default_yaml: Some("false"),
+        credential: false,
+    },
+    SettingDef {
         id: "mnemopi.embeddingModel",
         ty: crate::SettingType::String,
         env: Some("MNEMOPI_EMBEDDING_MODEL"),
+        default_yaml: None,
+        credential: false,
+    },
+    SettingDef {
+        id: "mnemopi.embeddingQueryPrefix",
+        ty: crate::SettingType::String,
+        env: None,
         default_yaml: None,
         credential: false,
     },
@@ -2032,6 +2053,13 @@ pub static SETTINGS: &[SettingDef] = &[
         ty: crate::SettingType::Number,
         env: None,
         default_yaml: Some("4000"),
+        credential: false,
+    },
+    SettingDef {
+        id: "mnemopi.recallRelevance",
+        ty: crate::SettingType::Enum(&["auto", "on", "off"]),
+        env: None,
+        default_yaml: Some("\"off\""),
         credential: false,
     },
     SettingDef {
@@ -2691,6 +2719,13 @@ pub static SETTINGS: &[SettingDef] = &[
         ty: crate::SettingType::Number,
         env: None,
         default_yaml: Some("5"),
+        credential: false,
+    },
+    SettingDef {
+        id: "sharpshooter.minPromptLength",
+        ty: crate::SettingType::Number,
+        env: None,
+        default_yaml: Some("16"),
         credential: false,
     },
     SettingDef {

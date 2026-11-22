@@ -10,6 +10,7 @@ pub mod core;
 pub mod history;
 pub mod local;
 pub mod mcp;
+pub mod memory;
 pub mod omp;
 pub mod rule;
 pub mod skill;
@@ -21,6 +22,7 @@ use crate::Registry;
 pub fn register_all(reg: &mut Registry) -> anyhow::Result<()> {
     reg.register(skill::SkillProvider)?;
     reg.register(rule::RuleProvider)?;
+    reg.register(memory::MemoryProvider)?;
     reg.register(omp::OmpProvider)?;
     reg.register(cfg::CfgProvider)?;
     reg.register(mcp::McpProvider)?;
@@ -47,7 +49,7 @@ pub struct SkillEntry {
 }
 
 /// A rule from the project rulebook (TS: `capability/rule.ts`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RuleEntry {
     pub name: String,
     /// Absolute path of the rule file on disk (may be empty for virtual rules).
@@ -55,6 +57,11 @@ pub struct RuleEntry {
     /// Rule content with frontmatter stripped.
     pub content: String,
     pub description: String,
+    /// Globs this rule applies to (frontmatter `globs`); empty = every path.
+    pub globs: Vec<String>,
+    /// Whether the rule is injected unconditionally (`alwaysApply`, or a
+    /// `RULES.md` sticky rule).
+    pub always_apply: bool,
 }
 
 /// Raw resource payload returned by a scheme resolver (TS `InternalResource`).

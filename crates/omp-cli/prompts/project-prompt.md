@@ -23,6 +23,10 @@ Before changes in these directories, MUST read:
 </dir-context>
 {{/if}}
 
+{{#ifAny contextFiles.length agentsMdSearch.files.length}}
+Context files above auto-loaded. NEVER `grep`/`glob` for `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, or similar agent/context files: relevant files already in context; others noise.
+{{/ifAny}}
+
 {{#if includeWorkspaceTree}}
 {{#if workspaceTree.rendered}}
 <workspace-tree>
@@ -47,12 +51,16 @@ Additional workspace directories. This CURRENT workspace state supersedes worksp
 {{/if}}
 </project-context>
 
-{{#if subagent}}
 <critical>
+- Each response MUST advance the task; completion only stopping condition.
+- MUST default to informed action; do not ask for confirmation when tools or repo context can answer.
+{{#if subagent}}
 - Changes complete → yield; verification is main agent's job. NEVER run it yourself unless your assignment explicitly instructs it.
+{{else}}
+- Before yielding, MUST verify significant behavioral changes: run the specific test, command, or scenario covering the change.
+{{/if}}
 </critical>
 
-{{/if}}
 {{#if appendPrompt}}
 {{appendPrompt}}
 {{/if}}

@@ -1,7 +1,56 @@
 [
  {
   "name": "security",
-  "description": "Not ported: security scans need the security-scan mode controller",
+  "description": "Plan, run, inspect, import, and compare OMP-native security scans",
+  "input": {
+   "hint": "<plan|scan|status|cancel|scans|show|import|export|validate|compare|disposition>"
+  },
+  "subcommands": [
+   {
+    "name": "plan",
+    "description": "Create an immutable security scan plan"
+   },
+   {
+    "name": "scan",
+    "description": "Start a planned or newly planned native scan"
+   },
+   {
+    "name": "status",
+    "description": "Show native scan operation status"
+   },
+   {
+    "name": "cancel",
+    "description": "Cancel a running native scan"
+   },
+   {
+    "name": "scans",
+    "description": "List stored project security scans"
+   },
+   {
+    "name": "show",
+    "description": "Render a scan or security:// resource"
+   },
+   {
+    "name": "import",
+    "description": "Import SARIF or a Codex Security bundle"
+   },
+   {
+    "name": "export",
+    "description": "Export a canonical bundle, SARIF, or report"
+   },
+   {
+    "name": "validate",
+    "description": "Validate one finding with OMP-native tools"
+   },
+   {
+    "name": "compare",
+    "description": "Compare finding lineage across two scans"
+   },
+   {
+    "name": "disposition",
+    "description": "Set a finding disposition with rationale"
+   }
+  ],
   "source": "builtin"
  },
  {

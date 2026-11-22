@@ -170,5 +170,506 @@
 
   const display = (...values) => globalThis.__ompDisplay(...values);
 
-  Object.assign(globalThis, { display, tool, output, log, phase, read, write, env });
+  // -------------------------------------------------------------------------
+  // Shell, agent, completion, judgment, workpool and budget host-call
+  // families. Op names and payload shapes are verbatim from shell-bridge.ts,
+  // agent-bridge.ts, completion-bridge.ts, judgment-bridge.ts,
+  // judgment-batch-bridge.ts, workpool-bridge.ts, handle-bridge.ts and
+  // budget-bridge.ts; every round-trip goes through `__ompHostCall`.
+  // -------------------------------------------------------------------------
+
+  class ShellError extends Error {
+    constructor(message, output, exitCode) {
+      super(message);
+      this.name = "ShellError";
+      this.output = output;
+      this.exitCode = exitCode;
+    }
+  }
+
+  // Run one command on the embedded bash engine; rejects with ShellError on a
+  // non-zero exit or timeout.
+  const sh = async (command, opts, ...rest) => {
+    if (typeof command !== "string") {
+      throw new TypeError(`sh() expects a command string (got ${typeof command})`);
+    }
+    const options = optionsArg("sh", opts, rest, ["cwd", "timeout"], "{ cwd, timeout }");
+    const args = { command };
+    if (!isNil(options.cwd)) args.cwd = String(options.cwd);
+    if (!isNil(options.timeout)) args.timeout = Number(options.timeout);
+    const result = await hostCall("__shell__", args);
+    const output = typeof result?.output === "string" ? result.output : "";
+    const exitCode = result?.exitCode;
+    if (exitCode === 0) return output;
+    const status = result?.timedOut
+      ? `timed out after ${options.timeout}s`
+      : `exited with code ${exitCode}`;
+    const detail = output ? `\n${output.replace(/\s+$/, "")}` : "";
+    throw new ShellError(`$ ${command}: ${status}${detail}`, output, exitCode ?? null);
+  };
+
+  const HANDLE_UNSET = Symbol("handle-unset");
+  const timeoutError = message => {
+    const error = new Error(message);
+    error.name = "TimeoutError";
+    return error;
+  };
+
+  class Handle {
+    // Duck-typed so handles built by the agent prelude (which loads after this
+    // one and rebinds the concrete classes) still satisfy `x instanceof Handle`.
+    static [Symbol.hasInstance](value) {
+      return (
+        value !== null &&
+        typeof value === "object" &&
+        typeof value.kind === "string" &&
+        "id" in value &&
+        typeof value.wait === "function"
+      );
+    }
+
+    constructor(kind, id, schema) {
+      this.kind = kind;
+      this.id = id;
+      this._schema = schema;
+      this._result = HANDLE_UNSET;
+    }
+
+    async status() {
+      const snapshot = await hostCall("__status__", {
+        item: { kind: this.kind, id: this.id },
+      });
+      return snapshot?.status ?? "failed";
+    }
+
+    async done() {
+      return (await this.status()) !== "running";
+    }
+
+    async wait(opts, ...rest) {
+      if (this._result !== HANDLE_UNSET) return this._result;
+      const options = optionsArg("Handle.wait", opts, rest, ["timeout"], "{ timeout }");
+      return (await wait([this], options))[0];
+    }
+
+    async cancel() {
+      const result = await hostCall("__cancel__", {
+        item: { kind: this.kind, id: this.id },
+      });
+      return Boolean(result?.cancelled);
+    }
+  }
+
+  class AgentHandle extends Handle {
+    constructor(id, agentName, schema) {
+      super("agent", id, schema);
+      this.agent = agentName;
+      this.handle = `agent://${id}`;
+    }
+
+    toString() {
+      return `<agent ${this.id} (${this.agent})>`;
+    }
+
+    async send(message) {
+      return await hostCall("write", {
+        path: this.handle,
+        content: String(message),
+        i: "Messaging agent",
+      });
+    }
+
+    async output(opts = {}) {
+      return await globalThis.output(this.id, opts);
+    }
+  }
+
+  class CompletionHandle extends Handle {
+    constructor(id, schema) {
+      super("completion", id, schema);
+    }
+
+    toString() {
+      return `<completion ${this.id}>`;
+    }
+  }
+
+  // Immediate-return wrapper for the async factories: await it for the handle,
+  // or call handle methods directly and they await resolution internally.
+  class PendingHandle {
+    constructor(promise) {
+      this._promise = promise;
+    }
+
+    then(onFulfilled, onRejected) {
+      return this._promise.then(onFulfilled, onRejected);
+    }
+
+    catch(onRejected) {
+      return this._promise.catch(onRejected);
+    }
+
+    finally(onFinally) {
+      return this._promise.finally(onFinally);
+    }
+
+    async status() {
+      return (await this._promise).status();
+    }
+
+    async done() {
+      return (await this._promise).done();
+    }
+
+    async wait(...args) {
+      return (await this._promise).wait(...args);
+    }
+
+    async cancel() {
+      return (await this._promise).cancel();
+    }
+
+    async send(message) {
+      return (await this._promise).send(message);
+    }
+
+    async output(options) {
+      return (await this._promise).output(options);
+    }
+  }
+
+  const resolveHandleSnapshot = (handle, snapshot) => {
+    const status = snapshot?.status ?? "failed";
+    if (status === "running") throw timeoutError(`${handle.kind} handle ${handle.id} is still running`);
+    if (status === "failed" || status === "cancelled") {
+      throw new Error(snapshot?.error || `${handle.kind} handle ${handle.id} failed`);
+    }
+    const value = Object.prototype.hasOwnProperty.call(snapshot ?? {}, "data")
+      ? snapshot.data
+      : handle._schema !== undefined
+        ? JSON.parse(snapshot?.text ?? "")
+        : (snapshot?.text ?? "");
+    handle._result = value;
+    return value;
+  };
+
+  const wait = async (handles, opts, ...rest) => {
+    const { timeout, raiseErrors = true } = optionsArg(
+      "wait",
+      opts,
+      rest,
+      ["timeout", "raiseErrors"],
+      "{ timeout, raiseErrors }",
+    );
+    const isHandleLike = value => value instanceof Handle || value instanceof PendingHandle;
+    const raw = isHandleLike(handles) ? [handles] : Array.from(handles ?? []);
+    const items = await Promise.all(raw);
+    for (const handle of items) {
+      if (!(handle instanceof Handle)) throw new TypeError("wait() expects agent or completion handles");
+    }
+    const results = new Array(items.length);
+    const pending = [];
+    const pendingIndexes = [];
+    for (let index = 0; index < items.length; index++) {
+      const handle = items[index];
+      if (handle._result === HANDLE_UNSET) {
+        pending.push({ kind: handle.kind, id: handle.id });
+        pendingIndexes.push(index);
+      } else {
+        results[index] = handle._result;
+      }
+    }
+    if (pending.length > 0) {
+      const args = { items: pending };
+      if (timeout !== undefined) args.timeoutMs = Math.max(0, Number(timeout) * 1000);
+      const response = await hostCall("__wait__", args);
+      const snapshots = Array.isArray(response?.items) ? response.items : [];
+      if (snapshots.length !== pending.length) throw new Error("wait() returned an incomplete handle result");
+      for (let offset = 0; offset < pendingIndexes.length; offset++) {
+        const index = pendingIndexes[offset];
+        try {
+          results[index] = resolveHandleSnapshot(items[index], snapshots[offset]);
+        } catch (error) {
+          if (error?.name === "TimeoutError") throw error;
+          results[index] = error instanceof Error ? error : new Error(String(error));
+        }
+      }
+    }
+    if (raiseErrors) {
+      const failure = results.find(value => value instanceof Error);
+      if (failure) throw failure;
+    }
+    return results;
+  };
+
+  const completion = (prompt, opts, ...rest) => {
+    const promise = (async () => {
+      const options = optionsArg(
+        "completion",
+        opts,
+        rest,
+        ["model", "system", "schema"],
+        "{ model, system, schema }",
+      );
+      const result = await hostCall("__completion__", { prompt, ...options });
+      if (!result || typeof result.id !== "string") throw new Error("completion() did not return a handle");
+      return new CompletionHandle(result.id, options.schema);
+    })();
+    return new PendingHandle(promise);
+  };
+
+  const checkQuestions = questions => {
+    if (questions === null || typeof questions !== "object" || Array.isArray(questions)) {
+      throw new TypeError("judge(state, questions) expects questions as an object keyed by id");
+    }
+  };
+
+  const judge = async (state, questions, opts, ...rest) => {
+    checkQuestions(questions);
+    const options = optionsArg("judge", opts, rest, ["images"], "{ images }");
+    const args = { state, questions };
+    if (!isNil(options.images)) args.images = options.images;
+    const result = await hostCall("__judge__", args);
+    if (!result || !isPlainObject(result.answers)) throw new Error("judge() did not return answers");
+    return result.answers;
+  };
+
+  class JudgmentItem {
+    constructor(item) {
+      this.key = item.key;
+      this.answers = item.answers;
+      this.error = item.error;
+      this.model = item.model;
+    }
+
+    get ok() {
+      return this.error === undefined;
+    }
+
+    toString() {
+      return this.error === undefined
+        ? `<judgment ${JSON.stringify(this.key)} ${JSON.stringify(this.answers)}>`
+        : `<judgment ${JSON.stringify(this.key)} error=${JSON.stringify(this.error)}>`;
+    }
+  }
+
+  class JudgmentBatch {
+    constructor(id, total, intent) {
+      this.id = id;
+      this.total = total;
+      this.intent = intent;
+    }
+
+    async _call(op, args = {}) {
+      return await hostCall("__judge_batch__", { op, id: this.id, ...args });
+    }
+
+    async status() {
+      return await this._call("status");
+    }
+
+    async drain(opts, ...rest) {
+      const { timeout } = optionsArg("JudgmentBatch.drain", opts, rest, ["timeout"], "{ timeout }");
+      const args = timeout === undefined ? {} : { timeoutMs: Math.max(0, Number(timeout) * 1000) };
+      const result = await this._call("drain", args);
+      const items = Array.isArray(result?.items) ? result.items : [];
+      return items.map(item => [item.key, new JudgmentItem(item)]);
+    }
+
+    async *drainIter(opts, ...rest) {
+      const { timeout } = optionsArg("JudgmentBatch.drainIter", opts, rest, ["timeout"], "{ timeout }");
+      const deadline = timeout === undefined ? undefined : Date.now() + Number(timeout) * 1000;
+      while (true) {
+        const remaining =
+          deadline === undefined ? undefined : Math.max(0, (deadline - Date.now()) / 1000);
+        const items = await this.drain({ timeout: remaining });
+        if (items.length === 0) return;
+        yield* items;
+      }
+    }
+
+    async results() {
+      return (await this._call("results"))?.results ?? {};
+    }
+
+    async failed() {
+      return (await this._call("failed"))?.failed ?? {};
+    }
+
+    async cancel() {
+      return Boolean((await this._call("cancel"))?.cancelled);
+    }
+
+    async close() {
+      await this._call("close");
+    }
+
+    toString() {
+      return `<judgeBatch ${this.id} total=${this.total}>`;
+    }
+  }
+
+  const judgeBatchFrom = result => {
+    if (!result || typeof result.id !== "string") throw new Error("judge_batch() did not return a batch");
+    return new JudgmentBatch(result.id, Number(result.total) || 0, result.intent ?? "Judging");
+  };
+
+  const judge_batch = async (states, questions, opts, ...rest) => {
+    checkQuestions(questions);
+    const options = optionsArg(
+      "judge_batch",
+      opts,
+      rest,
+      ["images", "concurrency", "retries", "minOk", "intent"],
+      "{ intent, concurrency, retries, minOk, images }",
+    );
+    if (
+      options.intent !== undefined &&
+      (typeof options.intent !== "string" || options.intent.trim().length === 0)
+    ) {
+      throw new TypeError("judge_batch() intent must be a non-empty string");
+    }
+    let items;
+    if (Array.isArray(states)) items = states.map((state, key) => ({ key, state }));
+    else if (isPlainObject(states)) items = Object.entries(states).map(([key, state]) => ({ key, state }));
+    else throw new TypeError("judge_batch(states, questions) expects an object or array");
+    const { images, ...rest2 } = options;
+    if (images !== undefined) {
+      if (!isPlainObject(images)) {
+        throw new TypeError("judge_batch() images must be an object keyed by input key");
+      }
+      const keys = new Set(items.map(item => item.key));
+      for (const key of Object.keys(images)) {
+        const typed = /^-?\d+$/.test(key) ? Number(key) : key;
+        if (!keys.has(typed) && !keys.has(key)) {
+          throw new Error(`images contains unknown input key ${JSON.stringify(key)}`);
+        }
+      }
+      items = items.map(item =>
+        Object.prototype.hasOwnProperty.call(images, String(item.key))
+          ? { ...item, images: images[String(item.key)] }
+          : item,
+      );
+    }
+    return judgeBatchFrom(
+      await hostCall("__judge_batch__", { op: "create", items, questions, ...rest2 }),
+    );
+  };
+
+  judge_batch.attach = async id =>
+    judgeBatchFrom(await hostCall("__judge_batch__", { op: "attach", id: String(id) }));
+
+  const agent = (prompt, opts, ...rest) => {
+    const promise = (async () => {
+      const options = optionsArg(
+        "agent",
+        opts,
+        rest,
+        ["agent", "label", "schema", "isolated", "apply", "merge", "schemaMode", "tools", "model"],
+        "{ agent, label, schema, schemaMode, isolated, apply, merge, tools, model }",
+      );
+      const result = await hostCall("__agent__", { prompt, ...options });
+      if (!result || typeof result.id !== "string") throw new Error("agent() did not return a handle");
+      return new AgentHandle(result.id, result.agent, options.schema);
+    })();
+    return new PendingHandle(promise);
+  };
+
+  class WorkPool {
+    constructor(name, agentName, limit) {
+      this.name = name;
+      this.agent = agentName;
+      this.limit = limit;
+    }
+
+    async push(...items) {
+      if (!items.every(item => typeof item === "string")) {
+        throw new TypeError("WorkPool.push() expects string items");
+      }
+      const result = await hostCall("__workpool__", { op: "push", name: this.name, items });
+      return result?.ids ?? [];
+    }
+
+    async status() {
+      return await hostCall("__workpool__", { op: "status", name: this.name });
+    }
+
+    async peek() {
+      return await hostCall("__workpool__", { op: "peek", name: this.name });
+    }
+
+    async close() {
+      return await hostCall("__workpool__", { op: "close", name: this.name });
+    }
+
+    toString() {
+      return `<workpool ${this.name} (${this.agent}) ${this.limit} agents>`;
+    }
+  }
+
+  const workpool = async (agentName, opts, ...rest) => {
+    if (isPlainObject(agentName) && isNil(opts) && rest.every(isNil)) {
+      opts = agentName;
+      agentName = undefined;
+    }
+    const options = optionsArg(
+      "workpool",
+      opts,
+      rest,
+      ["name", "context", "tools", "model"],
+      "{ name, context, tools, model }",
+    );
+    const result = await hostCall("__workpool__", {
+      op: "create",
+      ...(agentName === undefined ? {} : { agent: agentName }),
+      ...options,
+    });
+    if (!result || typeof result.name !== "string") throw new Error("workpool() did not return a pool");
+    return new WorkPool(result.name, result.agent, result.limit);
+  };
+
+  const budgetSnap = async () => {
+    const snapshot = await hostCall("__budget__", {});
+    return snapshot && typeof snapshot === "object" ? snapshot : {};
+  };
+
+  const budget = {
+    total: async () => (await budgetSnap()).total ?? null,
+    spent: async () => Number((await budgetSnap()).spent ?? 0),
+    remaining: async () => {
+      const snapshot = await budgetSnap();
+      return snapshot.total == null
+        ? Infinity
+        : Math.max(0, Number(snapshot.total) - Number(snapshot.spent ?? 0));
+    },
+    hard: async () => Boolean((await budgetSnap()).hard),
+  };
+
+  Object.assign(globalThis, {
+    display,
+    tool,
+    output,
+    log,
+    phase,
+    read,
+    write,
+    env,
+    sh,
+    ShellError,
+    Handle,
+    AgentHandle,
+    CompletionHandle,
+    PendingHandle,
+    wait,
+    completion,
+    judge,
+    judge_batch,
+    judgeBatch: judge_batch,
+    JudgmentItem,
+    JudgmentBatch,
+    agent,
+    workpool,
+    WorkPool,
+    budget,
+  });
 })();

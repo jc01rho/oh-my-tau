@@ -314,6 +314,24 @@ impl Persistence {
             .inspect(|_| self.clear_nav())
     }
 
+    /// Append the `handoff` compaction entry (`method: "handoff"`, no
+    /// `shortSummary`) on the writer's id chain. An append, so a pending
+    /// navigation move ends here — same contract as [`Self::append_compaction`].
+    ///
+    /// # Errors
+    /// Writer serialization/I/O failure.
+    pub fn append_handoff(
+        &self,
+        document: &str,
+        timestamp_iso: &str,
+        commit: &omp_compact::handoff::HandoffCommit<'_>,
+    ) -> Result<String> {
+        self.with_writer(|w| {
+            omp_compact::handoff::append_handoff(w, document, timestamp_iso, commit)
+        })
+        .inspect(|_| self.clear_nav())
+    }
+
     /// Append one seeded branch line (fresh id chained to the writer's leaf,
     /// link fields remapped); falls back to the DOM path. An append.
     ///

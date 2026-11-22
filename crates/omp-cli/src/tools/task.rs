@@ -77,8 +77,10 @@ Children start blank; parent IRC steers immediately; large payloads via `local:/
 
 /// Wire schema, byte-matching the TS `getTaskSchema` render under protocol
 /// defaults (batch enabled, isolation/effort/eval-tools off paths excluded):
-/// `context` + `tasks[]` batch shape; a top-level `model` is rejected
-/// (`"not": {}` — model selectors are per-item only).
+/// `context` + `tasks[]` batch shape, exactly the golden property set. Model
+/// selectors, `outputSchema` and `schemaMode` are accepted per `tasks[]` item as
+/// a runtime superset of the reference item schema; the top-level `model` key
+/// the reference does not declare is gone.
 #[must_use]
 pub fn schema() -> Value {
     let mut schema = base_schema();
@@ -111,8 +113,7 @@ fn base_schema() -> Value {
                     "tools": {"type": "array", "items": {"type": "string"}}
                 },
                 "required": ["task", "solutionSpace"]
-            }},
-            "model": {"not": {}}
+            }}
         },
         "required": ["context", "tasks"]
     })
@@ -869,8 +870,10 @@ mod tests {
     fn schema_matches_ts_reference() {
         let s = schema();
         let props = s["properties"].as_object().unwrap();
-        assert_eq!(props.len(), 3);
+        // Golden `getTaskSchema`: `context` + `tasks` only — no top-level `model`.
+        assert_eq!(props.len(), 2, "unexpected top-level keys: {props:?}");
         assert!(props["context"]["type"] == "string");
+        assert!(!props.contains_key("model"));
         assert!(props["tasks"]["items"]["required"]
             .as_array()
             .unwrap()

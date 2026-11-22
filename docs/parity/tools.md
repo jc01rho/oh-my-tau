@@ -1,4 +1,4 @@
-# Tool & Builtin Parity (Phase 1)
+# Tool & Builtin Parity (Phase 1, schema parity closed in Phase 3)
 
 Status legend: `PRESENT` (registered + schema equal) / `PRESENT-GAP` (registered, schema or
 behavior differs) / `MISSING` (not constructible on the target).
@@ -10,7 +10,7 @@ Sources verified this pass:
 | Reference registry | `/tmp/oh-my-pi-ro/packages/coding-agent/src/tools/builtin-names.ts` | 29 visible + 3 hidden |
 | Reference factories + gates | `/tmp/oh-my-pi-ro/packages/coding-agent/src/tools/index.ts` (`BUILTIN_TOOLS`, `isToolAllowed`) | 29 + 3 |
 | Target registry | `crates/omp-cli/src/tools.rs` (`builtin_tools`, `hidden_tools`, `hidden_tool_by_name`) | 18 visible + 3 hidden |
-| Target gates | `crates/omp-cli/src/tools.rs` (`enabled_by_settings`) | 11 ids |
+| Target gates | `crates/omp-cli/src/tools.rs` (`enabled_by_settings`) | **22 gates** |
 | Golden schema extract | `tests-tools/ts_schemas.ts` → `tests-tools/ts_tools.json` | **32 tools** (29 visible + 3 hidden) |
 | Golden differ | `tests-tools/compare.ts` (`STRICT_TOOLS`, `NOT_PORTED_YET`) | **21 compared**, 8 strict |
 
@@ -25,7 +25,9 @@ minus the 11 names in its `NOT_PORTED_YET` set (`debug`, `github`, `context_note
 a name that lands in Rust while still listed is reported as "now present in omp-rs, drop from
 NOT_PORTED_YET", and a listed name with no golden is reported as stale. Of the 21 compared,
 **8** are strict (`todo`, `ask`, `checkpoint`, `rewind`, `wait`, `think`, `yield`, `goal`):
-canonical-JSON parameters plus the full description must match. The other 13 get the per-param
+canonical-JSON parameters plus the full description must match. **Phase 3** emptied
+`PRECISE_PARAM_TOOLS`, so `ask` and `todo` now take the same canonical-JSON parameter comparison
+as the other strict tools instead of a per-property allowance. The other 13 get the per-param
 diff and a first-line description check. The non-registry tools of §3 (`computer`, `browser`,
 `generate_image`, `tts`, the five `vibe_*`, `report_tool_issue`, the `search` alias) are in
 neither layer — no golden, no diff.
@@ -46,11 +48,11 @@ todo, web_search, lsp, checkpoint, rewind`) and is asserted by
 | 3 | `edit` | on | yes | **PRESENT** | 5 modes via `vendor/pi-edit`; golden records the `replace` shape and matches. `crates/omp-cli/src/tools/edit.rs` |
 | 4 | `ast_grep` | **off** | yes | **PRESENT** | `{pat,path,lang,skip}`, equal to golden. Gate `astGrep.enabled` default false. `crates/omp-cli/src/tools/ast.rs` |
 | 5 | `ast_edit` | on | yes | **PRESENT** | `{ops,paths}`, equal to golden. `crates/omp-cli/src/tools/ast.rs` |
-| 6 | `ask` | on | yes | **PRESENT-GAP** | **Phase 1 landed** `{html: string}` ("one HTML `<form>`") with `parse_html_form` flattening named controls, plus the legacy `questions[]` path as recovery (omp `recoverAskHtml`/`legacyQuestionsHtml`). Remaining: the schema advertises *both* keys with **no** `required` list where omp requires `html`, and dispatch is object-only — a bare HTML string is rejected, not recovered. `crates/omp-cli/src/tools/ask.rs` |
+| 6 | `ask` | on | yes | **PRESENT** | Schema is omp's `askSchema` byte-for-byte: `{html: string}` ("one HTML `<form>`") with `required: ["html"]`. `parse_html_form` flattens named controls; the legacy `questions[]` path is **recovery-only at runtime** (omp `recoverAskHtml`/`legacyQuestionsHtml`) and no longer advertised. Gate `ask.enabled`. `crates/omp-cli/src/tools/ask.rs` |
 | 7 | `debug` | on | **no** | **MISSING** | DAP client. Ref `tools/debug.ts`. New `crates/omp-cli/src/tools/debug.rs` |
 | 8 | `eval` | on | yes | **PRESENT** | Target schema `{language: enum[py,js], code, title, timeout, reset}` required `[language,code]` — matches golden. Gate is `allowEval` in ref, ungated in target. `crates/omp-cli/src/tools/eval.rs:58` |
 | 9 | `github` | **off** | **no** | **MISSING** | Ref needs `gh.ts` + `gh-common`/`gh-view`/`gh-pr-diff`/`gh-pr-checkout`/`gh-run-watch`/`gh-search`/`github-cache`/`gh-cache-invalidation`/`glab-mr`. New `crates/omp-cli/src/tools/github.rs` |
-| 10 | `glob` | on | yes | **PRESENT-GAP** | **Phase 1 landed** `limit: {"type":"integer","minimum":1,"maximum":200}`, equal to the ref. Remaining: the ref's extra `pattern` key (`GLOB_ARGUMENTS`) is still absent, and `additionalProperties:false` refuses it. `crates/omp-cli/src/tools.rs:300` |
+| 10 | `glob` | on | yes | **PRESENT** | **Phase 3 landed** the golden `findSchema` exactly: `path, hidden, gitignore, limit{1..200}`, no `required`, no `additionalProperties` (the refusal of `pattern` is gone). The reference's fifth accepted key `pattern` (`GLOB_ARGUMENTS`) is read as a **runtime-only extension**: `glob_search_path` scopes each `;` entry under each `path` entry unless it is absolute, `~`-rooted or a URL (omp `globSearchPath`). `crates/omp-cli/src/tools.rs`, `search.rs` |
 | 11 | `grep` | on | yes | **PRESENT** | Wire schema equal incl. `skip: {anyOf:[number,null]}`; ref caps (`20`/`10`/`50`) unverified. `crates/omp-cli/src/tools/search.rs` |
 | 12 | `find` | detected | yes | **PRESENT** | Exact match; asserted by `tools::tests::find_schema_matches_omp`. Ref `defaultState:"detected"` when a native judge model exists; target gates only on `find.enabled != off`. `crates/omp-cli/src/tools/find.rs` |
 | 13 | `lsp` | on | yes | **PRESENT** | `{action + file,line,symbol,query,new_name,apply,timeout,payload}`, `additionalProperties:false` — matches golden. Ref gate adds `enableLsp`. `crates/omp-cli/src/tools/lsp.rs` |
@@ -59,9 +61,9 @@ todo, web_search, lsp, checkpoint, rewind`) and is asserted by
 | 16 | `context_notes` | **off** | **no** | **MISSING** | Ref `tools/context-notes.ts`; gate `compaction.experimentalContextManagement`. |
 | 17 | `new_context` | **off** | **no** | **MISSING** | Same gate as `context_notes`. |
 | 18 | `security_scan` | **off** | **no** | **MISSING** | Gate `security.enabled`. **Phase 1:** the dangling catalog half is cleaned — `builtin_commands.json` keeps one bare `security` entry described `"Not ported: security scans need the security-scan mode controller"` and lists no subcommands (`slash.md` §3, §5 #2). The tool itself is still unported. |
-| 19 | `task` | on | yes | **PRESENT-GAP** | `{context, tasks, model}` required `[context,tasks]`. Golden (`ts_tools.json`) has **no** top-level `model` — its `tasks[]` item is `{task, solutionSpace, name, agent, tools}` — so the target's top-level `model: {"not": {}}` (key advertised, rejected) is **target-only**, not a golden match; selectors are accepted per `tasks[]` item only. Ref gate `canSpawnAtDepth(task.maxRecursionDepth)` absent in target. `crates/omp-cli/src/tools/task.rs` |
-| 20 | `wait` | on | yes | **PRESENT-GAP** | Schema `{type:"object",properties:{}}` byte-equal. Runtime: 30-minute `WAIT_MAX`, and a wait wakes only on an owned job/service settling, that cap, or abort — the IRC/peer-message and owed-answer legs have no port (no peer bus), so the description's answer language is unbacked. Ref gate `async` \|\| `irc` \|\| `launch` absent. `crates/omp-cli/src/tools/wait.rs` |
-| 21 | `todo` | on | yes | **PRESENT-GAP** | **Phase 1 landed** `task: anyOf[string, array<string>]` with the ref description ("verbatim task content; array targets several (not start)") and `list[].items.minItems:1`. Remaining: target-only `reason` (`block reason`) has no counterpart in `todo.ts:60-69`. `crates/omp-cli/src/tools/todo.rs` |
+| 19 | `task` | on | yes | **PRESENT** | **Phase 3 landed** the golden property set exactly — the top-level `model: {"not": {}}` is gone, so `{context, tasks}` with `required: ["context","tasks"]` and items `{task, solutionSpace, name, agent, tools}` matches. Model selectors, `outputSchema` and `schemaMode` remain accepted **per `tasks[]` item** as a runtime superset. Ref gate `canSpawnAtDepth(task.maxRecursionDepth)` is now in `enabled_by_settings` (non-positive ceiling disables spawning). `crates/omp-cli/src/tools/task.rs` |
+| 20 | `wait` | on | yes | **PRESENT-GAP** | Schema `{type:"object",properties:{}}` byte-equal. Runtime: 30-minute `WAIT_MAX`, and a wait wakes only on an owned job/service settling, that cap, or abort — the IRC/peer-message and owed-answer legs have no port (no peer bus), so the description's answer language is unbacked. Gate is now in `enabled_by_settings`: `async.enabled || launch.enabled` (the IRC leg is the reference's always-false branch here). `crates/omp-cli/src/tools/wait.rs` |
+| 21 | `todo` | on | yes | **PRESENT** | **Phase 3 landed** the golden `todoSchema` exactly: 7-value `op` enum (`init, start, done, rm, drop, append, view`), five properties, `required: ["op"]`, plus the reference description verbatim. `block`/`unblock` and the `reason` note are **runtime-only extensions**: `Op`/`Entry` still deserialize them (tau's blocker tracking keeps working), but nothing advertises them. Gate `todo.enabled`. `crates/omp-cli/src/tools/todo.rs` |
 | 22 | `web_search` | on | yes | **PRESENT** | **Phase 1 landed** all 6 ref params (`query, recency, limit, max_tokens, temperature, num_search_results`); `temperature` is forwarded only when supplied, as `callSearch` does. `crates/omp-cli/src/tools/web_search.rs` |
 | 23 | `write` | on | yes | **PRESENT** | **Phase 1 landed** `required: ["path","content"]`; a call without `content` fails (`edit::write`). `crates/omp-cli/src/tools/edit.rs` |
 | 24 | `memory_edit` | **off** | **no** | **MISSING** | Ref gate `memory.backend === "mnemopi"`. |
@@ -112,7 +114,6 @@ Tools registered outside `BUILTIN_TOOLS`.
 ---
 
 ## 4. Shared-tool schema deltas (exact)
-
 Derived from `tests-tools/ts_tools.json` + the TS sources vs `tools.rs` / per-tool modules.
 **Phase 1 landed** the schema alignments marked _landed_; each bullet keeps the delta that is
 still open, and the runtime-only gaps (behavior no schema can show) are called out separately.
@@ -120,8 +121,10 @@ still open, and the runtime-only gaps (behavior no schema can show) are called o
 Runtime deltas that survive the schema work: `wait` blocks 30 minutes max and never waits on an
 answer (no peer bus), `yield` validates `type` sections but tracks none (no accumulation, so a
 materialized `type:"result"` cannot fail the way omp's "none submitted" check does), `ask` still
-accepts the `questions` fallback the reference only recovers into HTML, `todo` still carries
-`reason`, and `task` restricts `model` to per-item selectors.
+recovers the `questions[]` fallback the reference only recovers into HTML, `todo` still accepts
+`block`/`unblock` + `reason`, `glob` still accepts `pattern`, and `task` accepts model selectors
+per item. **Phase 3** moved all four out of the advertised schema: each is now runtime-only, so the
+wire schemas match the golden byte-for-byte.
 
 - **`bash`** — properties `command, timeout, cwd, pty, async, name, notify, ready{log,port,host,timeout}`,
   required `[command]`. **Landed:** `notify: {"type":"string"}` and the ref `name` contract
@@ -129,20 +132,20 @@ accepts the `questions` fallback the reference only recovers into HTML, `todo` s
   emits six schema variants (`bashSchemaBase`, `…WithAsync`, `…WithService`, `…WithAsyncAndService`,
   plus `…NoPty` forms; `bash.ts:460-519`); the target always advertises the union, and `pty` is
   accepted but ignored (`shell.md` §3).
-- **`glob`** — **Landed:** `limit: {"type":"integer","minimum":1,"maximum":200}`, matching
-  `GLOB_ARGUMENTS`. **Open:** the ref's `pattern` key is absent and `additionalProperties:false`
-  refuses it, so `globSearchPath` scoping has no counterpart.
-- **`ask`** — **Landed:** `{html: string}` ("one HTML `<form>`") as the primary shape,
-  `parse_html_form` flattening of named `<input>/<select>/<textarea>` controls, and the pre-HTML
-  `questions[]` shape still accepted as recovery (`recoverAskHtml`/`legacyQuestionsHtml`).
-  **Open:** the schema advertises both `html` and `questions` with **no** `required` where omp
-  requires `html`; dispatch is object-only, so an argument that is a bare HTML string is rejected
-  rather than recovered.
-- **`todo`** — **Landed:** `task: anyOf[{string}, {array of string}]` with the ref description
-  ("verbatim task content; array targets several (not start)"), array entries splitting like the
-  string form (`splitTaskList`, `todoTaskTargets`), and `list[].items.minItems:1`.
-  **Open:** `reason: {"type":"string","description":"block reason"}` is target-only; the ref has
-  no such key (`todo.ts:60-69`).
+- **`glob`** — **Phase 3 landed** the golden shape: `limit: {"type":"integer","minimum":1,"maximum":200}`,
+  no `required`, no `additionalProperties`. The reference's extra `pattern` key (`GLOB_ARGUMENTS`)
+  is a runtime-only extension read by `glob_search_path`, which scopes each `;` `pattern` entry
+  under each `;` `path` entry unless it is absolute, `~`-rooted or a URL (omp `globSearchPath`).
+- **`ask`** — **Phase 3 landed**: the schema is `askSchema` byte-for-byte — `{html: string}` with
+  `required: ["html"]`, nothing else. `parse_html_form` still flattens named
+  `<input>/<select>/<textarea>` controls, and the pre-HTML `questions[]` shape stays a
+  **recovery-only** runtime path (`recoverAskHtml`/`legacyQuestionsHtml`), out of the schema. The
+  description now matches the reference verbatim.
+- **`todo`** — **Phase 3 landed**: the schema is `todoSchema` byte-for-byte — 7-value `op` enum,
+  five properties, `required: ["op"]`. `block`/`unblock` and `reason` are **runtime-only
+  extensions**: `Op`/`Entry` deserialize them, so blocker tracking and the `(blocked: reason)`
+  summary still work, but nothing advertises them. Decision recorded here: keep the behavior,
+  drop it from the wire schema rather than widening the golden.
 - **`web_search`** — **Landed:** all six ref params — `query`, `recency`
   (enum `day|week|month|year`), `limit`, `max_tokens`, `temperature`, `num_search_results` — required
   `[query]`. `temperature` is forwarded only when the caller supplies one, matching `callSearch`.
@@ -166,10 +169,11 @@ accepts the `questions` fallback the reference only recovers into HTML, `todo` s
 - **`eval`** — target `{language, code, title, timeout, reset}`; golden match. Ref additionally
   gates on `allowEval` (backend reachability).
 - **`lsp`** — target action enum of 14 values with `additionalProperties:false`; golden match.
-- **`task`** — `{context, tasks, model}` required `[context,tasks]`. The golden schema (`ts_tools.json`)
-  carries no top-level `model` key at all (items are `{task, solutionSpace, name, agent, tools}`), so
-  this is **not** a match: the target's top-level `model: {"not": {}}` is **target-only** — it
-  advertises the key and refuses it — while model selectors are accepted only inside `tasks[]` items.
+- **`task`** — **Phase 3 landed**: the golden schema exactly — `{context, tasks}` with
+  `required: ["context","tasks"]` and items `{task, solutionSpace, name, agent, tools}`. The
+  target-only top-level `model: {"not": {}}` is gone; model selectors (`model`), `outputSchema` and
+  `schemaMode` remain a per-`tasks[]`-item runtime superset, and the `rubric` property is still
+  gated behind `OMP_TASK_RUBRIC=1`.
 - Unchanged and equal: `edit` (replace shape), `find`, `grep`, `ast_grep`, `ast_edit`, `checkpoint`,
   `rewind`, `think`.
 
@@ -194,11 +198,17 @@ Target files: `crates/omp-eval/src/prelude.js`, `prelude_agents.js`, `prelude_co
 
 ## 6. Settings gates
 
-Target `enabled_by_settings` (`crates/omp-cli/src/tools.rs`) — 11 ids, everything else returns `true`:
+Target `enabled_by_settings` (`crates/omp-cli/src/tools.rs`) — **Phase 3 extended it from 11 ids to
+the full 22-gate table** of the reference's `isToolAllowed` (`tools/index.ts:803-880`), one explicit
+arm per name, in the reference's order. Every other name returns `true` (the reference's own
+fallthrough for ungated tools).
 
-| Setting | Target tools | Default |
+Constructible tools (the gate decides whether the tool is advertised):
+
+| Setting / condition | Target tools | Default |
 |---|---|---|
-| `bash.enabled` | `bash` | on |
+| `bash.enabled` (or `edit.mode == "none"`) | `bash` | on |
+| `edit.mode != "none"` | `edit` | on |
 | `glob.enabled` | `glob` | on |
 | `grep.enabled` | `grep` | on |
 | `astGrep.enabled` | `ast_grep` | **off** |
@@ -208,34 +218,44 @@ Target `enabled_by_settings` (`crates/omp-cli/src/tools.rs`) — 11 ids, everyth
 | `web_search.enabled` | `web_search` | on |
 | `lsp.enabled` | `lsp` | on |
 | `checkpoint.enabled` | `checkpoint`, `rewind` | **off** |
-| `find.enabled` | `find` (`off` hides; `auto`/anything else keeps) | on when not `off` |
+| `find.enabled` (`off` hides; `auto`/`on` keeps) | `find` | `auto` |
+| `async.enabled` \|\| `launch.enabled` | `wait` | on |
+| `task.maxRecursionDepth > 0` | `task` | 2 |
+| `externalThinking` | `think` (hidden; model support applied by `hidden_tools`) | **off** |
+| `goal.enabled` | `goal` (hidden; goal-state leg in the plan function) | on |
+| `allowEval` | `eval` | always true here |
 
-Reference `isToolAllowed` (`tools/index.ts:801-880`) gates **22** names. Present in target:
-`bash`, `glob`, `grep`, `find`, `ast_grep`, `ast_edit`, `ask`, `todo`, `web_search`, `lsp`,
-`checkpoint`/`rewind`. Absent from target:
+Gates carried for tools that are **not constructible yet** — inert until the tool lands, kept so the
+table is complete and the gate goes live with it:
 
-| Ref gate | Setting / condition | Tools |
+| Setting / condition | Tools | Default |
 |---|---|---|
-| edit mode | `cfgEditMode === "none"` hides `edit`, and `bash` stays on when edit is disabled | `edit`, `bash` |
-| `allowEval` | eval backend reachable | `eval` |
-| `cfgDebugEnabled` | `debug.enabled` | `debug` |
-| `cfgGithubEnabled` | `github.enabled` | `github` |
-| `cfgSecurityEnabled` | `security.enabled` | `security_scan` |
-| `externalThinkingActive` | `externalThinking` + model support | `think` |
-| `cfgCompactionExperimentalContextManagement` | experimental context management | `context_notes`, `new_context` |
-| `async` \|\| `irc` \|\| `launch` | any of the three | `wait` |
-| `cfgMemoryBackend ∈ {hindsight, mnemopi}` | memory backend | `retain`, `recall`, `reflect` |
-| `cfgMemoryBackend === "mnemopi"` | memory backend | `memory_edit` |
-| `cfgAutolearnEnabled` + depth 0 | autolearn | `manage_skill` |
-| `cfgAutolearnEnabled` + depth 0 + backend ∈ {hindsight, mnemopi, local} | autolearn | `learn` |
-| `canSpawnAtDepth(task.maxRecursionDepth)` | recursion depth | `task` |
-| `goal.enabled` + goal-mode state | goal record exists/enabled/dropped | `goal` |
-| `todo`: `!includeYield \|\| prewalkArmed` | yield/prewalk interaction | `todo` |
-| `checkpoint`: `taskDepth === 0 \|\| requestedTools` | depth | `checkpoint`, `rewind` |
+| `debug.enabled` | `debug` | on |
+| `github.enabled` | `github` | **off** |
+| `security.enabled` | `security_scan` | **off** |
+| `compaction.experimentalContextManagement` | `context_notes`, `new_context` | **off** |
+| `memory.backend ∈ {hindsight, mnemopi}` | `retain`, `recall`, `reflect` | `off` |
+| `memory.backend == "mnemopi"` | `memory_edit` | `off` |
+| `autolearn.enabled` | `manage_skill` | **off** |
+| `autolearn.enabled` + backend ∈ {hindsight, mnemopi, local} | `learn` | **off** |
 
-Also absent on the target: the reference's auto-include/sibling rules — `includeYield` pushes
-`yield` into `requestedTools`; `ast_grep`/`ast_edit` and the memory tools auto-include their
-siblings; `checkpoint`/`rewind` pair.
+Legs the reference evaluates against **session state**, which a `(settings, name)` predicate cannot
+see, are documented at their arm and applied by the plan function or left as the reference's truthy
+branch:
+
+| Leg | Tools | Where |
+|---|---|---|
+| `taskDepth == 0 \|\| requestedTools !== undefined` | `checkpoint`, `rewind`, `manage_skill`, `learn` | plan function |
+| `restrictToolNames` + goal-record state | `goal` | plan function |
+| `!includeYield \|\| prewalkArmed` | `todo` | plan function |
+| `isFindEnabled` native-judge detection | `find` | not detected; `auto` stays on |
+| `supportsExternalThinking(model)` | `think` | `hidden_tools` |
+| `canSpawnAtDepth(depth)` | `task` | ceiling only; depth is session state |
+| `enableIrc && isIrcEnabled` | `wait` | no peer bus — the always-false branch |
+
+Also absent on the target: the reference's auto-include/sibling rules — `includeYield` pushes `yield`
+into `requestedTools`; `ast_grep`/`ast_edit` and the memory tools auto-include their siblings;
+`checkpoint`/`rewind` pair.
 
 ---
 
@@ -265,12 +285,18 @@ Landed in this worktree (the schema half of each delta):
 | Work | File | State |
 |---|---|---|
 | `write` required `[path,content]` | `crates/omp-cli/src/tools.rs` (`write` entry) | **LANDED** |
-| `glob` `limit` 1..200 integer | `crates/omp-cli/src/tools.rs:300` | **LANDED** |
+| `glob` `limit` 1..200 integer | `crates/omp-cli/src/tools.rs` | **LANDED** |
 | `web_search` all 6 params | `crates/omp-cli/src/tools/web_search.rs` | **LANDED** |
 | `todo` `task: string\|string[]` | `crates/omp-cli/src/tools/todo.rs` | **LANDED** |
 | `ask` `{html}` + legacy recovery | `crates/omp-cli/src/tools/ask.rs` | **LANDED** |
 | `bash` `notify` + `name` regex | `crates/omp-cli/src/tools/bash.rs`, `tools.rs` | **LANDED** |
 | `wait` / `yield` / `goal` schema parity | `wait.rs`, `yield_tool.rs`, `goal.rs` | **LANDED** |
+| **Phase 3** `ask` `required:["html"]`, `questions[]` recovery-only | `crates/omp-cli/src/tools/ask.rs` | **LANDED** |
+| **Phase 3** `todo` golden 7-op enum, no `reason`; block/unblock runtime-only | `crates/omp-cli/src/tools/todo.rs` | **LANDED** |
+| **Phase 3** `task` top-level `model` removed | `crates/omp-cli/src/tools/task.rs` | **LANDED** |
+| **Phase 3** `glob` `additionalProperties` dropped, `pattern` runtime-only | `crates/omp-cli/src/tools.rs`, `search.rs` | **LANDED** |
+| **Phase 3** `enabled_by_settings` 11 → 22 gates | `crates/omp-cli/src/tools.rs` | **LANDED** |
+| **Phase 3** allowances deleted (`ALLOWED_DELTAS` ask/todo/task/glob, `PRECISE_SCHEMA_ALLOWANCES`, `PRECISE_PARAM_TOOLS`) | `scripts/check-tools-parity.ts`, `tests-tools/compare.ts` | **LANDED** |
 
 Still open:
 
@@ -279,10 +305,6 @@ Still open:
 | `bash` six schema variants; `pty` actually honored | `crates/omp-cli/src/tools/bash.rs` |
 | `wait` answer/peer-message leg (needs a peer bus) | `crates/omp-cli/src/tools/wait.rs` |
 | `yield` section accumulation + "none submitted" finalizer | `crates/omp-cli/src/tools/yield_tool.rs` |
-| `ask` `required: ["html"]`, bare-string recovery | `crates/omp-cli/src/tools/ask.rs` |
-| `todo` drop or justify target-only `reason` | `crates/omp-cli/src/tools/todo.rs` |
-| `task` top-level `model` (currently `"not": {}`) | `crates/omp-cli/src/tools/task.rs` |
-| `glob` `pattern` key + `GLOB_ARGUMENTS` scoping | `crates/omp-cli/src/tools.rs` (`glob` entry) |
 | `read` behavior parity | `crates/omp-cli/src/tools/read.rs` + new `read_archive.rs`, `read_sqlite.rs`, `read_pdf.rs`, `read_json.rs`, `read_binary.rs`, `fetch.rs` |
 | `retain`/`recall`/`reflect`/`memory_edit`/`learn`/`manage_skill` | new `memory.rs`, `learn.rs`, `manage_skill.rs` |
 | `context_notes`/`new_context` | new `context_notes.rs`, `new_context.rs` |

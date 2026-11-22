@@ -141,6 +141,15 @@ impl Registry {
             .collect()
     }
 
+    /// Rendered reference entries in registration order: the body of
+    /// `xd://read/urls` (TS `InternalUrlRouter.reference`).
+    pub fn reference(&self) -> Vec<String> {
+        self.handlers
+            .iter()
+            .filter_map(|r| r.provider.prompt_reference())
+            .collect()
+    }
+
     /// Rewrite a single-slash alias (`local:/x`) or a filesystem path with a
     /// URL glued on (`/home/me/repo/local://x`) to `scheme://x` (TS `normalize`).
     pub fn normalize(&self, input: &str) -> String {

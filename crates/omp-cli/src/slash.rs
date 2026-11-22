@@ -511,14 +511,16 @@ pub async fn dispatch_builtin(
             }
         }
         "compact" => {
-            // TS parseCompactArgs: optional leading mode token (soft|remote|snapcompact).
+            // TS parseCompactArgs: optional leading mode token (soft|remote|snapcompact|handoff).
             let trimmed = args.trim();
             let (mode, instructions) = match trimmed.split_once(char::is_whitespace) {
-                None if matches!(trimmed, "soft" | "remote" | "snapcompact") => {
+                None if matches!(trimmed, "soft" | "remote" | "snapcompact" | "handoff") => {
                     (Some(trimmed), None)
                 }
                 None => (None, (!trimmed.is_empty()).then(|| trimmed.to_string())),
-                Some((first, rest)) if matches!(first, "soft" | "remote" | "snapcompact") => {
+                Some((first, rest))
+                    if matches!(first, "soft" | "remote" | "snapcompact" | "handoff") =>
+                {
                     if first == "snapcompact" {
                         return Some(usage(
                             rt,
@@ -532,15 +534,16 @@ pub async fn dispatch_builtin(
                 }
                 Some(_) => (None, Some(trimmed.to_string())),
             };
-            if let Some(mode) = mode {
-                // omp-rs compaction does not implement mode overrides; run the default.
+            // `handoff` is wired; the other overrides are not implemented, so they
+            // fall back to the default (soft) lane.
+            if let Some(mode) = mode.filter(|m| *m != "handoff") {
                 output(
                     rt,
                     &format!("/compact {mode} is not supported; running default compaction."),
                 );
             }
             let instructions = instructions.filter(|s| !s.is_empty());
-            let result = rt.compact(instructions.as_deref()).await;
+            let result = rt.compact(instructions.as_deref(), mode).await;
             match result {
                 Ok(_) => output(rt, "Compaction complete."),
                 Err(e) => output(rt, &format!("Compaction failed: {}", e.message)),
@@ -755,21 +758,11 @@ async fn dispatch_builtin_more(
             })
         }
         "memory" => {
-            let (verb, _rest) = subcommand(args);
-            match (verb.as_str(), verb.is_empty()) {
-                ("view", _) | (_, true) => output(rt, "Memory payload is empty."),
-                ("clear" | "reset", _) => output(rt, "Memory cleared."),
-                ("enqueue" | "rebuild", _) => output(rt, "Memory consolidation enqueued."),
-                ("sync", _) => output(rt, "Memory consolidation ran."),
-                ("queue" | "stats" | "diagnose", _) => output(
-                    rt,
-                    &format!("Memory is not available for the off backend (/{verb})."),
-                ),
-                ("mm", _) => output(
-                    rt,
-                    "Mental-model maintenance via /memory mm is unsupported in ACP mode; use the hindsight HTTP API directly.",
-                ),
-                _ => return Some(usage(rt, "Usage: /memory <view|stats|diagnose|clear|reset|enqueue|rebuild|queue|sync>")),
+            match crate::features::memory::handle_memory_command(&rt.cwd, args) {
+                crate::features::memory::MemoryCommandOutput::Output(text) => output(rt, &text),
+                crate::features::memory::MemoryCommandOutput::Usage(text) => {
+                    return Some(usage(rt, text));
+                }
             }
             Some(Handled {
                 agent_invoked: false,
@@ -881,7 +874,7 @@ async fn dispatch_ported(rt: &std::sync::Arc<Runtime>, name: &str, args: &str) -
         "computer" => Some(crate::features::browser::computer_command(rt, args).await),
         "ratchet" => Some(notice(rt, "/ratchet needs the ratchet eval-harness subsystem (eval preludes + hill-climb runner), which is not ported to omt.")),
         "prewalk" => Some(notice(rt, "Prewalk is a startup-time feature in omt (the --prewalk/--no-prewalk/--prewalk-into flags); arming or restarting it mid-session is not supported.")),
-        "security" => Some(notice(rt, "/security needs the security-scan mode controller (plan/run/compare), which is not ported to omt.")),
+        "security" => Some(crate::features::security::command(rt, args).await),
         "share" => Some(crate::features::share::command(rt, args).await),
         "browser" => Some(crate::features::browser::command(rt, args).await),
         "ssh" => Some(crate::features::ssh::command(rt, args).await),
@@ -3050,21 +3043,23 @@ async fn plugins_command(rt: &Runtime, args: &str) -> Outcome {
     }
 }
 
-/// `/handoff [focus]` — TS generates a handoff document and compacts in
-/// place. The summary prompts exist in omp-compact, but no live
-/// generate-and-compact-in-place flow is wired into the runtime.
-async fn handoff_command(rt: &Runtime, args: &str) -> Outcome {
+/// `/handoff [focus]` — TS `handoff` (alias for `/compact handoff`): generate a
+/// handoff document over the live context and compact in place with it.
+async fn handoff_command(rt: &Arc<Runtime>, args: &str) -> Outcome {
     if rt.state().await.get("isStreaming").and_then(Value::as_bool) == Some(true) {
         return usage(
             rt,
             "Wait for the current response to finish or abort it before handing off.",
         );
     }
-    let _ = args;
-    usage(
-        rt,
-        "/handoff (handoff document generation + compact-in-place) is not wired into the omt runtime; only the /compact summary path is available.",
-    )
+    let focus = Some(args.trim()).filter(|s| !s.is_empty());
+    match rt.compact(focus, Some("handoff")).await {
+        Ok(_) => output(rt, "Compaction complete."),
+        Err(e) => output(rt, &format!("Compaction failed: {}", e.message)),
+    }
+    Handled {
+        agent_invoked: false,
+    }
 }
 
 const ADVISOR_INACTIVE_ON: &str =
