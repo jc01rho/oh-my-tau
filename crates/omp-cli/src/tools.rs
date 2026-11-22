@@ -707,9 +707,7 @@ where
 }
 
 pub use ask::{tool_with_ui, AskUi, SelectOption};
-pub use ask_goal_compat::{
-    ask_user_question_with_ui, reset_session_goal, FollowUpDelivery, FollowUpSink,
-};
+pub use ask_goal_compat::{ask_user_question_with_ui, reset_session_goal, FollowUpSink};
 
 #[cfg(test)]
 mod tests {
