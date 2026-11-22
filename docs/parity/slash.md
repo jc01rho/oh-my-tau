@@ -109,7 +109,7 @@ tau-only names. `Handler` is the function that actually runs.
 | 17 | `/share` | PORTED | `features::share::command` | Encrypted link or secret gist. |
 | 18 | `/browser` | PORTED | `features::browser::command` | `headless` / `visible`. |
 | 19 | `/todo` | PARTIAL | `todo_command` (`slash.rs:1425`) | All 11 verbs ported (`phasesToMarkdown`, `findPhaseFuzzy`, `findTaskFuzzy`, `normalize_in_progress`, `commitTodos`); `edit` is TUI-only outside the TUI. |
-| 20 | `/session` | PARTIAL | `dispatch_builtin` | `info` only; the usage line names `delete` / `pin`, which live in `/delete` and `/pin`. |
+| 20 | `/session` | PARTIAL | `dispatch_builtin` | `info` and (8b-2) `delete` with TS's messages (new session, old file and artifacts deleted); `pin [account]` (pin a stored OAuth account to the provider) is not ported. |
 | 21 | `/jobs` | PORTED | `slash_extra::interactive::jobs_command` | `full` for untruncated command lines. |
 | 22 | `/usage` | PARTIAL | `usage_command` (`slash.rs:1663`) | `show`/`reset`; anthropic OAuth limits + reset credits. `reset` cannot select `provider/credential-id`. |
 | 23 | `/stats` | PORTED | `stats_command` (`slash.rs:2029`) | In-process dashboard, `--port`/`--host`. |

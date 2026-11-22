@@ -678,6 +678,9 @@ pub async fn dispatch_builtin(
                     agent_invoked: false,
                 });
             }
+            if verb == "delete" && rest.is_empty() {
+                return Some(session_delete_command(rt).await);
+            }
             Some(usage(rt, "Usage: /session [info|delete|pin [account]]"))
         }
         _ => dispatch_builtin_more(rt, name, args).await,
@@ -3054,6 +3057,35 @@ async fn plugins_command(rt: &Runtime, args: &str) -> Outcome {
             }
         }
         _ => usage(rt, "Usage: /plugins [list|enable|disable]"),
+    }
+}
+
+/// `/session delete` (TS builtin-session `handle`): the text-mode delete,
+/// reporting the deleted file and the new session.
+async fn session_delete_command(rt: &Arc<Runtime>) -> Outcome {
+    if rt.state().await.get("isStreaming").and_then(Value::as_bool) == Some(true) {
+        return usage(rt, "Cannot delete the session while streaming.");
+    }
+    let Some(old) = rt.session_file_on_disk() else {
+        return usage(rt, "No session file to delete (in-memory session).");
+    };
+    match rt.delete_session().await {
+        Ok(()) => output(
+            rt,
+            &format!(
+                "Session deleted: {}. New session: {} ({}).",
+                old.display(),
+                rt.session_id(),
+                rt.session_file().display()
+            ),
+        ),
+        Err(e) if crate::runtime::is_switch_cancelled(&e) => {
+            return usage(rt, "Session deletion cancelled.");
+        }
+        Err(e) => return usage(rt, &format!("{e:#}")),
+    }
+    Handled {
+        agent_invoked: false,
     }
 }
 

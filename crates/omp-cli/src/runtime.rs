@@ -2443,6 +2443,11 @@ impl Runtime {
     }
 
     /// Clear the conversation and start a fresh session file.
+    /// The session file on disk (`None` for an in-memory session).
+    pub(crate) fn session_file_on_disk(&self) -> Option<PathBuf> {
+        self.persist.file()
+    }
+
     /// TS `/delete` (`handleDeleteCommand` → `newSession({ drop: true })`):
     /// start a new session, then delete the previous session file with its
     /// artifacts directory. An in-memory session has nothing to delete.
@@ -6265,6 +6270,28 @@ mod compaction_guard_tests {
             "the concern continued the run"
         );
         std::mem::forget(provider);
+    }
+
+    #[tokio::test]
+    async fn session_delete_reports_the_deleted_file_and_the_new_session() {
+        let mut h = harness(1).await;
+        h.rt.prompt(None, "hello", None, Vec::new()).await.unwrap();
+        until_settled(&mut h.rx).await;
+        let old = h.rt.session_file_on_disk().expect("on disk");
+        crate::rpc::slash::try_dispatch(&h.rt, "/session delete").await;
+        let text = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter(|f| f["type"] == "command_output")
+            .filter_map(|f| f["text"].as_str().map(str::to_string))
+            .last()
+            .unwrap_or_default();
+        assert!(
+            text.starts_with(&format!(
+                "Session deleted: {}. New session: ",
+                old.display()
+            )),
+            "{text}"
+        );
+        assert!(!old.exists());
     }
 
     #[tokio::test]
