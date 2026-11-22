@@ -331,6 +331,17 @@ async fn async_main() -> Result<()> {
     if let Some(mode @ ("acp" | "rpc-ui")) = args.mode.as_deref() {
         bail!("omt: --mode {mode} is not supported (no {mode} subsystem)");
     }
+    if args.multi_session {
+        // PR-G11 lands the in-process `SessionRegistry`; until then the flag is accepted at the
+        // parser (the gateway argv must parse) but hosting several sessions is refused loudly
+        // rather than silently serving only the first one.
+        bail!("omt: --multi-session is not supported yet (no multi-session host); run one process per session");
+    }
+    if let Some(runtime) = args.session_runtime.as_deref() {
+        if !args.multi_session {
+            eprintln!("omt: --session-runtime {runtime} has no effect without --multi-session");
+        }
+    }
     if !args.config.is_empty() || !args.add_dir.is_empty() {
         eprintln!("omt: --config/--add-dir parsed but their subsystems are not in omt; ignored");
     }
@@ -374,6 +385,8 @@ async fn async_main() -> Result<()> {
 
     // System prompt options are assembled before model selection so
     // `--dump-system-prompt` can run without a provider.
+    // `--skill <path>` roots join skill discovery (mhc contract: repeatable, file or dir).
+    sysprompt::set_skill_paths(args.skill_paths.clone());
     let tools_csv = if args.no_tools {
         // Restrict to nothing: the --tools filter retains only named tools.
         Some("__none__".to_string())
@@ -421,6 +434,11 @@ async fn async_main() -> Result<()> {
     };
     if reference.is_some() {
         runtime::MODEL_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if args.no_model_fallback {
+        // The gateway pins a model id for the session's life: backoff retries stay, model
+        // switching does not.
+        runtime::MODEL_FALLBACK_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if args.thinking.is_some() {
         runtime::THINKING_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);

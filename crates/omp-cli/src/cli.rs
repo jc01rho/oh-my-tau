@@ -87,6 +87,19 @@ pub struct Args {
     pub sandbox: bool,
     /// `--context-strategy append|clm|clm-host` (opt-in; default `append`).
     pub context_strategy: Option<String>,
+    /// `--skill <path>` (repeatable): extra skill file or directory roots for discovery
+    /// (the OmOMeow gateway passes `--skill <root>/skills`). Distinct from `--skills`, which
+    /// filters skills by name.
+    pub skill_paths: Vec<PathBuf>,
+    /// `--multi-session`: host several RPC sessions in one process (`host::SessionRegistry`).
+    pub multi_session: bool,
+    /// `--session-runtime in-process|worker`: how a multi-session host runs each session.
+    pub session_runtime: Option<String>,
+    /// `--no-model-fallback`: never switch models on a retryable failure (backoff retries stay).
+    pub no_model_fallback: bool,
+    /// `--no-recommended-models`: accepted for gateway argv compatibility; omt never injects
+    /// recommended models, so this only records the intent.
+    pub no_recommended_models: bool,
     /// Image attachments collected from `@<image>` positional args
     /// (kept out of the text prompt; passed to the agent as content).
     pub images: Vec<pa_agent::types::ImageContent>,
@@ -131,6 +144,8 @@ pub(crate) const STRING_FLAGS: &[&str] = &[
     "--profile",
     "--alias",
     "--context-strategy",
+    "--skill",
+    "--session-runtime",
 ];
 
 /// Optional-value flags: consume the next token only when it is value-like
@@ -162,6 +177,9 @@ const VALUELESS_FLAGS: &[&str] = &[
     "--auto-approve",
     "--yolo",
     "--sandbox",
+    "--multi-session",
+    "--no-model-fallback",
+    "--no-recommended-models",
 ];
 
 const SERVICE_TIER_VALUES: &[&str] = &[
@@ -175,6 +193,10 @@ const SERVICE_TIER_VALUES: &[&str] = &[
 ];
 
 const MODE_VALUES: &[&str] = &["text", "json", "rpc", "acp", "rpc-ui"];
+
+/// `--session-runtime` values (`pieces/07`): `in-process` hosts every session inside this
+/// process; `worker` keeps one process per session.
+const SESSION_RUNTIME_VALUES: &[&str] = &["in-process", "worker"];
 
 fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
@@ -309,6 +331,24 @@ fn set_string(a: &mut Args, flag: &str, value: String, invalid: &mut Vec<String>
         "--skills" => {
             a.skills = value.split(',').map(|s| s.trim().to_string()).collect();
         }
+        "--skill" => {
+            // Repeatable; a skill file or directory root (mhc `--skill` contract).
+            if value.trim().is_empty() {
+                invalid.push("--skill requires a non-empty path".to_string());
+            } else {
+                a.skill_paths.push(PathBuf::from(value));
+            }
+        }
+        "--session-runtime" => {
+            if SESSION_RUNTIME_VALUES.contains(&value.as_str()) {
+                a.session_runtime = Some(value);
+            } else {
+                invalid.push(format!(
+                    "Invalid --session-runtime value: {}. Expected one of: in-process, worker.",
+                    json_str(&value)
+                ));
+            }
+        }
         "--approval-mode" => {
             if ["always-ask", "write", "yolo"].contains(&value.as_str()) {
                 a.approval_mode = Some(value);
@@ -411,6 +451,9 @@ pub fn parse_from<I: Iterator<Item = String>>(it: I) -> Result<Args> {
                 "--no-rules" => a.no_rules = true,
                 "--no-title" => a.no_title = true,
                 "--no-ui" => a.no_ui = true,
+                "--multi-session" => a.multi_session = true,
+                "--no-model-fallback" => a.no_model_fallback = true,
+                "--no-recommended-models" => a.no_recommended_models = true,
                 "--auto-approve" | "--yolo" => a.auto_approve = true,
                 _ => unreachable!("VALUELESS_FLAGS dispatch"),
             }
@@ -912,5 +955,45 @@ mod tests {
         );
         assert!(parse(&["--from-claude"]).unwrap().from_claude);
         assert!(parse(&["--from-codex"]).unwrap().from_codex);
+    }
+
+    #[test]
+    fn skill_flag_accumulates_repeatable_paths() {
+        let a = parse(&["--skill", "/a/skills", "--skill", "/b/skills/SKILL.md"]).unwrap();
+        assert_eq!(
+            a.skill_paths,
+            vec![
+                PathBuf::from("/a/skills"),
+                PathBuf::from("/b/skills/SKILL.md")
+            ]
+        );
+    }
+
+    #[test]
+    fn gateway_compat_flags_parse() {
+        let a = parse(&[
+            "--mode",
+            "rpc",
+            "--multi-session",
+            "--session-runtime",
+            "in-process",
+            "--no-model-fallback",
+            "--no-recommended-models",
+        ])
+        .unwrap();
+        assert_eq!(a.mode.as_deref(), Some("rpc"));
+        assert!(a.multi_session);
+        assert_eq!(a.session_runtime.as_deref(), Some("in-process"));
+        assert!(a.no_model_fallback);
+        assert!(a.no_recommended_models);
+    }
+
+    #[test]
+    fn session_runtime_rejects_unknown_value() {
+        let err = parse(&["--session-runtime", "threads"]).unwrap_err();
+        assert!(
+            err.to_string().contains("--session-runtime"),
+            "unexpected error: {err}"
+        );
     }
 }

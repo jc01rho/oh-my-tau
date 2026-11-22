@@ -461,7 +461,10 @@ impl Runtime {
                 Ok(mut r) => {
                     apply_launch_fallbacks(&mut r);
                     agent.set_credential_id(r.credential_id);
-                    RecoveryConfig::from_resolved(&r)
+                    let mut cfg = RecoveryConfig::from_resolved(&r);
+                    cfg.model_fallback_disabled =
+                        MODEL_FALLBACK_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
+                    cfg
                 }
                 Err(_) => RecoveryConfig::default(),
             },
@@ -4417,6 +4420,11 @@ struct MessageEnvelope {
 /// (TS `hasExplicitModel`); cleared by the first `load_session`.
 pub static MODEL_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static THINKING_PINNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by `main` for `--no-model-fallback`: recovery keeps backoff retries but never walks the
+/// fallback chain, so the gateway's pinned provider/id survives a retryable failure.
+pub static MODEL_FALLBACK_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Set by `main` for `-p` runs that persist no session: automatic titling
