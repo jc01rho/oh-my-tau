@@ -935,19 +935,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slash_clear_starts_a_new_session() {
+    async fn slash_clear_resets_the_context_in_place() {
         let mut h = harness().await;
         let before = h.port.rt.session_id();
         h.port.run_slash("clear".into(), String::new());
         let frames = until_result(&mut h.rx).await;
         assert_eq!(frames.last().unwrap()["status"], "completed");
         assert!(
-            outputs(&frames)
-                .iter()
-                .any(|t| t.contains("New session started.")),
+            outputs(&frames).iter().any(|t| t.contains("Context reset")),
             "frames: {frames:?}"
         );
-        assert_ne!(before, h.port.rt.session_id());
+        assert_eq!(
+            before,
+            h.port.rt.session_id(),
+            "/clear keeps the session, unlike /new"
+        );
     }
 
     #[tokio::test]

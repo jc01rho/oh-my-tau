@@ -445,6 +445,11 @@ pub enum LifecycleEvent {
         cwd: String,
         reason: ResourcesDiscoverReason,
     },
+
+    /// The live/model context was cleared in place: the session id, title and
+    /// transcript file survive (`/clear`, TS `SessionClearEvent`).
+    #[serde(rename = "session_clear")]
+    SessionClear,
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -837,6 +842,8 @@ impl ExtHost {
             &self.emit_event(&ev, ctx).await?.result,
         ))
     }
+        /// `session_clear`: the context was reset in place, the session kept.
+        emit_session_clear() => LifecycleEvent::SessionClear;
 
     /// `assistant_message`: a handler may rewrite the text of the finalized message (text blocks only).
     ///
