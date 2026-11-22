@@ -867,6 +867,9 @@ fn injected_message(payload: &Value) -> Option<AgentMessage> {
     }))
 }
 
+/// `(session file, file len, nav leaf divergence)`: what a cached branch was computed against.
+type BranchStamp = (PathBuf, u64, Option<Option<String>>);
+
 /// Live session facts the host ctx exposes synchronously (TS `ctx.isIdle()`,
 /// `getContextUsage()`, `hasPendingMessages()`, `sessionManager.getBranch()`, ...). Refreshed by
 /// [`Extensions::refresh_live`] at event boundaries; the host-side provider
@@ -876,8 +879,8 @@ struct Live {
     snap: Mutex<serde_json::Map<String, Value>>,
     /// Branch entries (root -> leaf) not yet sent to the host.
     branch: Mutex<Option<Value>>,
-    /// Session file len the cached branch was computed at.
-    branch_len: Mutex<Option<(PathBuf, u64)>>,
+    /// The stamp the cached branch was computed at.
+    branch_len: Mutex<Option<BranchStamp>>,
     /// Some loaded extension reads the branch (`getBranch`/`getEntry`/`getLeafId`/`getEntries`).
     needs_branch: std::sync::atomic::AtomicBool,
 }
@@ -951,6 +954,8 @@ pub struct Extensions {
     live: Arc<Live>,
     /// Runtime attached via [`Extensions::attach`]; re-served on reconnect.
     rt: Mutex<Option<Arc<Runtime>>>,
+    /// Last extension tool definitions installed onto `rt.agent` (for `reload` reconciliation).
+    installed_tools: Mutex<Vec<ToolInfo>>,
     /// Tool calls an extension `tool_call` handler blocked: their result events are delivered to
     /// extensions in TS's order (see `subscribe_lifecycle`).
     blocked_calls: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -1188,6 +1193,7 @@ impl Extensions {
             prompt_override: Mutex::new(None),
             live: Arc::new(Live::default()),
             rt: Mutex::new(None),
+            installed_tools: Mutex::new(Vec::new()),
             blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_agent_end: Arc::new(Mutex::new(None)),
             credential_disabled: Arc::new(CredentialDisabledFeed::default()),
@@ -1225,6 +1231,48 @@ impl Extensions {
             tokio::spawn(async move { ext.supervise_reconnect().await });
         }
         Ok(ext)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(host: Arc<ExtHost>, cwd: &Path) -> Arc<Self> {
+        Self::for_test_with_extra(host, cwd, Vec::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_extra(
+        host: Arc<ExtHost>,
+        cwd: &Path,
+        extra: Vec<PathBuf>,
+    ) -> Arc<Self> {
+        let hooks = ExtHooks::new(host.clone());
+        let ext = Arc::new(Self {
+            mcp: McpNotificationSink::new(host.clone()),
+            host,
+            hooks,
+            sub: Mutex::new(None),
+            turn: Arc::new(AtomicU64::new(0)),
+            stop: Arc::new(Mutex::new(StopState::default())),
+            cwd: cwd.to_path_buf(),
+            extra,
+            dir: None,
+            ctx: Mutex::new(SessionCtx::default()),
+            mode: Mutex::new(ExtMode::Rpc),
+            prompt_override: Mutex::new(None),
+            live: Arc::new(Live::default()),
+            rt: Mutex::new(None),
+            installed_tools: Mutex::new(Vec::new()),
+            blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_agent_end: Arc::new(Mutex::new(None)),
+            credential_disabled: Arc::new(CredentialDisabledFeed::default()),
+        });
+        ext.live.needs_branch.store(
+            sources_read_branch(ext.dir.as_deref(), &ext.extra),
+            Ordering::Relaxed,
+        );
+        let live = ext.live.clone();
+        ext.host
+            .set_ctx_provider(Some(Arc::new(move |_ty: &str| live.provide())));
+        ext
     }
 
     /// `pa-agent` hook points backed by the host.
@@ -1293,10 +1341,12 @@ impl Extensions {
     /// # Errors
     /// Transport failure on `list_tools`.
     pub async fn tools(&self) -> Result<Vec<Arc<dyn AgentTool>>> {
-        Ok(self
-            .host
-            .list_tools()
-            .await?
+        let infos = self.host.list_tools().await?;
+        *self
+            .installed_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = infos.clone();
+        Ok(infos
             .into_iter()
             .map(|info| {
                 Arc::new(ExtTool {
@@ -1305,6 +1355,51 @@ impl Extensions {
                 }) as Arc<dyn AgentTool>
             })
             .collect())
+    }
+
+    async fn reconcile_tools(&self, rt: &Arc<Runtime>) -> Result<()> {
+        let latest = self.host.list_tools().await?;
+        let _tool_guard = rt.lock_tool_list().await;
+        let prev = self
+            .installed_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut tools = rt.agent.tools().await;
+        let all_present = latest
+            .iter()
+            .all(|info| tools.iter().any(|t| t.name() == info.name));
+        if prev == latest && all_present {
+            return Ok(());
+        }
+        let remove_names: std::collections::HashSet<String> = prev
+            .iter()
+            .chain(latest.iter())
+            .map(|info| info.name.clone())
+            .collect();
+        tools.retain(|t| !remove_names.contains(t.name()));
+        let mut added: Vec<Arc<dyn AgentTool>> = latest
+            .iter()
+            .cloned()
+            .map(|info| {
+                Arc::new(ExtTool {
+                    host: self.host.clone(),
+                    info,
+                }) as Arc<dyn AgentTool>
+            })
+            .collect();
+        if let Some(gate) = crate::approval::Gate::get() {
+            added = gate.wrap_tools(added);
+        }
+        tools.extend(added);
+        crate::tools::republish_dyn_tools(&tools);
+        crate::tools::eval_bridge::refresh_session_tools(&tools);
+        rt.agent.set_tools(tools).await;
+        *self
+            .installed_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = latest;
+        Ok(())
     }
 
     /// Merge session info into the host's ctx state. Also sends the stored
@@ -1606,22 +1701,34 @@ impl Extensions {
             eprintln!("omt: extension failed to load: {}: {}", err.path, err.error);
         }
         self.send_ctx().await?;
+        if !self.extra.is_empty() || self.dir.is_some() {
+            self.live.needs_branch.store(
+                sources_read_branch(self.dir.as_deref(), &self.extra),
+                Ordering::Relaxed,
+            );
+        }
         *self
             .live
             .branch_len
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let rt = self
+            .rt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(rt) = &rt {
+            self.reconcile_tools(rt).await?;
+            if self.live.needs_branch.load(Ordering::Relaxed) {
+                self.refresh_branch(rt);
+            }
+        }
         emit_silent(self.host.emit_session_start(None).await);
         // A reload re-sends the whole discovered resource set (TS emits `resources_discover` on
         // extension reload); the loaders keep only the newest set.
         self.resources_discover(ResourcesDiscoverReason::Reload)
             .await;
-        if let Some(rt) = self
-            .rt
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
+        if let Some(rt) = rt {
             self.serve_incoming(&rt);
         }
         Ok(())
@@ -1717,26 +1824,22 @@ impl Extensions {
     fn refresh_branch(&self, rt: &Runtime) {
         let path = rt.session_file();
         let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+        let divergence = rt.leaf_divergence();
         {
             let mut seen = self
                 .live
                 .branch_len
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if seen.as_ref().is_some_and(|(p, l)| *p == path && *l == len) {
+            if seen
+                .as_ref()
+                .is_some_and(|(p, l, d)| *p == path && *l == len && *d == divergence)
+            {
                 return;
             }
-            *seen = Some((path, len));
+            *seen = Some((path, len, divergence));
         }
-        let Ok(entries) = rt.entries() else { return };
-        let branch = omp_session::tree::leaf_id(&entries)
-            .map(|leaf| {
-                omp_session::tree::branch_path(&entries, leaf)
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<Value>>()
-            })
-            .unwrap_or_default();
+        let branch = rt.branch_entries();
         *self
             .live
             .branch
@@ -3601,6 +3704,7 @@ mod tests {
             prompt_override: Mutex::new(None),
             live: Arc::new(Live::default()),
             rt: Mutex::new(None),
+            installed_tools: Mutex::new(Vec::new()),
             blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_agent_end: Arc::new(Mutex::new(None)),
             credential_disabled: Arc::new(CredentialDisabledFeed::default()),
@@ -3720,6 +3824,7 @@ mod tests {
             prompt_override: Mutex::new(None),
             live: Arc::new(Live::default()),
             rt: Mutex::new(None),
+            installed_tools: Mutex::new(Vec::new()),
             blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_agent_end: Arc::new(Mutex::new(None)),
         })
@@ -3850,6 +3955,160 @@ mod tests {
         assert!(ExtMode::Tui.has_ui() && ExtMode::Rpc.has_ui());
         assert!(!ExtMode::Print.has_ui() && !ExtMode::Json.has_ui());
         assert_eq!(ExtMode::Tui.name(), "tui");
+    }
+
+    async fn test_runtime(dir: &Path, extra_tools: Vec<Arc<dyn AgentTool>>) -> Arc<Runtime> {
+        use pa_agent::agent::{Agent, AgentInitialState, AgentOptions};
+
+        let model: pa_types::ai::Model = serde_json::from_value(json!({
+            "id": "a", "name": "a", "api": "openai-completions", "provider": "p",
+            "baseUrl": "http://127.0.0.1:9", "reasoning": false, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 100_000, "maxTokens": 4096
+        }))
+        .unwrap();
+        let mut tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(StubTool("keep_builtin"))];
+        tools.extend(extra_tools);
+        let agent = Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                system_prompt: Some("test".into()),
+                model: crate::adapter::json_round_trip(&model),
+                thinking_level: Some(pa_agent::types::ThinkingLevel::Off),
+                tools: Some(tools),
+                messages: None,
+            },
+            ..AgentOptions::default()
+        });
+        let persist = crate::persist::attach_in(&agent, dir, dir, None, crate::persist::uuid_v7())
+            .await
+            .unwrap();
+        let target = Arc::new(std::sync::RwLock::new(Some(
+            crate::adapter::ProviderTarget {
+                api_key: Some("k".into()),
+                model,
+                service_tier: None,
+                headers: None,
+                credential_id: None,
+            },
+        )));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        Runtime::start(Arc::new(agent), target, dir.to_path_buf(), persist, tx).await
+    }
+
+    struct StubTool(&'static str);
+
+    impl AgentTool for StubTool {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            "stub"
+        }
+        fn parameters(&self) -> &Value {
+            static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(|| json!({"type": "object", "properties": {}}))
+        }
+        fn execute(
+            self: Arc<Self>,
+            _id: String,
+            _params: Value,
+            _signal: AbortSignal,
+            _on_update: pa_agent::types::AgentToolUpdateCallback,
+        ) -> pa_agent::BoxFut<'static, Result<AgentToolResult>> {
+            Box::pin(async { Ok(AgentToolResult::text("ok")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_reconciles_tools_and_rebuilds_branch_for_session_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.jsonl");
+        let phase = dir.path().join("phase");
+        std::fs::write(&phase, "1").unwrap();
+        let host = sh_host(
+            dir.path(),
+            concat!(
+                "while IFS= read -r line; do\n",
+                "  printf '%s\\n' \"$line\" >> \"$REQ_LOG\"\n",
+                "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+                "  p=$(cat \"$PHASE_FILE\")\n",
+                "  case \"$line\" in\n",
+                "    *'\"method\":\"load\"'*)\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"loaded\":[{\"path\":\"ext.ts\",\"name\":\"ext\",\"handlers\":{\"session_start\":1}}],\"errors\":[]}}\\n' \"$id\";;\n",
+                "    *'\"method\":\"list_tools\"'*)\n",
+                "      if [ \"$p\" = \"1\" ]; then\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[{\"name\":\"ext_keep\",\"description\":\"v1\",\"parameters\":{\"type\":\"object\"},\"extension\":\"ext\"},{\"name\":\"ext_drop\",\"description\":\"drop\",\"parameters\":{\"type\":\"object\"},\"extension\":\"ext\"}]}\\n' \"$id\"\n",
+                "      else\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[{\"name\":\"ext_keep\",\"description\":\"v2\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}},\"extension\":\"ext\"},{\"name\":\"ext_added\",\"description\":\"new\",\"parameters\":{\"type\":\"object\"},\"extension\":\"ext\"}]}\\n' \"$id\"\n",
+                "      fi;;\n",
+                "    *)\n",
+                "      if [ -n \"$id\" ]; then\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{}}\\n' \"$id\"\n",
+                "      fi;;\n",
+                "  esac\n",
+                "done\n",
+            ),
+            vec![
+                ("REQ_LOG".into(), log.display().to_string()),
+                ("PHASE_FILE".into(), phase.display().to_string()),
+            ],
+        )
+        .await;
+        let ext_file = dir.path().join("ext.ts");
+        // Start without branch reads (`needs_branch == false` initially).
+        std::fs::write(&ext_file, "export default function() {}\n").unwrap();
+        let ext = Extensions::for_test_with_extra(host, dir.path(), vec![ext_file.clone()]);
+        assert!(!ext.live.needs_branch.load(Ordering::Relaxed));
+        let initial_tools = ext.tools().await.unwrap();
+        let rt = test_runtime(dir.path(), initial_tools).await;
+        rt.append_entry("custom", json!({"customType": "note", "v": 1}))
+            .unwrap();
+        let first_leaf = rt
+            .entries()
+            .unwrap()
+            .last()
+            .and_then(|e| e["id"].as_str())
+            .unwrap()
+            .to_string();
+        rt.append_entry("custom", json!({"customType": "note", "v": 2}))
+            .unwrap();
+        // Navigate `/tree` back to the first entry; reload must report the selected leaf, not the journal tail.
+        rt.branch_to(Some(first_leaf.clone())).unwrap();
+        ext.attach(rt.clone());
+        *ext.live.branch.lock().unwrap() = None;
+
+        // Edit the extension to read `getBranch()` before reload: `recover` must recompute `needs_branch`.
+        std::fs::write(&ext_file, "export default (pi) => pi.getBranch();\n").unwrap();
+        std::fs::write(&phase, "2").unwrap();
+        ext.reload().await.unwrap();
+        assert!(ext.live.needs_branch.load(Ordering::Relaxed));
+
+        let tools = rt.agent.tools().await;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"keep_builtin"), "{names:?}");
+        assert!(names.contains(&"ext_added"), "{names:?}");
+        assert!(!names.contains(&"ext_drop"), "{names:?}");
+        let kept = tools.iter().find(|t| t.name() == "ext_keep").unwrap();
+        assert_eq!(kept.description(), "v2");
+        assert!(kept.parameters()["properties"]["x"].is_object());
+
+        let reqs = std::fs::read_to_string(&log).unwrap();
+        let start_line = reqs
+            .lines()
+            .rfind(|l| l.contains("\"type\":\"session_start\""))
+            .expect("session_start emitted");
+        let start_val: Value = serde_json::from_str(start_line).unwrap();
+        let branch = start_val["params"]["ctx"]["branch"]
+            .as_array()
+            .expect("branch array in session_start ctx");
+        assert!(!branch.is_empty(), "{start_val}");
+        assert_eq!(
+            start_val["params"]["ctx"]["leafId"],
+            json!(first_leaf),
+            "{start_val}"
+        );
+
+        ext.host.shutdown().await.unwrap();
     }
 
     /// Answers every request with the `resources_discover` result read from `$PATHS` (one line) and

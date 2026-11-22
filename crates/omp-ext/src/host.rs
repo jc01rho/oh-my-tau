@@ -166,7 +166,7 @@ pub struct EmitResult {
     pub errors: Vec<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ToolInfo {
     pub name: String,
     #[serde(default)]
