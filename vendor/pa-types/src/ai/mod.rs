@@ -3,6 +3,7 @@
 //! Field names and JSON shapes match the TypeScript wire format exactly
 //! (camelCase keys, `type`-tagged content blocks, `role`-tagged messages).
 
+pub mod model_family;
 pub mod thinking_levels;
 
 pub use thinking_levels::{
@@ -764,11 +765,7 @@ pub fn supports_service_tier_fields(
     if matches!(tier, ServiceTier::Auto | ServiceTier::Scale) {
         return true;
     }
-    let eligible_id = model_id == "gpt-5.4"
-        || model_id == "gpt-5.5"
-        || model_id == "gpt-5.6"
-        || model_id == "gpt-6-astra"
-        || model_id.starts_with("gpt-5.6-");
+    let eligible_id = model_family::classify(model_id).is_service_tier_eligible();
     if tier == ServiceTier::Priority {
         return eligible_id;
     }

@@ -17,14 +17,29 @@
 #
 # Run: scripts/sync-catalog.sh
 #      OMP_VENDOR_SRC=/path/to/oh-my-pi scripts/sync-catalog.sh
+#      (no checkout: keeps the committed snapshot and exits 0)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENDOR_SRC="${OMP_VENDOR_SRC:-$ROOT/vendor-src/oh-my-pi}"
 
+# OMP_CATALOG_SRC is accepted as an alias for OMP_VENDOR_SRC.
+VENDOR_SRC="${OMP_CATALOG_SRC:-$VENDOR_SRC}"
+
 if [ ! -d "$VENDOR_SRC" ]; then
+  # Clean clone (vendor-src/ is not in git): nothing to regenerate from, so keep
+  # the committed snapshot. build.rs reads the same rules.json, so the models.db
+  # policy hash stays consistent.
   echo "sync-catalog: vendor source not found: $VENDOR_SRC" >&2
-  echo "sync-catalog: clone oh-my-pi there, or set OMP_VENDOR_SRC=/path/to/oh-my-pi" >&2
-  exit 1
+  echo "sync-catalog: skipping gen-data; using committed vendor/pa-ai/data/compat/{rules,axes}.json" >&2
+  echo "sync-catalog: and committed crates/omp-cli/assets/tui-model-catalog.json" >&2
+  echo "sync-catalog: (clone oh-my-pi there, or set OMP_VENDOR_SRC / OMP_CATALOG_SRC to refresh)" >&2
+  for f in vendor/pa-ai/data/compat/rules.json vendor/pa-ai/data/compat/axes.json crates/omp-cli/assets/tui-model-catalog.json; do
+    if [ ! -f "$ROOT/$f" ]; then
+      echo "sync-catalog: committed snapshot missing: $f" >&2
+      exit 1
+    fi
+  done
+  exit 0
 fi
 # Resolve to an absolute path: `cd`, OMP_TS_SRC (read by gen-data.ts) and the
 # models.json argument below must all agree even when OMP_VENDOR_SRC is passed

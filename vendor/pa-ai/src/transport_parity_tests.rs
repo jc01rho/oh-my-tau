@@ -74,10 +74,8 @@ fn env_of(case: &Value) -> TransportEnv {
 /// Mask UUID-shaped strings (the facade's per-inference session id) in `value`.
 fn mask_uuids(value: &mut Value, re: &regex::Regex) {
     match value {
-        Value::String(s) => {
-            if re.is_match(s) {
-                *s = re.replace_all(s, "<uuid>").into_owned();
-            }
+        Value::String(s) if re.is_match(s) => {
+            *s = re.replace_all(s, "<uuid>").into_owned();
         }
         Value::Array(a) => a.iter_mut().for_each(|v| mask_uuids(v, re)),
         Value::Object(o) => o.values_mut().for_each(|v| mask_uuids(v, re)),

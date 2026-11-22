@@ -87,14 +87,17 @@ pub fn get_google_thinking_budget(
         return budget;
     }
 
-    let (minimal, low, medium, high): (i64, i64, i64, i64) = if model_id.contains("2.5-pro") {
-        (128, 2048, 8192, 32768)
-    } else if model_id.contains("2.5-flash-lite") {
-        (512, 2048, 8192, 24576)
-    } else if model_id.contains("2.5-flash") {
-        (128, 2048, 8192, 24576)
-    } else {
-        return -1;
+    use crate::providers::model_family::{classify, GeminiVariant, ModelFamily, Revision};
+    let (minimal, low, medium, high): (i64, i64, i64, i64) = match classify(model_id) {
+        ModelFamily::Gemini { revision, variant } if revision == Revision::new(2, 5) => {
+            match variant {
+                GeminiVariant::Pro => (128, 2048, 8192, 32768),
+                GeminiVariant::FlashLite => (512, 2048, 8192, 24576),
+                GeminiVariant::Flash => (128, 2048, 8192, 24576),
+                GeminiVariant::Other => return -1,
+            }
+        }
+        _ => return -1,
     };
     match effort.budget_key() {
         "minimal" => minimal,
@@ -559,8 +562,7 @@ pub fn map_google_stop_reason(reason: &str) -> Result<StopReason, String> {
 }
 
 pub fn is_gemma4_model(model_id: &str) -> bool {
-    let lower = model_id.to_lowercase();
-    lower.contains("gemma-4") || lower.contains("gemma4")
+    crate::providers::model_family::classify(model_id).is_gemma(4)
 }
 
 pub fn is_gemini3_pro_model(model_id: &str) -> bool {

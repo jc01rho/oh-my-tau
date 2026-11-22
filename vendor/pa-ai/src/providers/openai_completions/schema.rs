@@ -83,10 +83,8 @@ fn has_unrepresentable_strict_object_map(schema: &Map<String, Value>) -> bool {
             return true;
         }
         match items {
-            Value::Object(o) => {
-                if has_unrepresentable_strict_object_map(o) {
-                    return true;
-                }
+            Value::Object(o) if has_unrepresentable_strict_object_map(o) => {
+                return true;
             }
             Value::Array(a) if a.iter().any(check) => {
                 return true;
@@ -1223,18 +1221,18 @@ fn moonshot_object(value: &Map<String, Value>, inside_map: bool) -> Map<String, 
             .unwrap_or_default();
         push_enum_value(&mut existing, &c);
         result.insert("enum".into(), Value::Array(existing));
-        if !result
+        if result
             .get("type")
-            .is_some_and(|t| t.as_str().is_some_and(|s| !s.is_empty()))
+            .is_none_or(|t| t.as_str().is_none_or(str::is_empty))
         {
             if let Some(t) = infer_json_schema_type(&c) {
                 result.insert("type".into(), json!(t));
             }
         }
     }
-    let type_missing = !result
+    let type_missing = result
         .get("type")
-        .is_some_and(|t| t.as_str().is_some_and(|s| !s.is_empty()));
+        .is_none_or(|t| t.as_str().is_none_or(str::is_empty));
     if type_missing
         && !result.get("anyOf").is_some_and(Value::is_array)
         && !result.get("oneOf").is_some_and(Value::is_array)
