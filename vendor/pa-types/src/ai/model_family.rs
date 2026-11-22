@@ -220,10 +220,10 @@ impl ModelFamily {
         let Self::Gpt { revision, variant } = self else {
             return false;
         };
-        match (revision.major, revision.minor, variant.as_deref()) {
-            (5, Some(4 | 5), None) | (5, Some(6), _) | (6, None, Some("astra")) => true,
-            _ => false,
-        }
+        matches!(
+            (revision.major, revision.minor, variant.as_deref()),
+            (5, Some(4 | 5), None) | (5, Some(6), _) | (6, None, Some("astra"))
+        )
     }
 }
 

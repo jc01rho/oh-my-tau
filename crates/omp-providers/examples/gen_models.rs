@@ -5,7 +5,8 @@
 //!   context / max tokens / input, output and cache-read cost;
 //! * `vendor/pa-ai/data/compat/rules.json` - provider seeds (api, baseUrl, cache-write cost for
 //!   `--add`) and the rules fingerprint stamped into `CATALOG_RULES_FINGERPRINT`;
-//! * `vendor/pa-ai/data/compat/axes.json` - the known `api` ids every row must use.
+//! * `vendor/pa-ai/data/compat/axes.json` - the known `api` ids every row must use (plus
+//!   `NATIVE_APIS`).
 //!
 //! Existing rows are refreshed in place: catalog-owned fields are rewritten, the hand-authored
 //! transport fields (api, base_url, thinking levels, headers, compat, featured) are kept, and rows
@@ -30,6 +31,9 @@ const TABLE_END: &str = "\n];\n";
 const ENTRY_START: &str = "    RawModel {\n";
 const ENTRY_END: &str = "    },\n";
 const FINGERPRINT_PREFIX: &str = "pub const CATALOG_RULES_FINGERPRINT: &str = ";
+/// Apis pa-ai streams with a dedicated provider outside the compat axes
+/// (`providers::mistral::API_MISTRAL_CONVERSATIONS`).
+const NATIVE_APIS: &[&str] = &["mistral-conversations"];
 
 /// One slim TUI catalog row: `[id, name, reasoning, vision, ctx, maxTokens, $in, $out, $cache, kind, priority]`.
 struct CatalogRow {
@@ -82,6 +86,7 @@ impl Sources {
             .context("axes.json has no apiRecords")?
             .keys()
             .cloned()
+            .chain(NATIVE_APIS.iter().map(|api| (*api).to_owned()))
             .collect();
         let raw: serde_json::Map<String, Value> =
             serde_json::from_str(&read("crates/omp-cli/assets/tui-model-catalog.json")?)?;
@@ -155,7 +160,7 @@ fn int_literal(v: u64) -> String {
     let digits = v.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push('_');
         }
         out.push(c);
@@ -269,7 +274,8 @@ fn regenerate(source: &str, sources: &Sources, add: &[String]) -> Result<String>
         + source[start..]
             .find(TABLE_END)
             .context("RAW_MODELS end not found")?;
-    let mut entries = parse_entries(&source[start..end])?;
+    // Include the newline that starts TABLE_END so the last entry ends with ENTRY_END.
+    let mut entries = parse_entries(&source[start..=end])?;
 
     let (mut refreshed, mut changed, mut kept) = (0, 0, Vec::new());
     for entry in &mut entries {

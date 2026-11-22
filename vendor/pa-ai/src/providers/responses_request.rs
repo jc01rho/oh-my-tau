@@ -487,15 +487,13 @@ fn build_input(model: &Model, view: &ModelView, context: &Context, o: &InputOpti
                             let parsed = parse_text_signature(t.text_signature.as_deref());
                             let mut msg_id = parsed.as_ref().map(|p| p.0.clone());
                             match &msg_id {
-                                None => {
-                                    if has_replayable {
-                                        msg_id = Some(if unsigned_text == 0 {
-                                            format!("msg_{msg_index}")
-                                        } else {
-                                            format!("msg_{msg_index}_{unsigned_text}")
-                                        });
-                                        unsigned_text += 1;
-                                    }
+                                None if has_replayable => {
+                                    msg_id = Some(if unsigned_text == 0 {
+                                        format!("msg_{msg_index}")
+                                    } else {
+                                        format!("msg_{msg_index}_{unsigned_text}")
+                                    });
+                                    unsigned_text += 1;
                                 }
                                 Some(_) if !o.preserve_message_ids && !has_replayable => {
                                     msg_id = None

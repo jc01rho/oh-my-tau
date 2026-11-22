@@ -552,9 +552,9 @@ fn detect_openai_compat(
     );
     r.d(
         "supportsForcedToolChoice",
-        !d.requires_enabled_thinking
-            && !(d.is_opencode_host && d.is_deepseek_reasoning)
-            && !(d.is_cline_pass && is_qwen),
+        !(d.requires_enabled_thinking
+            || (d.is_opencode_host && d.is_deepseek_reasoning)
+            || (d.is_cline_pass && is_qwen)),
     );
     r.d("supportsNamedToolChoice", true);
     r.d(
@@ -961,10 +961,7 @@ fn resolve_openai_responses_policy(
     r.d("reasoningContentField", "reasoning_content");
     r.d(
         "requiresReasoningContentForToolCalls",
-        (facts.is("kimi")
-            || (is_deepseek_family && reasoning_capable)
-            || (is_open_router && reasoning_capable))
-            && reasoning_capable,
+        (facts.is("kimi") || is_deepseek_family || is_open_router) && reasoning_capable,
     );
     r.d(
         "requiresReasoningContentForAllAssistantTurns",

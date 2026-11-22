@@ -18,7 +18,7 @@ type ProviderCatalog = HashMap<String, HashMap<String, Model>>;
 
 /// The `rules-<version>-<hash>` fingerprint of `data/compat/rules.json` this table was last
 /// generated against (checked by `omp-providers` `catalog` tests).
-pub const CATALOG_RULES_FINGERPRINT: &str = "rules-1-unset";
+pub const CATALOG_RULES_FINGERPRINT: &str = "rules-1-2gmit6ka8bkmk";
 
 /// The compat fields the fallback table carries: the
 /// [`OpenAiCompletionsCompat`] subset the TS fallback file uses. Absent
@@ -82,7 +82,7 @@ static RAW_MODELS: &[RawModel] = &[
         reasoning: true,
         thinking_levels: &[],
         input: &[crate::types::ModelInput::Text, crate::types::ModelInput::Image],
-        cost: (1.0, 5.0, 0.1, 1.25),
+        cost: (1.1, 5.5, 0.11, 1.25),
         context_window: 200_000,
         max_tokens: 64_000,
         featured: None,
@@ -102,7 +102,7 @@ static RAW_MODELS: &[RawModel] = &[
                 (crate::types::ModelThinkingLevel::Max, Some("max")),
         ],
         input: &[crate::types::ModelInput::Text, crate::types::ModelInput::Image],
-        cost: (11.0, 55.0, 1.1, 13.75),
+        cost: (10.0, 50.0, 1.0, 13.75),
         context_window: 1_000_000,
         max_tokens: 128_000,
         featured: None,
@@ -118,7 +118,7 @@ static RAW_MODELS: &[RawModel] = &[
         reasoning: true,
         thinking_levels: &[],
         input: &[crate::types::ModelInput::Text, crate::types::ModelInput::Image],
-        cost: (1.0, 5.0, 0.1, 1.25),
+        cost: (1.1, 5.5, 0.11, 1.25),
         context_window: 200_000,
         max_tokens: 64_000,
         featured: None,
@@ -170,7 +170,7 @@ static RAW_MODELS: &[RawModel] = &[
         reasoning: true,
         thinking_levels: &[],
         input: &[crate::types::ModelInput::Text, crate::types::ModelInput::Image],
-        cost: (0.99, 1.49, 0.0, 0.0),
+        cost: (0.99, 1.49, 0.99, 0.0),
         context_window: 131_072,
         max_tokens: 40_960,
         featured: None,
@@ -261,10 +261,10 @@ compat: Some(RawCompat {
                 (crate::types::ModelThinkingLevel::Xhigh, Some("max")),
                 (crate::types::ModelThinkingLevel::Max, None),
         ],
-        input: &[crate::types::ModelInput::Text],
-        cost: (0.14, 0.28, 0.002_8, 0.0),
+        input: &[crate::types::ModelInput::Text, crate::types::ModelInput::Image],
+        cost: (0.3, 1.2, 0.006, 0.0),
         context_window: 1_000_000,
-        max_tokens: 384_000,
+        max_tokens: 393_216,
         featured: None,
         headers: &[],
 compat: Some(RawCompat {
@@ -509,13 +509,13 @@ compat: Some(RawCompat {
     RawModel {
         provider: "mistral",
         id: "codestral-latest",
-        name: "Codestral (latest)",
+        name: "Codestral",
         api: "mistral-conversations",
         base_url: "https://api.mistral.ai",
         reasoning: false,
         thinking_levels: &[],
         input: &[crate::types::ModelInput::Text],
-        cost: (0.3, 0.9, 0.0, 0.0),
+        cost: (0.3, 0.9, 0.03, 0.0),
         context_window: 256_000,
         max_tokens: 4_096,
         featured: None,
@@ -694,7 +694,7 @@ compat: Some(RawCompat {
                 (crate::types::ModelThinkingLevel::Max, None),
         ],
         input: &[crate::types::ModelInput::Text],
-        cost: (0.22, 0.66, 0.007, 0.0),
+        cost: (0.15, 0.6, 0.003, 0.0),
         context_window: 1_000_000,
         max_tokens: 384_000,
         featured: None,
@@ -751,7 +751,7 @@ compat: Some(RawCompat {
     RawModel {
         provider: "openrouter",
         id: "~anthropic/claude-fable-latest",
-        name: "Anthropic: Claude Fable Latest",
+        name: "Claude Fable Latest",
         api: "openai-completions",
         base_url: "https://openrouter.ai/api/v1",
         reasoning: true,
@@ -4297,7 +4297,7 @@ compat: Some(RawCompat {
         reasoning: true,
         thinking_levels: &[],
         input: &[crate::types::ModelInput::Text],
-        cost: (0.14, 0.28, 0.002_8, 0.0),
+        cost: (0.14, 0.28, 0.0028, 0.0),
         context_window: 262_144,
         max_tokens: 65_536,
         featured: None,
@@ -4361,7 +4361,7 @@ compat: Some(RawCompat {
         reasoning: true,
         thinking_levels: &[],
         input: &[crate::types::ModelInput::Text],
-        cost: (0.0, 0.0, 0.0, 0.0),
+        cost: (0.6, 2.2, 0.11, 0.0),
         context_window: 204_800,
         max_tokens: 131_072,
         featured: None,
@@ -4377,7 +4377,8 @@ compat: Some(RawCompat {
             send_session_affinity_headers: None,
             supports_strict_mode: None,
         }),
-    },];
+    },
+];
 
 /// Expand a raw compat into the wire compat object (the fallback
 /// table only uses the OpenAI-completions shape).
