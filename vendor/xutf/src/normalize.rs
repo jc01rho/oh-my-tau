@@ -31,6 +31,29 @@ impl IntoUnicodeNormalized for String {
     }
 }
 
+/// Converts a borrowed string to NFC.
+pub trait ToUnicodeNormalized {
+    /// Returns this string in NFC.
+    fn to_nfc(&self) -> String;
+}
+
+impl ToUnicodeNormalized for str {
+    fn to_nfc(&self) -> String {
+        self.nfc().collect()
+    }
+}
+
+/// Whether the codepoint sequence `cps` is already in NFC. Values that are not
+/// Unicode scalars count as U+FFFD, like the permissive decoders that yield them.
+#[must_use]
+pub fn is_nfc_codepoints(cps: impl IntoIterator<Item = u32>) -> bool {
+    let text: String = cps
+        .into_iter()
+        .map(|cp| char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    is_nfc(&text)
+}
+
 /// Whether `text` is already in NFC, so normalizing it is a no-op.
 ///
 /// # Example
@@ -48,7 +71,7 @@ pub fn is_nfc(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{IntoUnicodeNormalized, is_nfc};
+    use super::{IntoUnicodeNormalized, ToUnicodeNormalized, is_nfc, is_nfc_codepoints};
 
     #[test]
     fn composes_combining_sequences() {
@@ -79,6 +102,19 @@ mod tests {
         for text in ["cafe\u{301}", "A\u{30a}", "\u{212b}"] {
             assert_eq!(is_nfc(text), text.to_owned().into_nfc() == text, "{text:?}");
         }
+    }
+
+    #[test]
+    fn borrowed_and_codepoint_forms_agree_with_owned() {
+        for text in ["", "caf\u{e9}", "cafe\u{301}", "A\u{30a}", "\u{212b}"] {
+            assert_eq!(text.to_nfc(), text.to_owned().into_nfc(), "{text:?}");
+            assert_eq!(
+                is_nfc_codepoints(text.chars().map(u32::from)),
+                is_nfc(text),
+                "{text:?}"
+            );
+        }
+        assert!(is_nfc_codepoints([0xd800, u32::from('a')]));
     }
 
     #[test]

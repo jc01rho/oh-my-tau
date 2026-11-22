@@ -1,9 +1,11 @@
 //! Token estimation (pi-agent-core `Tokenizer.countMessage`).
 //!
-//! omp counts with a model-specific native tokenizer when the catalog names one and with a
-//! `ceil(bytes / 4)` estimate otherwise (and always in tests). The estimate is the default here;
-//! inject a [`Tokenizer`] for exact counts.
+//! omp counts every fragment with the native tokenizer of the model's catalog family (and in
+//! `o200k_base` when the family is unknown). [`FamilyTokenizer`] counts exactly with the embedded
+//! `omp-utok` encoder of a known family and keeps the `ceil(bytes / 4)` [`ByteEstimate`] for an
+//! unknown one; callers without a model use [`ByteEstimate`] directly.
 
+use omp_utok::Encoding;
 use pa_types::ai::ModelTokenizer;
 use serde_json::Value;
 
@@ -69,6 +71,49 @@ impl Tokenizer for PatchEstimate {
 
     fn image_billing(&self) -> Option<ImageBilling> {
         Some(self.billing)
+    }
+}
+
+/// Counter for a model's tokenizer family (`Model::resolved_tokenizer`): exact counts from the
+/// family's embedded native encoder with its pixel [`ImageBilling`], or the [`ByteEstimate`] with
+/// the unknown-size image budgets when the family is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FamilyTokenizer {
+    family: Option<ModelTokenizer>,
+}
+
+impl FamilyTokenizer {
+    #[must_use]
+    pub const fn new(family: Option<ModelTokenizer>) -> Self {
+        Self { family }
+    }
+}
+
+const fn native_encoding(family: ModelTokenizer) -> Encoding {
+    match family {
+        ModelTokenizer::ClaudeV3 => Encoding::ClaudeV3,
+        ModelTokenizer::ClaudeV47 => Encoding::ClaudeV47,
+        ModelTokenizer::ClaudeV5 => Encoding::ClaudeV5,
+        ModelTokenizer::ClaudeV5Sonnet => Encoding::ClaudeV5Sonnet,
+        ModelTokenizer::Qwen3 => Encoding::Qwen3,
+        ModelTokenizer::DeepseekV3 => Encoding::DeepSeekV3,
+        ModelTokenizer::KimiK2 => Encoding::KimiK2,
+        ModelTokenizer::Glm5 => Encoding::Glm5,
+        ModelTokenizer::Cl100k => Encoding::Cl100kBase,
+        ModelTokenizer::O200k => Encoding::O200kBase,
+    }
+}
+
+impl Tokenizer for FamilyTokenizer {
+    fn count_text(&self, text: &str) -> u64 {
+        match self.family {
+            Some(family) => u64::from(native_encoding(family).count(text)),
+            None => ByteEstimate.count_text(text),
+        }
+    }
+
+    fn image_billing(&self) -> Option<ImageBilling> {
+        self.family.and_then(ImageBilling::for_tokenizer)
     }
 }
 
@@ -228,6 +273,64 @@ mod tests {
 
     fn image(width: u32, height: u32) -> Value {
         json!({"type": "image", "data": b64(&png(width, height)), "mimeType": "image/png"})
+    }
+
+    const PANGRAM: &str = "The quick brown fox jumps over the lazy dog. 1234567890 12 345 6789";
+    const CJK: &str = "东京は日本の首都であり、世界で最も人口の多い都市圏の一つです。深度求索发布了新一代基座模型。";
+
+    /// Reference counts from the vendored `omp-utok` fixtures: python tiktoken 0.14.0
+    /// (o200k/cl100k/Kimi), HF tokenizers (Qwen3/DeepSeek/GLM), ctok 1.0.0 and live sonnet-5
+    /// `count_tokens` (Claude, message frame subtracted).
+    #[test]
+    fn family_tokenizer_counts_each_family_with_its_own_encoder() {
+        let cases = [
+            (ModelTokenizer::O200k, CJK, 38),
+            (ModelTokenizer::Cl100k, CJK, 47),
+            (ModelTokenizer::Qwen3, CJK, 26),
+            (ModelTokenizer::DeepseekV3, CJK, 28),
+            (ModelTokenizer::KimiK2, CJK, 31),
+            (ModelTokenizer::Glm5, CJK, 30),
+            (ModelTokenizer::ClaudeV3, " leading space", 2),
+            (ModelTokenizer::ClaudeV47, " leading space", 3),
+            (ModelTokenizer::ClaudeV5, " leading space", 4),
+            (ModelTokenizer::ClaudeV5Sonnet, " hello    ", 4),
+        ];
+        for (family, text, want) in cases {
+            assert_eq!(
+                FamilyTokenizer::new(Some(family)).count_text(text),
+                want,
+                "{family:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn family_tokenizer_without_a_family_keeps_the_byte_estimate() {
+        let unknown = FamilyTokenizer::new(None);
+        assert_eq!(unknown.count_text(CJK), (138 + 3) >> 2);
+        assert_eq!(unknown.count_image(&image(1024, 1024)), 12_000);
+    }
+
+    #[test]
+    fn family_tokenizer_bills_images_with_the_family_scheme() {
+        let block = image(1024, 1024);
+        let o200k = FamilyTokenizer::new(Some(ModelTokenizer::O200k));
+        let claude = FamilyTokenizer::new(Some(ModelTokenizer::ClaudeV47));
+        assert_eq!(o200k.count_image(&block), 1024);
+        assert_eq!(claude.count_image(&block), 12_000);
+    }
+
+    #[test]
+    fn count_message_sums_exact_counts_per_fragment() {
+        let message = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": PANGRAM}, {"type": "text", "text": CJK}],
+        });
+        let o200k = FamilyTokenizer::new(Some(ModelTokenizer::O200k));
+        assert_eq!(
+            count_message(&o200k, &message, CountOptions::default()),
+            22 + 38
+        );
     }
 
     #[test]

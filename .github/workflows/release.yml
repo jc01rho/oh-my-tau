@@ -133,6 +133,27 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - uses: actions/checkout@v4
+        with:
+          path: src
+          sparse-checkout: |
+            LICENSE
+            NOTICE.md
+            vendor/LICENSE-oh-my-pi
+            vendor/omp-utok/data/LICENSE.ctok
+            vendor/omp-utok/data/LICENSE-Qwen.Apache-2.0
+          sparse-checkout-cone-mode: false
+      - name: Third-party notices
+        # The binary embeds third-party tokenizer data (omp-utok); Apache-2.0
+        # (Qwen) and MIT require their license texts to travel with it.
+        run: |
+          {
+            for f in LICENSE NOTICE.md vendor/LICENSE-oh-my-pi vendor/omp-utok/data/LICENSE.ctok vendor/omp-utok/data/LICENSE-Qwen.Apache-2.0; do
+              printf '==== %s ====\n\n' "$f"
+              cat "src/$f"
+              printf '\n\n'
+            done
+          } > dist/THIRD-PARTY-NOTICES.txt
       - name: Checksums
         run: |
           cd dist

@@ -75,4 +75,4 @@ pub use summary::{
     build_short_summary_request, build_summary_request, build_turn_prefix_request, compact,
     generate_summary, CompactionResult, Completer, SummaryKind, SummaryParams, SummaryRequest,
 };
-pub use tokens::{frame_tokens, ByteEstimate, PatchEstimate, Tokenizer};
+pub use tokens::{frame_tokens, ByteEstimate, FamilyTokenizer, PatchEstimate, Tokenizer};

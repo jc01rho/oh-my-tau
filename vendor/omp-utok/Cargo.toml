@@ -1,0 +1,28 @@
+[package]
+name = "omp-utok"
+version = "19.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Stencil Labs, Inc."]
+publish = false
+description = "Vendored from can1357/oh-my-pi (MIT), see ../LICENSE-oh-my-pi; Claude vocabularies from sanderland/ctok (MIT), see data/LICENSE.ctok. Exact offline token counts (utok)."
+
+[dependencies]
+xutf = { path = "../xutf" }
+zstd = "0.13"
+
+[dev-dependencies]
+fancy-regex = "0.17"
+regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tiktoken-rs = "0.12"
+
+# Upstream oh-my-pi workspace lint policy for the classes this code relies on
+# (the workspace `[lints]` table is not inherited, as for the other vendored
+# crates that keep upstream code verbatim).
+[lints.rust]
+mismatched_lifetime_syntaxes = "allow"
+
+[lints.clippy]
+too_many_arguments = "allow"
