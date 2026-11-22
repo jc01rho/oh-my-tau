@@ -169,6 +169,8 @@ pub struct Runtime {
     pub(crate) advisor: crate::features::advisor::Advisor,
     /// The session's one-shot model handoff (`/prewalk`, `features::prewalk`).
     pub(crate) prewalk: crate::features::prewalk::Prewalk,
+    /// The session's additional workspace roots (`/add-dir`, `features::workspace_dirs`).
+    pub(crate) workspace_dirs: crate::features::workspace_dirs::WorkspaceDirs,
     announced: std::sync::atomic::AtomicBool,
     settled: tokio::sync::Notify,
     /// The task running the current retry saga (`recover`); awaited after cancelling it.
@@ -647,6 +649,7 @@ impl Runtime {
             commands: Mutex::new(Vec::new()),
             advisor: crate::features::advisor::Advisor::default(),
             prewalk: crate::features::prewalk::Prewalk::default(),
+            workspace_dirs: crate::features::workspace_dirs::WorkspaceDirs::default(),
             announced: std::sync::atomic::AtomicBool::new(false),
             settled: tokio::sync::Notify::new(),
             retry_task: Mutex::new(None),
@@ -684,6 +687,22 @@ impl Runtime {
             reported_mode: Mutex::new(omp_ext::lifecycle::SessionModeState::default()),
         });
         rt.publish_session_file();
+        // The startup prompt was assembled with the configured roots.
+        rt.workspace_dirs.replace(
+            crate::sysprompt::session_options()
+                .map(|opts| opts.additional_workspace_roots)
+                .unwrap_or_default(),
+        );
+        let startup_roots = rt
+            .persist
+            .file()
+            .map(|path| omp_session::header_additional_directories(&path))
+            .unwrap_or_default();
+        rt.restore_workspace_directories(
+            startup_roots,
+            crate::features::workspace_dirs::configured(&rt.cwd),
+        )
+        .await;
         rt.bind_monitor_wakes();
         let host: Arc<dyn crate::tools::context_notes::ContextNotesHost> = rt.clone();
         crate::tools::context_host::bind(&host);
@@ -2948,6 +2967,11 @@ impl Runtime {
         crate::features::advisor::reset_for_new_session(self).await;
         crate::features::prewalk::reset_for_new_session(self);
         self.persist.start_new(&self.cwd, dir)?;
+        self.restore_workspace_directories(
+            Vec::new(),
+            crate::features::workspace_dirs::configured_for_new_session(&self.cwd),
+        )
+        .await;
         self.bump_generation();
         self.publish_session_file();
         self.herdr_session("new");
@@ -3063,6 +3087,9 @@ impl Runtime {
         branched: bool,
     ) -> Result<()> {
         let _serial = self.switch_serial.lock().await;
+        // Read before the binding moves: a fork or a `--no-session` resume does
+        // not bind `path` itself.
+        let source_roots = omp_session::header_additional_directories(path);
         if !branched {
             self.check_switch(
                 if fork { "fork" } else { "resume" },
@@ -3266,6 +3293,11 @@ impl Runtime {
             }
         }
         self.restore_title_from(&index);
+        self.restore_workspace_directories(
+            source_roots,
+            crate::features::workspace_dirs::configured(&self.cwd),
+        )
+        .await;
         self.notify_session_switch(
             if branched {
                 "branch"
@@ -4476,6 +4508,91 @@ impl Runtime {
     /// slash catalog (WASM plugin commands and `commands/*.md` files). Returns
     /// the report lines; extension hosts and MCP connections are named as
     /// needing `/restart` because they are not reloaded live.
+    /// Reassemble the base system prompt from the options the session was
+    /// built with, the live workspace roots and `tools` (TS
+    /// `refreshBaseSystemPrompt`).
+    async fn reassemble_base_prompt(
+        &self,
+        settings: &omp_settings::Settings,
+        tools: &[Arc<dyn pa_agent::types::AgentTool>],
+    ) {
+        let Some(mut opts) = crate::sysprompt::session_options() else {
+            return;
+        };
+        opts.additional_workspace_roots = self.workspace_dirs.list();
+        let model = self
+            .target
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|target| target.model.clone());
+        let hidden = crate::tools::hidden_tools(settings, model.as_ref(), false, false);
+        let surface: Vec<_> = tools
+            .iter()
+            .filter(|tool| tool.name() != crate::context::TOOL_NAME)
+            .cloned()
+            .collect();
+        self.agent
+            .set_system_prompt(crate::agent::base_prompt(
+                &self.cwd, &opts, &hidden, &surface,
+            ))
+            .await;
+    }
+
+    /// Replace the session's additional workspace roots (TS
+    /// `SessionManager.add/removeWorkspaceDirectory` + `refreshBaseSystemPrompt`):
+    /// persisted to the session header, then the base prompt is reassembled so the
+    /// next turn sees the change.
+    ///
+    /// # Errors
+    /// The session header could not be rewritten (the list is left unchanged).
+    pub(crate) async fn set_workspace_directories(&self, dirs: Vec<String>) -> Result<()> {
+        if self.persist.file().is_some() {
+            self.persist
+                .with_writer(|w| w.set_additional_directories(&dirs))
+                .context("Failed to save the workspace directories")?;
+        }
+        self.workspace_dirs.replace(dirs);
+        let settings = omp_settings::Settings::load(&self.cwd);
+        let tools = self.agent.tools().await;
+        self.reassemble_base_prompt(&settings, &tools).await;
+        Ok(())
+    }
+
+    /// Bind the roots of the session just opened: its header's list merged with
+    /// `configured` (TS `setAdditionalDirectories` merge at session creation).
+    /// The header and prompt are only touched when the effective list differs.
+    async fn restore_workspace_directories(
+        &self,
+        from_source: Vec<String>,
+        configured: Vec<String>,
+    ) {
+        let merged = crate::features::workspace_dirs::normalize_list(
+            &self.cwd,
+            from_source
+                .iter()
+                .chain(configured.iter())
+                .map(String::as_str),
+        );
+        // A fork's fresh header starts without the source's roots: compare with
+        // the destination header, not the source.
+        let header_stale = self
+            .persist
+            .file()
+            .is_some_and(|path| omp_session::header_additional_directories(&path) != merged);
+        if !header_stale && merged == self.workspace_dirs.list() {
+            return;
+        }
+        if let Err(e) = self.set_workspace_directories(merged.clone()).await {
+            eprintln!("omt: workspace directories: {e:#}");
+            // Not saved, but the live list and the prompt still agree.
+            self.workspace_dirs.replace(merged);
+            let settings = omp_settings::Settings::load(&self.cwd);
+            let tools = self.agent.tools().await;
+            self.reassemble_base_prompt(&settings, &tools).await;
+        }
+    }
+
     pub async fn reload_plugins(self: &Arc<Self>) -> Vec<String> {
         let settings = omp_settings::Settings::load(&self.cwd);
         let wasm = crate::tools::wasm::rediscover(&self.cwd);
@@ -4494,25 +4611,7 @@ impl Runtime {
             env.set_dyn_tools(&tools);
         }
         crate::tools::eval_bridge::set_session_tools(tools.clone());
-        if let Some(opts) = crate::sysprompt::session_options() {
-            let model = self
-                .target
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .map(|target| target.model.clone());
-            let hidden = crate::tools::hidden_tools(&settings, model.as_ref(), false, false);
-            let surface: Vec<_> = tools
-                .iter()
-                .filter(|tool| tool.name() != crate::context::TOOL_NAME)
-                .cloned()
-                .collect();
-            self.agent
-                .set_system_prompt(crate::agent::base_prompt(
-                    &self.cwd, &opts, &hidden, &surface,
-                ))
-                .await;
-        }
+        self.reassemble_base_prompt(&settings, &tools).await;
         self.agent.set_tools(tools).await;
         let catalog = crate::rpc::slash::dynamic_commands(self).await;
         let file_commands = catalog
@@ -7033,6 +7132,40 @@ mod compaction_guard_tests {
             h.rt.agent.tools().await.len(),
             tools_before + crate::tools::wasm::wasm_tools(&h.rt.cwd).len()
         );
+    }
+
+    #[tokio::test]
+    async fn add_dir_persists_in_the_header_and_follows_session_switches() {
+        let h = harness(0).await;
+        let extra = tempfile::tempdir().unwrap();
+        let extra_path = extra.path().to_string_lossy().into_owned();
+        crate::features::workspace_dirs::add_command(&h.rt, &extra_path).await;
+        assert_eq!(h.rt.workspace_dirs.list(), vec![extra_path.clone()]);
+        let first = h.rt.session_file_on_disk().expect("session file");
+        assert_eq!(
+            omp_session::header_additional_directories(&first),
+            vec![extra_path.clone()]
+        );
+        // Adding it again or a missing directory changes nothing.
+        crate::features::workspace_dirs::add_command(&h.rt, &extra_path).await;
+        crate::features::workspace_dirs::add_command(&h.rt, "/p8b2/does/not/exist").await;
+        assert_eq!(h.rt.workspace_dirs.list(), vec![extra_path.clone()]);
+        h.rt.new_session(None).await.expect("new session");
+        assert!(h.rt.workspace_dirs.list().is_empty());
+        h.rt.load_session(&first, None).await.expect("resume");
+        assert_eq!(h.rt.workspace_dirs.list(), vec![extra_path.clone()]);
+        // A fork writes a fresh header: the roots must be carried into it.
+        h.rt.fork_session(&first, None).await.expect("fork");
+        let fork = h.rt.session_file_on_disk().expect("fork file");
+        assert_ne!(fork, first);
+        assert_eq!(
+            omp_session::header_additional_directories(&fork),
+            vec![extra_path.clone()]
+        );
+        h.rt.load_session(&first, None).await.expect("resume again");
+        crate::features::workspace_dirs::remove_command(&h.rt, &extra_path).await;
+        assert!(h.rt.workspace_dirs.list().is_empty());
+        assert!(omp_session::header_additional_directories(&first).is_empty());
     }
 
     async fn until_settled(rx: &mut UnboundedReceiver<Value>) {

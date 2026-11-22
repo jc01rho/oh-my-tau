@@ -19,4 +19,5 @@ pub mod shake;
 pub mod share;
 pub mod skills;
 pub mod ssh;
+pub mod workspace_dirs;
 pub mod worktree;

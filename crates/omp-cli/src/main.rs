@@ -343,6 +343,7 @@ async fn async_main() -> Result<()> {
     if let Some(mode @ ("acp" | "rpc-ui")) = args.mode.as_deref() {
         bail!("omt: --mode {mode} is not supported (no {mode} subsystem)");
     }
+    crate::features::workspace_dirs::set_cli_dirs(args.add_dir.clone());
     if args.multi_session {
         if args.mode.as_deref() != Some("rpc") {
             return Err(usage_err("--multi-session requires --mode rpc"));
@@ -356,8 +357,8 @@ async fn async_main() -> Result<()> {
             eprintln!("omt: --session-runtime {runtime} has no effect without --multi-session");
         }
     }
-    if !args.config.is_empty() || !args.add_dir.is_empty() {
-        eprintln!("omt: --config/--add-dir parsed but their subsystems are not in omt; ignored");
+    if !args.config.is_empty() {
+        eprintln!("omt: --config parsed but its subsystem is not in omt; ignored");
     }
 
     let mut cwd = match args.cwd {
@@ -416,6 +417,7 @@ async fn async_main() -> Result<()> {
         model: args.model.clone().unwrap_or_default(),
         generated_append: Vec::new(),
         prompt: args.prompt.clone(),
+        additional_workspace_roots: crate::features::workspace_dirs::configured(&cwd),
     };
     if args.dump_system_prompt {
         let metas: Vec<sysprompt::ToolMeta> = tools::session_builtin_tools(
