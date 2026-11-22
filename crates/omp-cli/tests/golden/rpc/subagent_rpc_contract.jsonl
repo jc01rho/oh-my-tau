@@ -1,0 +1,6 @@
+{"dir":"out","frame":{"type":"get_subagents","id":"gw-1"}}
+{"dir":"in","frame":{"id":"gw-1","type":"response","command":"get_subagents","success":true,"data":{"subagents":[]}}}
+{"dir":"out","frame":{"type":"cancel_subagent","subagentId":"st_000000000000","id":"gw-2"}}
+{"dir":"in","frame":{"id":"gw-2","type":"response","command":"cancel_subagent","success":false,"error":"Unknown subagent: st_000000000000","code":"subagent_not_found","errorCode":"subagent_not_found"}}
+{"dir":"out","frame":{"type":"steer_subagent","subagentId":"st_000000000000","message":"ping","id":"gw-3"}}
+{"dir":"in","frame":{"id":"gw-3","type":"response","command":"steer_subagent","success":false,"error":"Unknown subagent: st_000000000000","code":"subagent_not_found","errorCode":"subagent_not_found"}}
