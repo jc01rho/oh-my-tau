@@ -87,10 +87,15 @@ pub static APP_KEYBINDINGS: &[(&str, KeybindingDef)] = &[
     ("app.model.selectTemporary", def(&["alt+p"], "Select temporary model for current session")),
     ("app.tools.expand", def(&["ctrl+o"], "Expand tools")),
     ("app.tools.toggleVisibility", def(&["ctrl+shift+o"], "Show or hide tool activity")),
+    ("app.ask.hide", def(&["alt+h"], "Hide or show a pending ask dialog")),
+    ("app.ask.note", def(&["n", "alt+n"], "Add or edit a note on the highlighted ask option")),
+    ("app.approval.approve", def(&["ctrl+enter", "ctrl+q"], "Approve a pending tool call")),
     ("app.editor.external", def(&["ctrl+g"], "Open external editor")),
+    ("app.local.open", def(&["alt+g"], "Open a local:// file in external editor")),
     ("app.message.followUp", def(&["ctrl+q", "ctrl+enter"], "Send follow-up message")),
     ("app.retry", def(&["f5", "alt+r"], "Retry last failed assistant turn")),
     ("app.message.dequeue", def(&["alt+up", "shift+up"], "Dequeue message")),
+    ("app.btw.inject", def(&["alt+i"], "Send a /btw answer's steering prompt to the main session")),
     ("app.clipboard.pasteImage", def(&["ctrl+v"], "Paste image or text from clipboard")),
     ("app.clipboard.pasteTextRaw", def(&["ctrl+shift+v", "alt+shift+v"], "Paste text from clipboard as raw text (no collapse)")),
     ("app.clipboard.copyLine", def(&["alt+shift+l"], "Copy current line")),
@@ -108,8 +113,14 @@ pub static APP_KEYBINDINGS: &[(&str, KeybindingDef)] = &[
     ("app.session.deleteNoninvasive", def(&["ctrl+backspace"], "Delete session (non-invasive)")),
     ("app.tree.foldOrUp", def(&["ctrl+left", "alt+left"], "Fold or move up")),
     ("app.tree.unfoldOrDown", def(&["ctrl+right", "alt+right"], "Unfold or move down")),
+    ("app.session.pin", def(&["alt+k"], "Pin the selected session in the resume picker")),
+    ("app.session.unpin", def(&["alt+shift+k"], "Unpin the selected session in the resume picker")),
+    ("app.tree.previousBranch", def(&[], "Jump to the previous branch in /tree")),
+    ("app.tree.nextBranch", def(&[], "Jump to the next branch in /tree")),
     ("app.plan.toggle", def(&["alt+shift+p"], "Toggle plan mode")),
     ("app.history.search", def(&["ctrl+r"], "Search history")),
+    ("app.links.hint", def(&["alt+o"], "Pick an extension link on screen by its hint tag")),
+    ("app.stt.pushToTalk", def(&["space"], "Hold to record speech-to-text")),
     ("app.stt.toggle", def(&[], "Toggle speech-to-text (default gesture: hold Space)")),
     ("app.live.toggle", def(&["ctrl+l"], "Start or stop live voice mode (/live)")),
 ];
@@ -471,6 +482,29 @@ mod tests {
     }
 
     // ---- canonical ids (TS canonicalKeyId) -------------------------------
+
+    #[test]
+    fn declares_every_upstream_id_plus_two_tree_extras() {
+        let all = keybindings();
+        assert_eq!(all.len(), 81);
+        let km = KeybindingsManager::defaults();
+        for (id, keys) in [
+            ("app.approval.approve", &["ctrl+enter", "ctrl+q"][..]),
+            ("app.ask.hide", &["alt+h"][..]),
+            ("app.ask.note", &["n", "alt+n"][..]),
+            ("app.btw.inject", &["alt+i"][..]),
+            ("app.links.hint", &["alt+o"][..]),
+            ("app.local.open", &["alt+g"][..]),
+            ("app.session.pin", &["alt+k"][..]),
+            ("app.session.unpin", &["alt+shift+k"][..]),
+            ("app.stt.pushToTalk", &["space"][..]),
+            ("app.tree.nextBranch", &[][..]),
+            ("app.tree.previousBranch", &[][..]),
+        ] {
+            assert_eq!(km.get_keys(id), keys, "{id}");
+        }
+        assert!(km.matches_event(&ev(KeyCode::Char('k'), CtMods::ALT), "app.session.pin"));
+    }
 
     #[test]
     fn canonicalizes_modifier_order_and_aliases() {

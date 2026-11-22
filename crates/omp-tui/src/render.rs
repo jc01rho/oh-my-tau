@@ -110,30 +110,32 @@ impl Multiplexer {
     /// Classify from the process environment.
     #[must_use]
     pub fn detect() -> Self {
-        let env = std::env::var_os("HERDR_ENV").is_some_and(|v| v == "1")
-            || std::env::var_os("HERDR_PANE_ID").is_some()
-            || std::env::var_os("HERDR_TAB_ID").is_some()
-            || std::env::var_os("HERDR_WORKSPACE_ID").is_some();
-        if env {
+        Self::detect_with(&|k| std::env::var(k).ok())
+    }
+
+    /// Classify from an injected environment lookup (testable core of
+    /// [`Self::detect`]).
+    #[must_use]
+    pub fn detect_with(env: &dyn Fn(&str) -> Option<String>) -> Self {
+        let set = |k: &str| env(k).is_some();
+        let term = env("TERM").unwrap_or_default();
+        if env("HERDR_ENV").as_deref() == Some("1")
+            || set("HERDR_PANE_ID")
+            || set("HERDR_TAB_ID")
+            || set("HERDR_WORKSPACE_ID")
+        {
             return Self::Herdr;
         }
-        if std::env::var_os("TMUX").is_some()
-            || std::env::var("TERM").is_ok_and(|t| t.starts_with("tmux"))
-        {
+        if set("TMUX") || term.starts_with("tmux") {
             return Self::Tmux;
         }
-        if std::env::var_os("STY").is_some()
-            || std::env::var("TERM").is_ok_and(|t| t.starts_with("screen"))
-        {
+        if set("STY") || term.starts_with("screen") {
             return Self::Screen;
         }
-        if std::env::var_os("ZELLIJ").is_some() {
+        if set("ZELLIJ") {
             return Self::Zellij;
         }
-        if std::env::var_os("CMUX_WORKSPACE_ID").is_some()
-            || std::env::var_os("CMUX_SURFACE_ID").is_some()
-            || std::env::var_os("CMUX_REMOTE_TRANSPORT").is_some()
-        {
+        if set("CMUX_WORKSPACE_ID") || set("CMUX_SURFACE_ID") || set("CMUX_REMOTE_TRANSPORT") {
             return Self::Cmux;
         }
         Self::None
@@ -155,26 +157,7 @@ impl Multiplexer {
 /// adjustment is a P1 item; this is the P0 static gate.
 #[must_use]
 pub fn sync_output_enabled() -> bool {
-    if let Some(v) = std::env::var_os("OMP_TUI_SYNC_OUTPUT") {
-        return v != "0" && v != "false";
-    }
-    let term = std::env::var("TERM").unwrap_or_default();
-    let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-    if Multiplexer::detect().owns_grid() {
-        // tmux ≥ 3.3 implements synchronized updates itself.
-        return true;
-    }
-    term.contains("kitty")
-        || term.contains("ghostty")
-        || term.contains("wezterm")
-        || term.contains("foot")
-        || term.contains("rio")
-        || term.contains("contour")
-        || program == "ghostty"
-        || program == "WezTerm"
-        || program == "kitty"
-        || program == "iTerm.app"
-        || program == "warpterminal"
+    crate::terminal_capabilities::TerminalCapabilities::detect().sync_output
 }
 
 /// Whether the kitty-keyboard probe is disabled (`OMP_TUI_KITTY_KEYS=0`).

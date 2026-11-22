@@ -862,6 +862,8 @@ async fn dispatch_ported(rt: &std::sync::Arc<Runtime>, name: &str, args: &str) -
         "mcp" => Some(mcp_command(rt, args).await),
         "modelpreset" => Some(modelpreset_command(rt, args).await),
         "pin" => Some(pin_command(rt, args).await),
+        "unpin" => Some(unpin_command(rt, args)),
+        "hotkeys" => Some(hotkeys_command(rt, args)),
         "skillful" => Some(setting_status_toggle(
             rt,
             args,
@@ -2892,6 +2894,60 @@ async fn pin_command(rt: &Runtime, args: &str) -> Outcome {
     }
 }
 
+/// `/unpin [session id]` — remove a pin (TS `/unpin` in builtin-lifecycle.ts).
+/// Unlike `/pin` this never toggles: unpinning an unpinned id is reported,
+/// not turned into a pin.
+fn unpin_command(rt: &Runtime, args: &str) -> Outcome {
+    let arg = args.trim();
+    let session_id = if arg.is_empty() {
+        rt.session_id()
+    } else {
+        arg.to_string()
+    };
+    let mut pinned = load_pinned_sessions();
+    if !pinned.remove(&session_id) {
+        return usage(rt, &format!("Session {session_id} is not pinned."));
+    }
+    match store_pinned_sessions(&pinned) {
+        Ok(()) => usage(rt, "Session unpinned."),
+        Err(e) => usage(rt, &format!("Failed to update pins: {e}")),
+    }
+}
+
+/// `/hotkeys` — resolved keybindings (defaults replaced by
+/// `keybindings.yml` overrides), app bindings first, then editor/TUI.
+fn hotkeys_command(rt: &Runtime, args: &str) -> Outcome {
+    if !args.trim().is_empty() {
+        return usage(rt, "Usage: /hotkeys");
+    }
+    let km = omp_tui::keybindings::load_default_manager();
+    usage(rt, &hotkeys_report(&km))
+}
+
+fn hotkeys_report(km: &omp_tui::keybindings::KeybindingsManager) -> String {
+    let resolved = km.get_resolved_bindings();
+    let width = resolved.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+    let mut text = String::from("Keybindings (edit keybindings.yml to override):");
+    for prefix in ["app.", "tui."] {
+        for (id, keys) in resolved.iter().filter(|(id, _)| id.starts_with(prefix)) {
+            let keys = if keys.is_empty() {
+                "(unbound)".to_string()
+            } else {
+                keys.join(", ")
+            };
+            let desc = km
+                .get_definition(id)
+                .map(|d| d.description)
+                .unwrap_or_default();
+            let _ = write!(text, "\n  {id:<width$}  {keys}  — {desc}");
+        }
+    }
+    for conflict in km.get_conflicts() {
+        let _ = write!(text, "\nConflict: {conflict:?}");
+    }
+    text
+}
+
 // =============================================================================
 // Shared setting toggles (/skillful, /extended-context) and /move, /plugins
 // =============================================================================
@@ -3156,6 +3212,36 @@ mod tests {
         assert_eq!(expanded.trim_end(), "Just text\nextra bits");
         assert_eq!(expand_file_command("nope", "", &dir), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn slash_hotkeys_report_lists_resolved_bindings() {
+        let mut user = omp_tui::keybindings::UserBindings::new();
+        user.insert("app.exit".into(), vec!["ctrl+q".into()]);
+        user.insert("app.model.select".into(), Vec::new());
+        let km = omp_tui::keybindings::KeybindingsManager::new(user);
+        let report = hotkeys_report(&km);
+        let line = |id: &str| {
+            report
+                .lines()
+                .find(|l| l.split_whitespace().next() == Some(id))
+                .unwrap_or_else(|| panic!("{id} missing from {report}"))
+                .to_string()
+        };
+        assert!(line("app.exit").contains("ctrl+q"));
+        assert!(!line("app.exit").contains("ctrl+d"));
+        assert!(line("app.model.select").contains("(unbound)"));
+        assert!(line("tui.input.submit").contains("enter"));
+        let app_pos = report.find("app.exit").unwrap();
+        let tui_pos = report.find("tui.input.submit").unwrap();
+        assert!(app_pos < tui_pos, "app bindings are listed first");
+    }
+
+    #[test]
+    fn slash_clear_unpin_hotkeys_are_reserved() {
+        for name in ["clear", "unpin", "hotkeys"] {
+            assert!(is_reserved_builtin(name), "/{name} must be reserved");
+        }
     }
 
     #[test]

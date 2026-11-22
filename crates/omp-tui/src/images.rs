@@ -71,17 +71,7 @@ fn diacritic(index: usize) -> char {
 /// `kitty`, sixel hints, `TERM_PROGRAM`).
 #[must_use]
 pub fn detect() -> ImageProtocol {
-    let term = std::env::var("TERM").unwrap_or_default();
-    if std::env::var_os("KITTY_WINDOW_ID").is_some() || term.contains("kitty") {
-        return ImageProtocol::Kitty;
-    }
-    if term.contains("sixel") {
-        return ImageProtocol::Sixel;
-    }
-    if std::env::var("TERM_PROGRAM").as_deref() == Ok("iTerm.app") {
-        return ImageProtocol::Iterm2;
-    }
-    ImageProtocol::None
+    crate::terminal_capabilities::TerminalCapabilities::detect().images
 }
 
 /// Whether we are inside a Herdr pane (`HERDR_ENV=1` canonical; identity vars
