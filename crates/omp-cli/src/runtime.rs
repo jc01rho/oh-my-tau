@@ -1874,6 +1874,10 @@ impl Runtime {
                 "The session changed before the message was admitted.",
                 "session_mismatch",
             )),
+            Some(_) if self.is_paused() => Err(CmdError::coded(
+                "The session is held; the message waits for the resume.",
+                "session_paused",
+            )),
             _ => Ok(()),
         }
     }

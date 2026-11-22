@@ -420,6 +420,9 @@ fn status_text(view: &TaskView) -> String {
                     clip(result, STATUS_RESULT_MAX_CHARS).0
                 ));
             }
+            if let Some(note) = &record.error_message {
+                text.push_str(&format!("\nnote: {note}"));
+            }
         }
         TaskStatus::Cancelled => {
             if let Some(reason) = &record.cancel_reason {

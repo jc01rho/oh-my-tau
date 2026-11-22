@@ -186,6 +186,9 @@ struct Shared {
     /// The child's `get_session_stats` answer (RPC mode, after the prompt
     /// settled).
     session_stats: Mutex<Option<Value>>,
+    /// The prompt frame went out (a resumed run sends it once its session
+    /// reopened): a run that ends before this never ran anything.
+    prompt_sent: AtomicBool,
 }
 
 impl Default for Shared {
@@ -196,6 +199,7 @@ impl Default for Shared {
             killable: AtomicBool::new(true),
             session_file: watch::Sender::new(None),
             session_stats: Mutex::new(None),
+            prompt_sent: AtomicBool::new(false),
         }
     }
 }
@@ -304,10 +308,6 @@ impl RunControl {
         self.shared.output_tokens.load(Ordering::SeqCst)
     }
 
-    /// The child's session file (RPC mode): the reopened file of a resumed
-    /// run, the one the child named in its opening `get_state`
-    /// ([`StartOptions::report_session`]), or the one its final session stats
-    /// named; `None` until known.
     #[must_use]
     pub fn session_file(&self) -> Option<String> {
         self.shared.session_file.borrow().clone()
@@ -321,6 +321,13 @@ impl RunControl {
             .await
             .ok()
             .and_then(|file| file.clone())
+    }
+
+    /// Whether the prompt frame went out: `false` when the run ended before
+    /// it (a reopen that failed or timed out, a cancel while queued).
+    #[must_use]
+    pub fn prompt_sent(&self) -> bool {
+        self.shared.prompt_sent.load(Ordering::SeqCst)
     }
 
     /// The child session's `get_session_stats` answer (RPC mode, after the
@@ -846,6 +853,9 @@ async fn drive_rpc(
     for frame in rpc.open(&spec.prompt, opts) {
         send(&mut stdin, &frame).await;
     }
+    if rpc.prompt_sent {
+        shared.prompt_sent.store(true, Ordering::SeqCst);
+    }
     publish_session(shared, &rpc);
     // A resumed run waits for its `switch_session` answer only so long.
     let reopen_deadline = opts
@@ -872,9 +882,12 @@ async fn drive_rpc(
                         send(&mut stdin, &frame).await;
                     }
                     publish_session(shared, &rpc);
-                    if rpc.prompt_sent && !rpc.finishing {
-                        for (message, ack) in held.drain(..) {
-                            steer_child(&mut stdin, &message, ack).await;
+                    if rpc.prompt_sent {
+                        shared.prompt_sent.store(true, Ordering::SeqCst);
+                        if !rpc.finishing {
+                            for (message, ack) in held.drain(..) {
+                                steer_child(&mut stdin, &message, ack).await;
+                            }
                         }
                     }
                     if rpc.finishing {

@@ -373,6 +373,20 @@ struct Entry {
     /// The epoch whose completion is being delivered right now (in memory
     /// only: the durable `notified_epoch` moves once delivery succeeded).
     notifying: Option<u64>,
+    /// The completed result a revival replaced, restored when the revived run
+    /// ends before its prompt goes out (a reopen that failed).
+    prior: Option<PriorRun>,
+}
+
+#[derive(Debug, Clone)]
+struct PriorRun {
+    status: TaskStatus,
+    run_epoch: u64,
+    final_response: Option<String>,
+    truncated: bool,
+    session_file: Option<String>,
+    ended_at_ms: Option<u64>,
+    duration_ms: u64,
 }
 
 struct Revived {
@@ -488,6 +502,7 @@ impl SubagentRegistry {
                     record,
                     control: None,
                     notifying: None,
+                    prior: None,
                 },
             );
         }
@@ -587,6 +602,7 @@ impl SubagentRegistry {
             record,
             control: Some(control.clone()),
             notifying: None,
+            prior: None,
         };
         let view = view_of(&entry);
         entries.insert(task_id.clone(), entry);
@@ -813,12 +829,21 @@ impl SubagentRegistry {
                 "{task_id} cannot be revived: its session file {session} is gone."
             ));
         }
+        let prior = PriorRun {
+            status: entry.record.status,
+            run_epoch: entry.record.run_epoch,
+            final_response: entry.record.final_response.clone(),
+            truncated: entry.record.truncated,
+            session_file: entry.record.session_file.clone(),
+            ended_at_ms: entry.record.ended_at_ms,
+            duration_ms: entry.record.duration_ms,
+        };
+        let undelivered = (entry.record.notified_epoch < entry.record.run_epoch
+            && !entry.record.dismissed)
+            .then(|| entry.record.final_response.clone().unwrap_or_default());
+        entry.prior = Some(prior);
         let record = &mut entry.record;
         let epoch = record.run_epoch + 1;
-        // A completion the parent has not received yet goes back with this
-        // send instead of being overwritten by the next run.
-        let undelivered = (record.notified_epoch < record.run_epoch && !record.dismissed)
-            .then(|| record.final_response.clone().unwrap_or_default());
         let spec = TaskSpec {
             id: Some(task_id.to_string()),
             agent: record.agent.clone(),
@@ -966,6 +991,34 @@ impl SubagentRegistry {
             return;
         }
         entry.control = None;
+        let prior = entry.prior.take();
+        let reopen_failed = epoch > 1
+            && !control.prompt_sent()
+            && entry.record.cancel_reason.is_none()
+            && out.status == RunStatus::Failed;
+        if let (true, Some(prior)) = (reopen_failed, prior) {
+            // The revived run never got its prompt in (the session did not
+            // reopen): the task stays the completed task it was, and the
+            // message is reported back as not delivered.
+            let record = &mut entry.record;
+            record.status = prior.status;
+            record.run_epoch = prior.run_epoch;
+            record.final_response = prior.final_response;
+            record.truncated = prior.truncated;
+            record.session_file = prior.session_file;
+            record.ended_at_ms = prior.ended_at_ms;
+            record.duration_ms = prior.duration_ms;
+            record.error_message = Some(format!(
+                "The last message was not delivered: {}",
+                error_summary(&out.stderr)
+            ));
+            record.updated_at_ms = now;
+            self.write(&entry.record);
+            let parent = entry.record.parent_session_id.clone();
+            drop(entries);
+            self.changed(&parent);
+            return;
+        }
         let record = &mut entry.record;
         record.status = if record.cancel_reason.is_some() {
             TaskStatus::Cancelled
@@ -1189,7 +1242,7 @@ mod tests {
     const FAKE_RPC: &str = r#"
 [ "$1" = "--mode" ] && [ "$2" = "rpc" ] || { echo "bad args: $*" >&2; exit 2; }
 dir=$(dirname "$0")
-sess="$dir/session-$$.jsonl"
+sess="$dir/${OMP_TEST_SESSION_NAME:-session}-$$.jsonl"
 answer=""
 holding=""
 field() { printf '%s\n' "$1" | sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p"; }
@@ -1208,7 +1261,12 @@ while IFS= read -r line; do
       printf '{"type":"response","command":"get_state","success":true,"data":{"sessionFile":"%s"}}\n' "$sess" ;;
     *'"type":"switch_session"'*)
       sess=$(field "$line" sessionPath)
-      echo '{"type":"response","command":"switch_session","success":true,"data":{"cancelled":false}}' ;;
+      case "$sess" in
+        *noreopen*)
+          echo '{"type":"response","command":"switch_session","success":false,"error":"Session file not found"}' ;;
+        *)
+          echo '{"type":"response","command":"switch_session","success":true,"data":{"cancelled":false}}' ;;
+      esac ;;
     *'"type":"prompt"'*)
       msg=$(field "$line" message)
       note user "$msg"
@@ -1673,6 +1731,47 @@ done
             second.status(),
             TaskStatus::Error,
             "the revived run is held to the same strict schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_reopen_keeps_the_completed_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = registry(dir.path(), 4);
+        let mut rx = reg.subscribe();
+        let mut req = request(dir.path(), "first", None, "parent");
+        req.env = vec![("OMP_TEST_SESSION_NAME".to_string(), "noreopen".to_string())];
+        let id = reg.spawn(req).unwrap().id().to_string();
+        wait_until(&reg, &mut rx, |r| settled(r, &id, 1)).await;
+        let SendOutcome::Revived { .. } = reg.send(&id, "again", Some("parent"), false).await
+        else {
+            panic!("a completed task revives");
+        };
+        wait_until(&reg, &mut rx, |_| {
+            reg.get(&id)
+                .is_some_and(|v| !v.live && v.record.run_epoch == 1)
+        })
+        .await;
+        let view = reg.get(&id).unwrap();
+        assert_eq!(
+            view.status(),
+            TaskStatus::Completed,
+            "the prior result survives"
+        );
+        assert_eq!(view.record.final_response.as_deref(), Some("answer:first"));
+        assert!(
+            view.record
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("was not delivered"),
+            "{:?}",
+            view.record.error_message
+        );
+        assert_eq!(
+            view.continuation(),
+            Continuation::Revive,
+            "still continuable"
         );
     }
 
