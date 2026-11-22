@@ -1013,13 +1013,14 @@ impl BankStore {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, content, source, session_id, timestamp, importance, veracity, \
-             memory_type, metadata_json, superseded_by, tier_name FROM (\nSELECT id, content, \
-             source, session_id, timestamp, importance, veracity, memory_type, metadata_json, \
-             superseded_by, 'working' AS tier_name FROM working_memory\nUNION ALL\nSELECT id, \
+             memory_type, metadata_json, superseded_by, tier_name FROM (\nSELECT rowid, id, \
              content, source, session_id, timestamp, importance, veracity, memory_type, \
-             metadata_json, superseded_by, 'episodic' AS tier_name FROM episodic_memory\n) ORDER \
-             BY CASE WHEN timestamp NOT GLOB '*[^0-9]*' THEN CAST(timestamp AS INTEGER) ELSE \
-             COALESCE(unixepoch(timestamp) * 1000, 0) END DESC, id LIMIT ?1 OFFSET ?2",
+             metadata_json, superseded_by, 'working' AS tier_name FROM working_memory\nUNION \
+             ALL\nSELECT rowid, id, content, source, session_id, timestamp, importance, veracity, \
+             memory_type, metadata_json, superseded_by, 'episodic' AS tier_name FROM \
+             episodic_memory\n) ORDER BY CASE WHEN timestamp NOT GLOB '*[^0-9]*' THEN \
+             CAST(timestamp AS INTEGER) ELSE COALESCE(unixepoch(timestamp) * 1000, 0) END DESC, \
+             rowid DESC, id LIMIT ?1 OFFSET ?2",
         )?;
         let rows = statement.query_map(params![limit.max(1), offset], |row| {
             let tier = tier_from_name(row.get::<_, String>(10)?.as_str());
