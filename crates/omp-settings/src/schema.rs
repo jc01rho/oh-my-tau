@@ -331,6 +331,13 @@ pub static SETTINGS: &[SettingDef] = &[
         credential: false,
     },
     SettingDef {
+        id: "btw.inject",
+        ty: crate::SettingType::Boolean,
+        env: None,
+        default_yaml: Some("false"),
+        credential: false,
+    },
+    SettingDef {
         id: "checkpoint.enabled",
         ty: crate::SettingType::Boolean,
         env: None,
