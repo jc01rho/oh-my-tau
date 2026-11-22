@@ -165,17 +165,9 @@ async fn announce_loaded_session(rt: &Runtime) {
 /// `navigateTree`): move the leaf, then hand the TUI the new branch's
 /// transcript and the prompt to restore (`tree_navigated`).
 async fn navigate_and_announce(rt: &Arc<Runtime>, entry_id: &str, summarize: bool) {
-    let summarizer = if summarize {
-        match rt.summarize_fn() {
-            Ok(f) => Some(f),
-            Err(e) => {
-                rt.send(prompt_failed(format!("branch summary unavailable: {e:#}")));
-                return;
-            }
-        }
-    } else {
-        None
-    };
+    // Without a live model the `session_before_tree` hook may still supply the
+    // summary; `navigate_tree` reports when neither can.
+    let summarizer = summarize.then(|| rt.summarize_fn().ok()).flatten();
     let options = serde_json::json!({ "summarize": summarize });
     match crate::tree::navigate_tree(rt, entry_id, &options, summarizer).await {
         Ok(data) => {

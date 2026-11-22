@@ -342,7 +342,10 @@ fn format_tool_call(name: &str, args: &Value) -> String {
                 let start = offset.unwrap_or(1);
                 display.push_str(&format!(":{start}"));
                 if let Some(limit) = limit {
-                    display.push_str(&format!("-{}", start + limit.saturating_sub(1)));
+                    display.push_str(&format!(
+                        "-{}",
+                        start.saturating_add(limit.saturating_sub(1))
+                    ));
                 }
             }
             format!("[read: {display}]")
@@ -1537,7 +1540,8 @@ impl TreeNavigator {
         frame.render_widget(block, area);
         let width = usize::from(inner.width);
         let height = usize::from(inner.height);
-        if width < 8 || height < 6 {
+        // Seven rows keep both "Summarize branch?" choices on screen.
+        if width < 8 || height < 7 {
             return;
         }
         let divider = || Line::from(Span::styled("─".repeat(width), fg("border")));
@@ -1578,10 +1582,14 @@ impl TreeNavigator {
         self.page.set(body_rows);
         let mut body = match &self.stage {
             Stage::Summary { cursor, .. } => {
-                let mut rows = vec![Line::from(Span::styled(
-                    "Summarize branch?",
-                    fg("accent").add_modifier(Modifier::BOLD),
-                ))];
+                let mut rows = Vec::new();
+                // Both choices stay visible; the heading only when it fits too.
+                if body_rows >= 3 {
+                    rows.push(Line::from(Span::styled(
+                        "Summarize branch?",
+                        fg("accent").add_modifier(Modifier::BOLD),
+                    )));
+                }
                 for (i, label) in ["No summary", "Summarize"].into_iter().enumerate() {
                     rows.push(if i == *cursor {
                         Line::from(Span::styled(

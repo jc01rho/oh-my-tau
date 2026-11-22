@@ -1159,8 +1159,9 @@ impl App {
                 summarized,
             } => {
                 // TS rebuilds the chat for the new leaf, restores a rewound
-                // prompt into an empty editor and reports the move.
-                self.journal.clear();
+                // prompt into an empty editor and reports the move. The
+                // `message_end` journal stays: it is the tree of a host that
+                // keeps no session journal.
                 self.status.streaming = false;
                 self.messages.rebuild(messages);
                 self.clear_scrollback = true;

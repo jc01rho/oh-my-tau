@@ -131,6 +131,27 @@ pub fn hotkey_groups(keys: &KeybindingsManager, theme: &Theme) -> Vec<HotkeyGrou
     ]
 }
 
+/// Widest keys column before key lists are clipped.
+const MAX_KEYS_COLS: usize = 28;
+
+fn clip_width(s: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(s) <= width {
+        return s.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 /// The help/keyhints overlay.
 #[derive(Debug, Clone)]
 pub struct Help {
@@ -177,7 +198,8 @@ impl Help {
         out
     }
 
-    /// Width of the keys column: the widest key list (TS `GitHelpSheet` rule).
+    /// Width of the keys column: the widest key list (TS `GitHelpSheet` rule),
+    /// capped so a long override list cannot push every action off screen.
     fn keys_width(&self) -> usize {
         self.groups
             .iter()
@@ -185,7 +207,7 @@ impl Help {
             .map(|r| UnicodeWidthStr::width(r.keys.as_str()))
             .max()
             .unwrap_or(0)
-            .max(3)
+            .clamp(3, MAX_KEYS_COLS)
     }
 }
 
@@ -204,8 +226,9 @@ impl Component for Help {
         let rows = self.flat_rows();
         let visible = usize::from(inner.height);
         let pad_keys = |keys: &str| {
-            let w = UnicodeWidthStr::width(keys);
-            format!("{}{keys}  ", " ".repeat(keys_w.saturating_sub(w)))
+            let shown = clip_width(keys, keys_w);
+            let w = UnicodeWidthStr::width(shown.as_str());
+            format!("{}{shown}  ", " ".repeat(keys_w.saturating_sub(w)))
         };
         let window: Vec<Line<'_>> = rows
             .iter()

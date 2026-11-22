@@ -99,6 +99,8 @@ pub(super) struct ApprovalDialog {
     scroll: usize,
     /// Detail rows on screen at the last render (Page Up/Down step).
     body_rows: Cell<usize>,
+    /// Last valid scroll offset at the last render (Page Down stops there).
+    max_scroll: Cell<usize>,
     choices: Vec<String>,
     choice: usize,
     armed_at: Instant,
@@ -129,6 +131,7 @@ impl ApprovalDialog {
             expanded: false,
             scroll: 0,
             body_rows: Cell::new(MAX_DETAIL_ROWS),
+            max_scroll: Cell::new(usize::MAX),
             choices: options,
             choice,
             armed_at: shown + APPROVE_ARM,
@@ -190,7 +193,7 @@ impl ApprovalDialog {
             KeyCode::Up => self.choice = (self.choice + count - 1) % count,
             KeyCode::Down => self.choice = (self.choice + 1) % count,
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page),
-            KeyCode::PageDown => self.scroll += page,
+            KeyCode::PageDown => self.scroll = (self.scroll + page).min(self.max_scroll.get()),
             KeyCode::Enter => {
                 return self
                     .choices
@@ -240,6 +243,7 @@ impl ApprovalDialog {
         let shown = detail.len().min(budget);
         self.body_rows.set(shown.max(1));
         let max_scroll = detail.len().saturating_sub(shown);
+        self.max_scroll.set(max_scroll);
         let scroll = self.scroll.min(max_scroll);
         let thumb = if overflows {
             (shown * shown / detail.len()).clamp(1, shown)
@@ -329,6 +333,6 @@ impl ApprovalDialog {
             };
             segments.remove(drop);
         }
-        join(&segments)
+        clip(&join(&segments), width)
     }
 }

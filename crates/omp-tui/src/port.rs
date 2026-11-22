@@ -212,7 +212,7 @@ impl RuntimePort for FakePort {
         self.record(format!("set_entry_label({entry_id}, {label:?})"));
         let mut journal = self.journal.lock();
         let Some(journal) = journal.as_mut() else {
-            return Ok(());
+            return Err("no session journal to label".into());
         };
         if !journal
             .entries
