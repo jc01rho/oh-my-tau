@@ -184,10 +184,15 @@ const unsupportedNow = (what: string): never => {
 };
 // `ctx.runEphemeralTurn` (TS EphemeralTurnOptions -> EphemeralTurnResult): the core runs the
 // /btw side turn (`run_ephemeral_turn` request); nothing enters the session history and tool
-// calls are never executed. Callbacks cannot cross the wire, so `onTextDelta` receives the
-// settled reply as one delta and `onUsage` the settled message. Callbacks run marked as inside
-// the side turn, so they cannot start another one (bounded recursion, as in TS).
+// calls are never executed. Callbacks cannot cross the wire, so the request announces them: with
+// `onTextDelta` it carries a `streamId` the core echoes on each `ephemeral_delta` request (awaited
+// in arrival order, so the callback sees the provider's deltas as they stream), and with `onUsage`
+// a `usageCallback` flag (the core skips its own `purpose` journal then, as TS does). Callbacks run
+// marked as inside the side turn, so they cannot start another one (bounded recursion, as in TS).
 const inEphemeral = new AsyncLocalStorage<true>();
+/** Live `onTextDelta` deliveries of running side turns, keyed by the id the core echoes back. */
+const ephemeralDeltas = new Map<number, (delta: string) => unknown>();
+let nextStreamId = 1;
 async function runEphemeralTurn(options: Json): Promise<{ replyText: string; assistantMessage: Json }> {
   if (inEphemeral.getStore()) throw new Error("runEphemeralTurn cannot start inside a running side turn");
   if (!options || typeof options !== "object") throw new Error("runEphemeralTurn: options must be an object");
@@ -197,6 +202,12 @@ async function runEphemeralTurn(options: Json): Promise<{ replyText: string; ass
     onUsage?: (message: Json) => unknown;
   };
   signal?.throwIfAborted();
+  const streamId = onTextDelta ? nextStreamId++ : undefined;
+  if (streamId !== undefined && onTextDelta) {
+    ephemeralDeltas.set(streamId, (delta) => inEphemeral.run(true, () => onTextDelta(delta)));
+    wire.streamId = streamId;
+  }
+  if (onUsage) wire.usageCallback = true;
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<never>((_, reject) => {
     onAbort = () => reject(signal?.reason ?? new Error("runEphemeralTurn aborted"));
@@ -208,6 +219,7 @@ async function runEphemeralTurn(options: Json): Promise<{ replyText: string; ass
       throw new Error("runEphemeralTurn: the core returned a malformed result");
     }
     const result = { replyText: reply.replyText, assistantMessage: reply.assistantMessage as Json };
+    // TS reports usage where the provider settles; the core already streamed every delta.
     await inEphemeral.run(true, async () => {
       if (onUsage) {
         try {
@@ -216,12 +228,11 @@ async function runEphemeralTurn(options: Json): Promise<{ replyText: string; ass
           log("warn", `runEphemeralTurn onUsage failed: ${e instanceof Error ? e.message : e}`);
         }
       }
-      // A delivery failure rejects the side turn (TS: awaited in order).
-      if (onTextDelta && result.replyText) await onTextDelta(result.replyText);
     });
     return result;
   } finally {
     if (onAbort) signal?.removeEventListener("abort", onAbort);
+    if (streamId !== undefined) ephemeralDeltas.delete(streamId);
   }
 }
 function makeCtx() {
@@ -1137,6 +1148,14 @@ async function dispatch(method: string, p: Json): Promise<unknown> {
     case "bus_emit":
       events.emit(String(p.channel), p.data);
       return true;
+    case "ephemeral_delta": {
+      // A running side turn's next text delta; the core awaits this, so delivery order is the
+      // provider's order and a throwing `onTextDelta` rejects the turn.
+      const deliver = ephemeralDeltas.get(Number(p.streamId));
+      if (!deliver) throw rpcError(-32602, `ephemeral_delta: no running side turn ${p.streamId}`);
+      await deliver(String(p.delta ?? ""));
+      return true;
+    }
     case "shutdown":
       // In a shared-daemon Worker, process.exit would kill every session;
       // close the session transport instead (daemon terminates this Worker).

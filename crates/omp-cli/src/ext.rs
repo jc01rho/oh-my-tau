@@ -436,7 +436,7 @@ impl omp_ext::lifecycle::HostResponder for RuntimeResponder {
         request: Value,
     ) -> omp_ext::lifecycle::BoxFuture<'_, Result<Value, String>> {
         Box::pin(async move {
-            let turn = EphemeralTurn::parse(&request)?;
+            let mut turn = EphemeralTurn::parse(&request)?;
             let rt = self
                 .rt
                 .upgrade()
@@ -444,11 +444,36 @@ impl omp_ext::lifecycle::HostResponder for RuntimeResponder {
             let mut messages = crate::features::btw::conversation(&rt)
                 .await
                 .map_err(|e| format!("runEphemeralTurn: failed to read the conversation: {e}"))?;
-            messages.extend(turn.tail);
-            use crate::features::btw::{SideTurn, SideTurnError};
-            match crate::features::btw::complete_side_turn(&rt, messages, turn.max_tokens).await {
-                Ok(SideTurn::Done(response)) => Ok(ephemeral_result(&response)),
-                Ok(SideTurn::Failed(response)) => Err(format!(
+            messages.extend(std::mem::take(&mut turn.tail));
+            let context = crate::features::btw::side_context(messages);
+            turn.check_context_bytes(&context)?;
+            let options = crate::features::btw::SideTurnOptions {
+                max_tokens: turn.max_tokens,
+                thinking_level: crate::adapter::model_thinking_level(
+                    rt.agent.thinking_level().await,
+                ),
+                minimize_effort: turn.minimize_effort,
+                session_id: Some(turn.side_session_id(&rt.session_id())),
+            };
+            let observer = DeltaObserver {
+                host: rt.ext_host(),
+                stream_id: turn.stream_id.clone(),
+            };
+            use crate::features::btw::{pump_side_stream, side_stream, SideTurn};
+            let stream = side_stream(&rt, &context, &options)
+                .await
+                .map_err(ephemeral_turn_error)?;
+            let reply = pump_side_stream(stream, &observer)
+                .await
+                .map_err(ephemeral_turn_error)?;
+            let (response, failed) = match reply.outcome {
+                SideTurn::Done(response) => (response, false),
+                SideTurn::Failed(response) => (response, true),
+            };
+            // TS reports usage where the provider settles the attempt, failed ones included.
+            turn.journal(&rt, &response);
+            if failed {
+                return Err(format!(
                     "runEphemeralTurn: the side turn {}: {}",
                     if response.stop_reason == pa_types::ai::StopReason::Aborted {
                         "was aborted"
@@ -459,14 +484,58 @@ impl omp_ext::lifecycle::HostResponder for RuntimeResponder {
                         .error_message
                         .as_deref()
                         .unwrap_or("no error message")
-                )),
-                Err(SideTurnError::NoModel(e)) => {
-                    Err(format!("runEphemeralTurn: no model available: {e}"))
-                }
-                Err(SideTurnError::Request(e)) => {
-                    Err(format!("runEphemeralTurn: request failed: {e}"))
-                }
+                ));
             }
+            // TS builds `replyText` from the accumulated text deltas, so the reply is exactly the text
+            // the host was streamed (tau has no obfuscator, so no later expansion can add to it).
+            let text = reply.text.trim();
+            let reply_text = if turn.dedupe_reply {
+                dedupe_ephemeral_reply(text, turn.reply_max_bytes)
+            } else {
+                text.to_string()
+            };
+            Ok(ephemeral_result(&reply_text, &response))
+        })
+    }
+}
+
+/// Prefix a side-turn failure the way the request's error messages read.
+fn ephemeral_turn_error(error: crate::features::btw::SideTurnError) -> String {
+    use crate::features::btw::SideTurnError;
+    match error {
+        SideTurnError::NoModel(e) => format!("runEphemeralTurn: no model available: {e}"),
+        SideTurnError::Request(e) => format!("runEphemeralTurn: request failed: {e}"),
+    }
+}
+
+/// Delivers one side turn's text to the host's `onTextDelta` (TS awaits each delivery in order, and
+/// a rejected delivery rejects the turn).
+struct DeltaObserver {
+    host: Option<Arc<ExtHost>>,
+    /// The host's side-turn id; `None` when the caller passed no `onTextDelta`.
+    stream_id: Option<Value>,
+}
+
+impl crate::features::btw::SideTurnObserver for DeltaObserver {
+    fn text_delta<'a>(
+        &'a self,
+        delta: &'a str,
+    ) -> crate::features::btw::BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let Some(stream_id) = &self.stream_id else {
+                return Ok(());
+            };
+            let host = self
+                .host
+                .as_ref()
+                .ok_or_else(|| "the extension host is not loaded".to_string())?;
+            host.request(
+                "ephemeral_delta",
+                json!({"streamId": stream_id, "delta": delta}),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         })
     }
 }
@@ -474,12 +543,35 @@ impl omp_ext::lifecycle::HostResponder for RuntimeResponder {
 /// Output-token cap of a side turn whose caller set none (the `/btw` ceiling).
 const EPHEMERAL_DEFAULT_MAX_TOKENS: u64 = 4096;
 
+/// Reply cap of an ephemeral turn whose caller set none (TS `EPHEMERAL_REPLY_MAX_BYTES`).
+const EPHEMERAL_REPLY_MAX_BYTES: u64 = 4096;
+
+/// Longest reply a `model_usage` entry keeps; a longer one is left out, never truncated
+/// (TS `COMPLETION_TEXT_MAX_CHARS`).
+const EPHEMERAL_COMPLETION_TEXT_MAX_CHARS: usize = 4000;
+
 /// A validated `run_ephemeral_turn` request (TS `EphemeralTurnOptions`, wire form from `host.ts`).
 #[derive(Debug)]
 struct EphemeralTurn {
     /// `history` copies followed by the prompt; appended after the live conversation.
     tail: Vec<pa_types::ai::Message>,
     max_tokens: u64,
+    /// TS `maxContextBytes`: reject the turn when its provider context is larger.
+    max_context_bytes: Option<u64>,
+    /// TS `minimizeEffort`: run at the model's lowest effort instead of the session's level.
+    minimize_effort: bool,
+    /// TS `conversationKey`: related side turns share one provider lineage.
+    conversation_key: Option<String>,
+    /// TS `purpose`: journal the settled attempt as a `model_usage` entry under this name.
+    purpose: Option<String>,
+    /// TS `dedupeReply` (default `true`): collapse repeated lines and bound the reply.
+    dedupe_reply: bool,
+    /// TS `replyMaxBytes` (default 4096): byte ceiling of the deduped reply.
+    reply_max_bytes: u64,
+    /// Host id echoed on every `ephemeral_delta`; `None` when there is no `onTextDelta`.
+    stream_id: Option<Value>,
+    /// The host's own `onUsage` reporter is in place, so the `purpose` journal would double count.
+    usage_callback: bool,
 }
 
 impl EphemeralTurn {
@@ -490,14 +582,51 @@ impl EphemeralTurn {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| "runEphemeralTurn: promptText must be a non-empty string".to_string())?;
-        let max_tokens = match request.get("maxTokens") {
-            None | Some(Value::Null) => EPHEMERAL_DEFAULT_MAX_TOKENS,
-            Some(v) => v
-                .as_u64()
-                .filter(|n| (1..=(1u64 << 53) - 1).contains(n))
-                .ok_or_else(|| {
-                    "runEphemeralTurn: maxTokens must be a positive safe integer".to_string()
-                })?,
+        let positive = |field: &str| -> Result<Option<u64>, String> {
+            match request.get(field) {
+                None | Some(Value::Null) => Ok(None),
+                Some(v) => v
+                    .as_u64()
+                    .filter(|n| (1..=(1u64 << 53) - 1).contains(n))
+                    .map(Some)
+                    .ok_or_else(|| {
+                        format!("runEphemeralTurn: {field} must be a positive safe integer")
+                    }),
+            }
+        };
+        let max_tokens = positive("maxTokens")?.unwrap_or(EPHEMERAL_DEFAULT_MAX_TOKENS);
+        let max_context_bytes = positive("maxContextBytes")?;
+        let reply_max_bytes = positive("replyMaxBytes")?.unwrap_or(EPHEMERAL_REPLY_MAX_BYTES);
+        let flag = |field: &str| -> Result<bool, String> {
+            match request.get(field) {
+                None | Some(Value::Null) => Ok(false),
+                Some(Value::Bool(b)) => Ok(*b),
+                Some(_) => Err(format!("runEphemeralTurn: {field} must be a boolean")),
+            }
+        };
+        let minimize_effort = flag("minimizeEffort")?;
+        // TS `args.dedupeReply === false`: only an explicit `false` turns the dedupe off.
+        let dedupe_reply = match request.get("dedupeReply") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("runEphemeralTurn: dedupeReply must be a boolean".into()),
+        };
+        let usage_callback = flag("usageCallback")?;
+        let text = |field: &str| -> Result<Option<String>, String> {
+            match request.get(field) {
+                None | Some(Value::Null) => Ok(None),
+                // An empty string is no key at all (TS reads these with a truthiness test).
+                Some(Value::String(s)) if s.is_empty() => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s.clone())),
+                Some(_) => Err(format!("runEphemeralTurn: {field} must be a string")),
+            }
+        };
+        let conversation_key = text("conversationKey")?;
+        let purpose = text("purpose")?;
+        let stream_id = match request.get("streamId") {
+            None | Some(Value::Null) => None,
+            Some(v @ (Value::Number(_) | Value::String(_))) => Some(v.clone()),
+            Some(_) => return Err("runEphemeralTurn: streamId must be a number or a string".into()),
         };
         match request.get("tools") {
             None | Some(Value::Null | Value::Bool(false)) => {}
@@ -521,15 +650,163 @@ impl EphemeralTurn {
         }))
         .map_err(|e| format!("runEphemeralTurn: invalid promptImages: {e}"))?;
         tail.push(user);
-        Ok(Self { tail, max_tokens })
+        Ok(Self {
+            tail,
+            max_tokens,
+            max_context_bytes,
+            minimize_effort,
+            conversation_key,
+            purpose,
+            dedupe_reply,
+            reply_max_bytes,
+            stream_id,
+            usage_callback,
+        })
+    }
+
+    /// TS `maxContextBytes`: the encoded provider context must fit the caller's ceiling.
+    fn check_context_bytes(&self, context: &pa_types::ai::Context) -> Result<(), String> {
+        let Some(limit) = self.max_context_bytes else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(context)
+            .map_err(|e| format!("runEphemeralTurn: failed to encode the context: {e}"))?
+            .len() as u64;
+        if bytes > limit {
+            return Err(format!(
+                "runEphemeralTurn: ephemeral turn context exceeds the configured {limit}-byte limit"
+            ));
+        }
+        Ok(())
+    }
+
+    /// TS `sideSessionId`: a keyed conversation keeps one provider lineage across its side turns,
+    /// an unkeyed one gets a fresh lineage per call.
+    fn side_session_id(&self, session: &str) -> String {
+        match &self.conversation_key {
+            Some(key) => format!("{session}:side:conversation:{key}"),
+            None => format!("{session}:side:{}", crate::persist::uuid_v7()),
+        }
+    }
+
+    /// TS `journalCompletion`: the settled attempt becomes a `model_usage` entry, so a side turn's
+    /// spend counts in session totals and `omt stats`. The host's own `onUsage` wins when the
+    /// caller passed one, and a failed write is logged rather than failing the turn.
+    fn journal(&self, rt: &Arc<Runtime>, response: &pa_types::ai::AssistantMessage) {
+        let Some(purpose) = self.journal_purpose() else {
+            return;
+        };
+        let payload = ephemeral_usage_payload(purpose, response);
+        if let Err(e) = rt.append_entry("model_usage", payload) {
+            eprintln!("omt: ephemeral turn: model usage journal failed: {e}");
+        }
+    }
+
+    /// The name the settled attempt is journaled under, or `None` when nothing is journaled: a turn
+    /// without a `purpose` has no name, and a host that reports usage itself already counted it.
+    fn journal_purpose(&self) -> Option<&str> {
+        match (&self.purpose, self.usage_callback) {
+            (Some(purpose), false) => Some(purpose),
+            _ => None,
+        }
     }
 }
 
-/// TS `EphemeralTurnResult`.
-fn ephemeral_result(response: &pa_types::ai::AssistantMessage) -> Value {
+/// The `model_usage` entry one settled side turn journals (TS `journalCompletion` + `completionRecord`).
+fn ephemeral_usage_payload(purpose: &str, response: &pa_types::ai::AssistantMessage) -> Value {
+    let reply = completion_reply(response);
+    let mut completion = serde_json::Map::new();
+    // TS counts UTF-16 code units (`reply.length`); longer text is left out, not truncated.
+    if reply.encode_utf16().count() <= EPHEMERAL_COMPLETION_TEXT_MAX_CHARS {
+        completion.insert("reply".into(), Value::String(reply));
+    }
+    let mut payload = json!({
+        "purpose": purpose,
+        "api": response.api,
+        "provider": response.provider,
+        "model": response.model,
+        "usage": response.usage,
+        "stopReason": response.stop_reason,
+        "completion": Value::Object(completion),
+    });
+    // The provider's own timing is journaled alongside, as TS does.
+    for key in ["duration", "ttft"] {
+        if let Some(value) = response.rest.get(key) {
+            payload[key] = value.clone();
+        }
+    }
+    if let Some(message) = &response.error_message {
+        payload["errorMessage"] = Value::String(message.clone());
+    }
+    payload
+}
+
+/// TS `completionRecord`'s reply: the text blocks, or — for a call answered through a forced tool
+/// call, which has no text — its arguments as JSON lines.
+fn completion_reply(response: &pa_types::ai::AssistantMessage) -> String {
+    let text = crate::features::btw::message_text(response);
+    if !text.is_empty() {
+        return text;
+    }
+    let mut reply = String::new();
+    for block in &response.content {
+        if let pa_types::ai::AssistantContentBlock::ToolCall(call) = block {
+            if !reply.is_empty() {
+                reply.push('\n');
+            }
+            reply.push_str(&Value::Object(call.arguments.clone()).to_string());
+        }
+    }
+    reply
+}
+
+/// TS `dedupeEphemeralReply`: collapse runs of one repeated line longer than three, then bound the
+/// text to `max_bytes` on a UTF-8 character boundary.
+fn dedupe_ephemeral_reply(text: &str, max_bytes: u64) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let mut j = i + 1;
+        while j < lines.len() && lines[j] == lines[i] {
+            j += 1;
+        }
+        let run = j - i;
+        if run > 3 {
+            out.push(lines[i].to_string());
+            out.push(format!("[…{run}×]"));
+        } else {
+            out.extend(std::iter::repeat_n(lines[i].to_string(), run));
+        }
+        i = j;
+    }
+    let result = out.join("\n");
+    if result.len() as u64 <= max_bytes {
+        return result;
+    }
+    let suffix = "\n[…truncated]";
+    let bytes = result.as_bytes();
+    let mut cut = (max_bytes.saturating_sub(suffix.len() as u64) as usize).min(bytes.len());
+    // Back off continuation bytes so a multi-byte character straddling the budget is dropped whole.
+    while cut > 0 && bytes[cut] & 0xc0 == 0x80 {
+        cut -= 1;
+    }
+    format!("{}{suffix}", &result[..cut])
+}
+
+/// TS `EphemeralTurnResult`; the assistant message never carries tool calls (a side turn has no
+/// tools to run, so a provider that emitted one has it dropped).
+fn ephemeral_result(reply_text: &str, response: &pa_types::ai::AssistantMessage) -> Value {
+    let mut sanitized = response.clone();
+    sanitized
+        .content
+        .retain(|block| !matches!(block, pa_types::ai::AssistantContentBlock::ToolCall(_)));
     json!({
-        "replyText": crate::features::btw::reply_text(response),
-        "assistantMessage": response,
+        "replyText": reply_text,
+        "assistantMessage": sanitized,
     })
 }
 
@@ -2346,10 +2623,55 @@ mod tests {
         assert!(err(json!({"promptText": "q", "tools": true})).contains("tools"));
         assert!(err(json!({"promptText": "q", "history": "x"})).contains("history"));
         assert!(err(json!({"promptText": "q", "promptImages": {}})).contains("promptImages"));
+        assert!(err(json!({"promptText": "q", "maxContextBytes": 0})).contains("maxContextBytes"));
+        assert!(
+            err(json!({"promptText": "q", "maxContextBytes": 9_007_199_254_740_992_u64}))
+                .contains("maxContextBytes")
+        );
+        assert!(err(json!({"promptText": "q", "replyMaxBytes": 1.5})).contains("replyMaxBytes"));
+        assert!(err(json!({"promptText": "q", "minimizeEffort": "yes"})).contains("minimizeEffort"));
+        assert!(err(json!({"promptText": "q", "dedupeReply": 1})).contains("dedupeReply"));
+        assert!(err(json!({"promptText": "q", "conversationKey": 3})).contains("conversationKey"));
+        assert!(err(json!({"promptText": "q", "purpose": {}})).contains("purpose"));
+        assert!(err(json!({"promptText": "q", "streamId": true})).contains("streamId"));
 
         let bare = EphemeralTurn::parse(&json!({"promptText": "why?", "tools": false})).unwrap();
         assert_eq!(bare.max_tokens, EPHEMERAL_DEFAULT_MAX_TOKENS);
         assert_eq!(bare.tail.len(), 1);
+        assert_eq!(bare.max_context_bytes, None);
+        assert!(
+            !bare.minimize_effort,
+            "effort is the session's unless minimized"
+        );
+        assert_eq!(bare.conversation_key, None);
+        assert_eq!(bare.purpose, None);
+        assert!(
+            bare.dedupe_reply,
+            "a reply is deduped unless the caller opts out"
+        );
+        assert_eq!(bare.reply_max_bytes, EPHEMERAL_REPLY_MAX_BYTES);
+        assert_eq!(bare.stream_id, None, "no onTextDelta, no stream");
+
+        let options = EphemeralTurn::parse(&json!({
+            "promptText": "q",
+            "maxContextBytes": 1024,
+            "minimizeEffort": true,
+            "conversationKey": "topic",
+            "purpose": "recap",
+            "dedupeReply": false,
+            "replyMaxBytes": 64,
+            "streamId": 7,
+            "usageCallback": true,
+        }))
+        .unwrap();
+        assert_eq!(options.max_context_bytes, Some(1024));
+        assert!(options.minimize_effort);
+        assert_eq!(options.conversation_key.as_deref(), Some("topic"));
+        assert_eq!(options.purpose.as_deref(), Some("recap"));
+        assert!(!options.dedupe_reply);
+        assert_eq!(options.reply_max_bytes, 64);
+        assert_eq!(options.stream_id, Some(json!(7)));
+        assert!(options.usage_callback);
 
         let full = EphemeralTurn::parse(&json!({
             "promptText": "and now?",
@@ -2392,10 +2714,260 @@ mod tests {
             "timestamp": 5,
         }))
         .unwrap();
-        let result = ephemeral_result(&response);
+        let result = ephemeral_result("it is fine", &response);
         assert_eq!(result["replyText"], "it is fine");
         assert_eq!(result["assistantMessage"]["model"], "m");
         assert_eq!(result["assistantMessage"]["stopReason"], "stop");
+    }
+
+    /// TS `dedupeEphemeralReply`: runs of one repeated line longer than three collapse, and an
+    /// over-budget reply is cut on a UTF-8 boundary and marked.
+    #[test]
+    fn ext_ephemeral_dedupe_reply_collapses_repeats_and_bounds_bytes() {
+        assert_eq!(dedupe_ephemeral_reply("", 4096), "");
+        assert_eq!(dedupe_ephemeral_reply("a\nb\nb\nb", 4096), "a\nb\nb\nb");
+        assert_eq!(
+            dedupe_ephemeral_reply("a\nb\nb\nb\nb\nc", 4096),
+            "a\nb\n[…4×]\nc"
+        );
+        let long = "가".repeat(10);
+        let bounded = dedupe_ephemeral_reply(&long, 20);
+        assert!(bounded.ends_with("\n[…truncated]"));
+        let kept = bounded.trim_end_matches("\n[…truncated]");
+        assert_eq!(
+            kept, "가",
+            "a character straddling the budget is dropped whole"
+        );
+        assert!(bounded.len() <= 20);
+    }
+
+    /// TS `journalCompletion`: a side turn with a `purpose` journals its settled attempt as a
+    /// `model_usage` entry, keeping the reply only while it is small and a forced tool call's
+    /// arguments when there is no text.
+    #[test]
+    fn ext_ephemeral_purpose_journals_the_settled_attempt() {
+        let payload = ephemeral_usage_payload("recap", &streamed_message("hi"));
+        assert_eq!(payload["purpose"], "recap");
+        assert_eq!(payload["model"], "a");
+        assert_eq!(payload["stopReason"], "stop");
+        assert_eq!(payload["completion"]["reply"], "hi");
+        assert!(payload.get("errorMessage").is_none());
+
+        // A reply past the journal's ceiling is left out, never truncated.
+        let long = ephemeral_usage_payload("recap", &streamed_message(&"x".repeat(4001)));
+        assert!(long["completion"].get("reply").is_none());
+        let at_limit = ephemeral_usage_payload("recap", &streamed_message(&"x".repeat(4000)));
+        assert_eq!(
+            at_limit["completion"]["reply"].as_str().unwrap().len(),
+            4000
+        );
+
+        // A call answered through a forced tool call has no text: its arguments are the reply.
+        let forced: pa_types::ai::AssistantMessage = serde_json::from_value(json!({
+            "content": [{"type": "toolCall", "id": "t", "name": "answer",
+                         "arguments": {"text": "it is fine"}}],
+            "api": "openai-completions", "provider": "p", "model": "a",
+            "usage": {"input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 3,
+                      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+            "stopReason": "error", "errorMessage": "boom", "timestamp": 5
+        }))
+        .unwrap();
+        let failed = ephemeral_usage_payload("recap", &forced);
+        assert_eq!(failed["completion"]["reply"], "{\"text\":\"it is fine\"}");
+        assert_eq!(failed["errorMessage"], "boom");
+    }
+
+    /// A `purpose` names the journal entry, and a host that reports usage itself (`onUsage`) already
+    /// counted the attempt, so the core journals nothing then (TS `args.onUsage ?? journalCompletion`).
+    #[test]
+    fn ext_ephemeral_journals_only_an_unreported_purpose() {
+        let parse = |extra: Value| {
+            let mut request = json!({"promptText": "q"});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            EphemeralTurn::parse(&request).unwrap()
+        };
+        assert_eq!(
+            parse(json!({"purpose": "recap"})).journal_purpose(),
+            Some("recap")
+        );
+        assert_eq!(
+            parse(json!({"purpose": "recap", "usageCallback": true})).journal_purpose(),
+            None,
+            "the host's own onUsage reporter wins"
+        );
+        assert_eq!(
+            parse(json!({"usageCallback": true})).journal_purpose(),
+            None
+        );
+        assert_eq!(parse(json!({})).journal_purpose(), None);
+    }
+
+    /// TS `maxContextBytes`: the encoded provider context must fit the caller's ceiling.
+    #[test]
+    fn ext_ephemeral_turn_context_ceiling_rejects_a_large_context() {
+        let messages = vec![serde_json::from_value(
+            json!({"role": "user", "content": "hello", "timestamp": 1}),
+        )
+        .unwrap()];
+        let context = crate::features::btw::side_context(messages);
+        let turn =
+            EphemeralTurn::parse(&json!({"promptText": "q", "maxContextBytes": 16})).unwrap();
+        assert!(turn
+            .check_context_bytes(&context)
+            .unwrap_err()
+            .contains("16-byte limit"));
+        let roomy =
+            EphemeralTurn::parse(&json!({"promptText": "q", "maxContextBytes": 4096})).unwrap();
+        assert!(roomy.check_context_bytes(&context).is_ok());
+        let unlimited = EphemeralTurn::parse(&json!({"promptText": "q"})).unwrap();
+        assert!(unlimited.check_context_bytes(&context).is_ok());
+    }
+
+    /// TS `sideSessionId`: a `conversationKey` keeps one provider lineage; without one every side
+    /// turn gets its own.
+    #[test]
+    fn ext_ephemeral_side_session_id_keys_a_conversation() {
+        let keyed =
+            EphemeralTurn::parse(&json!({"promptText": "q", "conversationKey": "topic"})).unwrap();
+        assert_eq!(keyed.side_session_id("s1"), "s1:side:conversation:topic");
+        assert_eq!(
+            keyed.side_session_id("s1"),
+            keyed.side_session_id("s1"),
+            "a keyed lineage is stable across calls"
+        );
+        let unkeyed = EphemeralTurn::parse(&json!({"promptText": "q"})).unwrap();
+        let first = unkeyed.side_session_id("s1");
+        assert!(first.starts_with("s1:side:") && !first.contains("conversation"));
+        assert_ne!(first, unkeyed.side_session_id("s1"));
+    }
+
+    /// TS `minimizeEffort` runs a side turn at the model's lowest effort; without it the turn asks
+    /// for the session's level, and a model without a thinking surface asks for nothing.
+    #[test]
+    fn ext_ephemeral_minimize_effort_lowers_the_requested_level() {
+        use pa_types::ai::ModelThinkingLevel;
+        let model: pa_types::ai::Model = serde_json::from_value(json!({
+            "id": "a", "name": "a", "api": "openai-completions", "provider": "p",
+            "baseUrl": "http://127.0.0.1:9", "reasoning": true, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 100_000, "maxTokens": 4096
+        }))
+        .unwrap();
+        let mut options = crate::features::btw::SideTurnOptions {
+            max_tokens: 64,
+            thinking_level: ModelThinkingLevel::High,
+            minimize_effort: false,
+            session_id: None,
+        };
+        assert_eq!(
+            crate::features::btw::side_turn_thinking_level(&model, &options),
+            Some(ModelThinkingLevel::High)
+        );
+        options.minimize_effort = true;
+        assert_eq!(
+            crate::features::btw::side_turn_thinking_level(&model, &options),
+            Some(ModelThinkingLevel::Minimal)
+        );
+        let mut plain = model;
+        plain.reasoning = false;
+        assert_eq!(
+            crate::features::btw::side_turn_thinking_level(&plain, &options),
+            None
+        );
+    }
+
+    /// Collects the deltas one side turn delivers.
+    struct Recording(std::sync::Mutex<Vec<String>>);
+
+    impl crate::features::btw::SideTurnObserver for Recording {
+        fn text_delta<'a>(
+            &'a self,
+            delta: &'a str,
+        ) -> crate::features::btw::BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(delta.to_string());
+                Ok(())
+            })
+        }
+    }
+
+    /// Refuses every delivery (a host whose `onTextDelta` threw).
+    struct Refusing;
+
+    impl crate::features::btw::SideTurnObserver for Refusing {
+        fn text_delta<'a>(
+            &'a self,
+            _delta: &'a str,
+        ) -> crate::features::btw::BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("the callback threw".into()) })
+        }
+    }
+
+    fn streamed_message(text: &str) -> pa_types::ai::AssistantMessage {
+        serde_json::from_value(json!({
+            "content": [{"type": "text", "text": text}],
+            "api": "openai-completions", "provider": "p", "model": "a",
+            "usage": {"input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 3,
+                      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+            "stopReason": "stop", "timestamp": 5
+        }))
+        .unwrap()
+    }
+
+    /// Every text delta reaches the observer in the provider's order, and the delivered deltas are
+    /// exactly the reply's text (TS `onTextDelta` + `providerReplyText`).
+    #[tokio::test]
+    async fn ext_ephemeral_stream_delivers_every_delta_in_order() {
+        use pa_types::ai::{AssistantMessageEvent, DoneStopReason};
+        let (writer, stream) = pa_ai::AssistantMessageEventStream::new();
+        let partial = streamed_message("");
+        let deltas = ["Hel", "lo, ", "world"];
+        for delta in deltas {
+            writer.push(AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: delta.into(),
+                partial: partial.clone(),
+            });
+        }
+        writer.push(AssistantMessageEvent::Done {
+            reason: DoneStopReason::Stop,
+            message: streamed_message("Hello, world"),
+        });
+        let seen = Recording(std::sync::Mutex::new(Vec::new()));
+        let Ok(reply) = crate::features::btw::pump_side_stream(stream, &seen).await else {
+            panic!("the stream settles");
+        };
+        let seen = seen.0.into_inner().unwrap();
+        assert_eq!(
+            seen,
+            deltas.iter().map(|d| d.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(seen.concat(), reply.text);
+        assert!(matches!(
+            reply.outcome,
+            crate::features::btw::SideTurn::Done(_)
+        ));
+    }
+
+    /// A delta the observer refuses aborts the side turn (TS: the awaited `onTextDelta` rejects).
+    #[tokio::test]
+    async fn ext_ephemeral_stream_stops_when_a_delta_is_not_delivered() {
+        use pa_types::ai::AssistantMessageEvent;
+        let (writer, stream) = pa_ai::AssistantMessageEventStream::new();
+        writer.push(AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "x".into(),
+            partial: streamed_message("x"),
+        });
+        let Err(err) = crate::features::btw::pump_side_stream(stream, &Refusing).await else {
+            panic!("a refused delivery fails the turn");
+        };
+        assert!(
+            matches!(err, crate::features::btw::SideTurnError::Request(m) if m.contains("not delivered"))
+        );
     }
 
     /// A core without a side-turn implementation answers with an explicit error,
