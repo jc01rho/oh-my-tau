@@ -81,6 +81,62 @@ pub enum ApprovalMode {
     Yolo,
 }
 
+/// Status of one built-in session mode (`SessionModeState` in omp's `extensibility/extensions/types.ts`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModeStatus {
+    #[default]
+    Inactive,
+    Active,
+    Paused,
+}
+
+/// Plan mode: `planFilePath` is omitted when no plan file is known (TS optional field).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanModeState {
+    pub status: ModeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_file_path: Option<String>,
+}
+
+/// Vibe mode status.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeModeState {
+    pub status: ModeStatus,
+}
+
+/// Goal mode: `objective`/`tokenBudget` are omitted when no goal is tracked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalModeState {
+    pub status: ModeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+}
+
+/// Loop mode status.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopModeState {
+    pub status: ModeStatus,
+}
+
+/// Detached snapshot of the built-in session modes (TS `SessionModeState`). Field order follows
+/// the TS object literal so the serialized event matches byte for byte.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModeState {
+    pub plan: PlanModeState,
+    pub vibe: VibeModeState,
+    pub goal: GoalModeState,
+    #[serde(rename = "loop")]
+    pub r#loop: LoopModeState,
+}
+
 /// An omp extension event. Message/entry payloads are opaque omp JSON (`AgentMessage`, `SessionEntry`, ...).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type")]
@@ -321,6 +377,14 @@ pub enum LifecycleEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         org_name: Option<String>,
     },
+
+    /// A built-in session mode changed, from any source: a slash command, a tool, RPC, or session
+    /// restore. `previous` is the last state reported through this event (all-inactive at first).
+    #[serde(rename = "mode_changed")]
+    ModeChanged {
+        previous: SessionModeState,
+        state: SessionModeState,
+    },
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -545,6 +609,8 @@ impl ExtHost {
         #[allow(clippy::too_many_arguments)] // one argument per omp payload field
         emit_credential_disabled(provider: String, disabled_cause: String, credential_id: Option<i64>, email: Option<String>, account_id: Option<String>, org_id: Option<String>, org_name: Option<String>) => LifecycleEvent::CredentialDisabled { provider, disabled_cause, credential_id, email, account_id, org_id, org_name };
     }
+        /// `mode_changed`: a built-in session mode changed.
+        emit_mode_changed(previous: SessionModeState, state: SessionModeState) => LifecycleEvent::ModeChanged { previous, state };
 
     /// `assistant_message`: a handler may rewrite the text of the finalized message (text blocks only).
     ///

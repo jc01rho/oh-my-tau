@@ -194,6 +194,8 @@ pub struct Runtime {
     ask_blocked: std::sync::atomic::AtomicU64,
     /// In-flight automatic title generation (`--mode print` awaits it before exiting).
     title_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Last built-in mode state reported through `mode_changed` (TS `#reportedModeState`).
+    reported_mode: Mutex<omp_ext::lifecycle::SessionModeState>,
 }
 
 /// The session journal as the experimental context tools see it
@@ -538,6 +540,7 @@ impl Runtime {
             compaction_done: tokio::sync::Notify::new(),
             switch_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             summarizer: Mutex::new(None),
+            reported_mode: Mutex::new(omp_ext::lifecycle::SessionModeState::default()),
         });
         rt.publish_session_file();
         let host: Arc<dyn crate::tools::context_notes::ContextNotesHost> = rt.clone();
@@ -2755,6 +2758,19 @@ impl Runtime {
         });
         *lock(&self.ext_frames) = feed;
         *lock(&self.ext_host) = host;
+    }
+
+    /// Record `state` as the last one reported through `mode_changed`: returns the state reported
+    /// before it when the modes moved, `None` when nothing changed (TS `#reportedModeKey`).
+    pub fn commit_mode_state(
+        &self,
+        state: &omp_ext::lifecycle::SessionModeState,
+    ) -> Option<omp_ext::lifecycle::SessionModeState> {
+        let mut reported = lock(&self.reported_mode);
+        if *reported == *state {
+            return None;
+        }
+        Some(std::mem::replace(&mut *reported, state.clone()))
     }
 
     /// Install the `session_before_switch` gate.
@@ -5789,6 +5805,99 @@ mod ultra_tests {
         }
         assert_eq!(parse_ultra_name("code"), None);
         assert_eq!(parse_ultra_name("max"), None);
+    }
+
+    /// Mode transitions run against the process-wide plan state, so the mode tests take turns.
+    static MODE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn bun_on_path() -> bool {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("bun").is_file()))
+    }
+
+    /// The real extension host with `tests/fixtures/mode_changed.ts` loaded: it records every
+    /// `mode_changed` it receives as a `seen:mode_changed` entry.
+    async fn mode_host() -> Option<(
+        Arc<omp_ext::ExtHost>,
+        UnboundedReceiver<omp_ext::HostMessage>,
+    )> {
+        if !bun_on_path() {
+            eprintln!("skipping mode_changed test: bun not found on PATH");
+            return None;
+        }
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut cfg = omp_ext::HostConfig::new(root.join("../../ext-host/host.ts"));
+        cfg.handler_timeout_ms = Some(5000);
+        let host = omp_ext::ExtHost::spawn(&cfg).await.expect("ext host");
+        let loaded = host
+            .load(
+                Some(&[root.join("tests/fixtures/mode_changed.ts")]),
+                None,
+                "/tmp",
+                Some(json!({"sessionId": "s1"})),
+            )
+            .await
+            .expect("load fixture");
+        assert!(loaded.errors.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.loaded.len(), 1);
+        let rx = host.take_incoming().expect("incoming");
+        Some((host, rx))
+    }
+
+    async fn next_mode_changed(rx: &mut UnboundedReceiver<omp_ext::HostMessage>) -> Value {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                .await
+                .expect("mode_changed in time")
+                .expect("host closed");
+            if let omp_ext::HostMessage::Notification { method, params } = msg {
+                if method == "append_entry" && params["customType"] == "seen:mode_changed" {
+                    let raw = params["data"].as_str().expect("fixture records JSON");
+                    return serde_json::from_str(raw).expect("mode_changed JSON");
+                }
+            }
+        }
+    }
+
+    /// `/plan` reports entering and leaving plan mode through `mode_changed`, with the previously
+    /// reported state as `previous`; a transition that moves nothing reports nothing.
+    #[tokio::test]
+    async fn mode_changed_reports_plan_enter_and_exit() {
+        let _guard = MODE_LOCK.lock().await;
+        let Some((host, mut rx)) = mode_host().await else {
+            return;
+        };
+        let h = harness(&[], "", None).await;
+        h.rt.set_ext_host(Some(host));
+        let plan_status = || {
+            crate::features::modes::snapshot(&h.rt.session_id())
+                .plan
+                .status
+        };
+        assert_eq!(plan_status(), omp_ext::lifecycle::ModeStatus::Inactive);
+
+        crate::features::plan::command(&h.rt, "fix the tests").await;
+        let entered = next_mode_changed(&mut rx).await;
+        assert_eq!(entered["type"], "mode_changed");
+        assert_eq!(entered["previous"]["plan"]["status"], "inactive");
+        assert_eq!(entered["state"]["plan"]["status"], "active");
+        assert_eq!(entered["state"]["vibe"]["status"], "inactive");
+        assert_eq!(entered["state"]["goal"]["status"], "inactive");
+        assert_eq!(entered["state"]["loop"]["status"], "inactive");
+        assert_eq!(plan_status(), omp_ext::lifecycle::ModeStatus::Active);
+
+        crate::features::plan::command(&h.rt, "off").await;
+        let left = next_mode_changed(&mut rx).await;
+        assert_eq!(left["previous"]["plan"]["status"], "active");
+        assert_eq!(left["state"]["plan"]["status"], "inactive");
+
+        crate::features::plan::command(&h.rt, "off").await;
+        let state = crate::features::modes::snapshot(&h.rt.session_id());
+        assert_eq!(state, omp_ext::lifecycle::SessionModeState::default());
+        assert!(
+            h.rt.commit_mode_state(&state).is_none(),
+            "an unchanged mode state reports nothing"
+        );
     }
 }
 
