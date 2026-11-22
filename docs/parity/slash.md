@@ -89,7 +89,7 @@ tau-only names. `Handler` is the function that actually runs.
 | 8 | `/computer` | PORTED | `features::browser::computer_command` | `on`/`off`/`status`. |
 | 9 | `/security` | PARTIAL | `features::security::command` | Rust verbs over the SQLite store and coordinator: `status plans plan preflight start cancel findings validate sarif cloud help`. The catalog lists upstream's 11 verbs, but `scan scans show import export compare disposition` have no handler yet (8b-2 ledger). |
 | 10 | `/ratchet` | STUB | `notice` (`slash.rs:880`) | Needs the eval-harness + hill-climb runner. |
-| 11 | `/prewalk` | STUB | `notice` (`slash.rs:881`) | Startup-only feature in omt (`--prewalk*` flags); `/prewalk restart` unsupported. |
+| 11 | `/prewalk` | PARTIAL | `features::prewalk` | 8b-2: manual one-shot handoff ported — arm / `off` / `restart [from] [into]` with upstream's checks and messages, deep-plan + continue nudges, todo gate, implementation-action test, switch before the next model call, checklist steer, startup flags and `prewalk.enabled`. Missing: `prewalk.auto` classification, plan-yolo, scrubbing a delivered plan nudge. |
 | 12 | `/modelpreset` | PORTED | `modelpreset_command` | `list save switch delete`. |
 | 13 | `/advisor` | PARTIAL | `features::advisor` | 8b-2: single-advisor core — a second `Agent` on the `advisor` role (upstream system prompt, `advise` tool, the session's read-only tools) reviews primary updates per `reviewMode`/`reviewInterval`; notes return as `<advisory>` blocks (steer while running with the `immuneTurns` cooldown, held for the next prompt, or a continuation at `continueSeverity`); `on/off/toggle/status/dump [raw]` drive that state with upstream's messages, `--advisor` enables it. Missing: `WATCHDOG.yml` multi-advisor rosters, advisor transcripts on disk and resumed spend, `syncBacklog` waits, tool-result eviction, watchdog/loop/emission guards, `configure` editor. |
 | 14 | `/export` | PORTED | `dispatch_builtin` | HTML export, `--themes`, `--copy`/`clipboard`. |
@@ -183,7 +183,7 @@ All 11 are honest about the gap except the four flagged below.
 | `/security` | `"/security needs the security-scan mode controller (plan/run/compare), which is not ported to omt."` | honest. **Phase 1:** `builtin_commands.json` now holds a single bare `security` entry, `"description": "Not ported: security scans need the security-scan mode controller"`, with **no subcommand list** — the 11 phantom subcommands (`plan\|scan\|status\|cancel\|scans\|show\|import\|export\|validate\|compare\|disposition`) are gone. The `security_scan` tool is still absent (`tools.md` §1 #18); porting still means both together (§6 #6). |
 | `/ratchet` | `"/ratchet needs the ratchet eval-harness subsystem (eval preludes + hill-climb runner), which is not ported to omt."` | honest |
 | `/handoff` | ~~not wired~~ — **ported** (handoff document + compact in place, §1 #32) | resolved |
-| `/prewalk` | `"Prewalk is a startup-time feature in omt (the --prewalk/--no-prewalk/--prewalk-into flags); arming or restarting it mid-session is not supported."` | honest |
+| `/prewalk` | ~~startup-only notice~~ — **partial**: arm/off/restart and the handoff at the first edit/write (§1 #11) | resolved (8b-2) |
 | `/add-dir` | `"Multi-root workspace directories are not tracked per-session in omt; …"` | honest |
 | `/remove-dir` | same notice | honest |
 | `/dirs` | same notice | honest |
