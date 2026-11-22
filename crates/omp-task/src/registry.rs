@@ -84,7 +84,7 @@ impl TaskStatus {
 }
 
 /// What a revival re-launches (the spawn inputs a run epoch does not carry).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpawnRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -96,6 +96,11 @@ pub struct SpawnRecord {
     pub extra_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<(String, String)>,
+    /// Every run epoch validates its answer the way the first one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(default)]
+    pub schema_mode: SchemaMode,
 }
 
 /// Token and cost totals of the child session (its `get_session_stats`).
@@ -317,9 +322,20 @@ pub enum Lookup {
 #[derive(Debug, Clone)]
 pub enum SendOutcome {
     Steered(TaskView),
-    Revived { view: TaskView, run_epoch: u64 },
-    NotContinuable { view: TaskView, reason: String },
-    NotFound { known: Vec<String> },
+    /// `undelivered`: the previous run's result when its completion had not
+    /// reached the parent yet (handed over here instead).
+    Revived {
+        view: TaskView,
+        run_epoch: u64,
+        undelivered: Option<String>,
+    },
+    NotContinuable {
+        view: TaskView,
+        reason: String,
+    },
+    NotFound {
+        known: Vec<String>,
+    },
     ScopeDenied(TaskView),
 }
 
@@ -354,6 +370,15 @@ pub type Listener = Arc<dyn Fn(&RegistryEvent) + Send + Sync>;
 struct Entry {
     record: TaskRecord,
     control: Option<RunControl>,
+    /// The epoch whose completion is being delivered right now (in memory
+    /// only: the durable `notified_epoch` moves once delivery succeeded).
+    notifying: Option<u64>,
+}
+
+struct Revived {
+    view: TaskView,
+    run_epoch: u64,
+    undelivered: Option<String>,
 }
 
 /// The background-task registry (one per process in production).
@@ -431,6 +456,12 @@ impl SubagentRegistry {
             let Ok(mut record) = serde_json::from_str::<TaskRecord>(&text) else {
                 continue;
             };
+            // The id builds file paths on write: only a well-formed id that
+            // names its own file is trusted.
+            let named_by_file = path.file_stem().and_then(|s| s.to_str()) == Some(&record.task_id);
+            if !is_task_id(&record.task_id) || !named_by_file {
+                continue;
+            }
             if entries.contains_key(&record.task_id)
                 || record.owner_pid == self.owner_pid
                 || process_alive(record.owner_pid)
@@ -456,6 +487,7 @@ impl SubagentRegistry {
                 Entry {
                     record,
                     control: None,
+                    notifying: None,
                 },
             );
         }
@@ -469,7 +501,8 @@ impl SubagentRegistry {
     /// Start a background task and return its view right away.
     ///
     /// # Errors
-    /// The name is already taken in the parent session.
+    /// The name is already taken in the parent session, or the store cannot
+    /// record the task (nothing is started then).
     pub fn spawn(self: &Arc<Self>, request: SpawnRequest) -> Result<TaskView, String> {
         let SpawnRequest {
             mut spec,
@@ -530,18 +563,30 @@ impl SubagentRegistry {
                 depth: spec.depth,
                 extra_args: spec.extra_args.clone(),
                 env: env.clone(),
+                output_schema: spec.output_schema.clone(),
+                schema_mode: spec.schema_mode,
             },
         };
+        // A task the store cannot record could never be reconciled after a
+        // restart: refuse it before anything starts.
+        if let Some(dir) = &self.store {
+            write_record(dir, &record).map_err(|e| {
+                format!(
+                    "Could not record the background task in {}: {e}",
+                    dir.display()
+                )
+            })?;
+        }
         let opts = StartOptions {
             resume_session: None,
             report_session: true,
             env,
         };
         let (control, join) = self.runner.start_with(spec, ChildMode::Rpc, opts);
-        self.write(&record);
         let entry = Entry {
             record,
             control: Some(control.clone()),
+            notifying: None,
         };
         let view = view_of(&entry);
         entries.insert(task_id.clone(), entry);
@@ -568,11 +613,16 @@ impl SubagentRegistry {
                 Lookup::ScopeDenied(view)
             };
         }
-        let by_name = entries
-            .values()
-            .filter(|e| owned(&e.record) && e.record.name.as_deref() == Some(target))
-            .max_by_key(|e| e.record.created_at_ms);
-        match by_name {
+        let named = |scope: &dyn Fn(&TaskRecord) -> bool| {
+            entries
+                .values()
+                .filter(|e| scope(&e.record) && e.record.name.as_deref() == Some(target))
+                .max_by_key(|e| e.record.created_at_ms)
+        };
+        // The caller's own child wins over a descendant that reused the name.
+        let direct =
+            named(&|record: &TaskRecord| caller.is_none_or(|c| record.parent_session_id == c));
+        match direct.or_else(|| named(&owned)) {
             Some(entry) => Lookup::Found(view_of(entry)),
             None => Lookup::NotFound {
                 known: known_tasks(&entries, caller),
@@ -623,13 +673,14 @@ impl SubagentRegistry {
             .count()
     }
 
-    /// Settled runs of `session`'s children whose completion is undelivered.
+    /// Settled runs of `session`'s children whose completion is undelivered
+    /// (and not being delivered right now).
     #[must_use]
     pub fn pending_notifications(&self, session: &str) -> Vec<TaskView> {
         let mut views: Vec<TaskView> = self
             .lock()
             .values()
-            .filter(|e| e.record.parent_session_id == session)
+            .filter(|e| e.record.parent_session_id == session && e.notifying.is_none())
             .map(view_of)
             .filter(TaskView::notification_pending)
             .collect();
@@ -638,8 +689,10 @@ impl SubagentRegistry {
     }
 
     /// Claim the delivery of `task_id`'s epoch-`epoch` completion; `false`
-    /// when it is already delivered (or claimed) or the run moved on. A
-    /// failed delivery gives the claim back with [`Self::abort_notify`].
+    /// when it is already delivered or being delivered, or the run moved on.
+    /// The claim lives in memory only: [`Self::finish_notify`] records the
+    /// delivery once the parent took it, [`Self::abort_notify`] gives the
+    /// claim back, and a process that dies in between leaves it pending.
     pub fn begin_notify(&self, task_id: &str, epoch: u64) -> bool {
         let mut entries = self.lock();
         let Some(entry) = entries.get_mut(task_id) else {
@@ -648,31 +701,39 @@ impl SubagentRegistry {
         if entry.control.is_some()
             || entry.record.run_epoch != epoch
             || entry.record.notified_epoch >= epoch
+            || entry.notifying.is_some()
         {
             return false;
         }
-        entry.record.notified_epoch = epoch;
+        entry.notifying = Some(epoch);
+        true
+    }
+
+    /// Record that the parent took the claimed epoch-`epoch` completion.
+    pub fn finish_notify(&self, task_id: &str, epoch: u64) {
+        let mut entries = self.lock();
+        let Some(entry) = entries.get_mut(task_id) else {
+            return;
+        };
+        if entry.notifying != Some(epoch) {
+            return;
+        }
+        entry.notifying = None;
+        entry.record.notified_epoch = entry.record.notified_epoch.max(epoch);
         self.write(&entry.record);
         let parent = entry.record.parent_session_id.clone();
         drop(entries);
         self.changed(&parent);
-        true
     }
 
     /// Give back a [`Self::begin_notify`] claim whose delivery failed.
     pub fn abort_notify(&self, task_id: &str, epoch: u64) {
         let mut entries = self.lock();
-        let Some(entry) = entries.get_mut(task_id) else {
-            return;
-        };
-        if entry.record.notified_epoch != epoch {
-            return;
+        if let Some(entry) = entries.get_mut(task_id) {
+            if entry.notifying == Some(epoch) {
+                entry.notifying = None;
+            }
         }
-        entry.record.notified_epoch = epoch.saturating_sub(1);
-        self.write(&entry.record);
-        let parent = entry.record.parent_session_id.clone();
-        drop(entries);
-        self.changed(&parent);
     }
 
     /// Deliver `message`: steer a running task, revive a completed one.
@@ -704,7 +765,11 @@ impl SubagentRegistry {
                 }
             }
             Continuation::Revive => match self.revive(view.id(), message) {
-                Ok((view, run_epoch)) => SendOutcome::Revived { view, run_epoch },
+                Ok(revived) => SendOutcome::Revived {
+                    view: revived.view,
+                    run_epoch: revived.run_epoch,
+                    undelivered: revived.undelivered,
+                },
                 Err(reason) => SendOutcome::NotContinuable { view, reason },
             },
             Continuation::NotContinuable(stop) => SendOutcome::NotContinuable {
@@ -724,12 +789,15 @@ impl SubagentRegistry {
         }
     }
 
-    fn revive(self: &Arc<Self>, task_id: &str, message: &str) -> Result<(TaskView, u64), String> {
+    fn revive(self: &Arc<Self>, task_id: &str, message: &str) -> Result<Revived, String> {
         let mut entries = self.lock();
         let entry = entries
             .get_mut(task_id)
             .ok_or_else(|| format!("{task_id} is no longer known."))?;
-        if entry.control.is_some() || entry.record.status != TaskStatus::Completed {
+        if entry.control.is_some()
+            || entry.notifying.is_some()
+            || entry.record.status != TaskStatus::Completed
+        {
             return Err(format!(
                 "{task_id} is {} and cannot be revived now.",
                 view_of(entry).status().as_str()
@@ -747,13 +815,17 @@ impl SubagentRegistry {
         }
         let record = &mut entry.record;
         let epoch = record.run_epoch + 1;
+        // A completion the parent has not received yet goes back with this
+        // send instead of being overwritten by the next run.
+        let undelivered = (record.notified_epoch < record.run_epoch && !record.dismissed)
+            .then(|| record.final_response.clone().unwrap_or_default());
         let spec = TaskSpec {
             id: Some(task_id.to_string()),
             agent: record.agent.clone(),
             prompt: message.to_string(),
             cwd: PathBuf::from(&record.cwd),
-            output_schema: None,
-            schema_mode: SchemaMode::Permissive,
+            output_schema: record.spawn.output_schema.clone(),
+            schema_mode: record.spawn.schema_mode,
             model: record.spawn.model.clone(),
             tools: record.spawn.tools.clone(),
             depth: record.spawn.depth,
@@ -765,7 +837,9 @@ impl SubagentRegistry {
             env: record.spawn.env.clone(),
         };
         let (control, join) = self.runner.start_with(spec, ChildMode::Rpc, opts);
+        record.notified_epoch = record.run_epoch;
         record.run_epoch = epoch;
+        record.owner_pid = self.owner_pid;
         record.status = TaskStatus::Pending;
         record.dismissed = false;
         record.final_response = None;
@@ -781,7 +855,11 @@ impl SubagentRegistry {
         drop(entries);
         self.watch(task_id.to_string(), epoch, control, join);
         self.changed(&parent);
-        Ok((view, epoch))
+        Ok(Revived {
+            view,
+            run_epoch: epoch,
+            undelivered,
+        })
     }
 
     /// Cancel a running task (terminal, never revived). A settled task is
@@ -844,9 +922,38 @@ impl SubagentRegistry {
     fn watch(self: &Arc<Self>, task_id: String, epoch: u64, control: RunControl, join: RunJoin) {
         let registry = Arc::clone(self);
         tokio::spawn(async move {
-            let out = join.await;
+            let mut join = join;
+            // Record the session file as soon as the child names it, so a
+            // task whose owner dies mid-run keeps its transcript.
+            let early = tokio::select! {
+                out = &mut join => Some(out),
+                file = control.session_file_reported() => {
+                    if let Some(file) = file {
+                        registry.record_session_file(&task_id, epoch, file);
+                    }
+                    None
+                }
+            };
+            let out = match early {
+                Some(out) => out,
+                None => join.await,
+            };
             registry.settle(&task_id, epoch, &control, &out);
         });
+    }
+
+    fn record_session_file(&self, task_id: &str, epoch: u64, file: String) {
+        let mut entries = self.lock();
+        let Some(entry) = entries.get_mut(task_id) else {
+            return;
+        };
+        if entry.record.run_epoch != epoch || entry.record.session_file.as_deref() == Some(&file) {
+            return;
+        }
+        entry.record.session_file = Some(file);
+        self.write(&entry.record);
+        drop(entries);
+        self.bump();
     }
 
     fn settle(&self, task_id: &str, epoch: u64, control: &RunControl, out: &RunOutput) {
@@ -1036,7 +1143,15 @@ fn write_record(dir: &Path, record: &TaskRecord) -> std::io::Result<()> {
         std::process::id(),
         TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&temp, text)?;
+    // Owner-only: records carry child output and environment.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    std::io::Write::write_all(&mut options.open(&temp)?, text.as_bytes())?;
     std::fs::rename(&temp, dir.join(format!("{}.json", record.task_id)))
 }
 
@@ -1101,6 +1216,7 @@ while IFS= read -r line; do
       case "$msg" in
         *hold*) holding=1 ;;
         *fail*) answer="failed:$msg"; settle error ;;
+        *json*) answer='{\"ok\":true}'; settle completed ;;
         *) answer="answer:$msg"; settle completed ;;
       esac ;;
     *'"type":"steer"'*)
@@ -1232,14 +1348,26 @@ done
 
         assert!(reg.begin_notify(&id, 1));
         assert!(!reg.begin_notify(&id, 1), "a delivery is claimed once");
-        assert!(!reg.get(&id).unwrap().is_open());
-        assert_eq!(reg.open_children("parent"), 0);
+        assert!(
+            reg.pending_notifications("parent").is_empty(),
+            "a claimed delivery is not pending"
+        );
         reg.abort_notify(&id, 1);
         assert_eq!(
-            reg.open_children("parent"),
+            reg.pending_notifications("parent").len(),
             1,
             "a failed delivery is pending again"
         );
+        let saved_path = dir.path().join("tasks").join(format!("{id}.json"));
+        let on_disk = || -> TaskRecord {
+            serde_json::from_str(&std::fs::read_to_string(&saved_path).unwrap()).unwrap()
+        };
+        assert!(reg.begin_notify(&id, 1));
+        assert_eq!(on_disk().notified_epoch, 0, "a claim is not durable");
+        reg.finish_notify(&id, 1);
+        assert_eq!(on_disk().notified_epoch, 1, "a delivery is");
+        assert!(!reg.get(&id).unwrap().is_open());
+        assert_eq!(reg.open_children("parent"), 0);
     }
 
     #[tokio::test]
@@ -1277,11 +1405,22 @@ done
         let session = reg.get(&id).unwrap().record.session_file.unwrap();
 
         let outcome = reg.send("Worker", "again", Some("parent"), false).await;
-        let SendOutcome::Revived { run_epoch, view } = outcome else {
+        let SendOutcome::Revived {
+            run_epoch,
+            view,
+            undelivered,
+        } = outcome
+        else {
             panic!("expected a revival, got {outcome:?}");
         };
         assert_eq!(run_epoch, 2);
         assert!(view.live);
+        assert_eq!(
+            undelivered.as_deref(),
+            Some("answer:first"),
+            "the undelivered first result goes back with the send"
+        );
+        assert_eq!(view.record.notified_epoch, 1);
         wait_until(&reg, &mut rx, |r| settled(r, &id, 2)).await;
         let done = reg.get(&id).unwrap();
         assert_eq!(done.status(), TaskStatus::Completed);
@@ -1378,6 +1517,7 @@ done
             .unwrap()
             .contains("boom"));
         assert!(reg.begin_notify(&id, 1));
+        reg.finish_notify(&id, 1);
         assert_eq!(
             reg.open_children("parent"),
             1,
@@ -1468,11 +1608,11 @@ done
             &record("st_00000000dead", dead_pid, TaskStatus::Running),
         )
         .unwrap();
-        let mut old = record("st_000000000old", dead_pid, TaskStatus::Completed);
+        let mut old = record("st_0000000000ab", dead_pid, TaskStatus::Completed);
         old.updated_at_ms = 0;
         write_record(&store, &old).unwrap();
         // pid 1 is always alive: a live owner's record is not ours to touch.
-        write_record(&store, &record("st_000000000ive", 1, TaskStatus::Running)).unwrap();
+        write_record(&store, &record("st_0000000000cd", 1, TaskStatus::Running)).unwrap();
 
         let reg = SubagentRegistry::new(TaskRunner::new("/nonexistent", 1), Some(store.clone()));
         assert_eq!(reg.load(), 1);
@@ -1487,10 +1627,10 @@ done
             lost.continuation(),
             Continuation::NotContinuable(Stop::Lost)
         );
-        assert!(reg.get("st_000000000ive").is_none());
-        assert!(reg.get("st_000000000old").is_none());
+        assert!(reg.get("st_0000000000cd").is_none());
+        assert!(reg.get("st_0000000000ab").is_none());
         assert!(
-            !store.join("st_000000000old.json").exists(),
+            !store.join("st_0000000000ab.json").exists(),
             "expired record pruned"
         );
         let saved: TaskRecord = serde_json::from_str(
@@ -1506,5 +1646,129 @@ done
         };
         assert!(released);
         assert_eq!(reg.open_children("parent"), 0);
+    }
+
+    #[tokio::test]
+    async fn revived_runs_keep_the_output_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = registry(dir.path(), 4);
+        let mut rx = reg.subscribe();
+        let mut req = request(dir.path(), "json first", None, "parent");
+        req.spec.output_schema = Some(serde_json::json!({"type": "object", "required": ["ok"]}));
+        req.spec.schema_mode = SchemaMode::Strict;
+        let id = reg.spawn(req).unwrap().id().to_string();
+        wait_until(&reg, &mut rx, |r| settled(r, &id, 1)).await;
+        assert_eq!(reg.get(&id).unwrap().status(), TaskStatus::Completed);
+        assert_eq!(
+            reg.get(&id).unwrap().record.spawn.schema_mode,
+            SchemaMode::Strict
+        );
+        let SendOutcome::Revived { .. } = reg.send(&id, "plain again", Some("parent"), false).await
+        else {
+            panic!("a completed task revives");
+        };
+        wait_until(&reg, &mut rx, |r| settled(r, &id, 2)).await;
+        let second = reg.get(&id).unwrap();
+        assert_eq!(
+            second.status(),
+            TaskStatus::Error,
+            "the revived run is held to the same strict schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_resolves_to_the_callers_own_child_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = registry(dir.path(), 4);
+        let mut rx = reg.subscribe();
+        let mine = reg
+            .spawn(request(dir.path(), "a", Some("Worker"), "root"))
+            .unwrap()
+            .id()
+            .to_string();
+        let mut nested = request(dir.path(), "b", Some("Worker"), "child");
+        nested.root_session_id = "root".to_string();
+        let theirs = reg.spawn(nested).unwrap().id().to_string();
+        assert!(
+            matches!(reg.lookup("Worker", Some("root"), false), Lookup::Found(v) if v.id() == mine)
+        );
+        assert!(
+            matches!(reg.lookup(&theirs, Some("root"), false), Lookup::Found(_)),
+            "a descendant stays reachable by id"
+        );
+        assert!(
+            matches!(reg.lookup("Worker", Some("child"), false), Lookup::Found(v) if v.id() == theirs)
+        );
+        wait_until(&reg, &mut rx, |r| {
+            settled(r, &mine, 1) && settled(r, &theirs, 1)
+        })
+        .await;
+    }
+
+    #[test]
+    fn load_skips_records_whose_id_does_not_name_their_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("tasks");
+        std::fs::create_dir_all(&store).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let evil = serde_json::json!({
+            "task_id": "../escaped", "agent": "task", "parent_session_id": "p", "root_session_id": "p",
+            "status": "running", "run_epoch": 1, "created_at_ms": 1, "updated_at_ms": 1, "cwd": "/",
+            "owner_pid": dead_pid,
+        });
+        std::fs::write(store.join("evil.json"), evil.to_string()).unwrap();
+        let reg = SubagentRegistry::new(TaskRunner::new("/nonexistent", 1), Some(store.clone()));
+        assert_eq!(reg.load(), 0);
+        assert!(reg.list(None).is_empty());
+        assert!(
+            !dir.path().join("escaped.json").exists(),
+            "nothing written outside the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_refuses_a_task_its_store_cannot_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-dir");
+        std::fs::write(&blocked, "file").unwrap();
+        let reg = SubagentRegistry::new(TaskRunner::new(fake_binary(dir.path()), 1), Some(blocked));
+        let refused = reg
+            .spawn(request(dir.path(), "x", None, "parent"))
+            .unwrap_err();
+        assert!(
+            refused.contains("Could not record the background task"),
+            "{refused}"
+        );
+        assert!(reg.list(None).is_empty(), "nothing started");
+    }
+
+    #[tokio::test]
+    async fn the_session_file_is_saved_while_the_child_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = registry(dir.path(), 4);
+        let mut rx = reg.subscribe();
+        let id = reg
+            .spawn(request(dir.path(), "hold on", None, "parent"))
+            .unwrap()
+            .id()
+            .to_string();
+        let saved = dir.path().join("tasks").join(format!("{id}.json"));
+        let on_disk = || -> TaskRecord {
+            serde_json::from_str(&std::fs::read_to_string(&saved).unwrap()).unwrap()
+        };
+        wait_until(&reg, &mut rx, |_| on_disk().session_file.is_some()).await;
+        assert!(reg.get(&id).unwrap().live, "saved before the run settles");
+        let CancelOutcome::Cancelled { .. } = reg.cancel(&id, None, Some("parent"), false) else {
+            panic!("the held run cancels");
+        };
+        wait_until(&reg, &mut rx, |r| settled(r, &id, 1)).await;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&saved).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "records are owner-only");
+        }
     }
 }

@@ -150,29 +150,34 @@ fn on_event(registry: &Arc<SubagentRegistry>, event: &RegistryEvent) {
 }
 
 /// Hand one settled run to its parent: a prompt with `steer` behavior wakes
-/// an idle session and queues into a running turn. A held session keeps it
-/// pending until [`flush_pending`].
+/// an idle session and queues into a running turn. The parent session is
+/// checked again right before admission, so a switch in between leaves the
+/// completion pending for its own session; a held session keeps it pending
+/// until [`flush_pending`].
 async fn deliver(rt: &Arc<Runtime>, registry: &SubagentRegistry, view: &TaskView) {
-    if !view.notification_pending()
-        || view.record.parent_session_id != rt.session_id()
-        || rt.is_paused()
-    {
+    let parent = &view.record.parent_session_id;
+    if !view.notification_pending() || *parent != rt.session_id() || rt.is_paused() {
         return;
     }
     let epoch = view.record.run_epoch;
     if !registry.begin_notify(view.id(), epoch) {
         return;
     }
-    if let Err(e) = rt
-        .prompt(None, &notification_text(view), Some("steer"), Vec::new())
+    match rt
+        .prompt_in_session(parent, &notification_text(view), Some("steer"))
         .await
     {
-        registry.abort_notify(view.id(), epoch);
-        eprintln!(
-            "omt: background task {} completion not delivered: {}",
-            view.id(),
-            e.message
-        );
+        Ok(()) => registry.finish_notify(view.id(), epoch),
+        Err(e) => {
+            registry.abort_notify(view.id(), epoch);
+            if !matches!(e.code, Some("session_mismatch" | "session_paused")) {
+                eprintln!(
+                    "omt: background task {} completion not delivered: {}",
+                    view.id(),
+                    e.message
+                );
+            }
+        }
     }
 }
 
@@ -420,10 +425,15 @@ pub(crate) async fn rpc_steer_subagent(id: &str, message: &str) -> Result<Value,
             "delivered": "steer",
             "runEpoch": view.record.run_epoch,
         })),
-        SendOutcome::Revived { run_epoch, .. } => Ok(json!({
+        SendOutcome::Revived {
+            run_epoch,
+            undelivered,
+            ..
+        } => Ok(json!({
             "subagentId": id,
             "delivered": "revive",
             "runEpoch": run_epoch,
+            "previousResult": undelivered,
         })),
         SendOutcome::NotContinuable { reason, .. } => {
             Err(CmdError::coded(reason, "subagent_not_running"))
@@ -471,27 +481,41 @@ pub(crate) fn rpc_subagent_messages(
     };
     let bytes = std::fs::read(&file)
         .map_err(|e| CmdError::new(format!("Cannot read subagent session file {file}: {e}")))?;
-    let len = bytes.len();
-    let start = usize::try_from(from).unwrap_or(usize::MAX).min(len);
-    let mut text = String::from_utf8_lossy(&bytes[start..]).into_owned();
+    let (start, next, messages) =
+        session_messages(&bytes, usize::try_from(from).unwrap_or(usize::MAX));
+    Ok(json!({
+        "subagentId": view.id(),
+        "sessionFile": file,
+        "fromByte": start,
+        "nextByte": next,
+        "messages": messages,
+    }))
+}
+
+/// The message entries of complete JSONL lines from byte `from` on, with
+/// the clamped start and the offset after the last complete line (a line
+/// still being written is left for the next read; a partial line at `from`
+/// is skipped).
+fn session_messages(bytes: &[u8], from: usize) -> (usize, usize, Vec<Value>) {
+    let start = from.min(bytes.len());
+    let mut first = start;
     if start > 0 && bytes[start - 1] != b'\n' {
-        text = text
-            .split_once('\n')
-            .map_or_else(String::new, |(_, rest)| rest.to_string());
+        first = bytes[start..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |at| start + at + 1);
     }
-    let messages: Vec<Value> = text
+    let next = bytes[first..]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(first, |at| first + at + 1);
+    let messages = String::from_utf8_lossy(&bytes[first..next])
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("message"))
         .filter_map(|entry| entry.get("message").cloned())
         .collect();
-    Ok(json!({
-        "subagentId": view.id(),
-        "sessionFile": file,
-        "fromByte": start,
-        "nextByte": len,
-        "messages": messages,
-    }))
+    (start, next, messages)
 }
 
 #[cfg(test)]
@@ -568,6 +592,25 @@ mod tests {
         let digest = Sha256::digest(real.display().to_string().as_bytes());
         let hash: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
         assert!(store.ends_with(format!("projects/my_proj-{hash}/senpi-task/tasks")));
+    }
+
+    #[test]
+    fn message_reads_resume_after_the_last_complete_line() {
+        let one = r#"{"type":"message","message":{"role":"user","content":"a"}}"#;
+        let two = r#"{"type":"message","message":{"role":"assistant","content":"b"}}"#;
+        let mut file = format!("{one}\n");
+        file.push_str(&two[..20]);
+        let (_, next, messages) = session_messages(file.as_bytes(), 0);
+        assert_eq!(messages.len(), 1, "the half-written line waits");
+        assert_eq!(next, one.len() + 1);
+        file.push_str(&two[20..]);
+        file.push('\n');
+        let (start, next2, messages) = session_messages(file.as_bytes(), next);
+        assert_eq!(start, next);
+        assert_eq!(messages, vec![json!({"role": "assistant", "content": "b"})]);
+        assert_eq!(next2, file.len());
+        let (_, _, mid) = session_messages(file.as_bytes(), 5);
+        assert_eq!(mid.len(), 1, "a read from inside a line skips that line");
     }
 
     #[test]

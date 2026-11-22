@@ -180,10 +180,21 @@ fn send_result(outcome: SendOutcome) -> AgentToolResult {
             format!("Delivered to {} as steer.", view.id()),
             json!({"kind": "steered", "task_id": view.id(), "status": view.status().as_str(), "delivered": "steer"}),
         ),
-        SendOutcome::Revived { view, run_epoch } => reply(
-            format!("Revived {} (run epoch {run_epoch}).", view.id()),
-            json!({"kind": "revived", "task_id": view.id(), "run_epoch": run_epoch}),
-        ),
+        SendOutcome::Revived {
+            view,
+            run_epoch,
+            undelivered,
+        } => {
+            let mut text = format!("Revived {} (run epoch {run_epoch}).", view.id());
+            if let Some(previous) = &undelivered {
+                text.push_str("\nIts previous run's result had not reached you yet:\n");
+                text.push_str(&clip(previous, STATUS_RESULT_MAX_CHARS).0);
+            }
+            reply(
+                text,
+                json!({"kind": "revived", "task_id": view.id(), "run_epoch": run_epoch, "previous_result": undelivered}),
+            )
+        }
         SendOutcome::NotContinuable { view, reason } => reply(
             reason.clone(),
             json!({"kind": "not_continuable", "task_id": view.id(), "status": view.status().as_str(), "reason": reason}),
@@ -717,7 +728,15 @@ done
         );
 
         let revived = run_send(&registry, caller, &json!({"to": held, "message": "more"})).await;
-        assert_eq!(text_of(&revived), format!("Revived {held} (run epoch 2)."));
+        assert!(
+            text_of(&revived).starts_with(&format!("Revived {held} (run epoch 2).")),
+            "{}",
+            text_of(&revived)
+        );
+        assert_eq!(
+            revived.details["previous_result"], "steered:go",
+            "the undelivered result goes back with the send"
+        );
         settled(&registry, &held, 2).await;
         assert_eq!(
             registry
@@ -767,6 +786,7 @@ done
             .to_string();
         settled(&registry, &id, 1).await;
         assert!(registry.begin_notify(&id, 1));
+        registry.finish_notify(&id, 1);
         assert_eq!(registry.open_children(caller), 1);
         let released = run_cancel(&registry, caller, &json!({"task_id": id}));
         assert_eq!(released.details["kind"], "released");

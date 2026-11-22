@@ -180,6 +180,38 @@ sleep 30"#,
     assert_eq!(control.phase(), RunPhase::Settled);
 }
 
+/// A resumed run whose child never answers `switch_session` is killed at
+/// the reopen deadline and settles failed; a steer held for the prompt
+/// fails instead of staying pending, and the permit is released.
+#[tokio::test]
+async fn reopen_deadline_kills_a_child_that_never_answers_the_switch() {
+    let _env = ENV_LOCK.lock().await;
+    set_finishing_deadline("15000");
+    std::env::set_var("OMP_TASK_TEST_REOPEN_DEADLINE_MS", "400");
+    let dir = tempfile::tempdir().unwrap();
+    let bin = fake_binary(dir.path(), "read -r switch\nsleep 30");
+    let runner = TaskRunner::new(&bin, 1);
+    let opts = omp_task::StartOptions {
+        resume_session: Some(dir.path().join("old.jsonl")),
+        ..omp_task::StartOptions::default()
+    };
+    let (control, join) = runner.start_with(spec("again", dir.path()), ChildMode::Rpc, opts);
+    let held = control.steer("waiting for the prompt");
+    let (receipt, out) =
+        tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(held, join) })
+            .await
+            .expect("run must not hang on a silent switch_session");
+    std::env::remove_var("OMP_TASK_TEST_REOPEN_DEADLINE_MS");
+    assert_eq!(out.status, RunStatus::Failed, "{out:?}");
+    assert!(
+        out.stderr.contains("timed out reopening the child session"),
+        "stderr: {}",
+        out.stderr
+    );
+    assert_eq!(receipt, Err(omp_task::SteerError::NotRunning));
+    assert_eq!(runner.available_permits(), 1, "permit released");
+}
+
 /// Finding 4 (steer receipt): a steer sent while the prompt is still running
 /// is acknowledged once written; once the prompt settled (Finishing), the
 /// receipt reports failure instead of a silently dropped message.

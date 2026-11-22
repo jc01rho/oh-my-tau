@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::{
@@ -64,6 +64,19 @@ const RPC_EXIT_GRACE: Duration = Duration::from_secs(10);
 /// if the child keeps stdout open (a missing `get_session_stats` reply or a
 /// child ignoring stdin EOF must not hang the run or hold its permit).
 const RPC_FINISHING_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Bound on a resumed run's `switch_session` answer.
+const RPC_REOPEN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Test knob for [`RPC_REOPEN_DEADLINE`] (`OMP_TASK_TEST_REOPEN_DEADLINE_MS`);
+/// unset in production.
+fn rpc_reopen_deadline() -> Duration {
+    std::env::var("OMP_TASK_TEST_REOPEN_DEADLINE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(RPC_REOPEN_DEADLINE)
+}
 
 /// Test knob for [`RPC_FINISHING_DEADLINE`] (`OMP_TASK_TEST_FINISHING_DEADLINE_MS`);
 /// unset in production.
@@ -169,7 +182,7 @@ struct Shared {
     /// the run's own completion takes it (the loser observes `false`).
     killable: AtomicBool,
     /// The child's session file (RPC mode), once known.
-    session_file: Mutex<Option<String>>,
+    session_file: watch::Sender<Option<String>>,
     /// The child's `get_session_stats` answer (RPC mode, after the prompt
     /// settled).
     session_stats: Mutex<Option<Value>>,
@@ -181,7 +194,7 @@ impl Default for Shared {
             phase: AtomicU8::default(),
             output_tokens: AtomicU64::default(),
             killable: AtomicBool::new(true),
-            session_file: Mutex::new(None),
+            session_file: watch::Sender::new(None),
             session_stats: Mutex::new(None),
         }
     }
@@ -297,11 +310,17 @@ impl RunControl {
     /// named; `None` until known.
     #[must_use]
     pub fn session_file(&self) -> Option<String> {
-        self.shared
-            .session_file
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.shared.session_file.borrow().clone()
+    }
+
+    /// Resolves once the child's session file is known (never, for a run
+    /// that ends without one: race it against the run's [`RunJoin`]).
+    pub async fn session_file_reported(&self) -> Option<String> {
+        let mut rx = self.shared.session_file.subscribe();
+        rx.wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|file| file.clone())
     }
 
     /// The child session's `get_session_stats` answer (RPC mode, after the
@@ -427,6 +446,17 @@ async fn run_controlled(
             },
         }
     };
+    if !shared.killable.load(Ordering::SeqCst) {
+        // A cancel accepted while the permit was being granted wins: the
+        // child is never spawned.
+        drop(permit);
+        for (_, ack) in steers {
+            let _ = ack.send(Err(SteerError::NotRunning));
+        }
+        drain_controls(&mut rx);
+        shared.set_phase(RunPhase::Settled);
+        return cancelled_output(id, spec.agent, None, String::new(), start);
+    }
     shared.set_phase(RunPhase::Running);
     let out = match spawn_child(&runner.binary, &spec, mode, &opts.env).await {
         Err(e) => spawn_failure(id, spec, &runner.binary, &e, start),
@@ -722,19 +752,32 @@ async fn drive_print(
 }
 
 /// Write one JSON-lines command; a write failure closes the channel.
-async fn send(stdin: &mut Option<ChildStdin>, frame: &Value) {
+/// Returns whether the frame was written.
+async fn send(stdin: &mut Option<ChildStdin>, frame: &Value) -> bool {
     let Some(pipe) = stdin.as_mut() else {
-        return;
+        return false;
     };
     let mut line = frame.to_string();
     line.push('\n');
     if pipe.write_all(line.as_bytes()).await.is_err() || pipe.flush().await.is_err() {
         *stdin = None;
+        return false;
     }
+    true
 }
 
 fn steer_frame(message: &str) -> Value {
     json!({"type": "steer", "message": message})
+}
+
+/// Write a steer and resolve its delivery receipt by the write's outcome.
+async fn steer_child(stdin: &mut Option<ChildStdin>, message: &str, ack: SteerAck) {
+    let written = send(stdin, &steer_frame(message)).await;
+    let _ = ack.send(if written {
+        Ok(())
+    } else {
+        Err(SteerError::NotRunning)
+    });
 }
 
 fn prompt_frame(message: &str) -> Value {
@@ -751,13 +794,13 @@ fn fail_held(held: &mut Vec<(String, SteerAck)>) {
 /// Publish what the RPC bookkeeping learned about the child session.
 fn publish_session(shared: &Shared, rpc: &RpcRun) {
     if let Some(file) = &rpc.session_file {
-        let mut slot = shared
-            .session_file
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if slot.as_deref() != Some(file.as_str()) {
-            *slot = Some(file.clone());
-        }
+        shared.session_file.send_if_modified(|slot| {
+            let changed = slot.as_deref() != Some(file.as_str());
+            if changed {
+                *slot = Some(file.clone());
+            }
+            changed
+        });
     }
     if let Some(stats) = &rpc.stats {
         *shared
@@ -804,19 +847,24 @@ async fn drive_rpc(
         send(&mut stdin, &frame).await;
     }
     publish_session(shared, &rpc);
+    // A resumed run waits for its `switch_session` answer only so long.
+    let reopen_deadline = opts
+        .resume_session
+        .as_ref()
+        .map(|_| Instant::now() + rpc_reopen_deadline());
     // Steers queued before the prompt went out (a resumed run reopens its
     // session first) wait for it and are acknowledged once written.
     let mut held: Vec<(String, SteerAck)> = Vec::new();
     for (message, ack) in steers {
         if rpc.prompt_sent {
-            send(&mut stdin, &steer_frame(&message)).await;
-            let _ = ack.send(Ok(()));
+            steer_child(&mut stdin, &message, ack).await;
         } else {
             held.push((message, ack));
         }
     }
     loop {
         let finishing_deadline = finishing_at.map(|at| at + rpc_finishing_deadline());
+        let reopening = reopen_deadline.filter(|_| !rpc.prompt_sent && !rpc.finishing);
         tokio::select! {
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
@@ -826,8 +874,7 @@ async fn drive_rpc(
                     publish_session(shared, &rpc);
                     if rpc.prompt_sent && !rpc.finishing {
                         for (message, ack) in held.drain(..) {
-                            send(&mut stdin, &steer_frame(&message)).await;
-                            let _ = ack.send(Ok(()));
+                            steer_child(&mut stdin, &message, ack).await;
                         }
                     }
                     if rpc.finishing {
@@ -860,6 +907,25 @@ async fn drive_rpc(
                 drain_controls(rx);
                 return collect_output(id, spec, false, None, String::new(), stderr, start);
             }
+            _ = sleep_until_opt(reopening), if reopening.is_some() => {
+                // The child never answered `switch_session`: kill it and
+                // settle failed instead of holding the slot and the steers.
+                kill_tree(&mut child);
+                let _ = child.wait().await;
+                let stderr = join_text(stderr, true).await;
+                let error = format!(
+                    "timed out reopening the child session: no switch_session answer within {:?}",
+                    rpc_reopen_deadline()
+                );
+                let stderr = if stderr.trim().is_empty() {
+                    error
+                } else {
+                    format!("{error}\n{stderr}")
+                };
+                fail_held(&mut held);
+                drain_controls(rx);
+                return collect_output(id, spec, false, None, String::new(), stderr, start);
+            }
             ctl = rx.recv(), if controls_open => match ctl {
                 Some(Control::Kill) => {
                     killed = true;
@@ -873,8 +939,7 @@ async fn drive_rpc(
                     } else if !rpc.prompt_sent {
                         held.push((message, ack));
                     } else {
-                        send(&mut stdin, &steer_frame(&message)).await;
-                        let _ = ack.send(Ok(()));
+                        steer_child(&mut stdin, &message, ack).await;
                     }
                 }
                 None => controls_open = false,
