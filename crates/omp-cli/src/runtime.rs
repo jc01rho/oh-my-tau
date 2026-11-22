@@ -1791,7 +1791,10 @@ impl Runtime {
             self.send(frame);
         }
         if settle {
+            // `session_settled` is omp's frame; `agent_settled` is the gateway's settle signal
+            // (it reads it as the "run is fully idle" marker before it releases a lane).
             self.send(json!({"type": "session_settled"}));
+            self.send(json!({"type": "agent_settled"}));
         }
         self.settled.notify_waiters();
     }
