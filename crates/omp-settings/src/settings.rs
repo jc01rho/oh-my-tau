@@ -95,6 +95,10 @@ pub struct Settings {
     /// Sources actually read, for diagnostics.
     global_path: Option<PathBuf>,
     project_path: Option<PathBuf>,
+    omo_path: Option<PathBuf>,
+    active_profile: Option<String>,
+    omo_diagnostics: Vec<String>,
+    omo_raw: Map<String, Value>,
 }
 
 impl Settings {
@@ -106,30 +110,99 @@ impl Settings {
     /// in [`Settings::global_path`]/[`Settings::project_path`] being `None` for that layer.
     #[must_use]
     pub fn load(cwd: &Path) -> Self {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let profile = crate::omo::active_profile_from_env();
+        let omo_global = home
+            .as_deref()
+            .and_then(|h| crate::omo::find_omo_config(&h.join(".omo")));
         let global = agent_config_path();
         let project_dir = cwd.join(".omp");
-        Self::load_from(global.as_deref(), &project_dir)
+        Self::load_from_with_omo(
+            global.as_deref(),
+            omo_global.as_deref(),
+            profile.as_deref(),
+            &project_dir,
+        )
+    }
+
+    #[must_use]
+    pub fn load_with_home(cwd: &Path, home: &Path, profile: Option<&str>) -> Self {
+        let effective_profile = profile
+            .map(ToOwned::to_owned)
+            .or_else(crate::omo::active_profile_from_env);
+        let omo_global = crate::omo::find_omo_config(&home.join(".omo"));
+        let global = agent_config_path_in_home(home);
+        let project_dir = cwd.join(".omp");
+        Self::load_from_with_omo(
+            global.as_deref(),
+            omo_global.as_deref(),
+            effective_profile.as_deref(),
+            &project_dir,
+        )
     }
 
     /// Same layering with explicit paths (used by tests and embedders).
     pub fn load_from(global_yaml: Option<&Path>, project_dir: &Path) -> Self {
+        let profile = crate::omo::active_profile_from_env();
+        if global_yaml.is_some_and(is_omo_config_path) {
+            return Self::load_from_with_omo(None, global_yaml, profile.as_deref(), project_dir);
+        }
+        Self::load_from_with_omo(global_yaml, None, profile.as_deref(), project_dir)
+    }
+
+    #[must_use]
+    pub fn load_from_with_omo(
+        global_yaml: Option<&Path>,
+        global_omo: Option<&Path>,
+        profile: Option<&str>,
+        project_dir: &Path,
+    ) -> Self {
         // Layer 1: TS defaults. Compile-time constants: parsed once per process
         // (507 YAML snippets cost ~9ms, and tools load settings on every call).
         let mut merged = defaults_layer().clone();
 
-        // Layer 2: global config.yml / config.yaml.
         let mut global_layer = Map::new();
-        let global_path = global_yaml.and_then(load_yaml_file);
-        if let Some((_, value)) = &global_path {
+        let mut omo_path = None;
+        let mut active_profile = None;
+        let mut omo_diagnostics = Vec::new();
+        let mut omo_raw = Map::new();
+
+        if let Some(omo_layer) = global_omo.and_then(|p| crate::omo::load_omo_file(p, profile)) {
+            deep_merge(&mut merged, omo_layer.translated.clone());
+            deep_merge(&mut global_layer, omo_layer.translated);
+            omo_path = Some(omo_layer.path);
+            active_profile = omo_layer.active_profile;
+            omo_diagnostics.extend(omo_layer.diagnostics);
+            omo_raw = omo_layer.raw_merged;
+        }
+
+        // Layer 2: global config.yml / config.yaml.
+        let global_yaml_loaded = global_yaml.and_then(load_yaml_file);
+        if let Some((_, value)) = &global_yaml_loaded {
             if let Some(obj) = value.as_object() {
                 deep_merge(&mut merged, obj.clone());
-                global_layer.clone_from(obj);
+                deep_merge(&mut global_layer, obj.clone());
             }
         }
+        let global_path = global_yaml_loaded
+            .map(|(p, _)| p)
+            .or_else(|| omo_path.clone());
 
         // Layer 3: project .omp/config.yml then config.yaml (later wins).
         let mut project_layer = Map::new();
         let mut project_path = None;
+        if let Some(proj_omo_file) = find_project_omo_config(project_dir) {
+            if let Some(omo_layer) = crate::omo::load_omo_file(&proj_omo_file, profile) {
+                deep_merge(&mut project_layer, omo_layer.translated.clone());
+                deep_merge(&mut merged, omo_layer.translated);
+                deep_merge(&mut omo_raw, omo_layer.raw_merged);
+                if active_profile.is_none() {
+                    active_profile = omo_layer.active_profile;
+                }
+                omo_diagnostics.extend(omo_layer.diagnostics);
+                project_path = Some(omo_layer.path);
+            }
+        }
         for name in ["config.yml", "config.yaml"] {
             let candidate = project_dir.join(name);
             if let Some((_, value)) = load_yaml_file(&candidate) {
@@ -161,8 +234,12 @@ impl Settings {
             global_layer,
             project_layer,
             env_layer,
-            global_path: global_path.map(|(p, _)| p),
+            global_path,
             project_path,
+            omo_path,
+            active_profile,
+            omo_diagnostics,
+            omo_raw,
         }
     }
 
@@ -193,15 +270,12 @@ impl Settings {
     /// Effective string-array value.
     #[must_use]
     pub fn get_string_array(&self, id: &str) -> Vec<String> {
-        self.get(id)
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(ToOwned::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.get(id).as_array().map_or_default(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                .collect()
+        })
     }
 
     /// Effective record value (`modelRoles`-style string maps).
@@ -259,24 +333,41 @@ impl Settings {
     pub fn raw(&self) -> &Map<String, Value> {
         &self.merged
     }
+
+    #[must_use]
+    pub fn omo_path(&self) -> Option<&Path> {
+        self.omo_path.as_deref()
+    }
+
+    #[must_use]
+    pub fn active_profile(&self) -> Option<&str> {
+        self.active_profile.as_deref()
+    }
+
+    #[must_use]
+    pub fn omo_diagnostics(&self) -> &[String] {
+        &self.omo_diagnostics
+    }
+
+    #[must_use]
+    pub fn omo_raw(&self) -> &Map<String, Value> {
+        &self.omo_raw
+    }
 }
 
 impl Settings {
     /// Named model presets (`modelPresets`, TS default `{}`).
     #[must_use]
     pub fn model_presets(&self) -> BTreeMap<String, ModelPreset> {
-        self.get("modelPresets")
-            .as_object()
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| {
-                        serde_json::from_value::<ModelPreset>(v.clone())
-                            .ok()
-                            .map(|preset| (k.clone(), preset))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.get("modelPresets").as_object().map_or_default(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    serde_json::from_value::<ModelPreset>(v.clone())
+                        .ok()
+                        .map(|preset| (k.clone(), preset))
+                })
+                .collect()
+        })
     }
 }
 
@@ -301,7 +392,7 @@ impl Settings {
     pub fn model_tags(&self) -> BTreeMap<String, ModelTagDef> {
         self.get("modelTags")
             .as_object()
-            .map(|obj| -> BTreeMap<String, ModelTagDef> {
+            .map_or_default(|obj| -> BTreeMap<String, ModelTagDef> {
                 obj.iter()
                     .filter_map(|(k, v)| {
                         serde_json::from_value::<ModelTagDef>(v.clone())
@@ -310,7 +401,6 @@ impl Settings {
                     })
                     .collect()
             })
-            .unwrap_or_default()
     }
 
     /// Model cycle order (TS default `["smol", "default", "slow"]`).
@@ -470,15 +560,95 @@ fn agent_dir() -> Option<PathBuf> {
     Some(root.join("agent"))
 }
 
-fn agent_config_path() -> Option<PathBuf> {
-    let agent = agent_dir()?;
-    for name in ["config.yml", "config.yaml"] {
-        let candidate = agent.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+#[must_use]
+pub fn resolve_agent_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("OMP_AGENT_DIR").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let omp_profile = std::env::var("OMP_PROFILE").ok();
+    Some(resolve_agent_dir_with_home(&home, omp_profile.as_deref()))
+}
+
+#[must_use]
+pub fn resolve_agent_dir_with_home(home: &Path, omp_profile: Option<&str>) -> PathBuf {
+    let omp_root = home.join(".omp");
+    if let Some(profile) = omp_profile.map(str::trim).filter(|s| !s.is_empty()) {
+        let profile_dir = omp_root.join("profiles").join(profile).join("agent");
+        if profile_dir.is_dir() {
+            return profile_dir;
         }
     }
-    Some(agent.join("config.yml"))
+    let primary_agent = omp_root.join("agent");
+    if primary_agent.is_dir() {
+        return primary_agent;
+    }
+    let fallback_agent = home.join(".omo").join("agent");
+    if fallback_agent.is_dir() {
+        return fallback_agent;
+    }
+    primary_agent
+}
+
+fn agent_config_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("OMP_AGENT_DIR").filter(|v| !v.is_empty()) {
+        let agent = PathBuf::from(dir);
+        for name in ["config.yml", "config.yaml"] {
+            let candidate = agent.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        return Some(agent.join("config.yml"));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    agent_config_path_in_home(&home).or_else(|| Some(agent_dir()?.join("config.yml")))
+}
+
+fn agent_config_path_in_home(home: &Path) -> Option<PathBuf> {
+    let mut dirs = Vec::new();
+    let omp_root = home.join(".omp");
+    if let Ok(profile) = std::env::var("OMP_PROFILE") {
+        let profile_dir = omp_root.join("profiles").join(profile).join("agent");
+        if profile_dir.is_dir() {
+            dirs.push(profile_dir);
+        }
+    }
+    dirs.push(omp_root.join("agent"));
+    dirs.push(home.join(".omo").join("agent").join("omp"));
+    dirs.push(home.join(".omo").join("agent"));
+    for dir in dirs {
+        for name in ["config.yml", "config.yaml"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn is_omo_config_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| {
+            crate::omo::OMO_CONFIG_FILENAMES.contains(&name)
+                || Path::new(name).extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("jsonc") || ext.eq_ignore_ascii_case("json")
+                })
+        })
+}
+
+fn find_project_omo_config(project_dir: &Path) -> Option<PathBuf> {
+    if let Some(found) = crate::omo::find_omo_config(project_dir) {
+        return Some(found);
+    }
+    if project_dir.file_name().is_some_and(|n| n == ".omp") {
+        if let Some(parent) = project_dir.parent() {
+            return crate::omo::find_omo_config(&parent.join(".omo"));
+        }
+    }
+    None
 }
 
 /// The TS-defaults layer: every `default_yaml` parsed and nested by id.

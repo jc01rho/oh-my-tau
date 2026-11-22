@@ -1894,6 +1894,13 @@ impl Runtime {
                 .flatten();
             injected = hook(message.to_string(), images_json).await;
         }
+        if crate::sysprompt::contains_ultrawork(message) {
+            let current = self.agent.system_prompt().await;
+            let updated = crate::sysprompt::apply_ultrawork_hook(message, &current);
+            if updated != current {
+                self.agent.set_system_prompt(updated).await;
+            }
+        }
         let notices = self.prompt_notices(message, true).await;
         let input = prompt_input(message, images, notices, injected);
         let pua = self.agent.prompt_until_accepted(input).await;

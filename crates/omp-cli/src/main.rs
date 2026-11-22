@@ -402,6 +402,7 @@ async fn async_main() -> Result<()> {
         compact_prompt: args.compact_prompt,
         model: args.model.clone().unwrap_or_default(),
         generated_append: Vec::new(),
+        prompt: args.prompt.clone(),
     };
     if args.dump_system_prompt {
         let metas: Vec<sysprompt::ToolMeta> = tools::session_builtin_tools(
