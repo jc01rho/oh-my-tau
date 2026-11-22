@@ -27,13 +27,15 @@ Copyright (c) 2026 Stencil Labs, Inc.).
 
 `omp-utok` embeds zstd-compressed rank tables derived from public tokenizer
 files: OpenAI tiktoken `o200k_base` / `cl100k_base` (MIT, openai/tiktoken), the
-Qwen3.8 `tokenizer.json` (Apache-2.0, Qwen), DeepSeek V3/V4 `tokenizer.json`
+Qwen3.8 `tokenizer.json` (Apache-2.0, Alibaba Cloud; license text in
+`vendor/omp-utok/data/LICENSE-Qwen.Apache-2.0`), DeepSeek V3/V4 `tokenizer.json`
 (MIT, deepseek-ai), Kimi K2 `tiktoken.model` (Modified MIT, moonshotai) and the
 GLM-5 `tokenizer.json` (MIT, zai-org), plus the measured Claude vocabularies of
 [sanderland/ctok](https://github.com/sanderland/ctok) v1.0.0 (MIT, see
 `vendor/omp-utok/data/LICENSE.ctok`). Packing formats and sources:
 [`vendor/omp-utok/data/README.md`](vendor/omp-utok/data/README.md) and
-`families.json` next to it.
+`families.json` next to it. Release builds ship these license texts next to the
+binaries as `THIRD-PARTY-NOTICES.txt`.
 
 Per-crate notices:
 

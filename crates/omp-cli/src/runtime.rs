@@ -3224,20 +3224,18 @@ impl Runtime {
         })
     }
 
-    fn live_window(&self) -> u64 {
+    /// Window and tokenizer family (`Model::resolved_tokenizer`, `None` when unknown) of the
+    /// live model, read from one target snapshot so a concurrent model switch cannot pair one
+    /// model's window with another's tokenizer.
+    fn live_window_and_tokenizer(&self) -> (u64, Option<pa_types::ai::ModelTokenizer>) {
         self.target
             .read()
             .ok()
-            .and_then(|t| t.as_ref().map(|t| t.model.context_window))
-            .unwrap_or(0)
-    }
-
-    /// Tokenizer family of the live model (`Model::resolved_tokenizer`); `None` when unknown.
-    fn live_tokenizer(&self) -> Option<pa_types::ai::ModelTokenizer> {
-        self.target
-            .read()
-            .ok()
-            .and_then(|t| t.as_ref().and_then(|t| t.model.resolved_tokenizer()))
+            .and_then(|t| {
+                t.as_ref()
+                    .map(|t| (t.model.context_window, t.model.resolved_tokenizer()))
+            })
+            .unwrap_or((0, None))
     }
 
     /// rpc `compact`: summarize the older history into a `compaction` entry and swap the agent's
@@ -3384,6 +3382,7 @@ impl Runtime {
             )
         };
         let settings = lock(&self.compaction).clone();
+        let (window, tokenizer) = self.live_window_and_tokenizer();
         let hooks = lock(&self.compaction_hooks).clone();
         // Handoff builds its own oneshot context from the live prompt + history
         // (`SessionHandoff.generateDocument`), so it is assembled here, before the
@@ -3420,8 +3419,8 @@ impl Runtime {
         let params = crate::compact::CompactParams {
             settings: &settings,
             model_id: &model_id,
-            context_window: Some(self.live_window()).filter(|w| *w > 0),
-            tokenizer: self.live_tokenizer(),
+            context_window: Some(window).filter(|w| *w > 0),
+            tokenizer,
             custom_instructions,
             method: mode,
             handoff: handoff_context.as_ref(),
@@ -3490,11 +3489,11 @@ impl Runtime {
     async fn auto_compaction_due(&self) -> bool {
         let mut settings = lock(&self.compaction).clone();
         settings.enabled = true;
-        let window = self.live_window();
+        let (window, tokenizer) = self.live_window_and_tokenizer();
         if !settings.enabled || window == 0 {
             return false;
         }
-        let tokenizer = omp_compact::FamilyTokenizer::new(self.live_tokenizer());
+        let tokenizer = omp_compact::FamilyTokenizer::new(tokenizer);
         // Read the live context in place (no snapshot copy of the messages).
         let mut usage = None;
         let mut stored = 0;
