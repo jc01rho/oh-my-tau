@@ -196,6 +196,44 @@ pub struct Runtime {
     title_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// The session journal as the experimental context tools see it
+/// (`tools::context_notes::ContextNotesHost`): the runtime owns the notebook.
+impl crate::tools::context_notes::ContextNotesHost for Runtime {
+    fn context_state(&self) -> crate::tools::context_notes::ContextState {
+        if !self.experimental_context_enabled() {
+            return crate::tools::context_notes::ContextState::Disabled;
+        }
+        // `--no-session` (and every other unjournaled runtime) owns no branch to
+        // write a notebook entry into.
+        if self.persist.file().is_none() {
+            return crate::tools::context_notes::ContextState::NotOwned;
+        }
+        crate::tools::context_notes::ContextState::Ready
+    }
+
+    fn session_id(&self) -> String {
+        self.persist.session_id()
+    }
+
+    fn branch(&self) -> Vec<Value> {
+        self.branch_entries()
+    }
+
+    fn append_custom_entry(&self, custom_type: &str, data: Value) -> Result<String> {
+        self.persist.append_entry(
+            "custom",
+            serde_json::json!({ "customType": custom_type, "data": data }),
+        )?;
+        Ok(self
+            .branch_entries()
+            .last()
+            .and_then(|entry| entry.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned())
+    }
+}
+
 /// Sink for applied session-name changes (the ext bridge's `set_session_name`).
 pub type NameListener = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -537,6 +575,66 @@ impl Runtime {
     /// attach point (start, `new_session`, `load_session`, fork/branch).
     pub fn publish_session_file(&self) {
         omp_urls::set_global_session_file(self.persist.file());
+        // Session-scoped prompt inputs travel with the session: the rulebook
+        // behind `rule://` and the project memory book behind `memory://`.
+        crate::sysprompt::install_active_rules(&self.cwd);
+        self.publish_memory_urls();
+    }
+
+    /// Publish the `memory://` book for this session's project when
+    /// `memory.backend` selects a live engine; clear it otherwise so a stale
+    /// session cannot leak records into the next one.
+    fn publish_memory_urls(&self) {
+        use omp_urls::schemes::memory as memory_scheme;
+        let settings = omp_settings::Settings::load(&self.cwd);
+        let backend = settings
+            .get_string("memory.backend")
+            .and_then(|id| omp_memory::MemoryBackend::parse(&id))
+            .unwrap_or(omp_memory::MemoryBackend::Off);
+        if backend == omp_memory::MemoryBackend::Off {
+            memory_scheme::set_memory_records(Vec::new());
+            return;
+        }
+        let input = omp_memory::runtime::RuntimeStart {
+            session_id: self.persist.session_id(),
+            data_dir: omp_providers::AgentDir::default().0.join("memory"),
+            workspace_root: self.cwd.clone(),
+            canonical_primary_root: None,
+            backend,
+            mnemopi: omp_memory::MnemopiSettings::default(),
+        };
+        let Ok(runtime) = omp_memory::MemoryRuntime::start(input) else {
+            memory_scheme::set_memory_records(Vec::new());
+            return;
+        };
+        let mut records = Vec::new();
+        for bank in runtime.status().recall_banks {
+            let Ok(omp_memory::runtime::MemoryProjection::Bank { records: rows, .. }) = runtime
+                .projection(
+                    &format!("root/{}", bank.as_str()),
+                    256,
+                    omp_memory::runtime::MAX_PROJECTION_BYTES,
+                )
+            else {
+                continue;
+            };
+            records.extend(rows.into_iter().map(|row| memory_scheme::MemoryRecord {
+                id: row.id,
+                bank: row.bank.as_str().to_owned(),
+                store: row.tier.as_str().to_owned(),
+                content: row.content,
+                memory_type: Some(row.memory_type),
+                source: row.source,
+                timestamp: Some(row.timestamp),
+                created_at: None,
+                importance: Some(row.importance),
+                veracity: Some(row.veracity),
+                session_id: Some(row.session_id),
+                metadata: Some(row.metadata),
+                immutable: row.tier == omp_memory::store::MemoryTier::Fact,
+            }));
+        }
+        memory_scheme::set_memory_records(records);
     }
 
     /// Session preamble omp writes: `model_change` then `thinking_level_change`.
@@ -753,11 +851,60 @@ impl Runtime {
         }
     }
 
+    /// `compaction.experimentalContextManagement`: the opt-in experimental
+    /// context surface (notebook tools + rollover) is live.
+    fn experimental_context_enabled(&self) -> bool {
+        omp_settings::Settings::load(&self.cwd)
+            .get_bool("compaction.experimentalContextManagement")
+            .unwrap_or(false)
+    }
+
+    /// A settled `new_context` result asks for a fresh context window after this
+    /// turn (`tools::context_rollover`): commit the rollover-only compaction
+    /// entry. No summarizer runs — the notebook (`context_notes`) carries the
+    /// state, and the entry's `details.kind` marks it as a rollover so the
+    /// journal reader re-injects the notebook instead of a summary.
+    fn on_new_context_request(&self) {
+        if !self.experimental_context_enabled() {
+            return;
+        }
+        let branch = self.branch_entries();
+        // `prepareCompaction`'s first-kept choice: the newest message entry.
+        let first_kept = branch
+            .iter()
+            .rev()
+            .find(|entry| entry.get("type").and_then(Value::as_str) == Some("message"))
+            .and_then(|entry| entry.get("id"))
+            .and_then(Value::as_str);
+        // The rollover carries no summarizer input, so the pre-rollover token
+        // count is journal metadata only; the last assistant usage is the
+        // cheapest honest number and 0 stands in when the turn has none.
+        let tokens_before = branch
+            .iter()
+            .rev()
+            .find(|entry| entry.get("type").and_then(Value::as_str) == Some("message"))
+            .and_then(|entry| entry.get("message"))
+            .and_then(|message| message.get("usage"))
+            .and_then(|usage| usage.get("contextTokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let compaction = crate::tools::context_rollover::rollover_compaction(first_kept, tokens_before);
+        let _ = self
+            .persist
+            .append_entry("compaction", compaction.to_entry_payload());
+    }
+
     /// TS `AgentSession`'s checkpoint toolResult leg of `#checkpointActiveReminderFor`:
     /// arm the shared checkpoint state with the message count AFTER the
     /// checkpoint tool result is appended (async: the listener runs sync while
     /// the agent holds its state lock, so the count is read on a task).
     fn on_tool_result_settled(&self, tr: &pa_agent::types::ToolResultMessage) {
+        if tr.tool_name == "new_context" {
+            if !tr.is_error {
+                self.on_new_context_request();
+            }
+            return;
+        }
         if tr.is_error {
             return;
         }
@@ -3029,6 +3176,51 @@ impl Runtime {
         )))
     }
 
+    /// The handoff oneshot context (`SessionHandoff.generateDocument`): the base
+    /// system prompt, the transformed history and `render_handoff_prompt` as the
+    /// trailing agent-attributed user message. Tools stay on the context so the
+    /// request shape matches a live turn (`toolChoice: none` is the completer's job).
+    async fn handoff_context(
+        &self,
+        focus: Option<&str>,
+    ) -> Result<pa_types::ai::Context, CmdError> {
+        let (status, _) = self.agent.status().await;
+        let messages = self.agent.messages_snapshot().await.into_vec();
+        // Same converter the live loop uses (developer/custom-role handling included),
+        // then across the wire shape the provider `Context` carries.
+        let converted = crate::agent::convert_to_llm()(messages)
+            .await
+            .map_err(|e| CmdError::new(format!("handoff context: {e:#}")))?;
+        let mut converted = converted
+            .into_iter()
+            .map(|m| {
+                json_round_trip(&m)
+                    .ok_or_else(|| CmdError::new("handoff context: message did not convert"))
+            })
+            .collect::<Result<Vec<pa_types::ai::Message>, CmdError>>()?;
+        converted.push(pa_types::ai::Message::User(pa_types::ai::UserMessage {
+            content: pa_types::ai::UserContent::Text(omp_compact::handoff::render_handoff_prompt(
+                focus,
+            )),
+            timestamp: pa_agent::now_ms().cast_unsigned(),
+            rest: serde_json::Map::default(),
+        }));
+        let tools: Vec<pa_types::ai::Tool> = status
+            .tools
+            .iter()
+            .map(|t| pa_types::ai::Tool {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters().clone(),
+            })
+            .collect();
+        Ok(pa_types::ai::Context {
+            system_prompt: Some(status.system_prompt),
+            messages: converted,
+            tools: Some(tools),
+        })
+    }
+
     fn live_window(&self) -> u64 {
         self.target
             .read()
@@ -3040,6 +3232,9 @@ impl Runtime {
     /// rpc `compact`: summarize the older history into a `compaction` entry and swap the agent's
     /// messages for the rebuilt context. Returns the `CompactionResult` the response carries.
     ///
+    /// `mode` selects the lane: `None`/`Some("soft")` is the local summary,
+    /// `Some("handoff")` the handoff document lane (see `handoff_context`).
+    ///
     /// A live turn is aborted first and, once the summary commits, resumed (TS
     /// `SessionMaintenance.compact` → `#scheduleInterruptedTurnResume`): queued
     /// messages drive the resume, otherwise the hidden auto-continue prompt does.
@@ -3048,6 +3243,7 @@ impl Runtime {
     pub async fn compact(
         self: &Arc<Self>,
         custom_instructions: Option<&str>,
+        mode: Option<&str>,
     ) -> Result<Value, CmdError> {
         use std::sync::atomic::Ordering::SeqCst;
         if self.compacting.swap(true, SeqCst) {
@@ -3073,7 +3269,7 @@ impl Runtime {
                 })
                 .await;
         }
-        let out = self.compact_inner(custom_instructions).await;
+        let out = self.compact_inner(custom_instructions, mode).await;
         self.compacting.store(false, SeqCst);
         // Release prompts parked in `cancel_compaction_and_wait`.
         self.compaction_done.notify_waiters();
@@ -3139,14 +3335,18 @@ impl Runtime {
     /// start, the commit proceeds only while the session, the switch
     /// generation, the navigation state and the journal tip are unchanged;
     /// Esc / a queued prompt cancel it outright (bug-hunt #2).
-    async fn compact_inner(&self, custom_instructions: Option<&str>) -> Result<Value, CmdError> {
+    async fn compact_inner(
+        &self,
+        custom_instructions: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<Value, CmdError> {
         let guard = Arc::new(crate::compact::CommitGuard::capture(
             &self.persist,
             Arc::clone(&self.switch_generation),
         )?);
         *lock(&self.compaction_guard) = Some(Arc::clone(&guard));
         let out = self
-            .compact_inner_guarded(custom_instructions, &guard)
+            .compact_inner_guarded(custom_instructions, mode, &guard)
             .await;
         *lock(&self.compaction_guard) = None;
         out
@@ -3155,6 +3355,7 @@ impl Runtime {
     async fn compact_inner_guarded(
         &self,
         custom_instructions: Option<&str>,
+        mode: Option<&str>,
         guard: &crate::compact::CommitGuard,
     ) -> Result<Value, CmdError> {
         let trace = std::env::var_os("OMP_RS_TURN_TRACE").is_some();
@@ -3173,6 +3374,14 @@ impl Runtime {
         };
         let settings = lock(&self.compaction).clone();
         let hooks = lock(&self.compaction_hooks).clone();
+        // Handoff builds its own oneshot context from the live prompt + history
+        // (`SessionHandoff.generateDocument`), so it is assembled here, before the
+        // summarization peak, and released right after the pass.
+        let handoff_context = if mode == Some("handoff") {
+            Some(self.handoff_context(custom_instructions).await?)
+        } else {
+            None
+        };
         // The branch extensions see matches what the pass will summarize: the
         // writer's live append point, not the file-order tail (bug-hunt #4).
         let nav_leaf = self.persist.leaf_divergence();
@@ -3202,6 +3411,8 @@ impl Runtime {
             model_id: &model_id,
             context_window: Some(self.live_window()).filter(|w| *w > 0),
             custom_instructions,
+            method: mode,
+            handoff: handoff_context.as_ref(),
             non_message_tokens,
             hook: bridge
                 .as_ref()
@@ -3305,7 +3516,7 @@ impl Runtime {
         self.emit_event(
             json!({"type": "auto_compaction_start", "reason": "threshold", "action": ACTION}),
         );
-        let end = match self.compact_inner(None).await {
+        let end = match self.compact_inner(None, None).await {
             Ok(result) => {
                 json!({"type": "auto_compaction_end", "action": ACTION, "result": result, "aborted": false, "willRetry": false})
             }
@@ -5777,7 +5988,7 @@ mod compaction_guard_tests {
         h.rt.set_compaction_settings(small_keep());
 
         let rt2 = Arc::clone(&h.rt);
-        let compact = tokio::spawn(async move { rt2.compact(None).await });
+        let compact = tokio::spawn(async move { rt2.compact(None, None).await });
         tokio::time::timeout(Duration::from_secs(30), async {
             while !*entered.borrow_and_update() {
                 entered.changed().await.expect("gate");
@@ -5855,7 +6066,7 @@ mod compaction_guard_tests {
         .await
         .expect("turn in flight");
 
-        h.rt.compact(None).await.expect("compaction commits");
+        h.rt.compact(None, None).await.expect("compaction commits");
 
         let mut frames = Vec::new();
         let resumed = tokio::time::timeout(Duration::from_secs(30), async {
@@ -5920,7 +6131,7 @@ mod compaction_guard_tests {
         })
         .await
         .expect("turn in flight");
-        let err = h.rt.compact(None).await.expect_err("too small");
+        let err = h.rt.compact(None, None).await.expect_err("too small");
         assert!(
             err.message.starts_with("Nothing to compact"),
             "{}",
@@ -5993,7 +6204,7 @@ mod compaction_guard_tests {
         h.rt.set_compaction_settings(small_keep());
 
         let rt2 = Arc::clone(&h.rt);
-        let compact = tokio::spawn(async move { rt2.compact(None).await });
+        let compact = tokio::spawn(async move { rt2.compact(None, None).await });
         tokio::time::timeout(Duration::from_secs(30), async {
             while !*entered.borrow_and_update() {
                 entered.changed().await.expect("gate");

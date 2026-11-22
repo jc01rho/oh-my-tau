@@ -961,7 +961,7 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
         }
         "compact" => {
             let custom = cmd.get("customInstructions").and_then(Value::as_str);
-            Ok(Some(rt.compact(custom).await?))
+            Ok(Some(rt.compact(custom, None).await?))
         }
         "set_auto_compaction" => {
             let enabled = bool_field(cmd, "enabled")?;
@@ -1025,7 +1025,10 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
                     "Cannot hand off while a response is in progress",
                 ));
             }
-            Err(unsupported("Handoff"))
+            let custom = cmd.get("customInstructions").and_then(Value::as_str);
+            rt.compact(custom, Some("handoff")).await?;
+            // TS `rpc-mode.ts`: `success(id, "handoff", {})` — an empty object, not null.
+            ok(json!({}))
         }
         "get_messages" => ok(json!({"messages": rt.messages().await})),
         "get_messages_page" => {

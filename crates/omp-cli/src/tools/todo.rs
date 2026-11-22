@@ -1,7 +1,9 @@
 //! `todo`: structured task phases for tracking progress within a session.
-//! Port of omp `tools/todo.ts`: the ops (init/start/done/drop/rm/block/
-//! unblock/append/view), the in-progress normalization, completion
-//! transitions and the summary text the model reads back.
+//! Port of omp `tools/todo.ts`: the ops (init/start/done/drop/rm/append/view),
+//! the in-progress normalization, completion transitions and the summary text
+//! the model reads back. `block`/`unblock` (with the optional `reason` note) are
+//! a runtime-only extension: accepted on the wire, never advertised in the
+//! schema, which stays byte-equal to omp's `todoSchema`.
 //!
 //! State: the phases of the last successful state-changing call. Like TS, a
 //! successful call's `details.phases` is the durable snapshot (the runtime
@@ -22,7 +24,7 @@ use pa_agent::BoxFut;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-const DESCRIPTION: &str = "`todo` NEVER takes a turn of its own: emit it in the same response as your next real tool call (parallel tool calls), `init` beside the first read or action, `done`/`start` beside the next action or check. A response whose only call is `todo` wastes a full model round trip.\nTasks identified by verbatim content, NEVER generated IDs (task-1). Unique, stable task/phase names; lost text: view, NEVER guess.\nBefore work, init for 3+ steps, requested task sets, or new instructions. MUST list EVERY user item separately (phased/numbered/bulleted/N); NEVER omit or remember leftovers.\nAfter successful mutation: no active means earliest pending starts (phase order); multiple active means only earliest stays. Blocked NEVER starts automatically; unblock returns pending. Done out of order may rewind pointer but NEVER reopen completed. Mark done immediately; follow phase order.\nExternal waits (user/agent/service): block with optional reason suppresses stop reminder, starts next pending. Unblock when actionable; append a clearing task for agent-actionable blocker.\nNEVER call todo alone: init with first work; done/start with next action.";
+const DESCRIPTION: &str = "`todo` NEVER takes a turn of its own: emit it in the same response as your next real tool call (parallel tool calls), `init` beside the first read or action, `done`/`start` beside the next action or check. A response whose only call is `todo` wastes a full model round trip.\nTasks identified by verbatim content, NEVER generated IDs (task-1). Unique, stable task/phase names; lost text: view, NEVER guess.\n`append` requires `items`; omitted `phase` uses the in-progress task's phase, else the first pending task's phase, else the last phase, else a new `Tasks` phase. Supply `phase` to target another phase; an empty name is invalid.\nBefore work, init for 3+ steps, requested task sets, or new instructions. MUST list EVERY user item separately (phased/numbered/bulleted/N); NEVER omit or remember leftovers.\nAfter successful mutation: no active means earliest pending starts (phase order); multiple active means only earliest stays. Done out of order may rewind pointer but NEVER reopen completed. Mark done immediately; follow phase order.";
 
 /// Default phase name for a flat `items` init (omp `DEFAULT_INIT_PHASE`).
 const DEFAULT_INIT_PHASE: &str = "Tasks";
@@ -937,19 +939,21 @@ pub fn tool() -> Arc<dyn AgentTool> {
     Arc::new(TodoTool::with_phases(Vec::new()))
 }
 
-/// Parameter schema, byte-equal (as JSON) to omp's `todoSchema`.
+/// Parameter schema, byte-equal (as JSON) to omp's `todoSchema`. The `block` /
+/// `unblock` ops and the `reason` note are runtime-only extensions: [`Op`] and
+/// [`Entry`] still deserialize them, but the advertised enum and property list
+/// stay exactly the reference's seven ops and five properties.
 #[must_use]
 pub fn schema() -> Value {
     json!({"type":"object","properties":{
-        "op":{"type":"string","enum":["init","start","done","rm","drop","block","unblock","append","view"]},
+        "op":{"type":"string","enum":["init","start","done","rm","drop","append","view"]},
         "list":{"type":"array","description":"phases for init","items":{"type":"object","properties":{
             "phase":{"type":"string"},
             "items":{"type":"array","items":{"type":"string"},"minItems":1}
         },"required":["phase","items"]}},
         "task":{"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"verbatim task content; array targets several (not start)"},
         "phase":{"type":"string"},
-        "items":{"type":"array","description":"tasks for flat init or append","items":{"type":"string"}},
-        "reason":{"type":"string","description":"block reason"}
+        "items":{"type":"array","description":"tasks for flat init or append","items":{"type":"string"}}
     },"required":["op"]})
 }
 #[cfg(test)]
@@ -1150,7 +1154,12 @@ mod tests {
     fn schema_matches_ts_shape() {
         let s = schema();
         assert_eq!(s["required"], json!(["op"]));
-        assert_eq!(s["properties"]["op"]["enum"].as_array().unwrap().len(), 9);
+        // omp `todoSchema`: seven ops; `block`/`unblock` are runtime-only.
+        assert_eq!(
+            s["properties"]["op"]["enum"],
+            json!(["init", "start", "done", "rm", "drop", "append", "view"])
+        );
+        assert!(s["properties"].get("reason").is_none());
         assert_eq!(
             s["properties"]["task"]["description"],
             json!("verbatim task content; array targets several (not start)")

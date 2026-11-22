@@ -17,14 +17,29 @@ pub(crate) mod eval_journal;
 mod find;
 mod jobs;
 pub mod mcp;
+pub(crate) mod aliases;
+pub(crate) mod browser_prelude;
+pub(crate) mod computer_prelude;
+pub(crate) mod context_notes;
+pub(crate) mod context_rollover;
+pub(crate) mod debug;
+pub(crate) mod github;
+pub(crate) mod github_cache;
+pub(crate) mod image_gen;
+pub(crate) mod memory_tools;
 mod read;
+pub(crate) mod read_fetch;
+pub(crate) mod read_formats;
 pub(crate) mod relevance;
 pub(crate) mod rlm;
 pub(crate) mod rlm_combinators;
 mod search;
+pub(crate) mod security_scan;
 pub mod shell_host;
 mod task;
 mod todo;
+pub(crate) mod tts;
+pub(crate) mod vibe;
 pub mod wasm;
 pub use todo::{phases_from_entries, TodoPhase, TodoTool};
 #[cfg(test)]
@@ -250,7 +265,7 @@ impl AgentTool for FnTool {
 
 const READ_DESCRIPTION: &str = "Use `read` for static web; browser only if needed.\n\nPath suffixes: :50 or :50- starts at line 50; :50-200 inclusive; :50+150 counts lines; :-60 last 60; commas join ranges (:5-16,960-973) or individual lines (:19,59). :raw verbatim without anchors/prefixes; combine :2-4:raw or :raw:2-4.\n\nSources:\n- Selected file: `[foo.ts#1A2B]` snapshot+lines. Copy `[FILENAME#TAG]` for anchored edits; NEVER invent tag.\n- Directory: complete root; child listings cap at 12 (`… N more`), read child; page via :N-M/:-N.";
 const BASH_DESCRIPTION: &str = "Persistent shell: one fact command/pipeline; dependencies use `&&`.\nScripts/heredocs/`$(…)`/complex pipelines → `eval`.\n`cwd`, not `cd`; `pty` only interactive.\nInternal URIs work as paths for builtins/coreutils, redirects, globs.\n`async` defers finite results but keeps the deadline (default 300s); `timeout: 0` for watchers and long jobs.\nNo `head`/`tail`/redirection; output trunc by default, full result at `artifact://<id>`.\nLong-lived services: unique name; ready requires name; no async/timeout; pty defaults true. ready needs log regex or port (both if given); host defaults 127.0.0.1, ready.timeout 30s.\nBackground results auto-deliver.";
-const GLOB_DESCRIPTION: &str = "Glob files/dirs: `;`-separated paths or internal URLs (`local://*.md`, `omp://**/*.md`); default workspace root.\n`gitignore` and `hidden` default true; ignored dotfiles need `gitignore: false`. Newest-first by directory; dirs end `/`.";
+const GLOB_DESCRIPTION: &str = "Glob files/dirs: `;`-separated paths or internal URLs (local://*.md, omp://**/*.md); default workspace root.\n`gitignore` and `hidden` default true; ignored dotfiles need `gitignore: false`. Newest-first by directory; dirs end `/`.\nBehavior search → `find`.";
 const GREP_DESCRIPTION: &str = "Regex: Rust, then PCRE2. `path`: `;`-separated file/dir/glob/URL; default `.`. Default case-sensitive, gitignore respected; `skip` paginates files.\nFile-only selector: `src/foo.ts:50-100`. Literal `\\n`/`\\\\n` enables cross-line.\nBare glob `*.ts` matches any depth; `dir/*.ts` only `dir`'s direct children (`dir/**/*.ts` recurses).";
 const WRITE_DESCRIPTION: &str = "SHOULD `edit` existing files; `write` for required new files or whole-file replacement. NEVER create docs or emojis unless requested.";
 const FIND_DESCRIPTION: &str = "Describe behavior, get implementing files and line ranges. MUST use first for unknown locations; known strings/regex/symbols → `grep`, names → `glob`.\n`query`: plain language, not regex; quoted phrases match whole. `grep_keywords`: likely verbatim terms, `[]` if unsure.\n`path`: one directory or file, host path or internal URL (`omp://`, `omp://<file>.md`, `skill://<name>`, `local://…`); omitted = workspace root. Scope known subsystem; batch related questions. Searches live files, no index; no `:start-end` selector (judges whole files).\nHits strongest first: `path:start-end score snippet` (workspace-relative, or URL under URL scope); read returned ranges. Scores: absolute comparable 0–1 probability; below ~0.4 = weak evidence, so widen query or use `grep` before concluding absence.";
@@ -354,7 +369,11 @@ pub fn builtin_tools_with_env_and_jobs(
         mk(
             "glob",
             GLOB_DESCRIPTION.to_string(),
-            json!({"type":"object","properties":{"path":{"type":"string"},"hidden":{"type":"boolean"},"gitignore":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200}},"additionalProperties":false}),
+            // Golden `findSchema` exactly: four properties, no `required`, no
+            // `additionalProperties`. The reference's fifth accepted key
+            // `pattern` (`GLOB_ARGUMENTS`) is read by `search::glob` as a
+            // runtime-only extension, so it is not advertised here.
+            json!({"type":"object","properties":{"path":{"type":"string"},"hidden":{"type":"boolean"},"gitignore":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200}}}),
             Arc::new(|env, args, signal| Box::pin(search::glob(env, args, signal))),
         ),
         mk(
@@ -407,34 +426,122 @@ pub fn builtin_tools_with_env_and_jobs(
         lsp::tool(env.clone()),
         checkpoint::checkpoint_tool(),
         checkpoint::rewind_tool(),
+        // Own AgentTool (DAP sessions, per-action tiers), not a `FnTool`.
+        debug::tool(env.clone()),
+        // Bound to the session cwd; gated off by default (`github.enabled`).
+        github::tool(cwd.to_path_buf()),
+        // Gated off by default (`speechgen.enabled`).
+        tts::tool(env.clone()),
     ];
     env.set_dyn_tools(&tools);
     (env, tools)
 }
 
-/// TS `isToolAllowed` setting gates for the plain built-ins: a tool whose
-/// `<id>.enabled` setting is off is not advertised (`astGrep`/`checkpoint`
-/// default off, the rest on). `find.enabled` is an enum: `off` hides it;
-/// `auto` stays on (TS narrows `auto` to native-judge models).
+/// TS `isToolAllowed` setting gates (`tools/index.ts`), one explicit arm per
+/// gated name — the same 22-name table, in the reference's order. `debug`,
+/// `github` and `tts` are gated for real now that they are in the builtin
+/// table. The remaining arms (`security_scan`, `context_notes`, `new_context`,
+/// `memory_edit`, `retain`, `recall`, `reflect`, `learn`, `manage_skill`) are
+/// kept so the table is complete and their gates go live with the tool, and are
+/// marked *inert* below: each needs a session-owned backend or host
+/// (`SecurityScanBackend`, `ContextNotesHost`, `MemoryToolBackend`) that this
+/// registry does not own, so the tool cannot be constructed here yet.
+///
+/// Every other name returns `true`: the reference's `return true` fallthrough for
+/// tools with no gate (`read`, `write`, `ast_grep`'s sibling rules, `yield`, ...).
+///
+/// Legs the reference evaluates against session state rather than settings cannot
+/// be expressed here and are noted per arm: `taskDepth` (`checkpoint`/`rewind`,
+/// `manage_skill`/`learn`), `requestedTools` (`restrictToolNames` for `goal`),
+/// `prewalkArmed` (`todo`), `isFindEnabled`'s native-judge detection (`find`),
+/// `allowEval`'s backend probe (`eval`), and `think`'s model support (applied by
+/// [`hidden_tools`]).
 #[must_use]
+#[allow(clippy::too_many_lines)] // one arm per reference gate, kept in table order
 pub fn enabled_by_settings(settings: &omp_settings::Settings, name: &str) -> bool {
-    if name == "find" {
-        return settings.get_string("find.enabled").as_deref() != Some("off");
+    // Setting defaults come from the ported TS defaults layer, so `unwrap_or`
+    // only fires for an unset key; the values here mirror `isToolAllowed`.
+    let flag = |id: &str, default: bool| settings.get_bool(id).unwrap_or(default);
+    let string = |id: &str| settings.get_string(id);
+    match name {
+        // `goal.enabled` and no goal record / enabled / dropped goal. The
+        // `restrictToolNames` and goal-state legs need session state.
+        "goal" => flag("goal.enabled", true),
+        // `enableLsp && lsp.enabled`; `enableLsp` is the host's LSP availability.
+        "lsp" => flag("lsp.enabled", true),
+        // `edit.mode === "none"` hides `edit`. The ported `edit.mode` enum has no
+        // `none` member yet, so this stays true until one is added; the arm keeps
+        // the gate in place rather than silently dropping it.
+        "edit" => string("edit.mode").as_deref() != Some("none"),
+        // `editDisabled || bash.enabled`: without an edit tool, bash is the only
+        // way to modify existing files, so it stays on.
+        "bash" => {
+            string("edit.mode").as_deref() == Some("none") || flag("bash.enabled", true)
+        }
+        // `allowEval`: any eval backend reachable. The port always has one, so
+        // this is the reference's truthy branch.
+        "eval" => true,
+        // `debug.enabled`; on by default, so the arm only hides `debug` when the
+        // setting is off.
+        "debug" => flag("debug.enabled", true),
+        // `(!includeYield || prewalkArmed) && todo.enabled`: the prewalk leg needs
+        // session state, so the setting is the whole gate here.
+        "todo" => flag("todo.enabled", true),
+        "glob" => flag("glob.enabled", true),
+        "grep" => flag("grep.enabled", true),
+        // `isFindEnabled`: `off` hides it; `auto` stays on (TS narrows `auto` to
+        // native-judge models, which this host does not detect).
+        "find" => string("find.enabled").as_deref() != Some("off"),
+        // `github.enabled`; off by default (the `gh`/`glab` CLI must be present).
+        "github" => flag("github.enabled", false),
+        "ast_grep" => flag("astGrep.enabled", false),
+        "ast_edit" => flag("astEdit.enabled", true),
+        "web_search" => flag("web_search.enabled", true),
+        // Inert until the security-scan mode controller lands (the tool needs a
+        // session `SecurityScanBackend`).
+        "security_scan" => flag("security.enabled", false),
+        // `externalThinkingActive`: the setting half lives here; the model-support
+        // half is [`hidden_tools`]'s `supports_external_thinking` check.
+        "think" => flag("externalThinking", false),
+        // `speechgen.enabled`; off by default.
+        "tts" => flag("speechgen.enabled", false),
+        "ask" => flag("ask.enabled", true),
+        // Inert until the context-management tools land (they need the session
+        // journal as a `ContextNotesHost`).
+        "context_notes" | "new_context" => {
+            flag("compaction.experimentalContextManagement", false)
+        }
+        // `checkpoint.enabled && (taskDepth == 0 || requestedTools !== undefined)`;
+        // the depth leg needs session state, so the setting is the gate here.
+        "checkpoint" | "rewind" => flag("checkpoint.enabled", false),
+        // `async || (enableIrc !== false && isIrcEnabled) || launch.enabled`. This
+        // port has no IRC/peer bus (see `docs/parity/tools.md` §4), so the IRC leg
+        // is the reference's always-false branch and the two settings decide.
+        "wait" => flag("async.enabled", true) || flag("launch.enabled", true),
+        // Inert until a session `MemoryToolBackend` is supplied.
+        "retain" | "recall" | "reflect" => matches!(
+            string("memory.backend").as_deref(),
+            Some("hindsight" | "mnemopi")
+        ),
+        "memory_edit" => string("memory.backend").as_deref() == Some("mnemopi"),
+        // Inert until the autolearn tools land; the depth/requested legs need
+        // session state.
+        "manage_skill" => flag("autolearn.enabled", false),
+        "learn" => {
+            flag("autolearn.enabled", false)
+                && matches!(
+                    string("memory.backend").as_deref(),
+                    Some("hindsight" | "mnemopi" | "local")
+                )
+        }
+        // `canSpawnAtDepth(task.maxRecursionDepth, taskDepth)`: a non-positive
+        // ceiling disables spawning everywhere (the depth leg is session state).
+        "task" => settings
+            .get_number("task.maxRecursionDepth")
+            .unwrap_or(2.0)
+            > 0.0,
+        _ => true,
     }
-    let id = match name {
-        "bash" => "bash.enabled",
-        "glob" => "glob.enabled",
-        "grep" => "grep.enabled",
-        "ast_grep" => "astGrep.enabled",
-        "ast_edit" => "astEdit.enabled",
-        "ask" => "ask.enabled",
-        "todo" => "todo.enabled",
-        "web_search" => "web_search.enabled",
-        "lsp" => "lsp.enabled",
-        "checkpoint" | "rewind" => "checkpoint.enabled",
-        _ => return true,
-    };
-    settings.get_bool(id).unwrap_or(true)
 }
 
 /// [`builtin_tools`] minus the ones switched off by settings: the surface a
@@ -508,12 +615,79 @@ pub fn hidden_tools(
 /// explicit `--tools <csv>` requests that name a hidden tool.
 #[must_use]
 pub fn hidden_tool_by_name(name: &str) -> Option<Arc<dyn AgentTool>> {
-    match name {
+    // Canonicalize first: a hidden tool named in an explicit `--tools` request
+    // may arrive with the caller's casing (`Think`), which must still resolve.
+    match aliases::normalize_tool_name(name).as_str() {
         "think" => Some(think::tool()),
         "yield" => Some(yield_tool::tool()),
         "goal" => Some(goal::tool()),
         _ => None,
     }
+}
+
+/// [`hidden_tool_by_name`] for the hidden tools that need the session [`Env`]:
+/// the `vibe_*` worker family (omp registers them beside `yield`, out of the
+/// visible catalog). Falls through to [`hidden_tool_by_name`].
+///
+/// Session wiring (`agent.rs`/`runtime.rs`) calls this from the `--tools <csv>`
+/// branch; until that call site lands the factory is exercised by the tests in
+/// this module.
+#[allow(dead_code)]
+#[must_use]
+pub fn hidden_tool_with_env_by_name(name: &str, env: &Arc<Env>) -> Option<Arc<dyn AgentTool>> {
+    match aliases::normalize_tool_name(name).as_str() {
+        "vibe_spawn" => Some(Arc::new(vibe::VibeSpawnTool::new(env.clone()))),
+        "vibe_send" => Some(Arc::new(vibe::VibeSendTool::new(env.clone()))),
+        "vibe_wait" => Some(Arc::new(vibe::VibeWaitTool::new(env.clone()))),
+        "vibe_kill" => Some(Arc::new(vibe::VibeKillTool::new(env.clone()))),
+        "vibe_list" => Some(Arc::new(vibe::VibeListTool::new(env.clone()))),
+        _ => hidden_tool_by_name(name),
+    }
+}
+
+/// [`hidden_tool_by_name`] for `learn` / `manage_skill`: the autolearn tools need
+/// a session [`memory_tools::MemoryToolBackend`], which the plain registry cannot
+/// invent, so the caller supplies it. Both stay off unless `autolearn.enabled`
+/// is set (`memory_tools::tools` applies the same gate), and `learn` additionally
+/// needs a memory backend the settings name (`memory.backend`).
+///
+/// `None` for any other name, or when the setting gate is closed.
+///
+/// Same story as [`hidden_tool_with_env_by_name`]: provided for the session
+/// wiring, exercised by this module's tests until then.
+#[allow(dead_code)]
+#[must_use]
+pub fn hidden_memory_tool_by_name(
+    name: &str,
+    env: &Arc<Env>,
+    backend: Arc<dyn memory_tools::MemoryToolBackend>,
+    settings: &omp_settings::Settings,
+) -> Option<Arc<dyn AgentTool>> {
+    let wanted = aliases::normalize_tool_name(name);
+    if !matches!(wanted.as_str(), "learn" | "manage_skill") {
+        return hidden_tool_with_env_by_name(name, env);
+    }
+    memory_tools::tools(env, backend, settings)
+        .into_iter()
+        .find(|tool| tool.name() == wanted.as_str())
+}
+
+/// Canonicalize an explicit `--tools <csv>` request (omp `normalizeToolNames`):
+/// legacy aliases collapse onto their canonical ID (`search` -> `grep`),
+/// canonical IDs lowercase, and duplicates drop while first-seen order holds.
+/// Explicit lists must route through this before matching tool names, or
+/// `--tools search` would silently match nothing.
+///
+/// Provided for the session wiring, exercised by this module's tests until the
+/// `agent.rs` `tools_csv` branch calls it.
+#[allow(dead_code)]
+#[must_use]
+pub fn normalize_requested_tools<I, S>(names: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    aliases::normalize_tool_names(names)
 }
 
 pub use ask::{tool_with_ui, AskUi, SelectOption};
@@ -662,6 +836,42 @@ mod tests {
         for on in ["read", "bash", "ast_edit", "lsp", "todo"] {
             assert!(defaults.iter().any(|n| n == on), "{on} off by default");
         }
+        // Phase 3 gates: these stay on by default (`edit.mode` has no `none`
+        // member, so the `edit` arm cannot hide it yet).
+        for on in [
+            "ask",
+            "glob",
+            "grep",
+            "web_search",
+            "task",
+            "wait",
+            "edit",
+            "debug",
+        ] {
+            assert!(defaults.iter().any(|n| n == on), "{on} off by default");
+        }
+        // `github.enabled` is off by default (no `gh`/`glab` assumption).
+        assert!(!defaults.iter().any(|n| n == "github"), "github on by default");
+        let with_github = names("github:\n  enabled: true\n");
+        assert!(
+            with_github.iter().any(|n| n == "github"),
+            "github gate ignored"
+        );
+        let no_debug = names("debug:\n  enabled: false\n");
+        assert!(!no_debug.iter().any(|n| n == "debug"), "debug gate ignored");
+        // `speechgen.enabled` is off by default and turns `tts` on.
+        assert!(!defaults.iter().any(|n| n == "tts"), "tts on by default");
+        let with_tts = names("speechgen:\n  enabled: true\n");
+        assert!(with_tts.iter().any(|n| n == "tts"), "tts gate ignored");
+        // `wait` is gated by `async.enabled || launch.enabled`.
+        let no_wait = names("async:\n  enabled: false\nlaunch:\n  enabled: false\n");
+        assert!(!no_wait.iter().any(|n| n == "wait"), "wait gate ignored");
+        // `task.maxRecursionDepth: 0` disables spawning everywhere.
+        let no_task = names("task:\n  maxRecursionDepth: 0\n");
+        assert!(!no_task.iter().any(|n| n == "task"), "task depth gate ignored");
+        // `ask.enabled: false` hides `ask`.
+        let no_ask = names("ask:\n  enabled: false\n");
+        assert!(!no_ask.iter().any(|n| n == "ask"), "ask gate ignored");
         let custom = names("lsp:\n  enabled: false\nastGrep:\n  enabled: true\ncheckpoint:\n  enabled: true\nfind:\n  enabled: \"off\"\n");
         assert!(!custom.iter().any(|n| n == "lsp" || n == "find"));
         assert!(
@@ -671,6 +881,75 @@ mod tests {
         for on in ["ast_grep", "checkpoint", "rewind"] {
             assert!(custom.iter().any(|n| n == on), "{on} not enabled by config");
         }
+    }
+
+    #[test]
+    fn explicit_tool_lists_normalize_legacy_aliases() {
+        // `--tools search` must resolve to `grep`, and duplicates collapse.
+        assert_eq!(
+            normalize_requested_tools(["search", "grep", "SEARCH", "read"]),
+            vec!["grep", "read"]
+        );
+        // Plugin names keep their spelling (a plugin may be case-sensitive).
+        assert_eq!(
+            normalize_requested_tools(["mcp__a_b", "Read"]),
+            vec!["mcp__a_b", "read"]
+        );
+        // Hidden tools resolve regardless of the caller's casing.
+        assert!(hidden_tool_by_name("Think").is_some());
+        assert!(hidden_tool_by_name("think").is_some());
+        assert!(hidden_tool_by_name("not_a_tool").is_none());
+    }
+
+    #[test]
+    fn hidden_vibe_tools_resolve_with_a_session_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, tools) = builtin_tools_with_env(dir.path(), EditMode::Hashline);
+        for name in ["vibe_spawn", "vibe_send", "vibe_wait", "vibe_kill", "vibe_list"] {
+            let tool = hidden_tool_with_env_by_name(name, &env)
+                .unwrap_or_else(|| panic!("{name} not constructible"));
+            assert_eq!(tool.name(), name);
+            assert!(
+                !tools.iter().any(|t| t.name() == name),
+                "{name} must not be advertised in the builtin table"
+            );
+        }
+        // The env-free hidden tools still route through the same factory.
+        assert!(hidden_tool_with_env_by_name("Think", &env).is_some());
+        assert!(hidden_tool_with_env_by_name("nope", &env).is_none());
+        drop(tools);
+    }
+
+    #[test]
+    fn hidden_memory_tools_follow_the_autolearn_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (env, tools) = builtin_tools_with_env(dir.path(), EditMode::Hashline);
+        let backend: Arc<dyn memory_tools::MemoryToolBackend> =
+            Arc::new(memory_tools::InMemoryBackend::new());
+
+        let off = omp_settings::Settings::load_from(None, dir.path());
+        for name in ["learn", "manage_skill"] {
+            assert!(
+                hidden_memory_tool_by_name(name, &env, backend.clone(), &off).is_none(),
+                "{name} active with autolearn off"
+            );
+        }
+
+        let cfg = dir.path().join("config.yml");
+        std::fs::write(&cfg, "autolearn:\n  enabled: true\nmemory:\n  backend: mnemopi\n").unwrap();
+        let on = omp_settings::Settings::load_from(Some(&cfg), dir.path());
+        for name in ["learn", "manage_skill"] {
+            let tool = hidden_memory_tool_by_name(name, &env, backend.clone(), &on)
+                .unwrap_or_else(|| panic!("{name} not constructible with autolearn on"));
+            assert_eq!(tool.name(), name);
+            assert!(
+                !tools.iter().any(|t| t.name() == name),
+                "{name} must not be advertised in the builtin table"
+            );
+        }
+        // Anything else falls through to the env factory rather than vanishing.
+        assert!(hidden_memory_tool_by_name("think", &env, backend, &on).is_some());
+        drop(tools);
     }
 
     #[test]
@@ -697,7 +976,10 @@ mod tests {
                 "web_search",
                 "lsp",
                 "checkpoint",
-                "rewind"
+                "rewind",
+                "debug",
+                "github",
+                "tts"
             ]
         );
         let edit = tools.iter().find(|t| t.name() == "edit").unwrap();
@@ -758,7 +1040,7 @@ mod tests {
         );
         assert_eq!(
             tools.iter().find(|t| t.name() == "glob").unwrap().description().lines().next().unwrap(),
-            "Glob files/dirs: `;`-separated paths or internal URLs (`local://*.md`, `omp://**/*.md`); default workspace root."
+            "Glob files/dirs: `;`-separated paths or internal URLs (local://*.md, omp://**/*.md); default workspace root."
         );
         // omp `findSchema`: `limit?": "1 <= number.integer <= 200"`, and `pattern`
         // stays off the wire schema. NOTE: unlike upstream `GLOB_ARGUMENTS`,

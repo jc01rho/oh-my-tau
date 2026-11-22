@@ -4,7 +4,7 @@
 //! Port of `src/internal-urls` (router, parse, types) from the TS agent.
 
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 pub mod parse;
 pub mod registry;
@@ -30,6 +30,13 @@ pub struct UrlCtx {
     pub cwd: Option<PathBuf>,
     /// Return directory shape without materializing an expensive listing.
     pub skip_directory_listing: bool,
+    /// Rules visible to the caller (TS `ResolveContext.rules`). `None` falls
+    /// back to the process-global book installed by
+    /// [`schemes::rule::set_active_rules`].
+    pub rules: Option<Arc<Vec<schemes::RuleEntry>>>,
+    /// Project memory root backing `memory://root[/<path>]`. `None` derives it
+    /// from the agent dir and [`Self::cwd`] (TS `getMemoryRoot`).
+    pub memory_root: Option<PathBuf>,
 }
 
 impl UrlCtx {
@@ -128,6 +135,12 @@ pub trait UrlProvider: Send + Sync {
 
     /// Prompt documentation line for this scheme (system prompt listing).
     fn prompt_doc(&self) -> Option<String> {
+        None
+    }
+
+    /// Sub-path, query and limit grammar the [`Self::prompt_doc`] line leaves
+    /// out, served on demand at `xd://read/urls` (TS `promptReference`).
+    fn prompt_reference(&self) -> Option<String> {
         None
     }
 }

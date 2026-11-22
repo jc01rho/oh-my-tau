@@ -104,20 +104,39 @@ fn chrono_ms(iso: &str) -> i64 {
 }
 
 #[test]
-fn rollover_still_unsupported() {
+fn rollover_compaction_replays_as_plain_summary() {
+    // A rollover compaction is a real compaction entry whose summary is the
+    // static rollover prompt; it must replay like any other summary, not fail
+    // the rebuild. Appended after scenario A, it also supersedes the earlier
+    // provider-native compaction on the branch.
     let mut all = entries();
-    let mut rollover = all[2].clone();
-    rollover["type"] = Value::from("compaction");
-    rollover["id"] = Value::from("ee11ee11");
-    rollover["parentId"] = Value::from("ee00ee00");
-    rollover["details"] = serde_json::json!({"kind": "experimental-context-rollover"});
-    rollover["summary"] = Value::from("rollover");
-    rollover["firstKeptEntryId"] = Value::from("cc11cc11");
-    all.push(rollover);
-    assert!(matches!(
-        build_session_context(&all, Leaf::Last),
-        Err(omp_compact::ContextError::Unsupported(
-            "experimental-context-rollover"
-        ))
-    ));
+    all.push(serde_json::json!({
+        "type": "compaction",
+        "id": "ee11ee11",
+        "parentId": "aa66bb66",
+        "timestamp": "2026-10-12T10:00:40.000Z",
+        "summary": "ROLLOVER-PROMPT",
+        "firstKeptEntryId": "aa55bb55",
+        "tokensBefore": 1234,
+        "details": {"kind": "experimental-context-rollover", "version": 1}
+    }));
+    let ctx = build_session_context(&all, Leaf::Last).unwrap();
+    let summary = &ctx.messages[0];
+    assert_eq!(summary["role"], "compactionSummary");
+    assert_eq!(summary["summary"], "ROLLOVER-PROMPT");
+    assert_eq!(summary["tokensBefore"], 1234);
+    // Nothing provider-native is attached: the rollover carries no payload.
+    assert!(summary.get("providerPayload").is_none());
+    assert!(summary.get("blocks").is_none());
+    // The kept tail from firstKeptEntryId replays verbatim.
+    let roles: Vec<&str> = ctx.messages[1..]
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["user", "assistant"]);
+    // And it converts like a local compaction summary.
+    let llm = convert_to_llm(&ctx.messages);
+    let text = llm[0]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("<summary>\nROLLOVER-PROMPT\n</summary>"));
+    assert_eq!(llm[0]["historyRewriteAt"], llm[0]["timestamp"]);
 }

@@ -14,15 +14,14 @@
 //! into the question list the dialog and renderer already speak (`<legend>` /
 //! `<label>` text becomes the question, radio/checkbox labels become options, a
 //! checkbox group is `multi`, `<textarea>` and text inputs become free-text
-//! questions), and the dialog/result path below is unchanged. Arguments are
-//! object-only (`{html}`), matching the schema; the pre-HTML `questions[]`
-//! shape is kept as a fallback (omp `recoverAskHtml`).
+//! questions), and the dialog/result path below is unchanged. The model-facing
+//! schema is omp's `askSchema` byte-for-byte: `html` is required and nothing
+//! else is advertised. The pre-HTML `questions[]` shape is recovery-only —
+//! [`parse_params`] still accepts it, as omp's `recoverAskHtml` does.
 //!
 //! Divergences from upstream, all host-driven: an option answers with its label
 //! (no `value`), per-field validation (`required`, `pattern`), image answers and
-//! the JSON form-data result text are not ported, and the model-facing schema
-//! advertises both shapes with no `required` list where omp requires `html` and
-//! relies on lenient argument validation.
+//! the JSON form-data result text are not ported.
 //!
 //! Not ported yet: images in answers, and `chat` results.
 
@@ -36,13 +35,44 @@ use pa_agent::BoxFut;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-const DESCRIPTION: &str = r#"Ask the user by sending one HTML `<form>` in `html`: named `<input>`, `<select>` and `<textarea>` controls, `type="radio"`/`checkbox` for choices, `<legend>`/`<label>` for the question text, `checked`/`selected` for preselecting. Legacy `questions[]` (`{id, question, options: [{label, description?}], multi?, recommended?}`) is still accepted.
+const DESCRIPTION: &str = r#"Ask the user to fill in one HTML form; blocks until they submit or cancel.
+
+Ask only for materially different tradeoffs the user must decide.
+Default: act using code/config/docs/history and conventions.
+Several viable choices: pick conservative/standard, proceed, state choice.
 
 <instruction>
-- Several viable choices: pick conservative/standard, proceed, state choice.
-- Batch related questions; 2–5 distinct options each; short labels, tradeoffs in `description`.
-- `recommended` auto-adds " (Recommended)"; `multi: true` permits multiple selections.
-- NEVER supply "Other": UI adds "Other (type your own)".
+- `html`: one <form> of plain semantic HTML, rendered natively in the user's terminal.
+  - NEVER <script>, <style>, style=, or buttons (<button>, type="submit"): the UI supplies Submit and Cancel.
+- Every control needs a name; the submitted form data arrives as JSON `{"name": value}`.
+- One-of: `<input type="radio">`; many-of: type="checkbox"; long lists: <select>.
+- Wrap each control in a <label>; group a question in a <fieldset> with a <legend>, or put it in a <p> right before the group.
+- Radio and checkbox groups automatically get an "Other" free-text answer. NEVER add your own "Other" option or a text field for it.
+- Preselect your recommendation with checked/selected/value: those values are submitted if the user does not answer in time.
+- Context the user needs to decide (findings, tradeoffs, diffs, drafts) goes inside the form: <p>, <ul>, <table>, <pre>.
+- Keep forms short: a few questions, 2–5 options each; ask follow-ups in a later call.
+- Answer values:
+  - radio group or <select> → the chosen value
+  - checkbox group (shared name) or <select multiple> → an array
+  - lone checkbox or radio group left unchecked → omitted
+  - type="number" → a number; text fields → their text
+  - automatic "Other" text → the radio's value, or an extra checkbox array entry
+- Free input: `<input type="text|number|date|email|url">`, <textarea>; placeholder, min/max, pattern, required are enforced.
+- Pictures: `<img src="…" alt="…">` and inline <svg> diagrams, as their own blocks.
+  - `src`: an http(s) URL, a data: URI, or a file path relative to the working directory.
+  - Inside a <label> an image shows only its alt.
+- Example, a choice with context and a number:
+```html
+<form>
+  <p>Sessions live in memory and are lost on restart.</p>
+  <fieldset>
+    <legend>Session store</legend>
+    <label><input type="radio" name="store" value="sqlite" checked> SQLite: one file, no new service</label>
+    <label><input type="radio" name="store" value="redis"> Redis: shared across instances, needs ops</label>
+  </fieldset>
+  <label>Session lifetime (days) <input type="number" name="ttl_days" value="30" min="1"></label>
+</form>
+```
 </instruction>"#;
 
 /// Labels the runtime adds to every question; options may not reuse them.
@@ -737,9 +767,9 @@ pub fn tool_with_ui(ui: Arc<dyn AskUi>) -> Arc<dyn AgentTool> {
 }
 
 fn parse_params(raw: Value) -> Result<Vec<QuestionItem>> {
-    // Dispatch is object-only (`{html}` or `{questions[]}`), as the schema
-    // declares; the harness validates arguments against it before the call, so
-    // any other shape is rejected here instead of being coerced.
+    // Dispatch is object-only (`{html}` or `{questions[]}`): `html` is what the
+    // schema declares and what the harness validates, and the pre-HTML
+    // `questions[]` shape is the recovery path omp's `recoverAskHtml` keeps.
     let questions = if let Some(html) = raw.get("html").and_then(Value::as_str) {
         if html.trim().is_empty() {
             return Err(anyhow!(INVALID_ASK_ERROR));
@@ -1401,31 +1431,29 @@ impl AgentTool for AskTool {
     }
 }
 
-/// Parameter schema: omp's `askSchema` (`{html: string}`) plus the legacy
-/// `questions[]` shape it still recovers. omp marks `html` required and leans on
-/// lenient argument validation for the legacy call; this crate validates
-/// strictly, so neither shape is required here.
+/// Parameter schema: omp's `askSchema`, byte-for-byte — `{html: string}` with
+/// `html` required. The legacy `questions[]` shape is not advertised; it stays a
+/// runtime recovery path in [`parse_params`] (omp `recoverAskHtml`).
 #[must_use]
 pub fn schema() -> Value {
     json!({"type":"object","properties":{
-        "html":{"type":"string","description":"one HTML <form>"},
-        "questions":{"type":"array","minItems":1,"items":{"type":"object","properties":{
-            "id":{"type":"string"},
-            "question":{"type":"string"},
-            "header":{"type":"string","description":"display chip"},
-            "options":{"type":"array","items":{"type":"object","properties":{
-                "label":{"type":"string"},
-                "description":{"type":"string"},
-                "preview":{"type":"string","description":"rich preview"}
-            },"required":["label"]}},
-            "multi":{"type":"boolean"},
-            "recommended":{"type":"number","description":"0-based default index"}
-        },"required":["id","question","options"]}}
-    }})
+        "html":{"type":"string","description":"one HTML <form>"}
+    },"required":["html"]})
 }
 #[cfg(test)]
 mod tests {
     use parking_lot::Mutex;
+
+    /// omp `askSchema`: `html` is the only advertised key, and it is required.
+    #[test]
+    fn schema_matches_omp() {
+        assert_eq!(
+            schema(),
+            json!({"type":"object","properties":{
+                "html":{"type":"string","description":"one HTML <form>"}
+            },"required":["html"]})
+        );
+    }
 
     use pa_agent::abort::AbortController;
 

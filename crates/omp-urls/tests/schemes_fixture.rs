@@ -3,8 +3,16 @@
 
 use std::path::PathBuf;
 
-use omp_urls::schemes::{artifact, core, history, local};
+use omp_urls::schemes::{artifact, core, history, local, RuleEntry};
 use omp_urls::{parse_internal_url, UrlCtx, UrlProvider};
+
+/// Serializes the tests that publish a process-global book (`rule://`,
+/// `memory://`); they share one process, so unguarded they race.
+static GLOBALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
+    GLOBALS.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn fixture() -> (tempfile::TempDir, PathBuf, UrlCtx) {
     let dir = tempfile::tempdir().unwrap();
@@ -187,17 +195,155 @@ fn history_unknown_agent_lists_known() {
 }
 
 #[test]
-fn rule_read_says_not_implemented() {
+fn rule_read_matches_ts_on_an_empty_book() {
+    let _guard = lock_globals();
     let (_dir, _artifacts, ctx) = fixture();
+    omp_urls::schemes::rule::set_active_rules(Vec::new());
     let provider = omp_urls::schemes::rule::RuleProvider;
     let url = parse_internal_url("rule://tdd").unwrap();
     let err = provider.read(&url, &ctx).unwrap_err().to_string();
-    assert_eq!(
-        err,
-        "rule:// is not implemented yet in oh-my-tau (no rulebook ported)"
-    );
+    assert_eq!(err, "Unknown rule: tdd\nAvailable: none");
     assert!(provider.locate(&url, &ctx).is_none());
     assert!(provider.complete("", &ctx).is_empty());
+    assert!(provider.prompt_doc().is_none());
+}
+
+#[test]
+fn rule_active_book_serves_read_locate_and_complete() {
+    let _guard = lock_globals();
+    let (dir, _artifacts, ctx) = fixture();
+    let file = dir.path().join("tdd.md");
+    std::fs::write(&file, "---\nalwaysApply: true\n---\nWrite tests first.\n").unwrap();
+    omp_urls::schemes::rule::set_active_rules(vec![RuleEntry {
+        name: "tdd".into(),
+        path: file.to_string_lossy().into_owned(),
+        content: "Write tests first.".into(),
+        description: "Test-first discipline".into(),
+        globs: vec!["*.rs".into()],
+        always_apply: true,
+    }]);
+
+    let provider = omp_urls::schemes::rule::RuleProvider;
+    let url = parse_internal_url("rule://tdd").unwrap();
+    let resource = provider.read(&url, &ctx).unwrap();
+    assert_eq!(resource.content, "Write tests first.");
+    assert_eq!(resource.immutable, Some(true));
+    assert_eq!(provider.locate(&url, &ctx).unwrap(), file);
+
+    let completions = provider.complete("", &ctx);
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].label, "tdd");
+    assert_eq!(
+        completions[0].detail.as_deref(),
+        Some("Test-first discipline")
+    );
+
+    // The scheme is advertised once it has addressable rules.
+    assert_eq!(
+        provider.prompt_doc().as_deref(),
+        Some("rule://<name>: details.")
+    );
+
+    // A miss lists the installed names.
+    let url = parse_internal_url("rule://nope").unwrap();
+    assert_eq!(
+        provider.read(&url, &ctx).unwrap_err().to_string(),
+        "Unknown rule: nope\nAvailable: tdd"
+    );
+
+    omp_urls::schemes::rule::set_active_rules(Vec::new());
+}
+
+#[test]
+fn memory_root_reads_project_artifacts() {
+    let (dir, _artifacts, _ctx) = fixture();
+    let root = dir.path().join("memories/--proj--");
+    std::fs::create_dir_all(root.join("skills/demo")).unwrap();
+    std::fs::write(root.join("memory_summary.md"), "Summary.\n").unwrap();
+    std::fs::write(root.join("MEMORY.md"), "# Memory\n").unwrap();
+    std::fs::write(root.join("skills/demo/SKILL.md"), "Skill").unwrap();
+    let ctx = UrlCtx {
+        memory_root: Some(root.clone()),
+        ..UrlCtx::default()
+    };
+
+    let provider = omp_urls::schemes::memory::MemoryProvider;
+    let url = parse_internal_url("memory://root").unwrap();
+    assert_eq!(provider.read(&url, &ctx).unwrap().content, "Summary.\n");
+
+    let url = parse_internal_url("memory://root/MEMORY.md").unwrap();
+    let resource = provider.read(&url, &ctx).unwrap();
+    assert_eq!(resource.content, "# Memory\n");
+    assert_eq!(provider.locate(&url, &ctx).unwrap(), root.join("MEMORY.md"));
+
+    let url = parse_internal_url("memory://root/skills/demo").unwrap();
+    assert_eq!(provider.read(&url, &ctx).unwrap().content, "SKILL.md");
+}
+
+#[test]
+fn memory_errors_match_ts() {
+    let _guard = lock_globals();
+    let (dir, _artifacts, _ctx) = fixture();
+    omp_urls::schemes::memory::set_memory_records(Vec::new());
+    let ctx = UrlCtx {
+        memory_root: Some(dir.path().join("absent")),
+        ..UrlCtx::default()
+    };
+    let provider = omp_urls::schemes::memory::MemoryProvider;
+
+    let url = parse_internal_url("memory://root").unwrap();
+    assert_eq!(
+        provider.read(&url, &ctx).unwrap_err().to_string(),
+        omp_urls::schemes::memory::ROOT_UNAVAILABLE
+    );
+
+    let url = parse_internal_url("memory://").unwrap();
+    assert_eq!(
+        provider.read(&url, &ctx).unwrap_err().to_string(),
+        "memory:// URL requires a namespace: memory://root or memory://<memory-id>"
+    );
+
+    // Without a published book, an unknown host is an unknown namespace.
+    let url = parse_internal_url("memory://m-1").unwrap();
+    let err = provider.read(&url, &ctx).unwrap_err().to_string();
+    assert!(err.starts_with("Unknown memory namespace: m-1."), "{err}");
+}
+
+#[test]
+fn memory_id_reads_published_row() {
+    let _guard = lock_globals();
+    let (dir, _artifacts, _ctx) = fixture();
+    let root = dir.path().join("memories/--proj--");
+    std::fs::create_dir_all(&root).unwrap();
+    omp_urls::schemes::memory::set_memory_records(vec![omp_urls::schemes::memory::MemoryRecord {
+        id: "m-1".into(),
+        bank: "proj".into(),
+        store: "working".into(),
+        content: "Body.".into(),
+        importance: Some(0.5),
+        ..omp_urls::schemes::memory::MemoryRecord::default()
+    }]);
+    let ctx = UrlCtx {
+        memory_root: Some(root),
+        ..UrlCtx::default()
+    };
+    let provider = omp_urls::schemes::memory::MemoryProvider;
+
+    let url = parse_internal_url("memory://m-1").unwrap();
+    let resource = provider.read(&url, &ctx).unwrap();
+    assert!(resource
+        .content
+        .starts_with("---\nid: m-1\nbank: proj\nstore: working\n"));
+    assert!(resource.content.ends_with("\n---\n\nBody."));
+
+    let labels: Vec<String> = provider
+        .complete("", &ctx)
+        .into_iter()
+        .map(|c| c.label)
+        .collect();
+    assert_eq!(labels, vec!["root".to_string(), "<memory-id>".to_string()]);
+
+    omp_urls::schemes::memory::set_memory_records(Vec::new());
 }
 
 #[test]

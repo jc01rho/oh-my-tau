@@ -20,6 +20,7 @@ use pa_agent::types::{
 use pa_agent::validation::validate_tool_arguments;
 use serde_json::{json, Value};
 
+use super::computer_prelude::DesktopSession;
 use super::Env;
 
 /// Per-cell execution context handed down from the `eval` tool: the cell's
@@ -41,6 +42,9 @@ pub struct EvalBridge {
     ctx: OpCtx,
     rt: tokio::runtime::Handle,
     policy: BridgePolicy,
+    /// This cell's desktop session for `__omp_prelude__("computer", …)`:
+    /// probed on first use, ended by `close`, reopened by the next call.
+    computer: Mutex<Option<DesktopSession>>,
 }
 
 /// Tools the bridge may dispatch to. Set once per process by the runtime
@@ -168,6 +172,65 @@ const AGENT_OPS: [&str; 9] = [
     "__cancel__",
 ];
 
+/// Output characters kept per `sh` command (TS `MAX_OUTPUT_CHARS`), so a
+/// runaway command cannot exhaust host or kernel memory.
+const SHELL_MAX_OUTPUT_CHARS: usize = 16 * 1024 * 1024;
+
+/// Trim `sh` output to [`SHELL_MAX_OUTPUT_CHARS`] the way TS does: keep the
+/// head and append the same truncation notice.
+fn clamp_shell_output(output: String) -> String {
+    if output.chars().count() <= SHELL_MAX_OUTPUT_CHARS {
+        return output;
+    }
+    let mut head: String = output.chars().take(SHELL_MAX_OUTPUT_CHARS).collect();
+    head.push_str(&format!(
+        "\n[output truncated: sh() keeps the first {SHELL_MAX_OUTPUT_CHARS} characters]\n"
+    ));
+    head
+}
+
+/// Prelude helper name → host op that serves it. Both runtimes' preludes call
+/// their helpers by name (`__omp_prelude__(name, params)`), while the host op
+/// vocabulary stays the per-bridge op names; this table is the one mapping
+/// between them. Op names are accepted as aliases so a prelude may call either
+/// form.
+fn prelude_op(name: &str) -> Option<&'static str> {
+    match name {
+        "sh" | "__shell__" => Some("__shell__"),
+        "wait" | "__wait__" => Some("__wait__"),
+        "completion" | "__completion__" => Some("__completion__"),
+        "judge" | "__judge__" => Some("__judge__"),
+        "judge_batch" | "__judge_batch__" => Some("__judge_batch__"),
+        "agent" | "__agent__" => Some("__agent__"),
+        "workpool" | "__workpool__" => Some("__workpool__"),
+        "budget" | "__budget__" => Some("__budget__"),
+        _ => None,
+    }
+}
+
+/// Definition JSON for a host prelude *family* the bridge serves by name
+/// (`browser`, `computer`), in the shape the eval doc-topic builder consumes.
+///
+/// Families are not helpers: their facades call
+/// `__omp_prelude__(family, params)` with the family's own parameter schema, so
+/// they are answered here rather than through [`prelude_op`].
+fn prelude_definition(name: &str) -> Option<Value> {
+    match name {
+        "browser" => Some(super::browser_prelude::browser_prelude_definition().to_json()),
+        "computer" => {
+            let definition = super::computer_prelude::computer_prelude_definition();
+            Some(json!({
+                "name": definition.name,
+                "documentation": definition.documentation,
+                "inlineDocumentation": definition.inline_documentation,
+                "exports": definition.exports,
+                "languages": ["js", "py"],
+            }))
+        }
+        _ => None,
+    }
+}
+
 impl EvalBridge {
     #[must_use]
     pub fn new(env: Arc<Env>, ctx: OpCtx, rt: tokio::runtime::Handle) -> Self {
@@ -177,6 +240,7 @@ impl EvalBridge {
             ctx,
             rt,
             policy,
+            computer: Mutex::new(None),
         }
     }
 
@@ -202,10 +266,20 @@ impl EvalBridge {
     }
 
     async fn dispatch(&self, op: &str, args: Value) -> Result<Value, String> {
+        if op == "__omp_prelude__" {
+            return self.named_prelude(&args).await;
+        }
+        if op == "__shell__" {
+            return self.sh_helper(args).await;
+        }
         if op == "__prelude__" {
-            // Kernel-side capability query: answer with the tool descriptor
-            // when this host can serve `name`, else refuse explicitly.
+            // Kernel-side capability query: answer with the host prelude
+            // definition for a prelude family, the tool descriptor for an
+            // enabled tool, else refuse explicitly.
             let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
+            if let Some(definition) = prelude_definition(name) {
+                return Ok(definition);
+            }
             return self.policy.find(name).map_or_else(
                 || Err(format!("prelude capability not supported: {name}")),
                 |tool| Ok(tool_descriptor(&tool)),
@@ -270,6 +344,138 @@ impl EvalBridge {
         }
         let value = self.call_tool("read", json!({"path": target})).await?;
         Ok(Value::String(bridge_text(&value)))
+    }
+
+    /// `__omp_prelude__(name, params)` host op: named-prelude dispatch.
+    ///
+    /// Both runtimes' preludes expose helpers by prelude name (`sh`, `wait`,
+    /// `agent`, `judge`, …) and call this one op, so adding a prelude family
+    /// never changes the kernel-side protocol. A prelude *family* (`browser`,
+    /// `computer`) is served by its own module; a helper name maps to the host
+    /// op that already serves it (see [`prelude_op`]); unknown names are
+    /// refused explicitly rather than silently succeeding.
+    async fn named_prelude(&self, args: &Value) -> Result<Value, String> {
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "__omp_prelude__ requires a string `name`".to_string())?;
+        let params = args
+            .get("parameters")
+            .or_else(|| args.get("params"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if let Some(result) = self.prelude_family(name, &params) {
+            return result;
+        }
+        let Some(op) = prelude_op(name) else {
+            return Err(format!("unknown prelude helper: {name}"));
+        };
+        if op == "__shell__" {
+            return self.sh_helper(params).await;
+        }
+        match super::eval_agents::handle(&self.env, op, params, &self.ctx).await {
+            Some(result) => result,
+            None => Err(format!("unknown eval host op: {op}")),
+        }
+    }
+
+    /// Route one call for a prelude *family*: `None` means `name` is not a
+    /// family, so the caller falls back to [`prelude_op`]'s helper table.
+    ///
+    /// A family's facades pass that family's own parameter schema (not one
+    /// helper's arguments), so the family module validates the parameters and
+    /// the bridge answers in the value shape (`{text, details}`) those facades
+    /// read.
+    fn prelude_family(&self, name: &str, params: &Value) -> Option<Result<Value, String>> {
+        match name {
+            "browser" => Some(browser_helper(params)),
+            "computer" => Some(self.computer_helper(params)),
+            _ => None,
+        }
+    }
+
+    /// `__omp_prelude__("computer", params)`: validate the computer prelude's
+    /// parameters and run them on this cell's [`DesktopSession`].
+    ///
+    /// Actions the port does not serve (`run`, handle-hop `call` chains,
+    /// desktop input, AX reads) fail by name inside
+    /// [`DesktopSession::execute`] instead of degrading silently.
+    fn computer_helper(&self, params: &Value) -> Result<Value, String> {
+        let parsed = super::computer_prelude::validate(params)?;
+        let mut slot = self.computer.lock().expect("computer session lock");
+        if slot.is_none() {
+            *slot = Some(DesktopSession::probe());
+        }
+        let session = slot.as_mut().expect("computer session");
+        let outcome = session.execute(&parsed)?;
+        if session.is_closed() {
+            *slot = None;
+        }
+        Ok(json!({"text": outcome.text, "details": outcome.details}))
+    }
+
+    /// `__shell__` host op (TS `runEvalShell`, `eval/shell-bridge.ts`):
+    /// `{command, cwd?, timeout?}` → `{output, exitCode?, timedOut?}`.
+    ///
+    /// Runs on the embedded `omp-shell` engine rather than through the `bash`
+    /// tool, so the cell blocks until the command exits: no auto-backgrounding
+    /// and no model-facing notices. A non-zero exit or timeout is a *result*,
+    /// not an error (the prelude raises `ShellError` from it); malformed
+    /// arguments, a missing exit status and cancellation are errors.
+    async fn sh_helper(&self, args: Value) -> Result<Value, String> {
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "sh() expects a command string".to_string())?;
+        let cwd = args.get("cwd").and_then(Value::as_str);
+        let timeout = args.get("timeout").and_then(Value::as_f64);
+        if args
+            .get("timeout")
+            .is_some_and(|t| !t.is_null() && timeout.is_none())
+        {
+            return Err("sh() timeout must be a number of seconds".to_string());
+        }
+        if timeout.is_some_and(|t| t < 0.0) {
+            return Err("sh() timeout must be a non-negative number of seconds".to_string());
+        }
+        let dir = match cwd {
+            Some(cwd) => super::util::resolve_to_cwd(cwd, &self.env.cwd),
+            None => self.env.cwd.clone(),
+        };
+        // 0 disables the executor deadline: the cell's own deadline governs.
+        let timeout = timeout.map(|t| if t == 0.0 { None } else { Some(t) });
+        let result = super::shell_host::execute_shell(super::shell_host::ShellExecRequest {
+            cwd: &dir,
+            command,
+            timeout: timeout.flatten(),
+            signal: &self.ctx.signal,
+            dyn_tools: None,
+            retain_bytes: SHELL_MAX_OUTPUT_CHARS,
+            on_chunk: None,
+            tap: None,
+        })
+        .await
+        .map_err(|e| format!("sh() command failed: {e:#}"))?;
+        let output = clamp_shell_output(result.output);
+        if result.outcome == Some("aborted") {
+            return Err("sh() command was cancelled".to_string());
+        }
+        let exit_code = result.exit_code;
+        let preview: String = output.chars().take(500).collect();
+        self.emit_status(json!({
+            "op": "run",
+            "cmd": command,
+            "code": exit_code,
+            "output": preview,
+            "hasError": result.outcome.is_some() || exit_code.is_some_and(|c| c != 0),
+        }));
+        if result.outcome == Some("timeout") {
+            return Ok(json!({"output": output, "timedOut": true}));
+        }
+        let Some(code) = exit_code else {
+            return Err("sh() command failed: missing exit status".to_string());
+        };
+        Ok(json!({"output": output, "exitCode": code}))
     }
 
     /// `write` host op: `{path, data | content, encoding?}` → resolved path
@@ -668,6 +874,25 @@ impl omp_eval::HostBridge for EvalBridge {
     }
 }
 
+/// `__omp_prelude__("browser", params)`: validate the browser prelude's
+/// parameters, then report that this build has no browser transport.
+///
+/// The tab supervisor, the CDP websocket and the managed-browser launcher are
+/// not ported here, so the call is refused by action name rather than answered
+/// with a fabricated result. Validation still runs first, so a malformed call
+/// gets the schema error the facade would show for it.
+fn browser_helper(params: &Value) -> Result<Value, String> {
+    super::browser_prelude::validate(params)?;
+    let action = params
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Err(format!(
+        "browser.{action} needs the browser transport (tab supervisor and CDP session), which this build \
+         does not include"
+    ))
+}
+
 fn tool_descriptor(tool: &Arc<dyn AgentTool>) -> Value {
     json!({
         "name": tool.name(),
@@ -1024,6 +1249,273 @@ mod tests {
             .unwrap()
             .iter()
             .all(|t| !matches!(t["name"].as_str(), Some("eval" | "checkpoint" | "rewind"))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn named_prelude_op_routes_helpers_to_their_host_ops() {
+        let env = env("prelude-op");
+        let b = bridge(
+            &env,
+            BridgePolicy {
+                tools: all_tools(&env),
+                before: None,
+                after: None,
+            },
+        );
+        // `sh` is served in-bridge, not by the agent-op table.
+        let out = b
+            .dispatch(
+                "__omp_prelude__",
+                json!({"name": "sh", "parameters": {"command": "echo prelude-ok"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["exitCode"], json!(0), "{out}");
+        assert!(
+            out["output"].as_str().unwrap().contains("prelude-ok"),
+            "{out}"
+        );
+
+        // Agent-family helpers map to the ops `eval_agents` already serves;
+        // `budget` is a pure snapshot, so routing is observable without
+        // spawning anything.
+        let budget = b
+            .dispatch(
+                "__omp_prelude__",
+                json!({"name": "budget", "parameters": {}}),
+            )
+            .await
+            .unwrap();
+        assert!(budget.is_object(), "{budget}");
+
+        // An op-spelled name routes the same way.
+        let direct = b
+            .dispatch(
+                "__omp_prelude__",
+                json!({"name": "__budget__", "parameters": {}}),
+            )
+            .await
+            .unwrap();
+        assert!(direct.is_object(), "{direct}");
+
+        // Unknown helper names are refused explicitly.
+        let err = b
+            .dispatch("__omp_prelude__", json!({"name": "nope", "parameters": {}}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown prelude helper: nope"), "{err}");
+
+        // A missing name is an argument error, not a silent success.
+        let err = b
+            .dispatch("__omp_prelude__", json!({"parameters": {}}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("requires a string `name`"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn named_prelude_routes_the_browser_family_through_its_module() {
+        let env = env("prelude-browser");
+        let b = bridge(
+            &env,
+            BridgePolicy {
+                tools: Vec::new(),
+                before: None,
+                after: None,
+            },
+        );
+        // Valid parameters reach the browser module, which refuses by action
+        // name because this build has no tab supervisor / CDP transport.
+        for action in ["tabs", "targets", "close"] {
+            let err = b
+                .dispatch("__omp_prelude__", json!({"name": "browser", "parameters": {"action": action}}))
+                .await
+                .unwrap_err();
+            assert!(err.contains(&format!("browser.{action}")), "{action}: {err}");
+            assert!(err.contains("browser transport"), "{action}: {err}");
+        }
+        // The family's own schema runs first, so a bad call reports the schema
+        // error the facade would surface rather than the transport refusal.
+        let err = b
+            .dispatch(
+                "__omp_prelude__",
+                json!({"name": "browser", "parameters": {"action": "tabs", "name": "main"}}),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown property \"name\""), "{err}");
+        let err = b
+            .dispatch("__omp_prelude__", json!({"name": "browser", "parameters": {}}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("missing string property \"action\""), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn named_prelude_routes_the_computer_family_through_its_module() {
+        let env = env("prelude-computer");
+        let b = bridge(
+            &env,
+            BridgePolicy {
+                tools: Vec::new(),
+                before: None,
+                after: None,
+            },
+        );
+        // `capabilities` is a read-only probe: it answers with the desktop
+        // report in the `{text, details}` shape the facade reads.
+        let caps = b
+            .dispatch("__omp_prelude__", json!({"name": "computer", "parameters": {"action": "capabilities"}}))
+            .await
+            .unwrap();
+        assert!(caps["text"].is_string(), "{caps}");
+        assert!(
+            caps["details"]["backend"]
+                .as_str()
+                .is_some_and(|b| ["x11", "wayland", "none"].contains(&b)),
+            "{caps}"
+        );
+        assert!(caps["details"].get("captureTool").is_some(), "{caps}");
+
+        // `close` ends this cell's session; the next call reopens one.
+        let closed = b
+            .dispatch("__omp_prelude__", json!({"name": "computer", "parameters": {"action": "close"}}))
+            .await
+            .unwrap();
+        assert_eq!(closed["details"], json!({"closed": true}), "{closed}");
+        assert_eq!(closed["text"], json!("Closed computer session"), "{closed}");
+        let reopened = b
+            .dispatch("__omp_prelude__", json!({"name": "computer", "parameters": {"action": "capabilities"}}))
+            .await
+            .unwrap();
+        assert!(reopened["details"].is_object(), "{reopened}");
+
+        // Actions the port does not serve fail by name, not silently.
+        let err = b
+            .dispatch(
+                "__omp_prelude__",
+                json!({"name": "computer", "parameters": {"action": "run", "code": "await desktop.displays()"}}),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("computer.run"), "{err}");
+        let err = b
+            .dispatch("__omp_prelude__", json!({"name": "computer", "parameters": {"action": "frobnicate"}}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("action must be one of"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prelude_capability_query_answers_family_definitions() {
+        let env = env("prelude-def");
+        let b = bridge(
+            &env,
+            BridgePolicy {
+                tools: all_tools(&env),
+                before: None,
+                after: None,
+            },
+        );
+        let browser = b.dispatch("__prelude__", json!({"name": "browser"})).await.unwrap();
+        assert_eq!(browser["name"], json!("browser"), "{browser}");
+        assert_eq!(browser["exports"], json!(["browser"]), "{browser}");
+        assert_eq!(browser["approval"], json!("exec"), "{browser}");
+        assert_eq!(browser["languages"], json!(["js", "py"]), "{browser}");
+
+        let computer = b.dispatch("__prelude__", json!({"name": "computer"})).await.unwrap();
+        assert_eq!(computer["name"], json!("computer"), "{computer}");
+        assert_eq!(computer["exports"], json!(["computer"]), "{computer}");
+        assert_eq!(computer["inlineDocumentation"], json!(true), "{computer}");
+
+        // Tool names still answer with the tool descriptor.
+        let read = b.dispatch("__prelude__", json!({"name": "read"})).await.unwrap();
+        assert_eq!(read["name"], json!("read"), "{read}");
+        assert!(read["parameters"].is_object(), "{read}");
+
+        // An unknown name is still refused.
+        let err = b.dispatch("__prelude__", json!({"name": "nope"})).await.unwrap_err();
+        assert!(err.contains("prelude capability not supported: nope"), "{err}");
+    }
+
+    #[test]
+    fn prelude_names_cover_every_helper_the_preludes_export() {
+        // Every helper the Python/JS preludes define must resolve to a host op;
+        // an unlisted one would fail at call time inside the kernel.
+        for name in [
+            "sh",
+            "wait",
+            "completion",
+            "judge",
+            "judge_batch",
+            "agent",
+            "workpool",
+            "budget",
+        ] {
+            assert!(prelude_op(name).is_some(), "{name} must resolve");
+        }
+        // Host op spellings are accepted too, so either call form works.
+        for name in [
+            "__shell__",
+            "__wait__",
+            "__completion__",
+            "__judge__",
+            "__judge_batch__",
+            "__agent__",
+            "__workpool__",
+            "__budget__",
+        ] {
+            assert_eq!(prelude_op(name), Some(name), "{name}");
+        }
+        assert_eq!(prelude_op("sh"), Some("__shell__"));
+        assert_eq!(prelude_op("judge_batch"), Some("__judge_batch__"));
+        assert_eq!(prelude_op("display"), None);
+        // Prelude families are routed by `named_prelude` itself, not the helper
+        // table: their facades pass a whole parameter object, not one helper's
+        // arguments.
+        assert_eq!(prelude_op("browser"), None);
+        assert_eq!(prelude_op("computer"), None);
+        assert!(prelude_definition("browser").is_some());
+        assert!(prelude_definition("computer").is_some());
+        assert!(prelude_definition("sh").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shell_helper_reports_exit_codes_and_rejects_bad_arguments() {
+        let env = env("sh");
+        let b = bridge(
+            &env,
+            BridgePolicy {
+                tools: Vec::new(),
+                before: None,
+                after: None,
+            },
+        );
+        let ok = b
+            .dispatch("__shell__", json!({"command": "echo hi"}))
+            .await
+            .unwrap();
+        assert_eq!(ok["exitCode"], json!(0), "{ok}");
+        assert!(ok["output"].as_str().unwrap().contains("hi"), "{ok}");
+        assert!(ok.get("timedOut").is_none(), "{ok}");
+
+        // A non-zero exit is a result the prelude turns into ShellError, not a
+        // host error, so the exit code survives.
+        let bad = b
+            .dispatch("__shell__", json!({"command": "exit 3"}))
+            .await
+            .unwrap();
+        assert_eq!(bad["exitCode"], json!(3), "{bad}");
+
+        for args in [
+            json!({}),
+            json!({"command": 1}),
+            json!({"command": "true", "timeout": "soon"}),
+            json!({"command": "true", "timeout": -1}),
+        ] {
+            let err = b.dispatch("__shell__", args.clone()).await.unwrap_err();
+            assert!(err.contains("sh()"), "{args}: {err}");
+        }
     }
 
     #[tokio::test]

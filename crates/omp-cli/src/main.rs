@@ -19,6 +19,7 @@ mod notices;
 mod paging;
 mod persist;
 mod rpc;
+mod rules;
 mod runtime;
 mod slash_extra;
 pub mod subcmd;
@@ -395,6 +396,9 @@ async fn async_main() -> Result<()> {
         .iter()
         .map(|t| (t.name().to_string(), t.name().to_string()))
         .collect();
+        // The dump is a whole session's prompt: install the discovered rulebook
+        // as the process-global `rule://` book, exactly as a live session does.
+        sysprompt::install_active_rules(&cwd);
         let built = sysprompt::build(&cwd, &sp_opts, &metas);
         for (i, block) in built.blocks.iter().enumerate() {
             if i > 0 {

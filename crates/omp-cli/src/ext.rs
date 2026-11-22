@@ -360,7 +360,7 @@ impl omp_ext::lifecycle::HostResponder for RuntimeResponder {
                     .map(str::to_owned),
                 _ => None,
             };
-            rt.compact(instructions.as_deref())
+            rt.compact(instructions.as_deref(), None)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.message)

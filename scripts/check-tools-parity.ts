@@ -3,13 +3,16 @@
 //
 // Intentional / deferred differences after Phase 1:
 // - bash: description first line awaits Phase 2 embedded shell
-// - ask: keeps legacy `questions[]` alongside `html` (omits required:["html"])
-// - todo: keeps tau's `reason` field for blocker tracking (TS has no `reason`)
-//   ask/todo parameter shape is NOT blanket-allowed: preciseSchemaDiffs below
-//   accepts only those exact properties and fails on any other
-//   property/type/required difference.
-// - task: keeps `model` schema entry (Phase 3/4 perCallModel gate)
 // - edit, eval, glob, web_search: wording-only first-line description deltas (params match)
+//
+// Closed in Phase 3 (allowances deleted, the deltas are gone):
+// - ask: schema is omp's `askSchema` exactly (`{html}` required); the legacy
+//   `questions[]` shape is recovery-only at runtime, no longer advertised
+// - todo: schema is omp's `todoSchema` exactly (7-value op, no `reason`);
+//   `block`/`unblock` + `reason` are runtime-only extensions
+// - task: top-level `model` removed (model selectors are per-item only)
+// - glob: `additionalProperties:false` dropped; the reference's `pattern` key is
+//   a runtime-only extension (`globSearchPath` scoping in `search::glob`)
 //
 // Run: bun scripts/check-tools-parity.ts
 import { spawnSync } from "node:child_process";
@@ -31,23 +34,7 @@ const ALLOWED_DELTAS: Record<string, RegExp[]> = {
 	// Wording-only first-line description deltas; parameters match exactly.
 	edit: [/^description first line differs:$/],
 	eval: [/^description first line differs:$/],
-	glob: [/^description first line differs:$/],
 	web_search: [/^description first line differs:$/],
-	// Legacy `questions[]` kept alongside `html`, so `html` is not required.
-	// The parameter shape itself is verified by preciseSchemaDiffs below.
-	ask: [
-		/^full description differs from TS$/,
-		/^extra in rust: questions$/,
-		/^required html: ts=true rust=false$/,
-		/^description first line differs:$/,
-	],
-	// tau keeps `reason` on todo for blocker tracking.
-	todo: [
-		/^full description differs from TS$/,
-		/^extra in rust: reason$/,
-	],
-	// Phase 3/4 perCallModel gate keeps `model` on task.
-	task: [/^extra in rust: model$/],
 };
 
 interface CompareReport {
@@ -147,37 +134,6 @@ interface DocumentedSchema {
 	items?: DocumentedSchema;
 }
 
-/** Legacy `ask.questions[]`, kept next to `html` until the form flow replaces it. */
-const ASK_QUESTIONS: DocumentedSchema = {
-	type: "array",
-	items: {
-		type: "object",
-		props: {
-			id: { type: "string" },
-			question: { type: "string" },
-			header: { type: "string" },
-			options: {
-				type: "array",
-				items: {
-					type: "object",
-					props: {
-						label: { type: "string" },
-						description: { type: "string" },
-						preview: { type: "string" },
-					},
-					required: ["label"],
-				},
-			},
-			multi: { type: "boolean" },
-			recommended: { type: "number" },
-		},
-		required: ["id", "question", "options"],
-	},
-};
-
-/** tau's `todo.reason`, used for blocker tracking. */
-const TODO_REASON: DocumentedSchema = { type: "string" };
-
 interface SchemaAllowance {
 	/** Properties omp-rs may add on top of the TS reference, with their documented schema. */
 	extra_props: Record<string, DocumentedSchema>;
@@ -188,20 +144,13 @@ interface SchemaAllowance {
 }
 
 /**
- * The only structural Phase 1 deltas allowed on `ask` and `todo`. Anything else
- * — an extra property, a lost property, a type change, or a required-flag change
- * — is a regression and fails the gate.
+ * Structural deltas tolerated between the Rust schema and the TS reference, per
+ * tool. Phase 3 closed the last two (`ask`, `todo`): both schemas now match the
+ * golden byte-for-byte and their runtime-only extensions are out-of-schema, so
+ * the table is empty. A new entry here must be justified in
+ * `docs/parity/tools.md` §4, not added to silence a diff.
  */
-const PRECISE_SCHEMA_ALLOWANCES: Record<string, SchemaAllowance> = {
-	// Legacy `questions[]` still accepted next to `html`; `html` stays optional.
-	ask: { extra_props: { questions: ASK_QUESTIONS }, optional_props: ["html"] },
-	// tau keeps `reason` on todo for blocker tracking and adds block/unblock ops.
-	todo: {
-		extra_props: { reason: TODO_REASON },
-		optional_props: [],
-		extra_enum_values: { op: ["block", "unblock"] },
-	},
-};
+const PRECISE_SCHEMA_ALLOWANCES: Record<string, SchemaAllowance> = {};
 
 type JsonSchema = Record<string, unknown>;
 

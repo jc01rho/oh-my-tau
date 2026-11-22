@@ -105,6 +105,57 @@ fn with_details(text: String, details: serde_json::Value) -> AgentToolResult {
     result
 }
 
+/// The `path` a call searches, from `path` plus the reference's runtime-only
+/// `pattern` key (omp `globSearchPath`): each `;` entry of `pattern` is scoped
+/// under each `;` entry of `path` unless it is absolute, `~`-rooted or a URL.
+fn glob_search_path(args: &serde_json::Value) -> Option<String> {
+    let base = args.get("path").and_then(serde_json::Value::as_str);
+    let Some(pattern) = args.get("pattern").and_then(serde_json::Value::as_str) else {
+        return base.map(ToOwned::to_owned);
+    };
+    let split = |value: &str| -> Vec<String> {
+        value
+            .split(';')
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect()
+    };
+    let patterns = split(pattern);
+    let bases = base.map(split).unwrap_or_default();
+    if bases.is_empty() {
+        return Some(patterns.join(";"));
+    }
+    let mut scoped: Vec<String> = Vec::new();
+    for dir in &bases {
+        for pattern in &patterns {
+            let standalone = pattern.starts_with('/')
+                || pattern.starts_with('~')
+                || is_url_like(pattern);
+            let entry = if standalone {
+                pattern.clone()
+            } else {
+                format!("{}/{pattern}", dir.trim_end_matches(['/', '\\']))
+            };
+            if !scoped.contains(&entry) {
+                scoped.push(entry);
+            }
+        }
+    }
+    Some(scoped.join(";"))
+}
+
+/// `scheme://` prefix test (omp's `/^[a-z][a-z0-9+.-]*:\/\//i`).
+fn is_url_like(value: &str) -> bool {
+    let Some((scheme, _)) = value.split_once("://") else {
+        return false;
+    };
+    !scheme.is_empty()
+        && scheme
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b.is_ascii_alphanumeric() || (i > 0 && matches!(b, b'+' | b'.' | b'-')))
+}
+
 /// Run the `glob` tool.
 ///
 /// # Errors
@@ -122,7 +173,7 @@ pub async fn glob(
     signal: AbortSignal,
 ) -> Result<AgentToolResult> {
     let fs = Fs::native();
-    let mut patterns = path_list(args.get("path").and_then(serde_json::Value::as_str));
+    let mut patterns = path_list(glob_search_path(&args).as_deref());
     if patterns.is_empty() {
         patterns.push(".".into());
     }
@@ -992,6 +1043,31 @@ mod tests {
 
     fn env_of(dir: &tempfile::TempDir) -> Arc<Env> {
         Arc::new(Env::new(dir.path(), true))
+    }
+
+    #[test]
+    fn glob_search_path_scopes_pattern_under_path() {
+        // The reference's runtime-only `pattern` key (`globSearchPath`).
+        let args = serde_json::json!({"path": "src", "pattern": "**/*.ts"});
+        assert_eq!(glob_search_path(&args).as_deref(), Some("src/**/*.ts"));
+        // Several paths x several patterns, deduplicated.
+        let args = serde_json::json!({"path": "a;b", "pattern": "*.rs;*.ts"});
+        assert_eq!(
+            glob_search_path(&args).as_deref(),
+            Some("a/*.rs;a/*.ts;b/*.rs;b/*.ts")
+        );
+        // Absolute, `~`-rooted and URL patterns stay standalone.
+        let args = serde_json::json!({"path": "src", "pattern": "/abs/*.ts;omp://**/*.md"});
+        assert_eq!(
+            glob_search_path(&args).as_deref(),
+            Some("/abs/*.ts;omp://**/*.md")
+        );
+        // No `path`: the patterns are the path list, as the reference does.
+        let args = serde_json::json!({"pattern": "*.ts"});
+        assert_eq!(glob_search_path(&args).as_deref(), Some("*.ts"));
+        // No `pattern`: plain `path` passthrough.
+        let args = serde_json::json!({"path": "src"});
+        assert_eq!(glob_search_path(&args).as_deref(), Some("src"));
     }
 
     #[test]

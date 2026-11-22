@@ -23,17 +23,22 @@ fn lock_env() -> MutexGuard<'static, ()> {
 
 #[test]
 fn schema_covers_ts_registry() {
-    // 526 register({...}) definitions extracted from TS v18.6.1, plus the 19
+    // 531 register({...}) definitions extracted from TS v18.6.1, plus the 19
     // settings only the TS panel (`createSettingsHost`) lists, plus the omp-rs
     // gates `magicKeywords.ultracode`, `systemPrompt.compact` and
     // `sandbox.enabled`.
-    assert_eq!(SETTINGS.len(), 548);
+    assert_eq!(SETTINGS.len(), 553);
     assert!(lookup("magicKeywords.ultracode").is_some());
     assert!(lookup("sandbox.enabled").is_some());
     assert!(lookup("systemPrompt.compact").is_some());
     assert!(lookup("modelRoles").is_some());
     assert!(lookup("cycleOrder").is_some());
     assert!(lookup("workspace.additionalDirectories").is_some());
+    assert!(lookup("hindsight.globalScope").is_some());
+    assert!(lookup("mnemopi.embeddingInputType").is_some());
+    assert!(lookup("mnemopi.embeddingQueryPrefix").is_some());
+    assert!(lookup("mnemopi.recallRelevance").is_some());
+    assert!(lookup("sharpshooter.minPromptLength").is_some());
     assert!(lookup("nope.unknown").is_none());
     let tier = lookup("tier.openai").unwrap();
     assert!(matches!(tier.ty, SettingType::Enum(vals) if vals.contains(&"flex")));

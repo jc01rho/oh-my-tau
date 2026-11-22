@@ -3,8 +3,9 @@
 //! (`LiveCompleter`), the manual/auto compaction commit (`compact_now`) and the post-turn
 //! threshold decision (`auto_check`).
 //!
-//! Only the local summary path (`soft` / `context-full`) is implemented; `snapcompact`, `handoff`,
-//! `shake`, remote and speculative/idle compaction are not (a `methodOrder` without `soft` therefore
+//! Only the local summary path (`soft` / `context-full`) and the handoff document
+//! lane (`handoff`) are implemented; `snapcompact`, `shake`, remote and
+//! speculative/idle compaction are not (a `methodOrder` without `soft` therefore
 //! disables automatic compaction).
 
 use std::future::Future;
@@ -292,8 +293,16 @@ pub struct CompactParams<'a> {
     /// Summarizer model id (`preferredDialect`) and window.
     pub model_id: &'a str,
     pub context_window: Option<u64>,
-    /// `/compact <instructions>`.
+    /// `/compact <instructions>` (soft path) — also the handoff focus text, already
+    /// folded into [`Self::handoff`]'s prompt by the caller.
     pub custom_instructions: Option<&'a str>,
+    /// Compaction method recorded on the entry (`soft` by default, `handoff` for
+    /// `/handoff` and `/compact handoff`). It selects the summarizer lane *and*
+    /// the replay prompt (`convert.rs` keys the `<handoff>` wrapper off it).
+    pub method: Option<&'a str>,
+    /// The handoff oneshot context (system prompt, history and the handoff prompt
+    /// as the trailing user message); required when `method == Some("handoff")`.
+    pub handoff: Option<&'a pa_types::ai::Context>,
     /// System prompt + tool schema tokens, added to the `tokensAfter` projection.
     pub non_message_tokens: u64,
     /// Extension `session_before_compact` gate (see [`CompactHook`]).
@@ -663,7 +672,39 @@ pub async fn compact_now(
         .unwrap_or(omp_compact::settings::DEFAULT_RESERVE_TOKENS);
     summary_params.context_window = params.context_window;
     summary_params.custom_instructions = params.custom_instructions;
-    let result = omp_compact::compact(completer, &prep, &summary_params).await?;
+    let method = params.method.unwrap_or("soft");
+    // Handoff (`/handoff`, `/compact handoff`): a handoff-document oneshot over the
+    // caller-built context instead of the history summary; the document is the
+    // compaction summary (no `shortSummary`).
+    let handoff_document = match params.method {
+        Some("handoff") => {
+            let context = params.handoff.ok_or_else(|| {
+                anyhow!("Handoff compaction needs a handoff context (system prompt + history)")
+            })?;
+            let max_tokens = omp_compact::summary::summary_max_tokens(summary_params.reserve_tokens);
+            let request = omp_compact::handoff::build_handoff_request(context.clone(), max_tokens);
+            let document =
+                omp_compact::handoff::generate_handoff_from_context(completer, request).await?;
+            Some(validate_handoff_document(&document)?)
+        }
+        _ => None,
+    };
+    let result = match &handoff_document {
+        Some(document) => {
+            let mut result = omp_compact::handoff::handoff_result(
+                document,
+                &prep.first_kept_entry_id,
+                prep.tokens_before,
+                &prep.file_ops,
+            );
+            // `handoffSummaryFromDocument`: the entry details carry the derived
+            // file lists (the summary itself already has the `<files>` block).
+            result.details =
+                omp_compact::handoff::handoff_summary_from_document(document, &prep.file_ops).1;
+            result
+        }
+        None => omp_compact::compact(completer, &prep, &summary_params).await?,
+    };
     // Commit gate (TS `sessionId() !== sourceSessionId || getBranch().at(-1)?.id
     // !== sourceLeafId`): a session switch, a `/tree` move, a concurrent append
     // or an abort since the plan was captured discards the pass — the summary
@@ -678,26 +719,68 @@ pub async fn compact_now(
         kept_entries,
         params.non_message_tokens,
         &tokenizer,
+        method,
     );
-    let options = ApplyOptions {
-        method: Some("soft".to_owned()),
-        tokens_after,
-        from_extension: Some(false),
-    };
-    persist
-        .append_compaction(&result, &ts, &options)
-        .context("writing the compaction entry")?;
+    // A handoff commits through `append_handoff`: TS sets `shortSummary = undefined`,
+    // while `apply::append_compaction` always writes it.
+    match &handoff_document {
+        Some(document) => {
+            let commit = omp_compact::handoff::HandoffCommit {
+                first_kept_entry_id: &result.first_kept_entry_id,
+                tokens_before: result.tokens_before,
+                tokens_after,
+                file_ops: &prep.file_ops,
+            };
+            persist
+                .append_handoff(document, &ts, &commit)
+                .context("writing the handoff compaction entry")?;
+        }
+        None => {
+            let options = ApplyOptions {
+                method: Some(method.to_owned()),
+                tokens_after,
+                from_extension: Some(false),
+            };
+            persist
+                .append_compaction(&result, &ts, &options)
+                .context("writing the compaction entry")?;
+        }
+    }
     let mut data = json!({
-        "summary": result.summary,
-        "shortSummary": result.short_summary,
-        "firstKeptEntryId": result.first_kept_entry_id,
+        "summary": result.summary.clone(),
+        "firstKeptEntryId": result.first_kept_entry_id.clone(),
         "tokensBefore": result.tokens_before,
-        "details": result.details,
+        "details": result.details.clone(),
     });
+    if handoff_document.is_none() {
+        data["shortSummary"] = json!(result.short_summary);
+    }
     if let Some(p) = &result.preserve_data {
         data["preserveData"] = p.clone();
     }
     Ok((result, data, view))
+}
+
+/// TS `SessionHandoff.generateDocument` validation: the document must carry content
+/// and a `## Goal` section heading, else the handoff is rejected before it can
+/// replace the session context.
+///
+/// # Errors
+/// The document is empty or has no `## Goal` heading.
+fn validate_handoff_document(document: &str) -> Result<String> {
+    if document.trim().is_empty() {
+        return Err(anyhow!("Handoff generation produced no content"));
+    }
+    // `^## Goal[ \t]*\r?$` per line.
+    let has_goal = document.lines().any(|line| {
+        line.trim_end_matches('\r')
+            .strip_prefix("## Goal")
+            .is_some_and(|rest| rest.chars().all(|c| c == ' ' || c == '\t'))
+    });
+    if !has_goal {
+        return Err(anyhow!("Handoff generation produced an invalid document"));
+    }
+    Ok(document.to_owned())
 }
 
 /// Build the synthetic compaction entry plus the post-compaction rebuild view
@@ -709,6 +792,7 @@ fn build_rebuild_view(
     kept_entries: Vec<Value>,
     non_message_tokens: u64,
     tokenizer: &dyn omp_compact::Tokenizer,
+    method: &str,
 ) -> (String, Vec<Value>, Option<u64>) {
     let ts = iso_from_ms(i64::try_from(now_ms()).unwrap_or(0));
     let rebuild_entry = synthetic_compaction_entry(
@@ -720,7 +804,7 @@ fn build_rebuild_view(
         },
         &ts,
         result,
-        Some("soft"),
+        Some(method),
     );
     let compaction_id = rebuild_entry
         .get("id")
@@ -739,7 +823,7 @@ fn build_rebuild_view(
     let tokens_after = project_tokens_after(
         &view_refs,
         result,
-        Some("soft"),
+        Some(method),
         &ts,
         non_message_tokens,
         tokenizer,
@@ -1235,7 +1319,7 @@ mod tests {
 
         // A local compaction of the resumed session must not carry the stale
         // remote payload forward; the rebuilt context keeps the tail.
-        h.rt.compact(None).await.expect("local compaction");
+        h.rt.compact(None, None).await.expect("local compaction");
         let entries = h.rt.entries().expect("entries");
         let new_compaction = entries
             .iter()
@@ -1361,7 +1445,7 @@ mod tests {
         let before = h.rt.messages().await.len();
         assert_eq!(before, 6);
 
-        let result = h.rt.compact(None).await.expect("compact");
+        let result = h.rt.compact(None, None).await.expect("compact");
         assert!(
             result["summary"].as_str().unwrap().contains("FAKE SUMMARY"),
             "{result}"
@@ -1386,7 +1470,7 @@ mod tests {
             "{after:?}"
         );
         // a second manual compaction right away is a no-op
-        let again = h.rt.compact(None).await.unwrap_err();
+        let again = h.rt.compact(None, None).await.unwrap_err();
         assert!(
             again.message.contains("Already compacted")
                 || again.message.contains("Nothing to compact"),
@@ -1395,9 +1479,106 @@ mod tests {
         );
     }
 
+    /// `/handoff`: the document is the compaction summary, the entry carries
+    /// `method: "handoff"` and NO `shortSummary` (TS `shortSummary = undefined`),
+    /// and the details carry the derived file lists.
     #[tokio::test]
-    async fn auto_compaction_fires_after_a_turn_over_threshold_and_emits_events() {
-        let mut h = harness(4).await;
+    async fn handoff_compaction_commits_method_handoff_without_short_summary() {
+        let mut h = harness(3).await;
+        h.rt.set_compaction_settings(CompactionSettings {
+            enabled: false,
+            ..small_keep()
+        });
+        let (fake, calls) = fake_summarizer("## Goal\nShip the handoff lane.\n\n## State\nWired.");
+        h.rt.set_summarizer(Some(fake));
+        talk(&mut h, 3).await;
+
+        let result = h.rt.compact(None, Some("handoff")).await.expect("handoff");
+        assert!(calls.load(Ordering::SeqCst) >= 1, "the document oneshot ran");
+        assert!(
+            result["summary"].as_str().unwrap().contains("## Goal"),
+            "{result}"
+        );
+        assert!(
+            result.get("shortSummary").is_none(),
+            "the rpc payload omits shortSummary for a handoff: {result}"
+        );
+
+        let entries = h.rt.entries().unwrap();
+        let comp = entries
+            .iter()
+            .find(|e| e["type"] == "compaction")
+            .expect("compaction entry");
+        assert_eq!(comp["method"], "handoff");
+        assert!(
+            comp.get("shortSummary").is_none(),
+            "the committed entry omits shortSummary: {comp}"
+        );
+        assert!(
+            comp["summary"].as_str().unwrap().contains("## Goal"),
+            "{comp}"
+        );
+        assert!(comp["details"].get("readFiles").is_some(), "{comp}");
+        assert!(comp["details"].get("modifiedFiles").is_some(), "{comp}");
+        assert!(comp["tokensAfter"].as_u64().is_some());
+
+        // The rebuilt context replays the handoff wrapper, not the soft summary.
+        let after = h.rt.messages().await;
+        assert!(
+            after[0].to_string().contains("handoff"),
+            "handoff replay wrapper: {:?}",
+            after[0]
+        );
+    }
+
+    /// A handoff document without a `## Goal` heading (or empty) is rejected
+    /// before anything is committed: the session context stays intact.
+    #[tokio::test]
+    async fn handoff_rejects_documents_without_a_goal_section() {
+        for document in ["no goal here at all", "   "] {
+            let mut h = harness(3).await;
+            h.rt.set_compaction_settings(CompactionSettings {
+                enabled: false,
+                ..small_keep()
+            });
+            let (fake, _) = fake_summarizer(document);
+            h.rt.set_summarizer(Some(fake));
+            talk(&mut h, 3).await;
+            let before = h.rt.messages().await.len();
+
+            let err = h
+                .rt
+                .compact(None, Some("handoff"))
+                .await
+                .expect_err("invalid handoff document");
+            assert!(
+                err.message.contains("Handoff generation produced"),
+                "{document:?}: {}",
+                err.message
+            );
+            assert!(
+                h.rt.entries()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e["type"] != "compaction"),
+                "nothing committed for {document:?}"
+            );
+            assert_eq!(h.rt.messages().await.len(), before, "context untouched");
+        }
+    }
+
+    #[test]
+    fn handoff_document_validation_requires_a_goal_heading() {
+        assert!(validate_handoff_document("## Goal\nDone.").is_ok());
+        assert!(validate_handoff_document("intro\n## Goal   \nbody").is_ok());
+        assert!(validate_handoff_document("intro\r\n## Goal\r\nbody").is_ok());
+        assert!(validate_handoff_document("## Goals\nno").is_err());
+        assert!(validate_handoff_document("## Goal: inline\nno").is_err());
+        assert!(validate_handoff_document("   ").is_err());
+    }
+
+    #[tokio::test]
+    async fn auto_compaction_fires_after_a_turn_over_threshold_and_emits_events() {        let mut h = harness(4).await;
         let (fake, _) = fake_summarizer("AUTO SUMMARY");
         h.rt.set_summarizer(Some(fake));
         h.rt.set_compaction_settings(CompactionSettings {
@@ -1537,7 +1718,7 @@ mod tests {
         h.rt.set_summarizer(Some(fake));
         h.rt.set_compaction_settings(small_keep());
 
-        h.rt.compact(None)
+        h.rt.compact(None, None)
             .await
             .expect("compact the selected branch");
 

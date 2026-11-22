@@ -6,7 +6,7 @@ from the code in `crates/omp-settings` plus every literal setting-id reference i
 
 Sources read for this document:
 
-- `crates/omp-settings/src/schema.rs` - generated registry (548 `SettingDef` entries)
+- `crates/omp-settings/src/schema.rs` - generated registry (553 `SettingDef` entries)
 - `crates/omp-settings/src/settings.rs` - layered store, accessors, `write_global`
 - `crates/omp-tui/src/overlays/settings_defs.rs` - generated settings-panel rows (379)
 - `crates/omp-tui/src/app.rs`, `crates/omp-tui/src/port.rs`, `crates/omp-cli/src/tui.rs` - live apply + persist path
@@ -33,14 +33,14 @@ preserving unknown keys. The TUI persists through it (`port.rs:186`,
 composer, display prefs, magic keywords).
 
 Recognising a setting is therefore *not* the same as honouring it: the store will
-return a value for all 548 ids, while a consumer has to read it to have any effect.
+return a value for all 553 ids, while a consumer has to read it to have any effect.
 
 ## 2. Declared inventory
 
 | Measure | Count |
 | --- | --- |
-| `SettingDef` entries (`schema.rs`) | **548** |
-| ...with an `env:` override | 35 |
+| `SettingDef` entries (`schema.rs`) | **553** |
+| ...with an `env:` override | 36 |
 | ...marked `credential: true` | 9 |
 | Panel rows (`settings_defs.rs`) | 379 |
 | Registry ids with no panel row | 169 |
@@ -136,7 +136,7 @@ Whole-group deaths worth flagging because a panel row still advertises them: `gc
 `memories.*` (no UI row - the memory tab shows the backends, not the local pipeline),
 `task.agent*` overrides (no UI row).
 
-## 5. Memory domain: 74 declared, 0 consumed
+## 5. Memory domain: 79 declared, 0 consumed
 
 The memory surface is the clearest case of registry-only parity.
 
@@ -144,13 +144,13 @@ The memory surface is the clearest case of registry-only parity.
 | --- | --- | --- | --- |
 | `memory` | 1 (`memory.backend`, 5 values) | 0 | 0 (mentioned in UI + `/memory` stub text) |
 | `memories` | 16 | 0 | 16 |
-| `mnemopi` | 23 | 0 | 6 |
-| `hindsight` | 26 | 0 | 17 |
-| `sharpshooter` | 3 | 0 | 2 |
+| `mnemopi` | 26 | 0 | 9 |
+| `hindsight` | 27 | 0 | 18 |
+| `sharpshooter` | 4 | 0 | 3 |
 | `autolearn` | 3 | 0 | 1 |
 | `contextFiles` | 1 (`contextFiles.extra`) | 0 | 0 |
 | `contextPromotion` | 1 | 0 | 0 |
-| **Total** | **74** | **0** | **42** |
+| **Total** | **79** | **0** | **47** |
 
 The remaining 32 are tier B: the 30 memory-tab panel rows persist them, and
 `omp-tui/src/overlays/settings.rs` uses `memory.backend` / `autolearn.enabled` only to
@@ -159,11 +159,8 @@ code path observes; `contextFiles.extra` is persisted and ignored;
 `disabledProviders` / `disabledExtensions` / `enabledProviders` / `enabledModels` have
 typed accessors in `settings.rs` with zero callers.
 
-Five memory ids present in the TS registry are missing here entirely:
-`hindsight.globalScope`, `mnemopi.embeddingInputType`,
-`mnemopi.embeddingQueryPrefix`, `mnemopi.recallRelevance`,
-`sharpshooter.minPromptLength`. There is also no `memories.enabled: true ->
-memory.backend: local` migration, so a legacy config silently keeps the `off` backend.
+There is no `memories.enabled: true -> memory.backend: local` migration, so a legacy
+config silently keeps the `off` backend.
 See `docs/research/06-memory-context-gap.md` for the subsystem behind these keys.
 
 ## 6. Provenance tracking status

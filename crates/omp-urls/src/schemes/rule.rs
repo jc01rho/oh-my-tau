@@ -4,40 +4,62 @@
 //! Virtual backing: resolved content is the rule body, not the file's bytes.
 
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use crate::{InternalResource, InternalUrl, UrlCompletion, UrlCtx, UrlProvider};
 
 use super::RuleEntry;
 
-/// Error text when the rulebook itself was never ported.
-pub const NOT_IMPLEMENTED: &str =
-    "rule:// is not implemented yet in oh-my-tau (no rulebook ported)";
+/// Prompt doc line (TS `prompts/internal-urls/rule.md`, trimmed).
+pub const PROMPT_DOC: &str = "rule://<name>: details.";
 
-/// Look up a rule by name; errors on a nameless URL (TS `lookupRule`/`findRule`).
-///
-/// An empty rulebook means the subsystem is absent, not that the name is wrong,
-/// so it reports [`NOT_IMPLEMENTED`] instead of the TS "Unknown rule" text.
-fn find_rule<'a>(url: &InternalUrl, rules: &'a [RuleEntry]) -> Result<&'a RuleEntry, String> {
+static ACTIVE_RULES: RwLock<Option<Arc<Vec<RuleEntry>>>> = RwLock::new(None);
+
+/// Install the process-global rulebook the active session loaded
+/// (TS `setActiveRules`). Read by `rule://` when the caller threads no
+/// [`UrlCtx::rules`].
+pub fn set_active_rules(rules: Vec<RuleEntry>) {
+    *ACTIVE_RULES.write().expect("active rules lock") = Some(Arc::new(rules));
+}
+
+/// The installed rulebook, or an empty book when no session installed one
+/// (TS `getActiveRules`).
+pub fn active_rules() -> Arc<Vec<RuleEntry>> {
+    ACTIVE_RULES
+        .read()
+        .expect("active rules lock")
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Rules addressable by one caller: the context's book when it threaded one,
+/// else the process-global book.
+fn rules_for(ctx: &UrlCtx) -> Arc<Vec<RuleEntry>> {
+    ctx.rules.clone().unwrap_or_else(active_rules)
+}
+
+/// Rule name addressed by `url` (TS `url.rawHost || url.hostname`).
+fn rule_name(url: &InternalUrl) -> Result<&str, String> {
     if url.host.is_empty() {
         return Err("rule:// URL requires a rule name: rule://<name>".to_string());
     }
-    if rules.is_empty() {
-        return Err(NOT_IMPLEMENTED.to_string());
-    }
-    match rules.iter().find(|r| r.name == url.host) {
+    Ok(&url.host)
+}
+
+/// Look up a rule by name; errors on a nameless URL (TS `findRule`).
+fn find_rule<'a>(url: &InternalUrl, rules: &'a [RuleEntry]) -> Result<&'a RuleEntry, String> {
+    let name = rule_name(url)?;
+    match rules.iter().find(|r| r.name == name) {
         Some(rule) => Ok(rule),
         None => {
-            let mut available: Vec<&str> = rules.iter().map(|r| r.name.as_str()).collect();
-            available.sort();
+            // TS preserves discovery order here; it does not sort.
+            let available: Vec<&str> = rules.iter().map(|r| r.name.as_str()).collect();
             let available_str = if available.is_empty() {
                 "none".to_string()
             } else {
                 available.join(", ")
             };
-            Err(format!(
-                "Unknown rule: {}\nAvailable: {available_str}",
-                url.host
-            ))
+            Err(format!("Unknown rule: {name}\nAvailable: {available_str}"))
         }
     }
 }
@@ -55,12 +77,10 @@ pub fn resolve(url: &InternalUrl, rules: &[RuleEntry]) -> Result<InternalResourc
 
 /// Rule source file (with frontmatter); `None` for unknown rules and rules with no file on disk.
 pub fn locate(url: &InternalUrl, rules: &[RuleEntry]) -> Result<Option<PathBuf>, String> {
-    if url.host.is_empty() {
-        return Err("rule:// URL requires a rule name: rule://<name>".to_string());
-    }
+    let name = rule_name(url)?;
     Ok(rules
         .iter()
-        .find(|r| r.name == url.host)
+        .find(|r| r.name == name)
         .filter(|r| !r.path.is_empty() && PathBuf::from(&r.path).exists())
         .map(|r| PathBuf::from(&r.path)))
 }
@@ -77,9 +97,6 @@ pub fn complete(rules: &[RuleEntry]) -> Vec<UrlCompletion> {
 }
 
 /// Read-only `rule://` provider over the session rulebook.
-///
-/// oh-my-tau has no TTSR rules subsystem yet, so the book is empty and every read
-/// surfaces [`NOT_IMPLEMENTED`] rather than a misleading "Unknown rule".
 #[derive(Default)]
 pub struct RuleProvider;
 
@@ -101,31 +118,23 @@ impl UrlProvider for RuleProvider {
         &SPEC
     }
 
-    fn read(&self, url: &InternalUrl, _ctx: &UrlCtx) -> anyhow::Result<InternalResource> {
-        resolve(url, &active_rules()).map_err(anyhow::Error::msg)
+    fn read(&self, url: &InternalUrl, ctx: &UrlCtx) -> anyhow::Result<InternalResource> {
+        resolve(url, &rules_for(ctx)).map_err(anyhow::Error::msg)
     }
 
-    fn locate(&self, url: &InternalUrl, _ctx: &UrlCtx) -> Option<PathBuf> {
-        locate(url, &active_rules()).ok().flatten()
+    fn locate(&self, url: &InternalUrl, ctx: &UrlCtx) -> Option<PathBuf> {
+        locate(url, &rules_for(ctx)).ok().flatten()
     }
 
-    fn complete(&self, _query: &str, _ctx: &UrlCtx) -> Vec<UrlCompletion> {
-        complete(&active_rules())
+    fn complete(&self, _query: &str, ctx: &UrlCtx) -> Vec<UrlCompletion> {
+        complete(&rules_for(ctx))
     }
 
     fn prompt_doc(&self) -> Option<String> {
-        (active_rule_count() > 0).then(|| "`rule://<name>`: details.".to_string())
+        // TS advertises the scheme only when the book has addressable rules;
+        // `SchemeHost` is not threaded here, so the global book is the signal.
+        (!active_rules().is_empty()).then(|| PROMPT_DOC.to_string())
     }
-}
-
-/// Rules addressable by `rule://`. oh-my-tau does not port the TS rulebook
-/// (Cursor/Windsurf/Cline discovery) yet; the empty book reports [`NOT_IMPLEMENTED`].
-fn active_rules() -> Vec<RuleEntry> {
-    Vec::new()
-}
-
-fn active_rule_count() -> usize {
-    active_rules().len()
 }
 
 #[cfg(test)]
@@ -133,12 +142,19 @@ mod tests {
     use super::*;
     use crate::parse_internal_url;
 
+    /// Serializes the tests that publish the process-global rulebook.
+    static GLOBAL_BOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_BOOK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn rule(name: &str, content: &str) -> RuleEntry {
         RuleEntry {
             name: name.to_string(),
             path: format!("/tmp/rules/{name}.md"),
             content: content.to_string(),
-            description: String::new(),
+            ..RuleEntry::default()
         }
     }
 
@@ -167,17 +183,27 @@ mod tests {
     }
 
     #[test]
-    fn empty_rulebook_reports_not_implemented() {
+    fn empty_rulebook_reports_unknown_rule() {
         let url = parse_internal_url("rule://tdd").unwrap();
         assert_eq!(
             resolve(&url, &[]).unwrap_err(),
-            "rule:// is not implemented yet in oh-my-tau (no rulebook ported)"
+            "Unknown rule: tdd\nAvailable: none"
         );
         // A nameless URL still keeps the TS parse error.
         let url = parse_internal_url("rule://").unwrap();
         assert_eq!(
             resolve(&url, &[]).unwrap_err(),
             "rule:// URL requires a rule name: rule://<name>"
+        );
+    }
+
+    #[test]
+    fn available_list_preserves_discovery_order() {
+        let rules = [rule("zeta", "z"), rule("alpha", "a")];
+        let url = parse_internal_url("rule://missing").unwrap();
+        assert_eq!(
+            resolve(&url, &rules).unwrap_err(),
+            "Unknown rule: missing\nAvailable: zeta, alpha"
         );
     }
 
@@ -191,5 +217,30 @@ mod tests {
             locate(&url, &rules).unwrap_err(),
             "rule:// URL requires a rule name: rule://<name>"
         );
+    }
+
+    #[test]
+    fn context_rules_override_the_global_book() {
+        let _guard = lock_globals();
+        set_active_rules(vec![rule("global", "g")]);
+        let ctx = UrlCtx {
+            rules: Some(Arc::new(vec![rule("scoped", "s")])),
+            ..UrlCtx::default()
+        };
+        let provider = RuleProvider;
+        let url = parse_internal_url("rule://scoped").unwrap();
+        assert_eq!(provider.read(&url, &ctx).unwrap().content, "s");
+        let url = parse_internal_url("rule://global").unwrap();
+        assert_eq!(
+            provider.read(&url, &ctx).unwrap_err().to_string(),
+            "Unknown rule: global\nAvailable: scoped"
+        );
+        // A context that threads no book falls back to the global one.
+        let url = parse_internal_url("rule://global").unwrap();
+        assert_eq!(
+            provider.read(&url, &UrlCtx::default()).unwrap().content,
+            "g"
+        );
+        set_active_rules(Vec::new());
     }
 }

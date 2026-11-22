@@ -258,6 +258,19 @@ fn write_tier(input: &str) -> Decision {
     let Some(scheme) = scheme_of(input) else {
         return Decision::tier(Tier::Write);
     };
+    // TS `deviceWriteTier`: the auto-QA device is a plain write; every other `xd://` device fails
+    // closed to `exec` until its mounted tool's own tier can be resolved.
+    if scheme == "xd" {
+        let device = input
+            .split_once("://")
+            .map_or("", |(_, rest)| rest)
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        if device == "report_issue" {
+            return Decision::tier(Tier::Write);
+        }
+    }
     match scheme.as_str() {
         "vault" | "cfg" | "conflict" => Decision::tier(Tier::Write),
         "agent" | "local" => Decision::tier(Tier::Read),
@@ -351,6 +364,22 @@ const LSP_READONLY_ACTIONS: &[&str] = &[
     "symbols",
     "status",
     "capabilities",
+];
+
+/// TS `DEBUG_READONLY_ACTIONS`: DAP actions that only read program state. Everything else
+/// (`launch`, `attach`, `continue`, `step_*`, `pause`, `evaluate`, breakpoint mutations, memory
+/// writes, `custom_request`) is exec-tier.
+const DEBUG_READONLY_ACTIONS: &[&str] = &[
+    "output",
+    "threads",
+    "stack_trace",
+    "scopes",
+    "variables",
+    "disassemble",
+    "read_memory",
+    "loaded_sources",
+    "modules",
+    "sessions",
 ];
 
 /// Critical bash shapes (TS `CRITICAL_BASH_PATTERNS`).
@@ -644,6 +673,44 @@ pub fn tool_decision(name: &str, args: &Value, settings: &omp_settings::Settings
                 Tier::Write
             })
         }
+        // Phase 3 tools: each delegates to its own `approval` helper where the module owns one,
+        // so the tier and the tool cannot drift apart.
+        "debug" => {
+            let action = str_arg(args, "action")
+                .map(str::to_lowercase)
+                .unwrap_or_default();
+            Decision::tier(if DEBUG_READONLY_ACTIONS.contains(&action.as_str()) {
+                Tier::Read
+            } else {
+                Tier::Exec
+            })
+        }
+        "github" => Decision::tier(if crate::tools::github::approval_for(args) == "read" {
+            Tier::Read
+        } else {
+            Tier::Exec
+        }),
+        "security_scan" => Decision::tier(if crate::tools::security_scan::approval(args) == "read" {
+            Tier::Read
+        } else {
+            Tier::Exec
+        }),
+        "context_notes" => {
+            let tier = match crate::tools::context_notes::context_notes_approval(args) {
+                crate::tools::context_notes::Approval::Write => Tier::Write,
+                crate::tools::context_notes::Approval::Read => Tier::Read,
+            };
+            Decision::tier(tier)
+        }
+        "new_context" => Decision::tier(Tier::Write),
+        // `retain`/`learn`/`manage_skill` charge a write only where they escape the project;
+        // `recall`/`reflect`/`memory_edit` stay reads.
+        "retain" | "recall" | "reflect" | "memory_edit" | "learn" | "manage_skill" => {
+            crate::tools::memory_tools::approval(name, args, settings)
+        }
+        "vibe_spawn" | "vibe_send" => Decision::tier(Tier::Exec),
+        "vibe_wait" | "vibe_kill" | "vibe_list" => Decision::tier(Tier::Read),
+        "generate_image" | "tts" => Decision::tier(Tier::Write),
         "glob" | "find" | "ast_grep" | "web_search" | "ask" | "think" | "wait" | "yield"
         | "todo" | "checkpoint" | "rewind" | "context" => Decision::tier(Tier::Read),
         n if n.starts_with("mcp__") => Decision::tier(Tier::Write),
@@ -686,6 +753,16 @@ fn approval_details(name: &str, args: &Value) -> Vec<String> {
             )];
             if let Some(file) = str_arg(args, "file").filter(|f| !f.is_empty()) {
                 lines.push(format!("File: {}", t(file)));
+            }
+            lines
+        }
+        "debug" => {
+            let mut lines = vec![format!(
+                "Action: {}",
+                str_arg(args, "action").unwrap_or("(missing)")
+            )];
+            if let Some(program) = str_arg(args, "program").filter(|p| !p.is_empty()) {
+                lines.push(format!("Program: {}", t(program)));
             }
             lines
         }

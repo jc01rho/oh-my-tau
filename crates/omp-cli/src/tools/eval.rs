@@ -56,17 +56,68 @@ Never repeat successful setup; after a kernel-loss notice, reload it.";
 /// union, `language` + `code` required).
 #[must_use]
 pub fn schema() -> Value {
+    build_eval_schema(&["py", "js"], None)
+}
+
+/// Session-scoped copy of [`schema`] (TS `buildEvalSchema(langs, maxTimeout)`):
+/// the `language` enum advertises only the enabled runtimes, and `max_timeout`
+/// (from `tools.maxTimeout`) narrows the timeout description to the effective
+/// ceiling so the model never sees a deadline it cannot use.
+#[must_use]
+pub fn build_eval_schema(langs: &[&str], max_timeout: Option<f64>) -> Value {
+    let names: Vec<&str> = langs
+        .iter()
+        .copied()
+        .filter(|lang| matches!(*lang, "py" | "js"))
+        .collect();
+    let names = if names.is_empty() {
+        vec!["py", "js"]
+    } else {
+        names
+    };
     json!({
         "type": "object",
         "properties": {
-            "language": {"enum": ["py", "js"], "type": "string", "description": "\"py\": IPython; \"js\": Bun"},
-            "code": {"type": "string", "description": "Code or standalone % command; top-level await works."},
+            "language": {
+                "enum": names.clone(),
+                "type": "string",
+                "description": describe_language_field(&names),
+            },
+            "code": {"type": "string", "description": "Code or standalone % command."},
             "title": {"type": "string", "description": "Short transcript label."},
-            "timeout": {"type": "number", "description": "Cell deadline in seconds; 0 disables it."},
+            "timeout": {"type": "number", "description": eval_timeout_description(max_timeout)},
             "reset": {"type": "boolean", "description": "Wipe only this kernel."}
         },
         "required": ["language", "code"]
     })
+}
+
+/// TS `describeLanguageField`: one clause per advertised runtime.
+fn describe_language_field(langs: &[&str]) -> String {
+    langs
+        .iter()
+        .map(|lang| match *lang {
+            "py" => "\"py\": IPython",
+            "js" => "\"js\": Bun",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// TS `evalTimeoutSchema`: the static clamp text plus, when `tools.maxTimeout`
+/// is configured, the effective ceiling it imposes on this session.
+fn eval_timeout_description(max_timeout: Option<f64>) -> String {
+    let configured = max_timeout
+        .filter(|t| *t > 0.0)
+        .map_or_else(String::new, |t| {
+            let ceiling = t.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
+            format!(" Configured tools.maxTimeout: {t}s (effective ceiling {ceiling}s).")
+        });
+    format!(
+        "Cell deadline in seconds; nonzero values clamp to {}–{}; 0 disables it.{configured}",
+        MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS
+    )
 }
 
 /// The `eval` tool proper: receives the call's abort signal and update
@@ -493,5 +544,74 @@ mod bridge_session_env_tests {
             .map(|(_, v)| v.clone())
             .expect("PI_TOOL_BRIDGE_SESSION set");
         assert!(v.starts_with("python:"), "{v}");
+    }
+}
+
+#[cfg(test)]
+mod eval_schema_tests {
+    use super::{build_eval_schema, schema};
+    use serde_json::json;
+
+    #[test]
+    fn static_schema_matches_ts_text() {
+        let props = schema()["properties"].clone();
+        // Upstream `evalCellCommonFields.code` text, verbatim.
+        assert_eq!(
+            props["code"]["description"],
+            json!("Code or standalone % command.")
+        );
+        // Upstream `evalTimeoutSchema()` with no configured maxTimeout.
+        assert_eq!(
+            props["timeout"]["description"],
+            json!(
+                "Cell deadline in seconds; nonzero values clamp to 1\u{2013}3600; 0 disables it."
+            )
+        );
+    }
+
+    #[test]
+    fn session_schema_narrows_languages_and_advertises_the_configured_ceiling() {
+        let s = build_eval_schema(&["py"], Some(120.0));
+        let props = s["properties"].clone();
+        assert_eq!(props["language"]["enum"], json!(["py"]));
+        assert_eq!(props["language"]["description"], json!("\"py\": IPython"));
+        let timeout = props["timeout"]["description"].as_str().unwrap();
+        assert!(
+            timeout.contains("Configured tools.maxTimeout: 120s (effective ceiling 120s)."),
+            "{timeout}"
+        );
+        assert!(timeout.contains("clamp to 1\u{2013}3600"), "{timeout}");
+    }
+
+    #[test]
+    fn configured_ceiling_never_exceeds_the_hard_clamp() {
+        let wide = build_eval_schema(&["js"], Some(9999.0));
+        let text = wide["properties"]["timeout"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("effective ceiling 3600s"), "{text}");
+    }
+
+    #[test]
+    fn empty_language_set_falls_back_to_the_full_union() {
+        assert_eq!(
+            build_eval_schema(&[], None)["properties"]["language"]["enum"],
+            json!(["py", "js"])
+        );
+        // Unknown tokens are dropped, not advertised.
+        assert_eq!(
+            build_eval_schema(&["py", "go"], None)["properties"]["language"]["enum"],
+            json!(["py"])
+        );
+    }
+
+    #[test]
+    fn unconfigured_max_timeout_keeps_the_plain_description() {
+        let text = build_eval_schema(&["py"], None)["properties"]["timeout"]["description"].clone();
+        assert!(!text.as_str().unwrap().contains("maxTimeout"), "{text}");
+        // A zero/negative maxTimeout means "unset" upstream, not "zero seconds".
+        let zero =
+            build_eval_schema(&["py"], Some(0.0))["properties"]["timeout"]["description"].clone();
+        assert!(!zero.as_str().unwrap().contains("maxTimeout"), "{zero}");
     }
 }
