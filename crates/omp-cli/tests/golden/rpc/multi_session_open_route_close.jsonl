@@ -1,0 +1,48 @@
+{"dir":"in","frame":{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864,"multiSession":true,"capabilities":"<RPC_COMMANDS>","launchProfile":{"multi_session":true,"session_runtime":"in-process"}}}
+{"dir":"out","frame":{"type":"get_protocol_info","id":"gw-1"}}
+{"dir":"in","frame":{"id":"gw-1","type":"response","command":"get_protocol_info","success":true,"data":{"protocolVersion":2,"serverVersion":"<SERVER_VERSION>","engine":"oh-my-tau","mode":"multi_session","capabilities":"<RPC_COMMANDS>","commands":"<RPC_COMMANDS>","agentDir":"<AGENT_DIR>","launchProfile":{"multi_session":true,"session_runtime":"in-process"}}}}
+{"dir":"out","frame":{"type":"list_sessions","id":"gw-2"}}
+{"dir":"in","frame":{"id":"gw-2","type":"response","command":"list_sessions","success":true,"data":{"sessions":[]}}}
+{"dir":"out","frame":{"type":"get_state","id":"gw-3"}}
+{"dir":"in","frame":{"id":"gw-3","type":"response","command":"get_state","success":false,"error":"get_state needs the sessionId of an open session","code":"missing_session_id","errorCode":"missing_session_id"}}
+{"dir":"out","frame":{"type":"open_session","sessionPath":"<SESSION_PATH>","cwd":"<CWD>","attended":false,"id":"gw-4"}}
+{"dir":"in","frame":{"id":"gw-4","type":"response","command":"open_session","success":true,"data":{"sessionId":"rpc-1","durableSessionId":"<SESSION_ID>","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","resumed":false}}}
+{"dir":"out","frame":{"type":"open_session","sessionPath":"<SESSION_PATH>","cwd":"<CWD>","attended":false,"id":"gw-5"}}
+{"dir":"in","frame":{"id":"gw-5","type":"response","command":"open_session","success":true,"data":{"sessionId":"rpc-2","durableSessionId":"<SESSION_ID>","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","resumed":false}}}
+{"dir":"out","frame":{"type":"open_session","sessionPath":"<SESSION_PATH>","cwd":"<CWD>","id":"gw-6"}}
+{"dir":"in","frame":{"id":"gw-6","type":"response","command":"open_session","success":false,"error":"<PATH> is already open here","code":"session_path_in_use","errorCode":"session_path_in_use"}}
+{"dir":"out","frame":{"type":"open_session","sessionPath":"<SESSION_PATH>","id":"gw-7"}}
+{"dir":"in","frame":{"id":"gw-7","type":"response","command":"open_session","success":false,"error":"sessionPath must be an absolute path","code":"invalid_path","errorCode":"invalid_path"}}
+{"dir":"out","frame":{"type":"open_session","cwd":"<CWD>","id":"gw-8"}}
+{"dir":"in","frame":{"id":"gw-8","type":"response","command":"open_session","success":false,"error":"cwd <PATH> No such file or directory (os error 2)","code":"invalid_path","errorCode":"invalid_path"}}
+{"dir":"out","frame":{"type":"list_sessions","id":"gw-9"}}
+{"dir":"in","frame":{"id":"gw-9","type":"response","command":"list_sessions","success":true,"data":{"sessions":[{"sessionId":"rpc-1","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","busy":"<BUSY>"},{"sessionId":"rpc-2","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","busy":"<BUSY>"}]}}}
+{"dir":"out","frame":{"type":"get_state","sessionId":"rpc-1","id":"gw-10"}}
+{"dir":"in","frame":{"id":"gw-10","type":"response","command":"get_state","success":true,"data":{"model":{"id":"text","name":"Mock Text","api":"openai-completions","provider":"mock","baseUrl":"<MOCK_BASE_URL>","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":128000,"maxTokens":4096,"compat":{"supportsDeveloperRole":true}},"thinkingLevel":"off","ultra":null,"isStreaming":false,"isCompacting":false,"steeringMode":"one-at-a-time","followUpMode":"one-at-a-time","interruptMode":"immediate","sessionId":"<SESSION_ID>","autoCompactionEnabled":true,"queuedMessageCount":0,"hasPendingAsyncWork":false,"isSettled":true,"queuedMessages":{"steering":[],"followUp":[]},"todoPhases":[],"fastModeEnabled":false,"tokensPerSecond":null,"fastModeActive":false,"messageCount":0,"systemPrompt":["<SYSTEM_PROMPT>"],"dumpTools":"<TOOLS_LIST>","goal":null,"paused":false,"runPaused":false,"pauseSeq":0,"pausedHeldInputCount":0,"pausedNoticeCount":0,"holds":[],"pause":{"pauseSeq":0,"records":[]},"sessionFile":"<SESSION_FILE>","contextUsage":"<CONTEXT_USAGE>"},"sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"get_state","sessionId":"rpc-2","id":"gw-11"}}
+{"dir":"in","frame":{"id":"gw-11","type":"response","command":"get_state","success":true,"data":{"model":{"id":"text","name":"Mock Text","api":"openai-completions","provider":"mock","baseUrl":"<MOCK_BASE_URL>","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":128000,"maxTokens":4096,"compat":{"supportsDeveloperRole":true}},"thinkingLevel":"off","ultra":null,"isStreaming":false,"isCompacting":false,"steeringMode":"one-at-a-time","followUpMode":"one-at-a-time","interruptMode":"immediate","sessionId":"<SESSION_ID>","autoCompactionEnabled":true,"queuedMessageCount":0,"hasPendingAsyncWork":false,"isSettled":true,"queuedMessages":{"steering":[],"followUp":[]},"todoPhases":[],"fastModeEnabled":false,"tokensPerSecond":null,"fastModeActive":false,"messageCount":0,"systemPrompt":["<SYSTEM_PROMPT>"],"dumpTools":"<TOOLS_LIST>","goal":null,"paused":false,"runPaused":false,"pauseSeq":0,"pausedHeldInputCount":0,"pausedNoticeCount":0,"holds":[],"pause":{"pauseSeq":0,"records":[]},"sessionFile":"<SESSION_FILE>","contextUsage":"<CONTEXT_USAGE>"},"sessionId":"rpc-2"}}
+{"dir":"out","frame":{"type":"prompt","message":"Reply deterministically","streamingBehavior":"followUp","sessionId":"rpc-2","id":"gw-12"}}
+{"dir":"in","frame":{"id":"gw-12","type":"response","command":"prompt","success":true,"sessionId":"rpc-2"}}
+{"dir":"in","frame":{"type":"agent_start","sessionId":"rpc-2"}}
+{"dir":"in","frame":{"type":"turn_start","sessionId":"rpc-2"}}
+{"dir":"in","frame":{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"MOCK-RPC-OK"}],"api":"openai-completions","provider":"mock","model":"text","responseId":"chatcmpl-mock-1","usage":"<USAGE>","stopReason":"stop","timestamp":"<TIMESTAMP>","duration":"<DURATION_MS>","ttft":"<DURATION_MS>"},"toolResults":[],"sessionId":"rpc-2"}}
+{"dir":"in","frame":{"type":"agent_end","messageCount":{"user":1,"assistant":1,"toolResult":0},"isTerminal":true,"yielded":true,"sessionId":"rpc-2"}}
+{"dir":"in","frame":{"type":"prompt_result","agentInvoked":true,"status":"completed","sessionSettled":true,"id":"gw-12","sessionId":"rpc-2"}}
+{"dir":"in","frame":{"type":"session_settled","sessionId":"rpc-2"}}
+{"dir":"in","frame":{"type":"agent_settled","sessionId":"rpc-2"}}
+{"dir":"out","frame":{"type":"get_last_assistant_text","sessionId":"rpc-1","id":"gw-13"}}
+{"dir":"in","frame":{"id":"gw-13","type":"response","command":"get_last_assistant_text","success":true,"data":{"text":null},"sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"get_last_assistant_text","sessionId":"rpc-2","id":"gw-14"}}
+{"dir":"in","frame":{"id":"gw-14","type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"MOCK-RPC-OK"},"sessionId":"rpc-2"}}
+{"dir":"out","frame":{"type":"get_state","sessionId":"rpc-9","id":"gw-15"}}
+{"dir":"in","frame":{"id":"gw-15","type":"response","command":"get_state","success":false,"error":"no open session rpc-9","code":"unknown_session","errorCode":"unknown_session","sessionId":"rpc-9"}}
+{"dir":"out","frame":{"type":"close_session","sessionId":"rpc-1","id":"gw-16"}}
+{"dir":"in","frame":{"id":"gw-16","type":"response","command":"close_session","success":true,"sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"list_sessions","id":"gw-17"}}
+{"dir":"in","frame":{"id":"gw-17","type":"response","command":"list_sessions","success":true,"data":{"sessions":[{"sessionId":"rpc-2","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","busy":"<BUSY>"}]}}}
+{"dir":"out","frame":{"type":"get_state","sessionId":"rpc-1","id":"gw-18"}}
+{"dir":"in","frame":{"id":"gw-18","type":"response","command":"get_state","success":false,"error":"no open session rpc-1","code":"unknown_session","errorCode":"unknown_session","sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"close_session","sessionId":"rpc-1","id":"gw-19"}}
+{"dir":"in","frame":{"id":"gw-19","type":"response","command":"close_session","success":false,"error":"no open session rpc-1","code":"unknown_session","errorCode":"unknown_session","sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"close_session","id":"gw-20"}}
+{"dir":"in","frame":{"id":"gw-20","type":"response","command":"close_session","success":false,"error":"close_session needs a sessionId","code":"missing_session_id","errorCode":"missing_session_id"}}

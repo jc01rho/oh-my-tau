@@ -1,0 +1,31 @@
+{"dir":"in","frame":{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864,"multiSession":true,"capabilities":"<RPC_COMMANDS>","launchProfile":{"multi_session":true,"session_runtime":"in-process"}}}
+{"dir":"out","frame":{"type":"open_session","sessionPath":"<SESSION_PATH>","cwd":"<CWD>","attended":false,"id":"gw-1"}}
+{"dir":"in","frame":{"id":"gw-1","type":"response","command":"open_session","success":true,"data":{"sessionId":"rpc-1","durableSessionId":"<SESSION_ID>","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","resumed":false}}}
+{"dir":"out","frame":{"type":"open_session","sessionPath":"<SESSION_PATH>","cwd":"<CWD>","attended":false,"id":"gw-2"}}
+{"dir":"in","frame":{"id":"gw-2","type":"response","command":"open_session","success":true,"data":{"sessionId":"rpc-2","durableSessionId":"<SESSION_ID>","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","resumed":false}}}
+{"dir":"out","frame":{"type":"release_session","reason":"takeover","id":"gw-3"}}
+{"dir":"in","frame":{"id":"gw-3","type":"response","command":"release_session","success":false,"error":"release_session needs a sessionId","code":"missing_session_id","errorCode":"missing_session_id"}}
+{"dir":"out","frame":{"type":"release_session","sessionId":"rpc-1","id":"gw-4"}}
+{"dir":"in","frame":{"id":"gw-4","type":"response","command":"release_session","success":false,"error":"reason must be \"takeover\", or \"move\" with a plain moveId","code":"invalid_release_reason","errorCode":"invalid_release_reason","sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"release_session","reason":"move","sessionId":"rpc-1","id":"gw-5"}}
+{"dir":"in","frame":{"id":"gw-5","type":"response","command":"release_session","success":false,"error":"reason must be \"takeover\", or \"move\" with a plain moveId","code":"invalid_release_reason","errorCode":"invalid_release_reason","sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"release_session","reason":"move","moveId":"../escape","sessionId":"rpc-1","id":"gw-6"}}
+{"dir":"in","frame":{"id":"gw-6","type":"response","command":"release_session","success":false,"error":"reason must be \"takeover\", or \"move\" with a plain moveId","code":"invalid_release_reason","errorCode":"invalid_release_reason","sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"release_session","reason":"swap","sessionId":"rpc-1","id":"gw-7"}}
+{"dir":"in","frame":{"id":"gw-7","type":"response","command":"release_session","success":false,"error":"reason must be \"takeover\", or \"move\" with a plain moveId","code":"invalid_release_reason","errorCode":"invalid_release_reason","sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"release_session","reason":"takeover","sessionId":"rpc-9","id":"gw-8"}}
+{"dir":"in","frame":{"id":"gw-8","type":"response","command":"release_session","success":false,"error":"no open session rpc-9","code":"unknown_session","errorCode":"unknown_session","sessionId":"rpc-9"}}
+{"dir":"out","frame":{"type":"set_model","provider":"mock","modelId":"hold","sessionId":"rpc-1","id":"gw-9"}}
+{"dir":"in","frame":{"id":"gw-9","type":"response","command":"set_model","success":true,"data":{"id":"hold","name":"Mock Hold","api":"openai-completions","provider":"mock","baseUrl":"<MOCK_BASE_URL>","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":128000,"maxTokens":4096,"compat":{"supportsDeveloperRole":true}},"sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"prompt","message":"Hold turn","streamingBehavior":"followUp","sessionId":"rpc-1","id":"gw-10"}}
+{"dir":"in","frame":{"id":"gw-10","type":"response","command":"prompt","success":true,"sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"release_session","reason":"takeover","sessionId":"rpc-1","id":"gw-11"}}
+{"dir":"in","frame":{"id":"gw-11","type":"response","command":"release_session","success":false,"error":"turn_active: the session is busy (<SIGNALS>); release with interrupt: true to stop it and take its queued input","code":"turn_active","errorCode":"turn_active","sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"get_state","sessionId":"rpc-1","id":"gw-12"}}
+{"dir":"in","frame":{"id":"gw-12","type":"response","command":"get_state","success":true,"data":{"model":{"id":"hold","name":"Mock Hold","api":"openai-completions","provider":"mock","baseUrl":"<MOCK_BASE_URL>","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":128000,"maxTokens":4096,"compat":{"supportsDeveloperRole":true}},"thinkingLevel":"off","ultra":null,"isStreaming":true,"isCompacting":false,"steeringMode":"one-at-a-time","followUpMode":"one-at-a-time","interruptMode":"immediate","sessionId":"<SESSION_ID>","autoCompactionEnabled":true,"queuedMessageCount":0,"hasPendingAsyncWork":false,"isSettled":false,"queuedMessages":{"steering":[],"followUp":[]},"todoPhases":[],"fastModeEnabled":false,"tokensPerSecond":null,"fastModeActive":false,"messageCount":1,"systemPrompt":["<SYSTEM_PROMPT>"],"dumpTools":"<TOOLS_LIST>","goal":null,"paused":false,"runPaused":false,"pauseSeq":0,"pausedHeldInputCount":0,"pausedNoticeCount":0,"holds":[],"pause":{"pauseSeq":0,"records":[]},"sessionFile":"<SESSION_FILE>","contextUsage":"<CONTEXT_USAGE>"},"sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"release_session","reason":"takeover","interrupt":true,"sessionId":"rpc-1","id":"gw-13"}}
+{"dir":"in","frame":{"id":"gw-13","type":"response","command":"release_session","success":true,"data":{"released":true,"session_path":"<SESSION_PATH>","attachments":0,"dropped":{"deliveries":[],"user_messages":[]}},"sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"release_session","reason":"move","moveId":"m1","target":"laptop","interrupt":true,"force":true,"sessionId":"rpc-2","id":"gw-14"}}
+{"dir":"in","frame":{"id":"gw-14","type":"response","command":"release_session","success":true,"data":{"released":true,"session_path":"<SESSION_PATH>","attachments":0,"dropped":{"deliveries":[],"user_messages":[]}},"sessionId":"rpc-2"}}
+{"dir":"out","frame":{"type":"get_state","sessionId":"rpc-2","id":"gw-15"}}
+{"dir":"in","frame":{"id":"gw-15","type":"response","command":"get_state","success":false,"error":"no open session rpc-2","code":"unknown_session","errorCode":"unknown_session","sessionId":"rpc-2"}}

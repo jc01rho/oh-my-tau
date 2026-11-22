@@ -1,0 +1,28 @@
+{"dir":"out","frame":{"type":"open_session","sessionPath":"<SESSION_PATH>","cwd":"<CWD>","attended":false,"id":"gw-1"}}
+{"dir":"in","frame":{"id":"gw-1","type":"response","command":"open_session","success":true,"data":{"sessionId":"rpc-1","durableSessionId":"<SESSION_ID>","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","resumed":false}}}
+{"dir":"out","frame":{"type":"prompt","message":"Reply deterministically","streamingBehavior":"followUp","sessionId":"rpc-1","id":"gw-2"}}
+{"dir":"in","frame":{"id":"gw-2","type":"response","command":"prompt","success":true,"sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"move_session","op":"export","moveId":"m1","sessionPath":"<SESSION_PATH>","target":"laptop","droppedUserMessages":[],"id":"gw-3"}}
+{"dir":"in","frame":{"id":"gw-3","type":"response","command":"move_session","success":false,"error":"session_open_here: close the session here before moving it","code":"session_open_here","errorCode":"session_open_here"}}
+{"dir":"out","frame":{"type":"release_session","reason":"move","moveId":"m1","target":"laptop","interrupt":true,"force":true,"sessionId":"rpc-1","id":"gw-4"}}
+{"dir":"in","frame":{"id":"gw-4","type":"response","command":"release_session","success":true,"data":{"released":true,"session_path":"<SESSION_PATH>","attachments":0,"dropped":{"deliveries":[],"user_messages":[]}},"sessionId":"rpc-1"}}
+{"dir":"out","frame":{"type":"move_session","op":"export","moveId":"m1","sessionPath":"<SESSION_PATH>","target":"laptop","droppedUserMessages":[],"id":"gw-5"}}
+{"dir":"in","frame":{"id":"gw-5","type":"response","command":"move_session","success":true,"data":{"move_id":"m1","session_id":"<SESSION_ID>","bundle_dir":"<BUNDLE_DIR>","files":1}}}
+{"dir":"out","frame":{"type":"move_session","op":"finish","moveId":"m1","sessionPath":"<SESSION_PATH>","answer":{"state":"accepted"},"id":"gw-6"}}
+{"dir":"in","frame":{"id":"gw-6","type":"response","command":"move_session","success":true,"data":{"ownership":"moved"}}}
+{"dir":"out","frame":{"type":"open_session","sessionPath":"<SESSION_PATH>","cwd":"<CWD>","attended":false,"id":"gw-7"}}
+{"dir":"in","frame":{"id":"gw-7","type":"response","command":"open_session","success":true,"data":{"sessionId":"rpc-2","durableSessionId":"<SESSION_ID>","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","resumed":false}}}
+{"dir":"out","frame":{"type":"prompt","message":"Reply deterministically","streamingBehavior":"followUp","sessionId":"rpc-2","id":"gw-8"}}
+{"dir":"in","frame":{"id":"gw-8","type":"response","command":"prompt","success":true,"sessionId":"rpc-2"}}
+{"dir":"out","frame":{"type":"close_session","sessionId":"rpc-2","id":"gw-9"}}
+{"dir":"in","frame":{"id":"gw-9","type":"response","command":"close_session","success":true,"sessionId":"rpc-2"}}
+{"dir":"out","frame":{"type":"move_session","op":"export","moveId":"m2","sessionPath":"<SESSION_PATH>","target":"laptop","droppedUserMessages":[],"id":"gw-10"}}
+{"dir":"in","frame":{"id":"gw-10","type":"response","command":"move_session","success":false,"error":"move_not_released: release the session for this move first","code":"move_not_released","errorCode":"move_not_released"}}
+{"dir":"out","frame":{"type":"open_session","sessionPath":"<SESSION_PATH>","cwd":"<CWD>","attended":false,"id":"gw-11"}}
+{"dir":"in","frame":{"id":"gw-11","type":"response","command":"open_session","success":true,"data":{"sessionId":"rpc-3","durableSessionId":"<SESSION_ID>","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","resumed":true}}}
+{"dir":"out","frame":{"type":"release_session","reason":"move","moveId":"m2","target":"laptop","interrupt":true,"force":true,"sessionId":"rpc-3","id":"gw-12"}}
+{"dir":"in","frame":{"id":"gw-12","type":"response","command":"release_session","success":true,"data":{"released":true,"session_path":"<SESSION_PATH>","attachments":0,"dropped":{"deliveries":[],"user_messages":[]}},"sessionId":"rpc-3"}}
+{"dir":"out","frame":{"type":"move_session","op":"export","moveId":"m2","sessionPath":"<SESSION_PATH>","target":"laptop","droppedUserMessages":["still owed"],"id":"gw-13"}}
+{"dir":"in","frame":{"id":"gw-13","type":"response","command":"move_session","success":true,"data":{"move_id":"m2","session_id":"<SESSION_ID>","bundle_dir":"<BUNDLE_DIR>","files":1}}}
+{"dir":"out","frame":{"type":"move_session","op":"finish","moveId":"m2","sessionPath":"<SESSION_PATH>","answer":{"state":"declined","reason":"cancelled"},"id":"gw-14"}}
+{"dir":"in","frame":{"id":"gw-14","type":"response","command":"move_session","success":true,"data":{"ownership":"writable"}}}
