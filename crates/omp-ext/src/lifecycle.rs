@@ -81,6 +81,14 @@ pub enum ApprovalMode {
     Yolo,
 }
 
+/// What spawned a subagent (`before_subagent_spawn.invocationKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentInvocationKind {
+    Task,
+    Eval,
+}
+
 /// An omp extension event. Message/entry payloads are opaque omp JSON (`AgentMessage`, `SessionEntry`, ...).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type")]
@@ -302,6 +310,21 @@ pub enum LifecycleEvent {
         exclude_from_context: bool,
         cwd: String,
     },
+    /// A subagent is about to spawn, before its model is resolved.
+    #[serde(rename = "before_subagent_spawn", rename_all = "camelCase")]
+    BeforeSubagentSpawn {
+        /// Agent definition name being spawned.
+        agent: String,
+        invocation_kind: SubagentInvocationKind,
+        /// Pre-expansion role alias; absent for an explicit selector.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_role: Option<String>,
+        /// Model patterns the spawn would use, in attempt order.
+        patterns: Vec<String>,
+        /// Stable per-spawn key, when the spawn has one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spawn_key: Option<String>,
+    },
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -364,6 +387,25 @@ fn str_of(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+/// A `model` handler result: one selector or a list, comma-separated entries flattened and
+/// blanks dropped (TS `normalizeModelPatternList`). `None` when nothing is left, which leaves the
+/// spawn's own patterns in place.
+fn model_patterns(v: &Value) -> Option<Vec<String>> {
+    let raw: Vec<&str> = match v {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        _ => return None,
+    };
+    let patterns: Vec<String> = raw
+        .iter()
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!patterns.is_empty()).then_some(patterns)
+}
+
 impl BeforeAgentStartOutcome {
     fn from_value(v: &Value) -> Self {
         Self {
@@ -408,6 +450,27 @@ impl SessionStopOutcome {
             continue_turn: v.get("continue").and_then(Value::as_bool) == Some(true),
             additional_context: str_of(v, "additionalContext"),
             reason: str_of(v, "reason"),
+        }
+    }
+}
+
+/// Outcome of `before_subagent_spawn`: `block` refuses the spawn, `model` replaces the pattern
+/// list, `note` labels the routing decision (surfaced as `resolvedModelRoute`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BeforeSubagentSpawnOutcome {
+    pub block: bool,
+    pub reason: Option<String>,
+    pub model: Option<Vec<String>>,
+    pub note: Option<String>,
+}
+
+impl BeforeSubagentSpawnOutcome {
+    fn from_value(v: &Value) -> Self {
+        Self {
+            block: v.get("block").and_then(Value::as_bool) == Some(true),
+            reason: str_of(v, "reason"),
+            model: v.get("model").and_then(model_patterns),
+            note: str_of(v, "note"),
         }
     }
 }
@@ -522,6 +585,31 @@ impl ExtHost {
         emit_tool_approval_requested(session_id: String, tool_name: String, tool_call_id: String, reason: Option<String>, approval_mode: ApprovalMode) => LifecycleEvent::ToolApprovalRequested { session_id, tool_name, tool_call_id, reason, approval_mode };
         /// `tool_approval_resolved`.
         emit_tool_approval_resolved(session_id: String, tool_name: String, tool_call_id: String, approved: bool, reason: Option<String>) => LifecycleEvent::ToolApprovalResolved { session_id, tool_name, tool_call_id, approved, reason };
+    }
+
+    /// `before_subagent_spawn`: `block` refuses the spawn; `model` replaces the pattern list.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_before_subagent_spawn(
+        &self,
+        agent: String,
+        invocation_kind: SubagentInvocationKind,
+        model_role: Option<String>,
+        patterns: Vec<String>,
+        spawn_key: Option<String>,
+        ctx: Option<Value>,
+    ) -> Result<BeforeSubagentSpawnOutcome> {
+        let ev = LifecycleEvent::BeforeSubagentSpawn {
+            agent,
+            invocation_kind,
+            model_role,
+            patterns,
+            spawn_key,
+        };
+        Ok(BeforeSubagentSpawnOutcome::from_value(
+            &self.emit_event(&ev, ctx).await?.result,
+        ))
     }
 
     /// `assistant_message`: a handler may rewrite the text of the finalized message (text blocks only).
@@ -901,4 +989,56 @@ pub fn serve(
         }
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `block` needs an explicit `true`; `reason`/`note` are plain strings.
+    #[test]
+    fn subagent_spawn_outcome_reads_block_and_reason() {
+        let blocked = BeforeSubagentSpawnOutcome::from_value(&json!({
+            "block": true,
+            "reason": "quota",
+            "note": "routed"
+        }));
+        assert!(blocked.block);
+        assert_eq!(blocked.reason.as_deref(), Some("quota"));
+        assert_eq!(blocked.note.as_deref(), Some("routed"));
+        assert_eq!(blocked.model, None);
+
+        let plain = BeforeSubagentSpawnOutcome::from_value(&json!({"block": false}));
+        assert!(!plain.block);
+        assert_eq!((plain.reason, plain.model, plain.note), (None, None, None));
+        assert!(!BeforeSubagentSpawnOutcome::from_value(&json!({"block": "yes"})).block);
+    }
+
+    /// `model` is a selector string or an array of them, comma-separated entries flatten, blanks
+    /// drop; an empty result means "no replacement".
+    #[test]
+    fn subagent_spawn_outcome_normalizes_model_patterns() {
+        let one = BeforeSubagentSpawnOutcome::from_value(&json!({"model": "a/b:high"}));
+        assert_eq!(one.model, Some(vec!["a/b:high".to_string()]));
+
+        let many = BeforeSubagentSpawnOutcome::from_value(&json!({
+            "model": ["a/b, c/d", " e/f ", ""]
+        }));
+        assert_eq!(
+            many.model,
+            Some(vec![
+                "a/b".to_string(),
+                "c/d".to_string(),
+                "e/f".to_string()
+            ])
+        );
+
+        for empty in [json!({"model": ""}), json!({"model": []}), json!({})] {
+            assert_eq!(
+                BeforeSubagentSpawnOutcome::from_value(&empty).model,
+                None,
+                "{empty}"
+            );
+        }
+    }
 }

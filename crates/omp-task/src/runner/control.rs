@@ -292,6 +292,7 @@ impl Future for RunJoin {
                 schema: SchemaValidation::NoSchema,
                 duration: Duration::ZERO,
                 truncated: false,
+                resolved_model_route: None,
             }),
             Poll::Pending => Poll::Pending,
         }
@@ -348,7 +349,14 @@ async fn run_controlled(
             ctl = rx.recv(), if controls_open => match ctl {
                 Some(Control::Kill) => {
                     shared.set_phase(RunPhase::Settled);
-                    return cancelled_output(id, spec.agent, None, String::new(), start);
+                    return cancelled_output(
+                        id,
+                        spec.agent,
+                        None,
+                        String::new(),
+                        start,
+                        spec.model_route.clone(),
+                    );
                 }
                 Some(Control::Steer(message, ack)) => steers.push((message, ack)),
                 None => controls_open = false,
@@ -389,7 +397,14 @@ async fn run_controlled(
         // `cancel()` won the killable transition after the drive loop already
         // produced its output: the run settles Cancelled, consistently with
         // `cancel()` having returned `true`.
-        cancelled_output(out.id, out.agent, out.exit_code, out.stderr, start)
+        cancelled_output(
+            out.id,
+            out.agent,
+            out.exit_code,
+            out.stderr,
+            start,
+            out.resolved_model_route.clone(),
+        )
     } else {
         out
     };
@@ -548,6 +563,7 @@ fn cancelled_output(
     exit_code: Option<i32>,
     stderr: String,
     start: Instant,
+    model_route: Option<String>,
 ) -> RunOutput {
     let stderr = if stderr.trim().is_empty() {
         "run cancelled".to_string()
@@ -564,6 +580,7 @@ fn cancelled_output(
         schema: SchemaValidation::NoSchema,
         duration: start.elapsed(),
         truncated: false,
+        resolved_model_route: model_route,
     }
 }
 
@@ -610,7 +627,14 @@ async fn drive_print(
         .ok()
         .and_then(std::process::ExitStatus::code);
     if killed {
-        return cancelled_output(id, spec.agent, exit_code, stderr, start);
+        return cancelled_output(
+            id,
+            spec.agent,
+            exit_code,
+            stderr,
+            start,
+            spec.model_route.clone(),
+        );
     }
     match status {
         Ok(status) => collect_output(id, spec, status.success(), exit_code, stdout, stderr, start),
@@ -765,7 +789,14 @@ async fn drive_rpc(
         .ok()
         .and_then(std::process::ExitStatus::code);
     if killed {
-        return cancelled_output(id, spec.agent, exit_code, stderr, start);
+        return cancelled_output(
+            id,
+            spec.agent,
+            exit_code,
+            stderr,
+            start,
+            spec.model_route.clone(),
+        );
     }
     if let Some(tokens) = rpc.output_tokens {
         shared.output_tokens.store(tokens, Ordering::SeqCst);
@@ -987,6 +1018,7 @@ mod tests {
             output_schema: None,
             schema_mode: SchemaMode::Permissive,
             model: None,
+            model_route: None,
             tools: None,
             depth: 0,
             extra_args: Vec::new(),
