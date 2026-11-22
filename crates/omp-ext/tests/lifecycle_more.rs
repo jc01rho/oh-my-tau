@@ -5,10 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use omp_ext::lifecycle::{
-    ApprovalMode, CompactingOutcome, CompactionAction, CompactionReason, GoalModeState,
-    LifecycleEvent, ModeStatus, PlanModeState, SessionModeState, SubagentInvocationKind,
-};
+use omp_ext::lifecycle::{ApprovalMode, CompactingOutcome, CompactionAction, CompactionReason, DiscoveredPath, GoalModeState, LifecycleEvent, ModeStatus, PlanModeState, ResourcesDiscoverReason, SessionModeState, SubagentInvocationKind};
 use omp_ext::{ExtHost, HostConfig, HostMessage};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -229,6 +226,13 @@ async fn retry_compaction_goal_approval_and_user_shell_payloads() {
             r#"{"type":"user_python","code":"1+1","excludeFromContext":false,"cwd":"/tmp"}"#,
         ),
         (
+            LifecycleEvent::ResourcesDiscover {
+                cwd: s("/work"),
+                reason: ResourcesDiscoverReason::Startup,
+            },
+            r#"{"type":"resources_discover","cwd":"/work","reason":"startup"}"#,
+        ),
+        (
             LifecycleEvent::AssistantMessage {
                 message: json!({"role":"assistant","content":[{"type":"text","text":"a"}]}),
             },
@@ -401,5 +405,68 @@ async fn assistant_message_rewrite_and_user_shell_results_aggregate() {
         .await
         .unwrap();
     assert_eq!(py.result, Some(json!({"output":"py","exitCode":0})));
+    host.shutdown().await.unwrap();
+}
+
+/// `resources_discover`: the handler's three path lists come back tagged with the extension that
+/// returned them (`ExtensionRunner.emitResourcesDiscover`), for both reasons.
+#[tokio::test]
+async fn resources_discover_collects_tagged_paths() {
+    if common::bun_missing("resources_discover_collects_tagged_paths") {
+        return;
+    }
+    // Both reasons serialize to the host's `{type, cwd, reason}` event.
+    for (reason, wire) in [
+        (
+            ResourcesDiscoverReason::Startup,
+            r#"{"type":"resources_discover","cwd":"/work","reason":"startup"}"#,
+        ),
+        (
+            ResourcesDiscoverReason::Reload,
+            r#"{"type":"resources_discover","cwd":"/work","reason":"reload"}"#,
+        ),
+    ] {
+        let ev = LifecycleEvent::ResourcesDiscover {
+            cwd: "/work".into(),
+            reason,
+        };
+        assert_eq!(serde_json::to_string(&ev).unwrap(), wire);
+    }
+
+    let host = loaded().await;
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lifecycle.ts");
+    let ext = fixture.to_string_lossy().into_owned();
+    for reason in [
+        ResourcesDiscoverReason::Startup,
+        ResourcesDiscoverReason::Reload,
+    ] {
+        let out = host
+            .emit_resources_discover("/work".into(), reason, None)
+            .await
+            .unwrap();
+        // A shared test host may hold the fixture twice; compare the distinct tagged paths.
+        let distinct = |paths: &[DiscoveredPath]| {
+            let mut v: Vec<(String, String)> = paths
+                .iter()
+                .map(|p| (p.path.clone(), p.extension_path.clone()))
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert_eq!(
+            distinct(&out.skill_paths),
+            vec![("skills/ext-a".to_string(), ext.clone())],
+            "{reason:?}"
+        );
+        assert_eq!(
+            distinct(&out.prompt_paths),
+            vec![("prompts/ext-b.md".to_string(), ext.clone())]
+        );
+        assert_eq!(
+            distinct(&out.theme_paths),
+            vec![("themes/ext-c.json".to_string(), ext.clone())]
+        );
+    }
     host.shutdown().await.unwrap();
 }

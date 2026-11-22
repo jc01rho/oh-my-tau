@@ -5,7 +5,7 @@ const OBSERVED = [
   "session_branch", "session_tree", "session_shutdown",
   "assistant_message", "auto_compaction_start", "auto_compaction_end", "auto_retry_start", "auto_retry_end",
   "retry_fallback_applied", "retry_fallback_succeeded", "ttsr_triggered", "todo_reminder", "goal_updated",
-  "tool_approval_requested", "tool_approval_resolved", "mode_changed", "after_provider_response", "session.compacting",
+  "tool_approval_requested", "tool_approval_resolved", "mode_changed", "after_provider_response", "session.compacting", "resources_discover",
 ];
 const RESULTS: Record<string, unknown> = {
   before_agent_start: { message: { customType: "fx", content: "hello", display: false }, systemPrompt: ["sys-a", "sys-b"] },
@@ -20,6 +20,7 @@ const RESULTS: Record<string, unknown> = {
   user_python: { result: { output: "py", exitCode: 0 } },
   "session.compacting": { context: ["ctx line"], prompt: "CUSTOM PROMPT", preserveData: { keep: 1 } },
 };
+  resources_discover: { skillPaths: ["skills/ext-a"], promptPaths: ["prompts/ext-b.md"], themePaths: ["themes/ext-c.json"] },
 
 export default function lifecycle(pi: any): void {
   for (const type of [...OBSERVED, ...Object.keys(RESULTS)]) {
