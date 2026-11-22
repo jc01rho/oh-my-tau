@@ -21,8 +21,8 @@ const RESULTS: Record<string, unknown> = {
   user_bash: { result: { output: "handled", exitCode: 0 } },
   user_python: { result: { output: "py", exitCode: 0 } },
   "session.compacting": { context: ["ctx line"], prompt: "CUSTOM PROMPT", preserveData: { keep: 1 } },
-};
   resources_discover: { skillPaths: ["skills/ext-a"], promptPaths: ["prompts/ext-b.md"], themePaths: ["themes/ext-c.json"] },
+};
 
 export default function lifecycle(pi: any): void {
   for (const type of [...OBSERVED, ...Object.keys(RESULTS)]) {
