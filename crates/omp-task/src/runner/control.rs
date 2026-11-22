@@ -30,11 +30,11 @@
 //!   failed), then closes stdin so the child exits.
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -79,6 +79,8 @@ fn rpc_finishing_deadline() -> Duration {
 const PROMPT_ID: &str = "omp-task-prompt";
 const FINAL_TEXT_ID: &str = "omp-task-final-text";
 const STATS_ID: &str = "omp-task-stats";
+const STATE_ID: &str = "omp-task-state";
+const SWITCH_ID: &str = "omp-task-switch";
 
 /// How [`TaskRunner::start`] drives the child process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +91,22 @@ pub enum ChildMode {
     /// `<binary> --mode rpc`: JSON-lines RPC; stdin stays open while the
     /// agent runs so it accepts steering messages.
     Rpc,
+}
+
+/// Extra child wiring for [`TaskRunner::start_with`] (background subagents).
+#[derive(Debug, Clone, Default)]
+pub struct StartOptions {
+    /// [`ChildMode::Rpc`] only: reopen this session file (`switch_session`)
+    /// before the prompt goes in, so the run continues an earlier child's
+    /// transcript instead of starting blank. A failed reopen fails the run
+    /// without prompting.
+    pub resume_session: Option<PathBuf>,
+    /// [`ChildMode::Rpc`] only: ask the child for its session file
+    /// (`get_state`) before the prompt, so [`RunControl::session_file`] is
+    /// known while the run is still going.
+    pub report_session: bool,
+    /// Extra environment for the child process.
+    pub env: Vec<(String, String)>,
 }
 
 /// Lifecycle phase of a started run.
@@ -150,6 +168,11 @@ struct Shared {
     /// Killability transition: starts `true`; exactly one of `cancel()` and
     /// the run's own completion takes it (the loser observes `false`).
     killable: AtomicBool,
+    /// The child's session file (RPC mode), once known.
+    session_file: Mutex<Option<String>>,
+    /// The child's `get_session_stats` answer (RPC mode, after the prompt
+    /// settled).
+    session_stats: Mutex<Option<Value>>,
 }
 
 impl Default for Shared {
@@ -158,6 +181,8 @@ impl Default for Shared {
             phase: AtomicU8::default(),
             output_tokens: AtomicU64::default(),
             killable: AtomicBool::new(true),
+            session_file: Mutex::new(None),
+            session_stats: Mutex::new(None),
         }
     }
 }
@@ -265,6 +290,30 @@ impl RunControl {
     pub fn output_tokens(&self) -> u64 {
         self.shared.output_tokens.load(Ordering::SeqCst)
     }
+
+    /// The child's session file (RPC mode): the reopened file of a resumed
+    /// run, the one the child named in its opening `get_state`
+    /// ([`StartOptions::report_session`]), or the one its final session stats
+    /// named; `None` until known.
+    #[must_use]
+    pub fn session_file(&self) -> Option<String> {
+        self.shared
+            .session_file
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The child session's `get_session_stats` answer (RPC mode, after the
+    /// prompt settled); `None` when unknown.
+    #[must_use]
+    pub fn session_stats(&self) -> Option<Value> {
+        self.shared
+            .session_stats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Future resolving to the settled [`RunOutput`] of a started run. The run
@@ -306,6 +355,19 @@ impl TaskRunner {
     /// Must be called inside a tokio runtime.
     #[must_use]
     pub fn start(&self, spec: TaskSpec, mode: ChildMode) -> (RunControl, RunJoin) {
+        self.start_with(spec, mode, StartOptions::default())
+    }
+
+    /// [`TaskRunner::start`] with extra child wiring (see [`StartOptions`]).
+    ///
+    /// Must be called inside a tokio runtime.
+    #[must_use]
+    pub fn start_with(
+        &self,
+        spec: TaskSpec,
+        mode: ChildMode,
+        opts: StartOptions,
+    ) -> (RunControl, RunJoin) {
         let id = spec.id.clone().unwrap_or_else(|| self.alloc_id());
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared::default());
@@ -321,6 +383,7 @@ impl TaskRunner {
             id.clone(),
             spec,
             mode,
+            opts,
             rx,
             shared,
         ));
@@ -333,6 +396,7 @@ async fn run_controlled(
     id: String,
     spec: TaskSpec,
     mode: ChildMode,
+    opts: StartOptions,
     mut rx: mpsc::UnboundedReceiver<Control>,
     shared: Arc<Shared>,
 ) -> RunOutput {
@@ -364,7 +428,7 @@ async fn run_controlled(
         }
     };
     shared.set_phase(RunPhase::Running);
-    let out = match spawn_child(&runner.binary, &spec, mode).await {
+    let out = match spawn_child(&runner.binary, &spec, mode, &opts.env).await {
         Err(e) => spawn_failure(id, spec, &runner.binary, &e, start),
         Ok(child) => {
             // Kill the whole process group when the run ends for any reason —
@@ -386,6 +450,7 @@ async fn run_controlled(
                         spec,
                         start,
                         &shared,
+                        &opts,
                     )
                     .await
                 }
@@ -464,7 +529,12 @@ fn child_pgid(child: &Child) -> Option<i32> {
 
 /// Spawn the child (own process group, killed on drop), retrying transient
 /// fork/exec failures like [`TaskRunner::spawn`].
-async fn spawn_child(binary: &Path, spec: &TaskSpec, mode: ChildMode) -> std::io::Result<Child> {
+async fn spawn_child(
+    binary: &Path,
+    spec: &TaskSpec,
+    mode: ChildMode,
+    env: &[(String, String)],
+) -> std::io::Result<Child> {
     let mut attempt = 0;
     loop {
         let mut command = Command::new(binary);
@@ -478,6 +548,7 @@ async fn spawn_child(binary: &Path, spec: &TaskSpec, mode: ChildMode) -> std::io
         }
         command.current_dir(&spec.cwd);
         super::apply_child_policy(&mut command, spec);
+        command.envs(env.iter().map(|(k, v)| (k, v)));
         if let Some(model) = spec.model.as_deref().filter(|m| !m.is_empty()) {
             command.arg("--model").arg(model);
         }
@@ -666,7 +737,37 @@ fn steer_frame(message: &str) -> Value {
     json!({"type": "steer", "message": message})
 }
 
-#[allow(clippy::too_many_arguments)] // one run's full context; split only to keep select! borrows simple
+fn prompt_frame(message: &str) -> Value {
+    json!({"id": PROMPT_ID, "type": "prompt", "message": message})
+}
+
+/// Fail steers still held back for a prompt that never went out.
+fn fail_held(held: &mut Vec<(String, SteerAck)>) {
+    for (_, ack) in held.drain(..) {
+        let _ = ack.send(Err(SteerError::NotRunning));
+    }
+}
+
+/// Publish what the RPC bookkeeping learned about the child session.
+fn publish_session(shared: &Shared, rpc: &RpcRun) {
+    if let Some(file) = &rpc.session_file {
+        let mut slot = shared
+            .session_file
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if slot.as_deref() != Some(file.as_str()) {
+            *slot = Some(file.clone());
+        }
+    }
+    if let Some(stats) = &rpc.stats {
+        *shared
+            .session_stats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(stats.clone());
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one run's full context; split only to keep select! borrows simple
 async fn drive_rpc(
     mut child: Child,
     rx: &mut mpsc::UnboundedReceiver<Control>,
@@ -676,6 +777,7 @@ async fn drive_rpc(
     spec: TaskSpec,
     start: Instant,
     shared: &Shared,
+    opts: &StartOptions,
 ) -> RunOutput {
     let stderr = read_all(child.stderr.take());
     let pgid = child_pgid(&child);
@@ -698,14 +800,20 @@ async fn drive_rpc(
     let mut rpc = RpcRun::default();
     let mut killed = false;
     let mut finishing_at: Option<Instant> = None;
-    send(
-        &mut stdin,
-        &json!({"id": PROMPT_ID, "type": "prompt", "message": spec.prompt}),
-    )
-    .await;
+    for frame in rpc.open(&spec.prompt, opts) {
+        send(&mut stdin, &frame).await;
+    }
+    publish_session(shared, &rpc);
+    // Steers queued before the prompt went out (a resumed run reopens its
+    // session first) wait for it and are acknowledged once written.
+    let mut held: Vec<(String, SteerAck)> = Vec::new();
     for (message, ack) in steers {
-        send(&mut stdin, &steer_frame(&message)).await;
-        let _ = ack.send(Ok(()));
+        if rpc.prompt_sent {
+            send(&mut stdin, &steer_frame(&message)).await;
+            let _ = ack.send(Ok(()));
+        } else {
+            held.push((message, ack));
+        }
     }
     loop {
         let finishing_deadline = finishing_at.map(|at| at + rpc_finishing_deadline());
@@ -714,6 +822,13 @@ async fn drive_rpc(
                 Ok(Some(line)) => {
                     for frame in rpc.on_line(&line) {
                         send(&mut stdin, &frame).await;
+                    }
+                    publish_session(shared, &rpc);
+                    if rpc.prompt_sent && !rpc.finishing {
+                        for (message, ack) in held.drain(..) {
+                            send(&mut stdin, &steer_frame(&message)).await;
+                            let _ = ack.send(Ok(()));
+                        }
                     }
                     if rpc.finishing {
                         shared.set_phase(RunPhase::Finishing);
@@ -741,6 +856,7 @@ async fn drive_rpc(
                 } else {
                     format!("{error}\n{stderr}")
                 };
+                fail_held(&mut held);
                 drain_controls(rx);
                 return collect_output(id, spec, false, None, String::new(), stderr, start);
             }
@@ -754,6 +870,8 @@ async fn drive_rpc(
                         // The prompt settled before the steer went out: fail
                         // the delivery explicitly instead of acknowledging it.
                         let _ = ack.send(Err(SteerError::NotRunning));
+                    } else if !rpc.prompt_sent {
+                        held.push((message, ack));
                     } else {
                         send(&mut stdin, &steer_frame(&message)).await;
                         let _ = ack.send(Ok(()));
@@ -763,8 +881,10 @@ async fn drive_rpc(
             },
         }
     }
+    fail_held(&mut held);
     drain_controls(rx);
     drop(stdin);
+    publish_session(shared, &rpc);
     if killed {
         kill_tree(&mut child);
     }
@@ -827,6 +947,16 @@ struct RpcRun {
     fallback_error: Option<String>,
     /// `get_session_stats` `tokens.output`.
     output_tokens: Option<u64>,
+    /// `get_session_stats` `data` (token totals, cost, session file).
+    stats: Option<Value>,
+    /// The child's session file: the reopened one of a resumed run, else the
+    /// one `get_state` / `get_session_stats` named.
+    session_file: Option<String>,
+    /// The prompt frame went out (a resumed run sends it once its session
+    /// reopened).
+    prompt_sent: bool,
+    /// The prompt held back until `switch_session` answered.
+    pending_prompt: Option<String>,
     /// Prompt settled: final-answer requests sent, steering closed.
     finishing: bool,
     /// Everything collected: close stdin so the child exits.
@@ -845,6 +975,26 @@ fn error_text(value: Option<&Value>) -> Option<String> {
 }
 
 impl RpcRun {
+    /// The frames that open the run: an optional `get_state` probe, then the
+    /// prompt, or (resumed run) a `switch_session` whose answer releases the
+    /// held prompt.
+    fn open(&mut self, prompt: &str, opts: &StartOptions) -> Vec<Value> {
+        if let Some(path) = &opts.resume_session {
+            let path = path.display().to_string();
+            let frame = json!({"id": SWITCH_ID, "type": "switch_session", "sessionPath": path});
+            self.session_file = Some(path);
+            self.pending_prompt = Some(prompt.to_string());
+            return vec![frame];
+        }
+        let mut frames = Vec::new();
+        if opts.report_session {
+            frames.push(json!({"id": STATE_ID, "type": "get_state"}));
+        }
+        frames.push(prompt_frame(prompt));
+        self.prompt_sent = true;
+        frames
+    }
+
     /// Consume one stdout line; returns the commands to write back.
     fn on_line(&mut self, line: &str) -> Vec<Value> {
         let Ok(frame) = serde_json::from_str::<Value>(line) else {
@@ -901,9 +1051,44 @@ impl RpcRun {
                         if success {
                             self.output_tokens =
                                 frame.pointer("/data/tokens/output").and_then(Value::as_u64);
+                            if self.session_file.is_none() {
+                                self.session_file = frame
+                                    .pointer("/data/sessionFile")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string);
+                            }
+                            self.stats = frame.get("data").cloned();
                         }
                         self.close_stdin = true;
                         Vec::new()
+                    }
+                    Some("get_state") => {
+                        if success && self.session_file.is_none() {
+                            self.session_file = frame
+                                .pointer("/data/sessionFile")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                        }
+                        Vec::new()
+                    }
+                    Some("switch_session") => {
+                        let Some(prompt) = self.pending_prompt.take() else {
+                            return Vec::new();
+                        };
+                        let reopened =
+                            success && frame.pointer("/data/cancelled") != Some(&Value::Bool(true));
+                        if reopened {
+                            self.prompt_sent = true;
+                            vec![prompt_frame(&prompt)]
+                        } else {
+                            let why = error_text(frame.get("error"))
+                                .unwrap_or_else(|| "the session switch was cancelled".to_string());
+                            self.prompt_error =
+                                Some(format!("could not reopen the child session: {why}"));
+                            self.finishing = true;
+                            self.close_stdin = true;
+                            Vec::new()
+                        }
                     }
                     _ => Vec::new(),
                 }
@@ -1174,5 +1359,60 @@ read -r eof || exit 0
         );
         let empty = RpcRun::default();
         assert!(!empty.outcome().0, "no prompt_result = failure");
+    }
+
+    #[test]
+    fn report_session_probes_state_before_the_prompt() {
+        let mut rpc = RpcRun::default();
+        let opts = StartOptions {
+            report_session: true,
+            ..StartOptions::default()
+        };
+        let frames = rpc.open("go", &opts);
+        assert_eq!(frames[0]["type"], "get_state");
+        assert_eq!(frames[1], prompt_frame("go"));
+        assert!(rpc.prompt_sent);
+        rpc.on_line(r#"{"type":"response","command":"get_state","success":true,"data":{"sessionFile":"/s/a.jsonl"}}"#);
+        assert_eq!(rpc.session_file.as_deref(), Some("/s/a.jsonl"));
+        rpc.on_line(r#"{"type":"response","command":"get_session_stats","success":true,"data":{"tokens":{"output":7},"cost":0.5}}"#);
+        assert_eq!(rpc.output_tokens, Some(7));
+        assert_eq!(rpc.stats.as_ref().unwrap()["cost"], 0.5);
+        // The plain start keeps its single opening frame.
+        let mut plain = RpcRun::default();
+        assert_eq!(
+            plain.open("go", &StartOptions::default()),
+            vec![prompt_frame("go")]
+        );
+    }
+
+    #[test]
+    fn resumed_run_prompts_only_after_the_session_reopened() {
+        let opts = StartOptions {
+            resume_session: Some(PathBuf::from("/s/old.jsonl")),
+            ..StartOptions::default()
+        };
+        let mut rpc = RpcRun::default();
+        let frames = rpc.open("again", &opts);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["type"], "switch_session");
+        assert_eq!(frames[0]["sessionPath"], "/s/old.jsonl");
+        assert!(!rpc.prompt_sent, "the prompt waits for the reopen");
+        assert_eq!(rpc.session_file.as_deref(), Some("/s/old.jsonl"));
+        let next = rpc.on_line(r#"{"type":"response","command":"switch_session","success":true,"data":{"cancelled":false}}"#);
+        assert_eq!(next, vec![prompt_frame("again")]);
+        assert!(rpc.prompt_sent);
+
+        let mut failed = RpcRun::default();
+        failed.open("again", &opts);
+        let next = failed.on_line(
+            r#"{"type":"response","command":"switch_session","success":false,"error":"Session file not found: /s/old.jsonl"}"#,
+        );
+        assert!(next.is_empty(), "no prompt on a failed reopen");
+        assert!(failed.close_stdin && failed.finishing);
+        let (ok, _, error) = failed.outcome();
+        assert!(!ok);
+        assert!(error
+            .unwrap()
+            .contains("could not reopen the child session"));
     }
 }

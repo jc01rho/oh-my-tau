@@ -1829,6 +1829,9 @@ impl Runtime {
             // (it reads it as the "run is fully idle" marker before it releases a lane).
             self.send(json!({"type": "session_settled"}));
             self.send(json!({"type": "agent_settled"}));
+            // The gateway reads the next lifecycle record to tell a finished
+            // session from one still waiting on background children.
+            crate::tools::subagents::on_session_settled(self);
         }
         self.settled.notify_waiters();
     }
@@ -2116,6 +2119,23 @@ impl Runtime {
         };
         self.journal_hold("release", seq, Some(cause), &at);
         self.send(crate::pause::resumed_frame(seq, cause, &at));
+        // Background completions held back during the Stop go out now.
+        crate::tools::subagents::flush_pending();
+    }
+
+    /// Whether a Stop hold is in place (`interrupt intent:"stop"`).
+    pub fn is_paused(&self) -> bool {
+        lock(&self.pause).paused()
+    }
+
+    /// Append a `custom` session entry `{customType, data}` (best effort).
+    pub(crate) fn journal_custom(&self, custom_type: &str, data: Value) {
+        if let Err(e) = self
+            .persist
+            .append_entry("custom", json!({"customType": custom_type, "data": data}))
+        {
+            eprintln!("omt: {custom_type} journal: {e:#}");
+        }
     }
 
     fn journal_hold(&self, op: &str, seq: u64, cause: Option<&str>, at: &str) {

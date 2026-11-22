@@ -29,7 +29,7 @@ use crate::envelope::{format_task_result, TaskResultEnvelope};
 use crate::params::{SchemaMode, TaskItem};
 use crate::schema::{validate_output, SchemaValidation};
 
-pub use control::{ChildMode, RunControl, RunJoin, RunPhase, SteerError};
+pub use control::{ChildMode, RunControl, RunJoin, RunPhase, StartOptions, SteerError};
 
 /// Maximum output bytes per agent (mirrors `MAX_OUTPUT_BYTES` in
 /// `task/types.ts`).
