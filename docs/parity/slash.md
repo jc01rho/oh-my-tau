@@ -51,6 +51,17 @@ Totals: **PORTED 43 / PARTIAL 10 / STUB 11 / UNIQUE 3 = 67 reserved**, plus
 too; the names that do not are `ultra`, `rlm`, `sandbox`, and `budget` (top-level in
 tau, a nested `Adjust the token budget` entry upstream).
 
+**Phase 8b-2 (this pass):** `/memory`, `/force`, `/handoff` and `/delete` are
+ported; `/advisor`, `/prewalk` and `/reload-plugins` are real but partial (named
+gaps in §1); `/local`, `/open`, `/settings`, `/tree`, `/resume` and `/exit` run in
+the TUI and answer as TUI-only elsewhere; `/goal` is reclassified STUB (goal mode
+has no runtime) and `/session` PARTIAL. Still not ported, each with its reason in
+§3/§4: `/security` verbs `scan scans show import export compare disposition`,
+`/ratchet`, `/add-dir` `/remove-dir` `/dirs`, `/guided-goal`, `/pause`,
+`/forget-approvals`, `/join` `/leave`, `/tan` `/omfg` `/cleanse`, `/setup`,
+`/plan-review`, `/vibe`, `/git`, `/hub`, `/commit`, `/live`, `/record`. The
+counts above are the Phase 1 measurement.
+
 Mechanism parity, not just the name table:
 
 - `parse_slash_command` (`slash.rs:37`) ↔ `helpers/parse.ts` `parseSlashCommand` —
@@ -181,10 +192,10 @@ All 11 are honest about the gap except the four flagged below.
 | Command | Target message / reason | Severity |
 |---|---|---|
 | `/security` | `"/security needs the security-scan mode controller (plan/run/compare), which is not ported to omt."` | honest. **Phase 1:** `builtin_commands.json` now holds a single bare `security` entry, `"description": "Not ported: security scans need the security-scan mode controller"`, with **no subcommand list** — the 11 phantom subcommands (`plan\|scan\|status\|cancel\|scans\|show\|import\|export\|validate\|compare\|disposition`) are gone. The `security_scan` tool is still absent (`tools.md` §1 #18); porting still means both together (§6 #6). |
-| `/ratchet` | `"/ratchet needs the ratchet eval-harness subsystem (eval preludes + hill-climb runner), which is not ported to omt."` | honest |
+| `/ratchet` | `"/ratchet needs the ratchet eval-harness subsystem (eval preludes + hill-climb runner), which is not ported to omt."` | honest; 8b-2: still not ported (the ratchet prelude for omp-rs's eval kernel and the kickoff flow) |
 | `/handoff` | ~~not wired~~ — **ported** (handoff document + compact in place, §1 #32) | resolved |
 | `/prewalk` | ~~startup-only notice~~ — **partial**: arm/off/restart and the handoff at the first edit/write (§1 #11) | resolved (8b-2) |
-| `/add-dir` | `"Multi-root workspace directories are not tracked per-session in omt; …"` | honest |
+| `/add-dir` | `"Multi-root workspace directories are not tracked per-session in omt; …"` | honest; 8b-2: still not ported — TS persists the list in the session header, and the omp-rs writer has no header rewrite (it keeps an append handle on the file); the prompt would also need per-root context files |
 | `/remove-dir` | same notice | honest |
 | `/dirs` | same notice | honest |
 | `/memory` | ~~canned strings~~ — **ported** on the session's shared engine (§1 #35) | resolved (8b-2) |
@@ -215,29 +226,29 @@ or a `commands/*.md` file can claim any of these today.
 | Command | Upstream provider | Note |
 |---|---|---|
 | `/settings` | modes | **TUI-only like TS**: omp-tui opens `overlays/settings.rs`; text-mode dispatch says it needs the TUI (8b-2). |
-| `/setup` | modes | First-run wizard. |
-| `/plan-review` | modes | Review gate on plan mode; tau has `/plan` only. |
-| `/vibe` | modes | |
+| `/setup` | modes | **Not ported (8b-2)**: first-run provider wizard (TUI-only upstream); omp-rs has `/login` but no setup wizard overlay. |
+| `/plan-review` | modes | **Not ported (8b-2)**: needs the plan-review overlay and a `plan_review_requested` producer (tui.md §2). |
+| `/vibe` | modes | **Not ported (8b-2)**: vibe mode (persistent fast/good worker sessions, read-only toolset) has no omp-rs mode controller; only the hidden `vibe_*` tools exist. |
 | `/guided-goal` | modes | **Not ported (8b-2)**: it interviews the user and finishes with `goal create`, but omp-rs goal mode is unported (the hidden `goal` tool has no runtime, §1 #56), so the kickoff could not complete. |
 | `/hotkeys` | session | Keybinding help overlay; blocked on the 9 missing binding ids (`tui.md` §1). |
-| `/git` | session | In tau, `/branch` and `/fork` are *conversation* forks — port `/git` subcommand-form only. |
+| `/git` | session | **Not ported (8b-2)**: the git UI (split diff viewer, staging, commit composer) is an absent overlay. |
 | `/local` | session | **Ported (8b-2), TUI-only like TS `handleTui`**: picker over the session's `local://` files or `/local <name>`, opened in `$VISUAL`/`$EDITOR` with the TUI stopped (`app.local.open` runs the same flow); text-mode dispatch says it needs the TUI. |
-| `/hub` | session | `/git hub`. |
+| `/hub` | session | **Not ported (8b-2)**: the Agent Hub overlay is absent (tui.md §2 "Agent hub"). |
 | `/tree` | session | **TUI-only like TS**: `overlays/tree.rs` (8c); text-mode dispatch says it needs the TUI (8b-2). |
 | `/resume` | lifecycle | **TUI-only like TS**: `overlays/sessions.rs` with pins (8b-2); text-mode dispatch says it needs the TUI. |
 | `/unpin` | lifecycle | `/pin` exists, unpin-by-id does not. |
 | `/delete` | lifecycle | **Ported (8b-2)**: `Runtime::delete_session` starts a new session, then deletes the old session file and its artifacts dir (TS `newSession({ drop: true })`); "Nothing to delete (in-memory session)". |
 | `/exit` | lifecycle | **TUI-only like TS**: the TUI quits; text-mode dispatch says it needs the TUI (8b-2). |
 | `/clear` | lifecycle | **Dispatches in tau** but is unadvertised/unreserved — see §5. |
-| `/commit` | commit | Dedicated commit flow. |
-| `/live` | control | |
-| `/record` | control | Session recording. |
-| `/pause` | control | |
-| `/forget-approvals` | control | |
-| `/join` | collaboration | Sub-command of `/collab` in tau's model, absent there anyway. |
-| `/leave` | collaboration | Same. |
+| `/commit` | commit | **Not ported (8b-2)**: committing only this agent's (and its subagents') changes needs per-agent change attribution omp-rs does not record. |
+| `/live` | control | **Not ported (8b-2)**: Codex realtime voice mode — omp-rs has no realtime audio transport. |
+| `/record` | control | **Not ported (8b-2)**: screen recording to an `omp play` file — no recorder/player in omp-rs. |
+| `/pause` | control | **Not ported (8b-2)**: freezing main/subagents/advisor at safe points plus the pause screen (`pause-screen.ts`); PR-G1's `pause.rs` is the RPC lane-hold contract, not this freeze. |
+| `/forget-approvals` | control | **Not ported (8b-2)**: it clears `always-ask-cached` grants, but omp-rs has no approval cache and its approval prompt offers no remember/session rows, so there is nothing to forget. |
+| `/join` | collaboration | **Not ported (8b-2)**: collab guest (join a room, replicate the host transcript, prompt as guest) — `omp-collab` has the guest handle but no TUI guest session. |
+| `/leave` | collaboration | **Not ported (8b-2)**: pairs with `/join` (guest leave); stopping a hosted session stays `/collab stop`. |
 | `/open` | collaboration | **Ported (8b-2), TUI-only like TS**: opens the last http(s) link of the latest assistant message (`open`/`xdg-open`/`start`); `link`/`url` accepted, other args print the usage. The usage hint names `/copy link` instead of TS's block drill keys (no copy selector). |
-| `/tan`, `/omfg`, `/cleanse` | lifecycle | Easter-egg names; presence in the reference array is confirmed, semantics unread. |
+| `/tan`, `/omfg`, `/cleanse` | lifecycle | **Not ported (8b-2)**: `/tan` forks the session into a background agent session (`TanCommandController`); `/omfg` forges and validates a TTSR rule over a side turn with a save/amend flow (`omfg-controller.ts`, `omfg-rule.ts`); `/cleanse` runs weighted parallel diagnostic subagents. Each answers the reserved-name notice. |
 
 `/providers` did **not** appear at top level in this extraction (it is nested under
 `/settings`/`/setup`), so it is not counted here despite appearing in a crude
