@@ -7,21 +7,28 @@
 //! (`normalizeSchemaForMCP`), result formatting, per-request timeouts, lazy
 //! connect and per-server failure isolation.
 //!
-//! Not ported (omp features outside the agent-tool surface): OAuth flows,
-//! Smithery, tool caching across sessions, prompts/resources, the TUI render
-//! callbacks, and Bun-compatible hashing for overlong tool names (see
+//! Also covers OAuth 2.0 (PKCE, RFC 9728/8414 discovery, token refresh on
+//! 401) in [`oauth`] and the cross-session tool cache in [`cache`].
+//!
+//! Not ported (omp features outside the agent-tool surface): the interactive
+//! browser login flow, Smithery, prompts/resources, the TUI render callbacks, and Bun-compatible hashing for overlong tool names (see
 //! [`names::create_tool_name`]).
 
+pub mod cache;
 pub mod client;
 pub mod config;
 pub mod errors;
 pub mod format;
 pub mod manager;
 pub mod names;
+pub mod oauth;
 pub mod schema;
+#[cfg(test)]
+pub(crate) mod test_http;
 pub mod timeout;
 pub mod transport;
 
+pub use cache::ToolCache;
 pub use client::{call_tool, connect_to_server, list_tools, Connection};
 pub use config::{load_configs, McpConfigFile, McpServerConfig, ServerKind};
 pub use errors::{JsonRpcError, McpConnectionTimeoutError, McpError, McpTransportError};

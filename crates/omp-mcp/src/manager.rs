@@ -16,6 +16,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::cache::ToolCache;
 use crate::client::{call_tool, connect_to_server, list_tools, Connection};
 use crate::config::{load_configs, McpServerConfig};
 use crate::errors::McpError;
@@ -58,6 +59,7 @@ struct ServerEntry {
 pub struct McpManager {
     cwd: Arc<PathBuf>,
     servers: Mutex<BTreeMap<String, ServerEntry>>,
+    cache: Option<ToolCache>,
 }
 
 impl std::fmt::Debug for McpManager {
@@ -88,13 +90,50 @@ impl McpManager {
         Self {
             cwd,
             servers: Mutex::new(servers),
+            cache: None,
         }
+    }
+
+    /// Persist tool lists to `cache` and serve them before connecting.
+    #[must_use]
+    pub fn with_tool_cache(mut self, cache: ToolCache) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Build a manager from omp's standard config locations for `cwd`.
     #[must_use]
     pub fn from_default_configs(cwd: &std::path::Path) -> Self {
-        Self::new(Arc::new(cwd.to_path_buf()), load_configs(cwd))
+        let manager = Self::new(Arc::new(cwd.to_path_buf()), load_configs(cwd));
+        match ToolCache::default_location() {
+            Some(cache) => manager.with_tool_cache(cache),
+            None => manager,
+        }
+    }
+
+    /// Tools available without connecting: live lists for connected servers,
+    /// otherwise fresh cache entries from earlier sessions. Servers with
+    /// neither are skipped.
+    pub async fn cached_tools(&self) -> Vec<DiscoveredTool> {
+        let guard = self.servers.lock().await;
+        let mut out = Vec::new();
+        for (server, entry) in guard.iter() {
+            let definitions = match &entry.state {
+                ServerState::Connected(connection) => connection.tools.clone(),
+                _ => self
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| cache.get(server, &entry.config)),
+            };
+            for definition in definitions.unwrap_or_default() {
+                out.push(DiscoveredTool {
+                    server: server.clone(),
+                    registry_name: create_tool_name(server, &definition.name),
+                    definition,
+                });
+            }
+        }
+        out
     }
 
     /// Configured server names.
@@ -161,6 +200,11 @@ impl McpManager {
             .expect("server entry vanished while connecting");
         match result {
             Ok(connection) => {
+                if let (Some(cache), Some(tools)) = (&self.cache, &connection.tools) {
+                    if let Err(error) = cache.put(name, &config, tools) {
+                        tracing::warn!("failed to write MCP tool cache: {error}");
+                    }
+                }
                 entry.state = ServerState::Connected(Box::new(connection));
                 entry.status = ServerStatus::Connected;
                 Ok(())
@@ -283,4 +327,119 @@ fn is_retriable(error: &McpError) -> bool {
     ]
     .iter()
     .any(|pattern| message.contains(pattern))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_http::{MockServer, Reply};
+    use serde_json::json;
+
+    fn mcp_server(tool_name: &'static str) -> impl Fn(&crate::test_http::Request) -> Reply {
+        move |req| {
+            let rpc = req.json();
+            let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+            let result = match rpc.get("method").and_then(Value::as_str) {
+                Some("initialize") => json!({
+                    "protocolVersion": crate::PROTOCOL_VERSION,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "mock" },
+                }),
+                Some("tools/list") => json!({
+                    "tools": [{ "name": tool_name, "inputSchema": { "type": "object" } }]
+                }),
+                _ => return Reply::status(202),
+            };
+            Reply::json(200, json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+        }
+    }
+
+    fn configs(url: &str) -> BTreeMap<String, McpServerConfig> {
+        BTreeMap::from([(
+            "srv".to_string(),
+            serde_json::from_value(json!({ "type": "http", "url": url })).unwrap(),
+        )])
+    }
+
+    fn manager(url: &str, cache: &ToolCache) -> McpManager {
+        McpManager::new(Arc::new(PathBuf::from(".")), configs(url)).with_tool_cache(cache.clone())
+    }
+
+    #[tokio::test]
+    async fn connect_fills_cache_for_next_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ToolCache::new(dir.path().join("tools.json"), crate::cache::DEFAULT_TTL);
+        let server = MockServer::start(mcp_server("search")).await;
+        let url = format!("{}/mcp", server.base);
+
+        let first = manager(&url, &cache);
+        assert!(first.cached_tools().await.is_empty());
+        let live = first.tools().await;
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].registry_name, "mcp__srv_search");
+
+        // A new session sees the schema before connecting.
+        let second = manager(&url, &cache);
+        let cached = second.cached_tools().await;
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].registry_name, "mcp__srv_search");
+        assert_eq!(second.statuses().await["srv"], ServerStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn reconnect_refreshes_stale_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ToolCache::new(dir.path().join("tools.json"), crate::cache::DEFAULT_TTL);
+        let old = MockServer::start(mcp_server("old_tool")).await;
+        let url = format!("{}/mcp", old.base);
+        manager(&url, &cache).tools().await;
+
+        // Same config, server now advertises a different tool.
+        let config = configs(&url).remove("srv").unwrap();
+        cache
+            .put(
+                "srv",
+                &config,
+                &[crate::ToolDefinition {
+                    name: "old_tool".into(),
+                    title: None,
+                    description: None,
+                    input_schema: json!({}),
+                    output_schema: None,
+                    annotations: None,
+                }],
+            )
+            .unwrap();
+        let new = MockServer::start(mcp_server("new_tool")).await;
+        let new_url = format!("{}/mcp", new.base);
+        let m = manager(&new_url, &cache);
+        assert!(m.cached_tools().await.is_empty(), "url change must miss");
+        m.tools().await;
+        let names: Vec<_> = manager(&new_url, &cache)
+            .cached_tools()
+            .await
+            .into_iter()
+            .map(|t| t.definition.name)
+            .collect();
+        assert_eq!(names, ["new_tool"]);
+    }
+
+    #[tokio::test]
+    async fn failed_connect_keeps_previous_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ToolCache::new(dir.path().join("tools.json"), crate::cache::DEFAULT_TTL);
+        let server = MockServer::start(mcp_server("search")).await;
+        let url = format!("{}/mcp", server.base);
+        manager(&url, &cache).tools().await;
+        let broken = MockServer::start(|_| Reply::status(500)).await;
+        let config = configs(&url).remove("srv").unwrap();
+        let tools = cache.get("srv", &config).unwrap();
+        let broken_url = format!("{}/mcp", broken.base);
+        let broken_config = configs(&broken_url).remove("srv").unwrap();
+        cache.put("srv", &broken_config, &tools).unwrap();
+        let m = manager(&broken_url, &cache);
+        assert!(m.tools().await.is_empty());
+        assert!(matches!(m.statuses().await["srv"], ServerStatus::Failed(_)));
+        assert_eq!(m.cached_tools().await.len(), 1);
+    }
 }

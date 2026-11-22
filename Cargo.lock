@@ -2898,11 +2898,14 @@ dependencies = [
 name = "omp-mcp"
 version = "0.12.0"
 dependencies = [
+ "base64 0.22.1",
  "futures",
+ "getrandom 0.2.17",
  "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
