@@ -720,9 +720,9 @@ pub fn tool_decision(name: &str, args: &Value, settings: &omp_settings::Settings
     }
 }
 
-/// TS `formatApprovalDetails`.
-fn approval_details(name: &str, args: &Value) -> Vec<String> {
-    let t = truncate_for_prompt;
+/// TS `formatApprovalDetails`; `t` shortens each value (the prompt
+/// truncates, the dialog's expanded view keeps everything).
+fn approval_details(name: &str, args: &Value, t: fn(&str) -> String) -> Vec<String> {
     match name {
         "bash" => vec![format!(
             "Command: {}",
@@ -806,13 +806,12 @@ fn approval_details(name: &str, args: &Value) -> Vec<String> {
             }
             lines
         }
-        "task" => task_details(args),
+        "task" => task_details(args, t),
         _ => Vec::new(),
     }
 }
 
-fn task_details(args: &Value) -> Vec<String> {
-    let t = truncate_for_prompt;
+fn task_details(args: &Value, t: fn(&str) -> String) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(agent) = str_arg(args, "agent") {
         lines.push(format!("Agent: {}", t(agent)));
@@ -877,12 +876,23 @@ fn task_details(args: &Value) -> Vec<String> {
 /// TS `formatApprovalPrompt`.
 #[must_use]
 pub fn format_prompt(name: &str, args: &Value, reason: Option<&str>) -> String {
+    prompt_with(name, args, reason, truncate_for_prompt)
+}
+
+/// [`format_prompt`] without value truncation: the approval dialog's
+/// expanded details (TS `fullPrompt`).
+#[must_use]
+pub fn format_full_prompt(name: &str, args: &Value, reason: Option<&str>) -> String {
+    prompt_with(name, args, reason, str::to_owned)
+}
+
+fn prompt_with(name: &str, args: &Value, reason: Option<&str>, t: fn(&str) -> String) -> String {
     let mut lines = vec![format!("Allow tool: {name}")];
     if let Some(reason) = reason.filter(|r| !r.is_empty()) {
         lines.push(format!("Reason: {reason}"));
     }
     lines.extend(
-        approval_details(name, args)
+        approval_details(name, args, t)
             .into_iter()
             .filter(|l| !l.is_empty()),
     );
@@ -1047,8 +1057,10 @@ impl Gate {
             ));
         };
         let prompt = format_prompt(name, args, resolved.reason.as_deref());
+        let full = format_full_prompt(name, args, resolved.reason.as_deref());
+        let full = (full != prompt).then_some(full.as_str());
         let choice = tokio::select! {
-            c = select(&rt, &prompt, &["Approve", "Deny"]) => Ok(c),
+            c = select(&rt, &prompt, full, &["Approve", "Deny"]) => Ok(c),
             () = signal.aborted() => Err(()),
         };
         match choice {
@@ -1149,8 +1161,15 @@ fn report(r: anyhow::Result<omp_ext::EmitResult>) {
 }
 
 /// `ctx.ui.select` through the session's frame stream: a TUI dialog or an rpc client's
-/// `extension_ui_response`. `None` = cancelled.
-async fn select(rt: &Arc<Runtime>, title: &str, options: &[&str]) -> Option<String> {
+/// `extension_ui_response`. `None` = cancelled. The frame is tagged `kind: "approval"` (the TUI
+/// draws its approval dialog; other clients see a plain select) and carries the untruncated
+/// details as `fullPrompt` when the prompt shortened them.
+async fn select(
+    rt: &Arc<Runtime>,
+    title: &str,
+    full_prompt: Option<&str>,
+    options: &[&str],
+) -> Option<String> {
     let id = format!(
         "ext-ui-{}",
         std::time::SystemTime::now()
@@ -1158,13 +1177,18 @@ async fn select(rt: &Arc<Runtime>, title: &str, options: &[&str]) -> Option<Stri
             .map_or(0, |d| d.as_nanos())
     );
     let waiter = crate::rpc::register_pending_ui_request(&id);
-    rt.send(json!({
+    let mut frame = json!({
         "type": "extension_ui_request",
         "id": id,
         "method": "select",
         "title": title,
         "options": options,
-    }));
+        "kind": "approval",
+    });
+    if let Some(full) = full_prompt {
+        frame["fullPrompt"] = Value::from(full);
+    }
+    rt.send(frame);
     let answer = waiter.await.ok()?;
     if answer.get("cancelled").and_then(Value::as_bool) == Some(true) {
         return None;
@@ -1279,6 +1303,23 @@ mod tests {
         assert_eq!(
             deny_message(&r, "write"),
             "Tool \"write\" is blocked by tool policy.\nReason: skill:// URLs are read-only"
+        );
+    }
+
+    #[test]
+    fn full_prompt_keeps_what_the_prompt_elides() {
+        let long = "x".repeat(2500);
+        let args = json!({ "command": long });
+        let prompt = format_prompt("bash", &args, None);
+        assert!(prompt.ends_with("[…500ch elided…]"), "{prompt}");
+        assert_eq!(
+            format_full_prompt("bash", &args, None),
+            format!("Allow tool: bash\nCommand: {long}")
+        );
+        let short = json!({ "command": "ls" });
+        assert_eq!(
+            format_full_prompt("bash", &short, None),
+            format_prompt("bash", &short, None)
         );
     }
 

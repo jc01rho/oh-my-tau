@@ -462,9 +462,9 @@ mod tests {
     #[test]
     fn override_text_specs() {
         assert_eq!(override_bytes("printf hello"), Some(b"hello".to_vec()));
-        // argv split is literal — no shell quoting layer; coreutils printf
-        // ignores extra operands beyond the format.
-        assert_eq!(override_bytes("printf a b"), Some(b"a".to_vec()));
+        // argv split is literal — no shell quoting layer: the format and both
+        // operands arrive as separate arguments (GNU and BSD printf agree).
+        assert_eq!(override_bytes("printf %s-%s a b"), Some(b"a-b".to_vec()));
         assert_eq!(override_bytes("definitely-not-a-real-cmd-xyz"), None);
         assert_eq!(override_bytes(""), None);
     }

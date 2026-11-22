@@ -3141,18 +3141,24 @@ impl Runtime {
         let Ok(entries) = self.entries() else {
             return Vec::new();
         };
-        let leaf = match self.persist.leaf_divergence() {
-            Some(Some(id)) => Some(id),
-            Some(None) => None,
-            None => omp_session::tree::leaf_id(&entries).map(str::to_owned),
-        };
-        leaf.map(|leaf| {
-            omp_session::tree::branch_path(&entries, &leaf)
-                .into_iter()
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
+        self.live_leaf(&entries)
+            .map(|leaf| {
+                omp_session::tree::branch_path(&entries, &leaf)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The live leaf of `entries` (TS `getLeafId()`): the writer's append
+    /// point after a `/tree` move, else the last journaled entry.
+    #[must_use]
+    pub fn live_leaf(&self, entries: &[Value]) -> Option<String> {
+        match self.persist.leaf_divergence() {
+            Some(leaf) => leaf,
+            None => omp_session::tree::leaf_id(entries).map(str::to_owned),
+        }
     }
 
     // ---------------------------------------------------------- compaction
@@ -3168,6 +3174,20 @@ impl Runtime {
     #[allow(dead_code)]
     pub fn set_summarizer(&self, f: Option<crate::compact::SummarizeFn>) {
         *lock(&self.summarizer) = f;
+    }
+
+    /// The compaction summarizer as a plain function (`/tree` branch summaries
+    /// run on the compaction lane, like TS `navigateTree`).
+    ///
+    /// # Errors
+    /// The live model target cannot build a completer (no model / credentials).
+    pub fn summarize_fn(&self) -> Result<crate::compact::SummarizeFn> {
+        use omp_compact::summary::Completer as _;
+        let summarizer = self.summarizer()?;
+        Ok(Arc::new(move |request| {
+            let summarizer = summarizer.clone();
+            Box::pin(async move { summarizer.complete(request).await })
+        }))
     }
 
     fn summarizer(&self) -> Result<crate::compact::Summarizer> {
