@@ -51,8 +51,9 @@ Totals: **PORTED 43 / PARTIAL 10 / STUB 11 / UNIQUE 3 = 67 reserved**, plus
 too; the names that do not are `ultra`, `rlm`, `sandbox`, and `budget` (top-level in
 tau, a nested `Adjust the token budget` entry upstream).
 
-**Phase 8b-2 (this pass):** `/memory`, `/force`, `/handoff` and `/delete` are
-ported; `/advisor`, `/prewalk` and `/reload-plugins` are real but partial (named
+**Phase 8b-2 (this pass):** `/memory`, `/force`, `/delete` and `/session delete`
+are ported, and `/handoff`'s row is corrected to PORTED (main already ran the real
+handoff document + compact path); `/advisor`, `/prewalk` and `/reload-plugins` are real but partial (named
 gaps in §1); `/local`, `/open`, `/settings`, `/tree`, `/resume` and `/exit` run in
 the TUI and answer as TUI-only elsewhere; `/goal` is reclassified STUB (goal mode
 has no runtime) and `/session` PARTIAL. Still not ported, each with its reason in
@@ -98,7 +99,7 @@ tau-only names. `Handler` is the function that actually runs.
 | 6 | `/skillful` | PARTIAL | `setting_status_toggle` | Flips the setting + prints status; prompt-side skill listing effect unverified. |
 | 7 | `/extended-context` | PARTIAL | `setting_status_toggle` | Same shape as `/skillful`, on `extendedContext`. |
 | 8 | `/computer` | PORTED | `features::browser::computer_command` | `on`/`off`/`status`. |
-| 9 | `/security` | PARTIAL | `features::security::command` | Rust verbs over the SQLite store and coordinator: `status plans plan preflight start cancel findings validate sarif cloud help`. The catalog lists upstream's 11 verbs, but `scan scans show import export compare disposition` have no handler yet (8b-2 ledger). |
+| 9 | `/security` | PARTIAL | `features::security::command` | Rust verbs over the SQLite store and coordinator: `status plans plan preflight start cancel findings validate sarif cloud help`. The catalog lists upstream's 11 verbs, but `scan scans show import export compare disposition` have no handler (8b-2): `start` only records a queued operation and nothing in omp-rs executes it, so `scan` would be a false success; `scans show import export compare disposition` need upstream's bundle store (scan records, dispositions, comparison, SARIF/Codex importers) and a `security://` handler, none of which exist in omp-rs. |
 | 10 | `/ratchet` | STUB | `notice` (`slash.rs:880`) | Needs the eval-harness + hill-climb runner. |
 | 11 | `/prewalk` | PARTIAL | `features::prewalk` | 8b-2: manual one-shot handoff ported — arm / `off` / `restart [from] [into]` with upstream's checks and messages, deep-plan + continue nudges, todo gate, implementation-action test, switch before the next model call, checklist steer, startup flags and `prewalk.enabled`. Missing: `prewalk.auto` classification, plan-yolo, scrubbing a delivered plan nudge. |
 | 12 | `/modelpreset` | PORTED | `modelpreset_command` | `list save switch delete`. |
