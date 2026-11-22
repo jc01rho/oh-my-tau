@@ -61,6 +61,9 @@ pub struct RecoveryConfig {
     pub chain_key: String,
     /// Role name reported in `retry_fallback_*` events (e.g. `default`); the chain key when `None`.
     pub role_label: Option<String>,
+    /// `--no-model-fallback`: keep backoff retries but never walk the fallback chain, so the
+    /// provider/id cannot change under the gateway mid-session.
+    pub model_fallback_disabled: bool,
 }
 
 impl RecoveryConfig {
@@ -86,6 +89,7 @@ impl RecoveryConfig {
             fallback,
             chain_key,
             role_label: primary.role.clone(),
+            model_fallback_disabled: false,
         }
     }
 
@@ -556,7 +560,7 @@ impl TurnRecovery {
         now_ms: u64,
         rand01: f64,
     ) -> Vec<String> {
-        if self.cfg.fallback.chains.is_empty() {
+        if self.cfg.fallback.chains.is_empty() || self.cfg.model_fallback_disabled {
             return Vec::new();
         }
         self.state.note_cooldown(
@@ -761,6 +765,7 @@ mod tests {
             fallback,
             chain_key: "p/a".into(),
             role_label: Some("default".into()),
+            model_fallback_disabled: false,
         }
     }
 
@@ -805,6 +810,7 @@ mod tests {
             fallback,
             chain_key: "p/a".into(),
             role_label: None,
+            model_fallback_disabled: false,
         };
         let mut r = TurnRecovery::new(c);
         let mut f = failed("429 rate limit exceeded. Retry-After: 5");
@@ -837,6 +843,22 @@ mod tests {
             r.finish_attempt(&a, false),
             Verdict::Retry { delay_ms: 100 }
         ));
+    }
+
+    /// `--no-model-fallback`: a retryable failure still backs off, but the walk never leaves the
+    /// pinned model (the gateway keeps one provider/id for the session's life).
+    #[test]
+    fn model_fallback_disabled_keeps_backoff_but_never_switches() {
+        let mut c = cfg(&["q/b", "r/c"]);
+        c.model_fallback_disabled = true;
+        let mut r = TurnRecovery::new(c);
+        let f = failed("503 overloaded");
+        let a = r.begin_attempt(&f, 0.0);
+        assert!(
+            r.consult("p/a", &a, 0, 0.0).is_empty(),
+            "a pinned model must not fall back"
+        );
+        assert!(matches!(r.finish_attempt(&a, false), Verdict::Retry { .. }));
     }
 
     #[test]

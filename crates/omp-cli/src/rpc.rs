@@ -206,7 +206,89 @@ impl AskUi for RpcAskUi {
 const MAX_REASSEMBLED_BYTES: u64 = 67_108_864;
 const CACHE_WARMING_MODES: [&str; 3] = ["off", "streaming", "idle"];
 
+/// RPC protocol version advertised by `get_protocol_info` (the transport `negotiate_protocol`
+/// version is separate: that one selects frame chunking).
+pub const PROTOCOL_VERSION: u32 = 2;
+/// Engine name the OmOMeow gateway records for this host.
+pub const ENGINE: &str = "oh-my-tau";
+
+/// Every command `dispatch` answers, in catalog order.
+///
+/// This is the single source of truth behind `get_protocol_info`; `tests::catalog_matches_dispatch`
+/// keeps it in step with the `match kind` arms below.
+pub const RPC_COMMANDS: &[&str] = &[
+    "negotiate_protocol",
+    "get_protocol_info",
+    "prompt",
+    "steer",
+    "follow_up",
+    "remove_queued_message",
+    "promote_queued_message",
+    "abort",
+    "abort_and_prompt",
+    "interrupt",
+    "set_client_info",
+    "extension_request",
+    "reload",
+    "resume_session",
+    "new_session",
+    "switch_session",
+    "open_session",
+    "branch",
+    "fork",
+    "get_state",
+    "set_fast_mode",
+    "goal",
+    "set_ask_dialog",
+    "get_available_commands",
+    "get_entries",
+    "get_tree",
+    "set_todos",
+    "set_host_tools",
+    "set_host_uri_schemes",
+    "set_subagent_subscription",
+    "set_event_filter",
+    "get_subagents",
+    "get_subagent_messages",
+    "cancel_subagent",
+    "steer_subagent",
+    "live_start",
+    "live_stop",
+    "live_mute",
+    "set_model",
+    "cycle_model",
+    "get_available_models",
+    "set_thinking_level",
+    "cycle_thinking_level",
+    "get_available_thinking_levels",
+    "set_steering_mode",
+    "set_follow_up_mode",
+    "set_interrupt_mode",
+    "compact",
+    "set_auto_compaction",
+    "set_cache_warming",
+    "set_auto_retry",
+    "abort_retry",
+    "abort_bash",
+    "get_session_stats",
+    "export_html",
+    "get_branch_messages",
+    "get_last_assistant_text",
+    "set_session_name",
+    "handoff",
+    "get_messages",
+    "get_messages_page",
+    "get_login_providers",
+    "login",
+    "predict_word",
+    "predict_word_feedback",
+];
+
 /// Success/failure response frame in omp's key order.
+///
+/// A failure carries the error code twice, as `code` (omp's spelling) and `errorCode` (the
+/// OmOMeow gateway's `MoveHost`/`lane-hold` parsers read `errorCode`). An error without a code
+/// falls back to `rpc_failed` so every failure frame is machine-classifiable.
 fn response(id: Option<&Value>, command: &str, result: CmdResult) -> Value {
     let mut m = Map::new();
     if let Some(id) = id {
@@ -224,9 +306,9 @@ fn response(id: Option<&Value>, command: &str, result: CmdResult) -> Value {
         Err(e) => {
             m.insert("success".into(), json!(false));
             m.insert("error".into(), json!(e.message));
-            if let Some(code) = e.code {
-                m.insert("code".into(), json!(code));
-            }
+            let code = e.code.unwrap_or("rpc_failed");
+            m.insert("code".into(), json!(code));
+            m.insert("errorCode".into(), json!(code));
         }
     }
     Value::Object(m)
@@ -235,13 +317,13 @@ fn response(id: Option<&Value>, command: &str, result: CmdResult) -> Value {
 fn str_field<'a>(cmd: &'a Value, key: &str) -> Result<&'a str, CmdError> {
     cmd.get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| CmdError::new(format!("{key} must be a string")))
+        .ok_or_else(|| CmdError::coded(format!("{key} must be a string"), "invalid_params"))
 }
 
 fn bool_field(cmd: &Value, key: &str) -> Result<bool, CmdError> {
     cmd.get(key)
         .and_then(Value::as_bool)
-        .ok_or_else(|| CmdError::new(format!("{key} must be a boolean")))
+        .ok_or_else(|| CmdError::coded(format!("{key} must be a boolean"), "invalid_params"))
 }
 
 fn queue_mode_field(cmd: &Value) -> Result<QueueMode, CmdError> {
@@ -885,6 +967,69 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
             rt.abort().await;
             none()
         }
+        "interrupt" => {
+            match crate::pause::parse_intent(cmd).map_err(CmdError::coded_params)? {
+                crate::pause::InterruptIntent::Stop => rt.pause_for_stop().await?,
+                crate::pause::InterruptIntent::Abort => rt.abort().await,
+            }
+            ok(json!({"interrupted": false}))
+        }
+        "set_client_info" => {
+            rt.set_client_info(cmd)?;
+            none()
+        }
+        "extension_request" => {
+            let name = cmd
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if name.is_empty() {
+                return Err(CmdError::coded(
+                    "Extension RPC request name cannot be empty",
+                    "invalid_params",
+                ));
+            }
+            let Some(host) = rt.ext_host() else {
+                return Err(CmdError::coded(
+                    format!("extension_unavailable: no extension host for {name}"),
+                    "extension_unavailable",
+                ));
+            };
+            let data = cmd.get("data").cloned().unwrap_or(Value::Null);
+            match host
+                .request_extension(name, data, std::time::Duration::from_secs(5))
+                .await
+            {
+                Ok(v) => ok(v),
+                Err(e) => {
+                    let message = format!("{e:#}");
+                    let code = if message.contains("timed out") {
+                        "extension_timeout"
+                    } else if message.contains("Unknown extension RPC request") {
+                        "unknown_extension_request"
+                    } else {
+                        "extension_failed"
+                    };
+                    Err(CmdError::coded(message, code))
+                }
+            }
+        }
+        "reload" => {
+            // Extensions reload; the session and any hold survive (the gateway reloads while
+            // holding a lane).
+            if let Some(ext) = crate::rpc::slash::extensions() {
+                if let Err(e) = ext.reload().await {
+                    eprintln!("omt: extension reload: {e:#}");
+                }
+            }
+            rt.announce_commands();
+            ok(json!({"cancelled": false}))
+        }
+        "resume_session" => {
+            rt.release_pause("resume_session");
+            none()
+        }
         "abort_and_prompt" => {
             let message = str_field(cmd, "message")?.to_string();
             let images = images(cmd);
@@ -1301,8 +1446,26 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
             }
             none()
         }
-        other => Err(CmdError::new(format!("Unknown command: {other}"))),
+        "get_protocol_info" => ok(protocol_info(rt)),
+        other => Err(CmdError::coded(
+            format!("Unknown command: {other}"),
+            "unknown_command",
+        )),
     }
+}
+
+/// `get_protocol_info` payload: what the gateway needs to branch on before it drives a session.
+fn protocol_info(rt: &Arc<Runtime>) -> Value {
+    json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "serverVersion": env!("CARGO_PKG_VERSION"),
+        "engine": ENGINE,
+        "mode": "classic",
+        "capabilities": RPC_COMMANDS,
+        "commands": RPC_COMMANDS,
+        "agentDir": omp_providers::AgentDir::default().0.display().to_string(),
+        "sessionId": rt.session_id(),
+    })
 }
 
 const RPC_CHUNK_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -1710,9 +1873,9 @@ pub async fn run_with(
             });
             continue;
         }
-        if kind == "abort" && busy.load(std::sync::atomic::Ordering::SeqCst) {
-            // A command is in flight (possibly waiting on a dialog): abort the run now
-            // instead of queueing behind it.
+        if matches!(kind, "abort" | "interrupt") && busy.load(std::sync::atomic::Ordering::SeqCst) {
+            // A command is in flight (possibly waiting on a dialog): abort or hold the run now
+            // instead of queueing behind it — `interrupt` awaits `wait_for_idle`.
             let reply = handle(&rt, &cmd).await;
             rt.send(reply);
             continue;
@@ -1745,6 +1908,69 @@ pub async fn run_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_frames_carry_code_and_error_code() {
+        let frame = response(
+            Some(&json!("e1")),
+            "interrupt",
+            Err(CmdError::coded(
+                "no interactive client",
+                "stop_requires_interactive_client",
+            )),
+        );
+        assert_eq!(frame["success"], json!(false));
+        assert_eq!(frame["code"], json!("stop_requires_interactive_client"));
+        assert_eq!(
+            frame["errorCode"],
+            json!("stop_requires_interactive_client")
+        );
+        assert!(frame.get("data").is_none());
+    }
+
+    #[test]
+    fn uncoded_failures_fall_back_to_rpc_failed() {
+        let frame = response(None, "get_state", Err(CmdError::new("boom")));
+        assert_eq!(frame["code"], json!("rpc_failed"));
+        assert_eq!(frame["errorCode"], json!("rpc_failed"));
+    }
+
+    #[test]
+    fn catalog_matches_dispatch() {
+        // Every advertised command must appear as a `match kind` arm, so `get_protocol_info`
+        // cannot advertise a command the dispatcher answers with `unknown_command`.
+        let source = include_str!("rpc.rs");
+        let body = source
+            .split("async fn dispatch")
+            .nth(1)
+            .and_then(|rest| rest.split("\n        other => Err(CmdError::coded(").next())
+            .expect("dispatch body");
+        let mut seen = std::collections::BTreeSet::new();
+        for command in RPC_COMMANDS {
+            assert!(seen.insert(*command), "duplicate catalog entry: {command}");
+            let quoted = format!("\"{command}\"");
+            assert!(
+                body.contains(&quoted),
+                "catalog lists `{command}` but dispatch has no arm for it"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_command_is_coded() {
+        assert_eq!(
+            CmdError::coded("Unknown command: nope", "unknown_command").code,
+            Some("unknown_command")
+        );
+    }
+
+    #[test]
+    fn protocol_info_advertises_engine_and_commands() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(ENGINE, "oh-my-tau");
+        assert!(RPC_COMMANDS.contains(&"get_protocol_info"));
+        assert!(RPC_COMMANDS.contains(&"get_state"));
+    }
 
     fn big_response(id: &str) -> Value {
         json!({"id": id, "type": "response", "command": "get_available_models", "success": true,

@@ -25,6 +25,8 @@ interface Ext {
   tools: Map<string, Json>;
   commands: Map<string, Json>;
   flags: Map<string, Json>;
+  /** Extension RPC names this extension registered (`api.rpc.handle`). */
+  rpc: string[];
   label?: string;
 }
 
@@ -326,10 +328,29 @@ type ProviderReg = { name: string; config: Json; extension: string };
 /** Undo log for one `loadOne` call: what it registered on host-wide state. */
 interface LoadTracker {
   subs: (() => void)[];
+  /** Extension RPC names this load registered (`api.rpc.handle`). */
+  rpc: string[];
   /** Providers this load wrote, with the registration they replaced (if any). */
   providers: { name: string; prior?: ProviderReg }[];
   /** `flagValues` entries this load overwrote, recorded before the write. */
   flags: Map<string, FlagWrite>;
+}
+
+/**
+ * Extension RPC registry: `<name>` -> the extension that owns it.
+ * Names are dotted and prefixed with the extension's own namespace (`omomeow.*`, `omo.*`).
+ */
+const rpcHandlers = new Map<string, { ext: string; fn: (data: unknown) => unknown }>();
+
+const RPC_NAME_RE = /^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$/;
+
+/** Validate an extension RPC name; the contract fixes the shape, not the namespace contents. */
+function checkRpcName(name: string): string {
+  const n = name.trim();
+  if (!n) throw new Error("extension rpc name cannot be empty");
+  if (n.length > 64) throw new Error(`extension rpc name too long (${n.length} > 64): ${n}`);
+  if (!RPC_NAME_RE.test(n)) throw new Error(`extension rpc name must be dotted lowercase: ${n}`);
+  return n;
 }
 
 /** One `flagValues` write a load made: the value it replaced, and its revision. */
@@ -344,6 +365,9 @@ interface FlagWrite {
 
 /** Undo everything a failed load registered, so nothing of it outlives the error. */
 function rollbackLoad(ext: Ext, track: LoadTracker) {
+  for (const name of track.rpc.splice(0)) {
+    if (rpcHandlers.get(name)?.ext === ext.name) rpcHandlers.delete(name);
+  }
   for (const off of track.subs.splice(0).reverse()) {
     try {
       off();
@@ -420,6 +444,19 @@ function makeApi(ext: Ext, track: LoadTracker) {
     },
     registerCommand(name: string, options: Json) {
       ext.commands.set(name, { name, ...options });
+    },
+    // `api.rpc.handle(name, fn)` answers `extension_request` from the core. Registration is
+    // synchronous so a bad name or a duplicate fails the load instead of surfacing on call.
+    rpc: {
+      handle(name: string, fn: (data: unknown) => unknown) {
+        const n = checkRpcName(String(name));
+        if (typeof fn !== "function") throw new Error(`extension rpc handler must be a function: ${n}`);
+        const live = rpcHandlers.get(n);
+        if (live) throw new Error(`duplicate extension rpc handler: ${n} (already registered by ${live.ext})`);
+        rpcHandlers.set(n, { ext: ext.name, fn });
+        ext.rpc.push(n);
+        track.rpc.push(n);
+      },
     },
     registerShortcut: () => unsupportedNow("registerShortcut"),
     // Semantics mirror pi-coding-agent loader.ts: the default seeds flagValues; getFlag only
@@ -528,8 +565,8 @@ async function loadOne(path: string): Promise<{ ext?: Ext; error?: string }> {
   const factory = typeof mod === "function" ? mod : mod.default;
   if (typeof factory !== "function") return { error: `Extension does not export a valid factory function: ${path}` };
   const base = basename(path).replace(/\.(ts|js)$/, "");
-  const ext: Ext = { path: resolved, name: base === "index" ? basename(resolve(path, "..")) : base, handlers: new Map(), tools: new Map(), commands: new Map(), flags: new Map() };
-  const track: LoadTracker = { subs: [], providers: [], flags: new Map() };
+  const ext: Ext = { path: resolved, name: base === "index" ? basename(resolve(path, "..")) : base, handlers: new Map(), tools: new Map(), commands: new Map(), flags: new Map(), rpc: [] };
+  const track: LoadTracker = { subs: [], rpc: [], providers: [], flags: new Map() };
   const api = makeApi(ext, track);
   try {
     await (factory as (a: unknown) => unknown)(api);
@@ -566,6 +603,7 @@ async function load(p: Json) {
       handlers: Object.fromEntries([...ext.handlers].map(([k, v]) => [k, v.length])),
       tools: [...ext.tools.keys()],
       commands: [...ext.commands.keys()],
+      rpc: ext.rpc.slice(),
       flags: [...ext.flags.values()].map((f) => ({ ...f })),
     });
   }
@@ -1121,6 +1159,16 @@ async function dispatch(method: string, p: Json): Promise<unknown> {
       return exts.flatMap((e) => [...e.commands.values()].map((c) => ({ name: c.name, description: c.description, extension: e.name })));
     case "call_command":
       return callCommand(p);
+    // `extension_request`: answer a named query an extension registered via `api.rpc.handle`.
+    case "rpc_request": {
+      const name = String(p.name ?? "").trim();
+      if (!name) throw rpcError(-32602, "Extension RPC request name cannot be empty");
+      const h = rpcHandlers.get(name);
+      if (!h) throw rpcError(-32601, `Unknown extension RPC request: ${name}`);
+      return (await h.fn(p.data)) ?? null;
+    }
+    case "list_rpc":
+      return [...rpcHandlers].map(([name, h]) => ({ name, extension: h.ext }));
     case "set_ctx":
       state = { ...state, ...(p.ctx as Json) };
       return true;
