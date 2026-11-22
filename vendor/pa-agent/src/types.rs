@@ -879,18 +879,15 @@ mod context_messages_tests {
 
     #[test]
     fn last_mut_on_shared_segment_copies_on_write() {
-        let mut a: ContextMessages = vec![AgentMessage::user("x")].into();
+        let x = AgentMessage::user("x");
+        let y = AgentMessage::user("y");
+        let (x_dbg, y_dbg) = (format!("{x:?}"), format!("{y:?}"));
+        let mut a: ContextMessages = vec![x].into();
         a.freeze();
         let b = a.clone();
-        *a.last_mut().unwrap() = AgentMessage::user("y");
-        assert_eq!(
-            format!("{:?}", b.last().unwrap()),
-            format!("{:?}", AgentMessage::user("x"))
-        );
-        assert_eq!(
-            format!("{:?}", a.last().unwrap()),
-            format!("{:?}", AgentMessage::user("y"))
-        );
+        *a.last_mut().unwrap() = y;
+        assert_eq!(format!("{:?}", b.last().unwrap()), x_dbg);
+        assert_eq!(format!("{:?}", a.last().unwrap()), y_dbg);
     }
 
     #[test]
