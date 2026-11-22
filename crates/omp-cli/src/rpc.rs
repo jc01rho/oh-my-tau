@@ -228,6 +228,7 @@ pub const RPC_COMMANDS: &[&str] = &[
     "abort_and_prompt",
     "interrupt",
     "set_client_info",
+    "extension_request",
     "reload",
     "resume_session",
     "new_session",
@@ -976,6 +977,43 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
         "set_client_info" => {
             rt.set_client_info(cmd)?;
             none()
+        }
+        "extension_request" => {
+            let name = cmd
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if name.is_empty() {
+                return Err(CmdError::coded(
+                    "Extension RPC request name cannot be empty",
+                    "invalid_params",
+                ));
+            }
+            let Some(host) = rt.ext_host() else {
+                return Err(CmdError::coded(
+                    format!("extension_unavailable: no extension host for {name}"),
+                    "extension_unavailable",
+                ));
+            };
+            let data = cmd.get("data").cloned().unwrap_or(Value::Null);
+            match host
+                .request_extension(name, data, std::time::Duration::from_secs(5))
+                .await
+            {
+                Ok(v) => ok(v),
+                Err(e) => {
+                    let message = format!("{e:#}");
+                    let code = if message.contains("timed out") {
+                        "extension_timeout"
+                    } else if message.contains("Unknown extension RPC request") {
+                        "unknown_extension_request"
+                    } else {
+                        "extension_failed"
+                    };
+                    Err(CmdError::coded(message, code))
+                }
+            }
         }
         "reload" => {
             // Extensions reload; the session and any hold survive (the gateway reloads while

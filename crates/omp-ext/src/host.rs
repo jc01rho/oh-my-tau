@@ -121,6 +121,9 @@ pub struct LoadedExtension {
     pub tools: Vec<String>,
     #[serde(default)]
     pub commands: Vec<String>,
+    /// Extension RPC names this extension registered (`api.rpc.handle`).
+    #[serde(default)]
+    pub rpc: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -204,6 +207,9 @@ pub struct ExtHost {
     /// learned from `load` (mirrors the TS runner's `hasHandlers` gate).
     /// `None` = not loaded yet / unknown: send everything.
     subscribed: Mutex<Option<HashSet<String>>>,
+    /// Extension RPC names registered through `api.rpc.handle`, learned from `load`.
+    /// `None` = not loaded yet.
+    loaded_rpc: Mutex<Option<HashSet<String>>>,
     /// Live session state merged into the host ctx of every emit/tool call that carries no
     /// explicit `ctx` (branch, leafId, contextUsage, idle, pending, ...).
     ctx_provider: Mutex<Option<CtxProvider>>,
@@ -362,6 +368,7 @@ impl ExtHost {
         let (generation, _) = watch::channel(0usize);
         let host = Arc::new(Self {
             subscribed: Mutex::new(None),
+            loaded_rpc: Mutex::new(None),
             ctx_provider: Mutex::new(None),
             conn: Mutex::new(conn),
             child: tokio::sync::Mutex::new(Some(child)),
@@ -511,6 +518,12 @@ impl ExtHost {
             .subscribed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(subscribed);
+        let rpc: HashSet<String> = result
+            .loaded
+            .iter()
+            .flat_map(|e| e.rpc.iter().cloned())
+            .collect();
+        *lock(&self.loaded_rpc) = Some(rpc);
         Ok(result)
     }
 
@@ -680,6 +693,37 @@ impl ExtHost {
             .await
     }
 
+    /// Whether any loaded extension advertised `name` through `api.rpc.handle`.
+    #[must_use]
+    pub fn has_rpc_handler(&self, name: &str) -> bool {
+        lock(&self.loaded_rpc)
+            .as_ref()
+            .is_some_and(|set| set.contains(name))
+    }
+
+    /// Answer a named extension query (`api.rpc.handle`).
+    ///
+    /// `budget` bounds the wait: the core budget must stay below the gateway's own, so an
+    /// unresponsive handler is reported as `extension_timeout` instead of hanging the lane.
+    ///
+    /// # Errors
+    /// Transport failure, an unregistered name, handler failure, or a budget overrun.
+    pub async fn request_extension(
+        &self,
+        name: &str,
+        data: Value,
+        budget: std::time::Duration,
+    ) -> Result<Value> {
+        let call = self.request("rpc_request", json!({"name": name, "data": data}));
+        match tokio::time::timeout(budget, call).await {
+            Ok(v) => v,
+            Err(_) => bail!(
+                "rpc_request: {name} timed out after {}ms",
+                budget.as_millis()
+            ),
+        }
+    }
+
     /// Merge fields into the host's session state without emitting an event.
     ///
     /// # Errors
@@ -743,6 +787,7 @@ impl ExtHost {
         let (generation, _) = watch::channel(0usize);
         let host = Arc::new(Self {
             subscribed: Mutex::new(None),
+            loaded_rpc: Mutex::new(None),
             ctx_provider: Mutex::new(None),
             conn: Mutex::new(conn),
             child: tokio::sync::Mutex::new(None),
@@ -878,6 +923,7 @@ impl ExtHost {
         *lock(&self.conn) = conn;
         *self.child.lock().await = child;
         *lock(&self.subscribed) = None;
+        *lock(&self.loaded_rpc) = None;
         let (tx, rx) = mpsc::unbounded_channel();
         *lock(&self.incoming) = Incoming {
             delivery: Delivery::Pending(VecDeque::new()),
