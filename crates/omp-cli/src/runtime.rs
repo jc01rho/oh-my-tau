@@ -598,8 +598,10 @@ impl Runtime {
 
     /// Publish the `memory://` book for this session's project when
     /// `memory.backend` selects a live engine; clear it otherwise so a stale
-    /// session cannot leak records into the next one.
-    fn publish_memory_urls(&self) {
+    /// session cannot leak records into the next one. The book is read from
+    /// the session's shared engine (the memory tools' and `/memory`'s), so a
+    /// `/memory clear` republishes an empty book.
+    pub(crate) fn publish_memory_urls(&self) {
         use omp_urls::schemes::memory as memory_scheme;
         let settings = omp_settings::Settings::load(&self.cwd);
         let backend = settings
@@ -610,15 +612,8 @@ impl Runtime {
             memory_scheme::set_memory_records(Vec::new());
             return;
         }
-        let input = omp_memory::runtime::RuntimeStart {
-            session_id: self.persist.session_id(),
-            data_dir: omp_providers::AgentDir::default().0.join("memory"),
-            workspace_root: self.cwd.clone(),
-            canonical_primary_root: None,
-            backend,
-            mnemopi: omp_memory::MnemopiSettings::default(),
-        };
-        let Ok(runtime) = omp_memory::MemoryRuntime::start(input) else {
+        let Ok(Some(runtime)) = crate::tools::memory_backend::shared_runtime(&self.cwd, &settings)
+        else {
             memory_scheme::set_memory_records(Vec::new());
             return;
         };

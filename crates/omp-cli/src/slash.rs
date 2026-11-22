@@ -759,7 +759,20 @@ async fn dispatch_builtin_more(
         }
         "memory" => {
             match crate::features::memory::handle_memory_command(&rt.cwd, args) {
-                crate::features::memory::MemoryCommandOutput::Output(text) => output(rt, &text),
+                crate::features::memory::MemoryCommandOutput::Output(text) => {
+                    // TS `clear`/`reset` refresh what the session caches from
+                    // memory: here the `memory://` book.
+                    if matches!(
+                        args.split_whitespace()
+                            .next()
+                            .map(str::to_lowercase)
+                            .as_deref(),
+                        Some("clear" | "reset")
+                    ) {
+                        rt.publish_memory_urls();
+                    }
+                    output(rt, &text);
+                }
                 crate::features::memory::MemoryCommandOutput::Usage(text) => {
                     return Some(usage(rt, text));
                 }
