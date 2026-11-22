@@ -824,15 +824,12 @@ impl Extensions {
         (transform, before, after)
     }
 
-    /// Notify request-accounting hooks at the real provider boundary.
-    /// Currently payload mutation remains on the native Rust stream path.
-    pub async fn before_provider_request(&self) -> Result<()> {
-        if self.host.has_handlers("before_provider_request") {
-            self.host
-                .emit(json!({"type":"before_provider_request","payload":{}}), None)
-                .await?;
-        }
-        Ok(())
+    /// The real outbound payload at the provider boundary: every
+    /// `before_provider_request` handler sees the previous handler's payload, and a
+    /// returned payload replaces it, so the rewrite lands in the request that is
+    /// actually sent (TS `emitBeforeProviderRequest`). `None` keeps it unchanged.
+    pub fn before_provider_request(&self, payload: Value) -> Option<Value> {
+        provider_payload(&self.host, payload)
     }
 
     /// Extension tools as `AgentTool` wrappers (`list_tools` -> `call_tool`).
@@ -1522,6 +1519,40 @@ impl Extensions {
             })
             .await
     }
+
+    /// [`Self::before_provider_request`] as the loop's payload hook
+    /// (`StreamRequestOptions::on_payload`): the provider calls it with the payload it
+    /// is about to send.
+    pub fn payload_hook(self: &Arc<Self>) -> pa_agent::stream::OnPayloadHook {
+        let ext = Arc::clone(self);
+        Arc::new(move |payload: Value, _model: &pa_agent::types::Model| {
+            ext.before_provider_request(payload)
+        })
+    }
+}
+
+/// [`Extensions::before_provider_request`] for the requests that build their own
+/// `SimpleStreamOptions` instead of going through the loop (compaction, side turns);
+/// upstream wires the same hook there.
+pub fn ai_payload_hook(host: Arc<ExtHost>) -> pa_ai::types::OnPayloadHook {
+    Arc::new(move |payload: Value, _model: &pa_types::ai::Model| provider_payload(&host, payload))
+}
+
+/// One `before_provider_request` round trip: nothing when no extension subscribes
+/// (`has_handlers`), the handlers' chained replacement otherwise. A transport failure
+/// leaves the payload alone and is reported, like a failing handler in TS.
+fn provider_payload(host: &Arc<ExtHost>, payload: Value) -> Option<Value> {
+    if !host.has_handlers("before_provider_request") {
+        return None;
+    }
+    let event = json!({"type": "before_provider_request", "payload": payload});
+    match host.emit_blocking(event, None) {
+        Ok(result) => result.result.get("payload").cloned(),
+        Err(error) => {
+            eprintln!("omt: before_provider_request: {error:#}");
+            None
+        }
+    }
 }
 
 /// Emit `session_stop` from the would-stop point and translate its outcome
@@ -2159,6 +2190,141 @@ mod tests {
         // A bare string becomes a displayed default-type message; other shapes are dropped.
         assert!(injected_message(&json!("note")).is_some());
         assert!(injected_message(&json!(7)).is_none());
+    }
+
+    /// Fake host for the payload hook: logs every request line to `$OMP_TEST_LOG`,
+    /// answers `load` with the subscribers in `$OMP_TEST_HANDLERS` and `emit` with a
+    /// replacement payload (what `host.ts` returns after the handler chain).
+    const PAYLOAD_HOST: &str = concat!(
+        "while IFS= read -r line; do\n",
+        "  printf '%s\\n' \"$line\" >> \"$OMP_TEST_LOG\"\n",
+        "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+        "  case \"$line\" in\n",
+        "    *'\"method\":\"load\"'*)\n",
+        "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"loaded\":[{\"path\":\"/e.ts\",\"name\":\"e\",\"handlers\":%s}],\"errors\":[]}}\\n' \"$id\" \"$OMP_TEST_HANDLERS\"\n",
+        "      ;;\n",
+        "    *'\"method\":\"emit\"'*)\n",
+        "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":{\"payload\":{\"model\":\"rewritten\",\"n\":2}},\"handlers\":[],\"errors\":[]}}\\n' \"$id\"\n",
+        "      ;;\n",
+        "  esac\n",
+        "done\n",
+    );
+
+    async fn payload_host(dir: &std::path::Path, handlers: &str) -> Arc<ExtHost> {
+        let log = dir.join("requests.log");
+        sh_host(
+            dir,
+            PAYLOAD_HOST,
+            vec![
+                ("OMP_TEST_LOG".into(), log.to_string_lossy().into_owned()),
+                ("OMP_TEST_HANDLERS".into(), handlers.into()),
+            ],
+        )
+        .await
+    }
+
+    /// An [`Extensions`] over an already-spawned (fake) host.
+    fn sh_ext(host: Arc<ExtHost>, cwd: &std::path::Path) -> Arc<Extensions> {
+        Arc::new(Extensions {
+            hooks: ExtHooks::new(host.clone()),
+            host,
+            sub: Mutex::new(None),
+            turn: Arc::new(AtomicU64::new(0)),
+            stop: Arc::new(Mutex::new(StopState::default())),
+            cwd: cwd.to_path_buf(),
+            extra: Vec::new(),
+            dir: None,
+            ctx: Mutex::new(SessionCtx::default()),
+            mode: Mutex::new(ExtMode::Print),
+            prompt_override: Mutex::new(None),
+            live: Arc::new(Live::default()),
+            rt: Mutex::new(None),
+            blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_agent_end: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn agent_model() -> pa_agent::types::Model {
+        serde_json::from_value(json!({
+            "id": "a", "name": "a", "api": "openai-completions", "provider": "p",
+            "baseUrl": "http://127.0.0.1:9"
+        }))
+        .expect("agent model json")
+    }
+
+    /// The provider's real payload reaches `before_provider_request`, and the payload
+    /// the handlers leave behind is what the request goes out with.
+    #[tokio::test]
+    async fn before_provider_request_sends_the_real_payload_and_applies_the_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = payload_host(dir.path(), r#"{"before_provider_request":1}"#).await;
+        let ext = sh_ext(host, dir.path());
+
+        let sent = json!({
+            "model": "orig",
+            "messages": [{"role": "user", "text": "real-payload-marker"}]
+        });
+        let out = ext
+            .before_provider_request(sent)
+            .expect("the handler's replacement payload");
+        assert_eq!(out, json!({"model": "rewritten", "n": 2}));
+
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            seen.contains(r#""type":"before_provider_request""#),
+            "the event carries the TS name: {seen}"
+        );
+        assert!(
+            seen.contains("real-payload-marker"),
+            "the real payload crosses, not an empty one: {seen}"
+        );
+    }
+
+    /// Hooks chain the way the loop composes them: the extension hook sees the earlier
+    /// hook's payload and its own replacement is the final one.
+    #[tokio::test]
+    async fn before_provider_request_chains_onto_an_earlier_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = payload_host(dir.path(), r#"{"before_provider_request":1}"#).await;
+        let ext = sh_ext(host, dir.path());
+
+        let earlier: pa_agent::stream::OnPayloadHook = Arc::new(|mut payload: Value, _model| {
+            payload["earlier"] = json!(true);
+            Some(payload)
+        });
+        let hook =
+            crate::adapter::chain_agent_payload_hooks(Some(earlier), Some(ext.payload_hook()))
+                .expect("both hooks present");
+
+        let out = hook(json!({"model": "orig"}), &agent_model()).expect("replacement");
+        assert_eq!(out, json!({"model": "rewritten", "n": 2}));
+
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            seen.contains(r#""earlier":true"#),
+            "the extension hook saw the earlier hook's payload: {seen}"
+        );
+    }
+
+    /// No subscriber: no round trip and no payload change (`has_handlers`).
+    #[tokio::test]
+    async fn before_provider_request_skips_the_round_trip_without_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = payload_host(dir.path(), r#"{"session_start":1}"#).await;
+        host.load(None, None, "/w", None).await.unwrap();
+        let ext = sh_ext(host, dir.path());
+
+        assert!(ext
+            .before_provider_request(json!({"model": "orig"}))
+            .is_none());
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !seen.contains(r#""method":"emit""#),
+            "no emit without a subscriber: {seen}"
+        );
     }
 
     #[test]

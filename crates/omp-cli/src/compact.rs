@@ -200,6 +200,9 @@ pub struct LiveCompleter {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Stored credential row behind `api_key`: re-resolved per summary (expired OAuth refreshes).
     pub credential_id: Option<i64>,
+    /// The session's extension payload hook: a summary request carries the same
+    /// `before_provider_request` handlers as a live turn (upstream `onPayload`).
+    pub payload: Option<pa_ai::types::OnPayloadHook>,
 }
 
 impl Completer for LiveCompleter {
@@ -219,6 +222,7 @@ impl Completer for LiveCompleter {
                     max_tokens: Some(request.max_tokens),
                     api_key,
                     headers: headers.map(|h| h.into_iter().collect()),
+                    on_payload: self.payload.clone(),
                     ..pa_ai::types::StreamOptions::default()
                 },
                 // `resolveCompactionEffort`: High by default, only for reasoning models.
@@ -252,6 +256,7 @@ impl LiveCompleter {
             api_key: t.api_key,
             headers: t.headers,
             credential_id: t.credential_id,
+            payload: None,
         })
     }
 }
