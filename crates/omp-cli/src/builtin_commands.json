@@ -984,7 +984,7 @@
  },
  {
   "name": "local",
-  "description": "Reserved upstream command (not implemented in this build)",
+  "description": "Open a session local:// file in $EDITOR (picker when no name given)",
   "source": "builtin"
  },
  {

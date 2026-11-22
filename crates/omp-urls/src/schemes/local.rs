@@ -217,6 +217,86 @@ fn list_files_recursively(root: &Path) -> anyhow::Result<Vec<String>> {
     Ok(files)
 }
 
+/// One session `local://` file (TS `LocalFileEntry`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalFileEntry {
+    /// Path under the local root, `/`-separated.
+    pub name: String,
+    /// `local://<name>`.
+    pub url: String,
+    /// On-disk path.
+    pub path: PathBuf,
+    /// Size in bytes.
+    pub size: u64,
+    /// Last modification.
+    pub modified: std::time::SystemTime,
+}
+
+/// TS `listLocalFiles`: every file under the session's local root, newest
+/// first, then by name. A missing root is an empty listing.
+///
+/// # Errors
+/// A listing failure other than a missing root.
+pub fn list_local_files(ctx: &UrlCtx) -> anyhow::Result<Vec<LocalFileEntry>> {
+    let root = resolve_local_root(ctx);
+    let names = match list_files_recursively(&root) {
+        Ok(names) => names,
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(e),
+    };
+    let mut entries: Vec<LocalFileEntry> = names
+        .into_iter()
+        .filter_map(|name| {
+            let path = root.join(&name);
+            let meta = std::fs::metadata(&path).ok()?;
+            Some(LocalFileEntry {
+                url: format!("local://{name}"),
+                name,
+                path,
+                size: meta.len(),
+                modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+            })
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(entries)
+}
+
+/// Non-creating locate of a `local://` URL with TS `InternalUrlRouter.locate`
+/// semantics: traversal, absolute paths and a realpath escaping the root are
+/// errors; a missing target is `Ok(None)`.
+///
+/// # Errors
+/// Invalid URL, traversal / absolute path, or a target escaping the root.
+pub fn locate_local(href: &str, ctx: &UrlCtx) -> anyhow::Result<Option<PathBuf>> {
+    let url = crate::parse::parse_internal_url(href)?;
+    let root = resolve_local_root(ctx);
+    let relative = extract_relative_path(&url)?;
+    let target = if relative.is_empty() {
+        root.clone()
+    } else {
+        root.join(relative)
+    };
+    ensure_within_root(&target, &root, &url.raw_href)?;
+    let Ok(real_root) = std::fs::canonicalize(&root) else {
+        return Ok(None);
+    };
+    let Ok(real) = std::fs::canonicalize(&target) else {
+        return Ok(None);
+    };
+    ensure_within_root(&real, &real_root, &url.raw_href)?;
+    Ok(Some(real))
+}
+
 /// TS `buildListing`.
 fn build_listing(url: &InternalUrl, root: &Path) -> anyhow::Result<InternalResource> {
     let files = list_files_recursively(root)?;
@@ -339,5 +419,65 @@ impl UrlProvider for LocalProvider {
                 detail: None,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+
+    fn ctx_in(tag: &str) -> (UrlCtx, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("omp-urls-local-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = UrlCtx {
+            session_file: Some(base.join("sess.jsonl")),
+            ..UrlCtx::default()
+        };
+        let root = base.join("sess").join("local");
+        (ctx, root)
+    }
+
+    #[test]
+    fn listing_is_newest_first_and_missing_root_is_empty() {
+        let (ctx, root) = ctx_in("list");
+        assert!(list_local_files(&ctx).unwrap().is_empty());
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("a.md"), "aa").unwrap();
+        std::fs::write(root.join("dir/b.md"), "bbb").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .append(true)
+            .open(root.join("dir/b.md"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let files = list_local_files(&ctx).unwrap();
+        let names: Vec<(&str, u64)> = files.iter().map(|f| (f.name.as_str(), f.size)).collect();
+        assert_eq!(names, [("dir/b.md", 3), ("a.md", 2)]);
+        assert_eq!(files[0].url, "local://dir/b.md");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn locate_rejects_traversal_absolute_and_escapes() {
+        let (ctx, root) = ctx_in("locate");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.md"), "x").unwrap();
+        let found = locate_local("local://note.md", &ctx).unwrap().unwrap();
+        assert_eq!(found, std::fs::canonicalize(root.join("note.md")).unwrap());
+        assert_eq!(locate_local("local://missing.md", &ctx).unwrap(), None);
+        assert!(locate_local("local://../x", &ctx).is_err());
+        assert!(locate_local("local://a/%2E%2E/%2E%2E/x", &ctx).is_err());
+        #[cfg(unix)]
+        {
+            let outside = root.parent().unwrap().join("outside.md");
+            std::fs::write(&outside, "secret").unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("link.md")).unwrap();
+            let err = locate_local("local://link.md", &ctx).unwrap_err();
+            assert!(err.to_string().contains("escapes local root"));
+        }
+        let _ = std::fs::remove_dir_all(root.parent().unwrap().parent().unwrap());
     }
 }

@@ -863,6 +863,12 @@ async fn dispatch_ported(rt: &std::sync::Arc<Runtime>, name: &str, args: &str) -
         "pin" => Some(pin_command(rt, args).await),
         "unpin" => Some(unpin_command(rt, args)),
         "hotkeys" => Some(hotkeys_command(rt, args)),
+        // Upstream runs these only in the interactive TUI (`handleTui`), which
+        // handles them locally; text-mode dispatch says so.
+        "local" => Some(notice(
+            rt,
+            &format!("/{name} is only available in the interactive TUI."),
+        )),
         "skillful" => Some(setting_status_toggle(
             rt,
             args,
@@ -3084,7 +3090,6 @@ const UNPORTED_RESERVED: &[&str] = &[
     "vibe",
     "guided-goal",
     "git",
-    "local",
     "hub",
     "tree",
     "resume",
@@ -3283,14 +3288,45 @@ mod tests {
 
     #[test]
     fn every_upstream_builtin_name_is_reserved() {
-        for name in UNPORTED_RESERVED
-            .iter()
-            .copied()
-            .chain(["clear", "unpin", "hotkeys"])
-        {
+        // The 26 upstream names Phase 8b reserved; ported ones leave
+        // `UNPORTED_RESERVED` but must stay reserved.
+        const UPSTREAM_ONLY: [&str; 26] = [
+            "settings",
+            "setup",
+            "plan-review",
+            "vibe",
+            "guided-goal",
+            "git",
+            "local",
+            "hub",
+            "tree",
+            "resume",
+            "delete",
+            "exit",
+            "commit",
+            "live",
+            "record",
+            "pause",
+            "forget-approvals",
+            "join",
+            "leave",
+            "open",
+            "tan",
+            "omfg",
+            "cleanse",
+            "clear",
+            "unpin",
+            "hotkeys",
+        ];
+        for name in UPSTREAM_ONLY {
             assert!(is_reserved_builtin(name), "/{name} must be reserved");
         }
-        assert_eq!(UNPORTED_RESERVED.len() + 3, 26);
+        for name in UNPORTED_RESERVED {
+            assert!(
+                UPSTREAM_ONLY.contains(name),
+                "/{name} is not an upstream-only name"
+            );
+        }
     }
 
     #[test]
