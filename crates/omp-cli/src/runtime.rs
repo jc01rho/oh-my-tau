@@ -540,6 +540,8 @@ impl Runtime {
             summarizer: Mutex::new(None),
         });
         rt.publish_session_file();
+        let host: Arc<dyn crate::tools::context_notes::ContextNotesHost> = rt.clone();
+        crate::tools::context_host::bind(&host);
         rt.record_model_state().await;
         let listener = rt.clone();
         let sub = rt
@@ -3648,6 +3650,13 @@ impl Runtime {
                 );
                 tools.extend(crate::tools::mcp::mcp_tools(&self.cwd));
                 tools.extend(crate::tools::wasm::wasm_tools(&self.cwd));
+                tools.extend(crate::features::security::session_tools(
+                    &settings, &self.cwd,
+                ));
+                tools.extend(crate::tools::context_host::session_tools(&settings));
+                tools.extend(crate::tools::memory_backend::session_tools(
+                    &env, &self.cwd, &settings,
+                ));
                 // TS `reconcileThinkTool`: model swaps re-evaluate the hidden
                 // think tool's eligibility.
                 let hidden =

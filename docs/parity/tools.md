@@ -102,7 +102,7 @@ Tools registered outside `BUILTIN_TOOLS`.
 | `mcp__<server>_<tool>` | `isMCPToolName` in `builtin-names.ts` | `crates/omp-cli/src/tools/mcp.rs` | **PRESENT** |
 | `computer` | `tools/computer.ts` + `tools/computer/prelude-definition.ts` (eval prelude capability) | only a `/computer` slash command in `crates/omp-cli/src/features/browser.rs` | **MISSING as tool** |
 | `browser` | `tools/browser.ts` + `tools/browser/prelude-definition.ts` | only a `/browser` slash command in `features/browser.rs` | **MISSING as tool** |
-| `generate_image` | `tools/image-gen.ts`, gated `generateImage.enabled` in `sdk.ts` | none | **MISSING** |
+| `generate_image` | `tools/image-gen.ts`, gated `generateImage.enabled` in `sdk.ts` | `crates/omp-cli/src/tools/image_gen.rs`, gated `generate_image.enabled` | **PRESENT** |
 | `tts` | `tools/tts.ts`, gated `speechgen.enabled` in `sdk.ts` | none | **MISSING** |
 | `vibe_spawn`, `vibe_send`, `vibe_wait`, `vibe_kill`, `vibe_list` | `tools/vibe.ts` (`VibeSpawnTool`…`VibeListTool`) | none | **MISSING (5 tools)** |
 | `report_tool_issue` | `tools/report-tool-issue.ts`, dispatched through `write xd://report_issue` | none | **MISSING** |

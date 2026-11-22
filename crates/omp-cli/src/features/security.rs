@@ -1358,11 +1358,56 @@ fn store_path(repository_root: &Path) -> PathBuf {
 
 fn coordinator_from_env() -> Result<SecurityCoordinator> {
     let repository_root = std::env::current_dir().context("resolving working directory")?;
-    let store = Arc::new(SecurityStore::open(store_path(&repository_root))?);
+    let db_path = store_path(&repository_root);
+    coordinator_at(repository_root, &db_path)
+}
+
+/// Coordinator for `repository_root` backed by the store at `db_path`.
+fn coordinator_at(repository_root: PathBuf, db_path: &Path) -> Result<SecurityCoordinator> {
+    let store = Arc::new(SecurityStore::open(db_path)?);
     let token = std::env::var("OMP_CODEX_TOKEN")
         .ok()
         .or_else(|| std::env::var("CODEX_TOKEN").ok());
     Ok(SecurityCoordinator::new(store, repository_root).with_codex_token(token))
+}
+
+/// Repository containing `cwd`: the nearest ancestor with a `.git` entry,
+/// else `cwd` itself (the `/security` command's own fallback).
+fn repository_root_of(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(cwd)
+        .to_path_buf()
+}
+
+/// Session tools for the agent loop: the `security_scan` tool over the
+/// coordinator of the repository containing `cwd`, or nothing when
+/// `security.enabled` is off or the store cannot be opened.
+#[must_use]
+pub fn session_tools(
+    settings: &omp_settings::Settings,
+    cwd: &Path,
+) -> Vec<Arc<dyn pa_agent::types::AgentTool>> {
+    let repository_root = repository_root_of(cwd);
+    let db_path = store_path(&repository_root);
+    session_tools_at(settings, repository_root, &db_path)
+}
+
+fn session_tools_at(
+    settings: &omp_settings::Settings,
+    repository_root: PathBuf,
+    db_path: &Path,
+) -> Vec<Arc<dyn pa_agent::types::AgentTool>> {
+    if !crate::tools::security_scan::enabled(settings) {
+        return Vec::new();
+    }
+    match coordinator_at(repository_root, db_path) {
+        Ok(coordinator) => vec![crate::tools::security_scan::tool(Arc::new(coordinator))],
+        Err(err) => {
+            tracing::warn!("security_scan unavailable: {err:#}");
+            Vec::new()
+        }
+    }
 }
 
 /// `/security` entry point, wired from `slash.rs`.
@@ -1558,6 +1603,55 @@ mod tests {
     fn coordinator(tag: &str) -> SecurityCoordinator {
         let store = Arc::new(SecurityStore::open_in_memory().expect("in-memory store"));
         SecurityCoordinator::new(store, scratch_dir(tag))
+    }
+
+    fn settings_with(security_enabled: Option<bool>) -> omp_settings::Settings {
+        let dir = scratch_dir("settings");
+        let cfg = security_enabled.map(|on| {
+            let path = dir.join("config.yml");
+            fs::write(&path, format!("security:\n  enabled: {on}\n")).expect("write config");
+            path
+        });
+        omp_settings::Settings::load_from(cfg.as_deref(), &dir)
+    }
+
+    #[test]
+    fn session_tools_empty_when_disabled() {
+        let repo = scratch_dir("disabled");
+        let db = repo.join("security.db");
+        for flag in [None, Some(false)] {
+            let tools = session_tools_at(&settings_with(flag), repo.clone(), &db);
+            assert!(tools.is_empty(), "flag {flag:?} must register nothing");
+        }
+        assert!(!db.exists(), "a disabled gate must not open the store");
+    }
+
+    #[test]
+    fn session_tools_registers_security_scan_when_enabled() {
+        let repo = scratch_dir("enabled");
+        let db = repo.join("security.db");
+        let tools = session_tools_at(&settings_with(Some(true)), repo, &db);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(names, ["security_scan"]);
+        assert!(db.exists(), "the store is opened at the given path");
+    }
+
+    #[test]
+    fn session_tools_empty_when_store_cannot_open() {
+        let repo = scratch_dir("badstore");
+        // A directory is not a database file.
+        let tools = session_tools_at(&settings_with(Some(true)), repo.clone(), &repo);
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn repository_root_is_nearest_git_ancestor_else_cwd() {
+        let repo = scratch_dir("root");
+        fs::create_dir_all(repo.join(".git")).expect("create .git");
+        let nested = repo.join("src");
+        assert_eq!(repository_root_of(&nested), repo);
+        let bare = scratch_dir("noroot");
+        assert_eq!(repository_root_of(&bare.join("src")), bare.join("src"));
     }
 
     fn sample_finding(scan_id: &str) -> Finding {
