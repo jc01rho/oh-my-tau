@@ -23,6 +23,7 @@ pub enum KernelStatus {
 
 /// Flag to `landlock_create_ruleset` that returns the ABI version instead of
 /// creating a ruleset.
+#[cfg(target_os = "linux")]
 const LANDLOCK_CREATE_RULESET_VERSION: u64 = 0x1;
 
 /// Probe the running kernel for its Landlock support.

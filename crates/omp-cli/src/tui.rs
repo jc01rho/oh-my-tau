@@ -161,6 +161,37 @@ async fn announce_loaded_session(rt: &Runtime) {
     }));
 }
 
+/// `/tree` and double-Esc navigation (TS selector-controller after
+/// `navigateTree`): move the leaf, then hand the TUI the new branch's
+/// transcript and the prompt to restore (`tree_navigated`).
+async fn navigate_and_announce(rt: &Arc<Runtime>, entry_id: &str, summarize: bool) {
+    // Without a live model the `session_before_tree` hook may still supply the
+    // summary; `navigate_tree` reports when neither can.
+    let summarizer = summarize.then(|| rt.summarize_fn().ok()).flatten();
+    let options = serde_json::json!({ "summarize": summarize });
+    match crate::tree::navigate_tree(rt, entry_id, &options, summarizer).await {
+        Ok(data) => {
+            let data = data.unwrap_or(Value::Null);
+            if data.get("cancelled").and_then(Value::as_bool) == Some(true) {
+                rt.send(crate::events::notice_frame(
+                    "info",
+                    "Navigation cancelled",
+                    None,
+                ));
+                return;
+            }
+            rt.send(serde_json::json!({
+                "type": "tree_navigated",
+                "messages": rt.messages().await,
+                "name": rt.session_name(),
+                "editorText": data.get("editorText").cloned().unwrap_or(Value::Null),
+                "summarized": data.get("summaryEntry").is_some(),
+            }));
+        }
+        Err(e) => rt.send(prompt_failed(format!("navigation failed: {e:?}"))),
+    }
+}
+
 /// [`omp_tui::RuntimePort`] backed by the omp-cli [`Runtime`]; the async
 /// `Runtime` methods are spawned onto the tokio runtime from these sync hooks.
 struct Port {
@@ -665,14 +696,36 @@ impl omp_tui::RuntimePort for Port {
     }
 
     fn rewind_entry(&self, entry_id: String) {
+        self.navigate_tree(entry_id, false);
+    }
+
+    fn navigate_tree(&self, entry_id: String, summarize: bool) {
         let rt = self.rt.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                crate::tree::navigate_tree(&rt, &entry_id, &serde_json::json!({}), None).await
-            {
-                rt.send(prompt_failed(format!("rewind failed: {e:?}")));
-            }
-        });
+        tokio::spawn(async move { navigate_and_announce(&rt, &entry_id, summarize).await });
+    }
+
+    fn set_entry_label(&self, entry_id: String, label: Option<String>) -> Result<(), String> {
+        // TS `appendLabelChange`: the target must exist; an unset label clears it.
+        let entries = self.rt.entries().map_err(|e| format!("{e:#}"))?;
+        if !entries
+            .iter()
+            .any(|e| e.get("id").and_then(Value::as_str) == Some(entry_id.as_str()))
+        {
+            return Err(format!("Entry {entry_id} not found"));
+        }
+        let mut payload = serde_json::json!({ "targetId": entry_id });
+        if let Some(label) = label {
+            payload["label"] = Value::String(label);
+        }
+        self.rt
+            .append_entry("label", payload)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn session_journal(&self) -> Option<omp_tui::port::SessionJournal> {
+        let entries = self.rt.entries().ok()?;
+        let leaf = self.rt.live_leaf(&entries);
+        Some(omp_tui::port::SessionJournal { entries, leaf })
     }
 
     fn abort_compaction(&self) {

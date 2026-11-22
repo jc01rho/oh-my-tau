@@ -93,6 +93,20 @@ pub enum AppEvent {
         messages: Vec<Value>,
         name: Option<String>,
     },
+    /// `{"type":"tree_navigated", "messages": [...], "name"?, "editorText"?,
+    /// "summarized"}` — `/tree` (or the rewind selector) moved the leaf: the
+    /// transcript is rebuilt for the new branch (TS `renderInitialMessages`
+    /// after `navigateTree`) and a rewound prompt returns to an empty editor.
+    TreeNavigated {
+        /// The new branch's messages.
+        messages: Vec<Value>,
+        /// Session name, when set.
+        name: Option<String>,
+        /// Prompt text to restore (user-authored targets only).
+        editor_text: Option<String>,
+        /// A branch summary was recorded for the abandoned path.
+        summarized: bool,
+    },
     /// `{"type":"session_reset"}` — `/new` / `/clear` started a fresh session:
     /// the transcript and the terminal scrollback are dropped (TS
     /// `resetTranscript()` + `requestRender(true, { clearScrollback: true })`).
@@ -212,6 +226,19 @@ pub fn parse_frame(frame: &Value) -> AppEvent {
                 .unwrap_or_default(),
             name: session_loaded_name(frame),
         },
+        "tree_navigated" => AppEvent::TreeNavigated {
+            messages: frame
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            name: session_loaded_name(frame),
+            editor_text: frame
+                .get("editorText")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            summarized: frame.get("summarized").and_then(Value::as_bool) == Some(true),
+        },
         "session_reset" => AppEvent::SessionReset,
         "clipboard_copy" => AppEvent::ClipboardCopy(
             frame
@@ -238,18 +265,33 @@ pub fn parse_frame(frame: &Value) -> AppEvent {
     }
 }
 
-/// Like [`parse_frame`] but consumes the frame so a `session_loaded` history
-/// (potentially the whole transcript) is moved into the event, not cloned.
-/// Every other frame type parses exactly as [`parse_frame`] does.
+/// Like [`parse_frame`] but consumes the frame so a `session_loaded` /
+/// `tree_navigated` history (potentially the whole transcript) is moved into
+/// the event, not cloned. Every other frame type parses exactly as
+/// [`parse_frame`] does.
 #[must_use]
 pub fn parse_frame_owned(mut frame: Value) -> AppEvent {
-    if frame.get("type").and_then(Value::as_str) == Some("session_loaded") {
-        let name = session_loaded_name(&frame);
+    let kind = frame.get("type").and_then(Value::as_str);
+    if matches!(kind, Some("session_loaded" | "tree_navigated")) {
         let messages = match frame.get_mut("messages").map(Value::take) {
             Some(Value::Array(items)) => items,
             _ => Vec::new(),
         };
-        return AppEvent::SessionLoaded { messages, name };
+        return match parse_frame(&frame) {
+            AppEvent::SessionLoaded { name, .. } => AppEvent::SessionLoaded { messages, name },
+            AppEvent::TreeNavigated {
+                name,
+                editor_text,
+                summarized,
+                ..
+            } => AppEvent::TreeNavigated {
+                messages,
+                name,
+                editor_text,
+                summarized,
+            },
+            other => other,
+        };
     }
     parse_frame(&frame)
 }
