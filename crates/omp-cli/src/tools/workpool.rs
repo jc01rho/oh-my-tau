@@ -804,6 +804,7 @@ impl WorkpoolEngine {
             output_schema: None,
             schema_mode: SchemaMode::Permissive,
             model: pool.agent.model.clone(),
+            model_route: None,
             tools: None,
             depth: omp_task::current_task_depth() + 1,
             extra_args: Vec::new(),
