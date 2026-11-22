@@ -255,6 +255,46 @@ sleep 30"#,
     assert_eq!(runner.available_permits(), 1, "permit released");
 }
 
+/// A resumed child that acknowledges the reopen and then stops reading stdin
+/// cannot swallow a large prompt: the write is bounded, the run ends failed
+/// and the prompt is not reported as delivered.
+#[tokio::test]
+async fn a_stalled_prompt_write_is_bounded() {
+    let _env = ENV_LOCK.lock().await;
+    set_finishing_deadline("15000");
+    std::env::set_var("OMP_TASK_TEST_REOPEN_DEADLINE_MS", "15000");
+    std::env::set_var("OMP_TASK_TEST_PROMPT_WRITE_DEADLINE_MS", "400");
+    let dir = tempfile::tempdir().unwrap();
+    let bin = fake_binary(
+        dir.path(),
+        r#"read -r switch
+echo '{"type":"response","command":"switch_session","success":true,"data":{"cancelled":false}}'
+sleep 30"#,
+    );
+    let runner = TaskRunner::new(&bin, 1);
+    let opts = omp_task::StartOptions {
+        resume_session: Some(dir.path().join("old.jsonl")),
+        ..omp_task::StartOptions::default()
+    };
+    let big = "x".repeat(512 * 1024);
+    let (control, join) = runner.start_with(spec(&big, dir.path()), ChildMode::Rpc, opts);
+    let started = Instant::now();
+    let out = tokio::time::timeout(Duration::from_secs(20), join)
+        .await
+        .expect("a stalled prompt write must not hold the run");
+    std::env::remove_var("OMP_TASK_TEST_PROMPT_WRITE_DEADLINE_MS");
+    std::env::remove_var("OMP_TASK_TEST_REOPEN_DEADLINE_MS");
+    assert_eq!(out.status, RunStatus::Failed, "{out:?}");
+    assert!(
+        out.stderr.contains("timed out writing the prompt"),
+        "stderr: {}",
+        out.stderr
+    );
+    assert!(!control.prompt_sent(), "the prompt never reached the child");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(runner.available_permits(), 1, "permit released");
+}
+
 /// Finding 4 (steer receipt): a steer sent while the prompt is still running
 /// is acknowledged once written; once the prompt settled (Finishing), the
 /// receipt reports failure instead of a silently dropped message.
