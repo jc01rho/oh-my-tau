@@ -4,6 +4,7 @@
 //! registers extension tools, serves host->core requests (`append_entry`,
 //! `send_message`, ui frames), and emits omp lifecycle events.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -943,6 +944,9 @@ pub struct Extensions {
     credential_disabled: Arc<CredentialDisabledFeed>,
 }
 
+    /// MCP server notifications (`mcp_notification`), buffered until the session ctx is wired.
+    mcp: McpNotificationSink,
+
 /// `resources_discover` round trip: emit (only when an extension subscribes, TS `hasHandlers`),
 /// then register every returned path with the loader that owns it. Extracted from
 /// [`Extensions::resources_discover`] so the fake-host tests can drive it.
@@ -1153,6 +1157,7 @@ impl Extensions {
         }
 
         let ext = Arc::new(Self {
+            mcp: McpNotificationSink::new(host.clone()),
             host,
             hooks,
             sub: Mutex::new(None),
@@ -1180,6 +1185,11 @@ impl Extensions {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sub);
         }
+
+        // MCP managers publish every server notification here, whether they were
+        // created before or after this session (omp `sdk.ts` bridges the manager's
+        // `addNotificationListener` into each session's runner).
+        register_mcp_notifications(ext.mcp.clone());
         ext.live.needs_branch.store(
             sources_read_branch(ext.dir.as_deref(), &ext.extra),
             Ordering::Relaxed,
@@ -1283,7 +1293,12 @@ impl Extensions {
             ctx.session_file = session_file.map(Path::to_path_buf);
             ctx.model = model.to_string();
         }
-        self.send_ctx().await
+        self.send_ctx().await?;
+        // The host now carries this session's ctx, so buffered MCP notifications can
+        // run their handlers against it (omp drains `#pendingMcpNotifications` once
+        // `initialize()` wired the runtime context).
+        self.mcp.attach();
+        Ok(())
     }
 
     /// Update the session title in the host's ctx state (`host.ts set_ctx`
@@ -1833,6 +1848,114 @@ fn handle_notification(rt: &Arc<Runtime>, msg: HostMessage) {
             );
         }
         _ => {}
+    }
+}
+
+/// Cap on `mcp_notification` frames buffered before the session ctx is wired (omp
+/// `MAX_PENDING_MCP_NOTIFICATIONS`); drop-oldest under pressure.
+const MAX_PENDING_MCP_NOTIFICATIONS: usize = 100;
+
+/// One session's MCP notification state: the host that runs the handlers, whether the
+/// session ctx has been sent yet, and the frames received before it was.
+struct McpNotificationState {
+    host: Arc<ExtHost>,
+    attached: AtomicBool,
+    pending: Mutex<VecDeque<LifecycleEvent>>,
+}
+
+/// Sink for MCP server notifications: every connected server's frames reach
+/// [`Extensions`] here, which emits them as `mcp_notification` (omp `emitMcpNotification`).
+#[derive(Clone)]
+pub struct McpNotificationSink {
+    state: Arc<McpNotificationState>,
+}
+
+impl McpNotificationSink {
+    fn new(host: Arc<ExtHost>) -> Self {
+        Self {
+            state: Arc::new(McpNotificationState {
+                host,
+                attached: AtomicBool::new(false),
+                pending: Mutex::new(VecDeque::new()),
+            }),
+        }
+    }
+
+    /// One JSON-RPC notification from `server`, after the runtime handled it. Buffered
+    /// while the session ctx is not wired yet; emitted at once afterwards.
+    pub fn publish(&self, server: String, method: String, params: Value) {
+        let event = LifecycleEvent::McpNotification {
+            server,
+            method,
+            params,
+        };
+        if !self.state.attached.load(Ordering::Relaxed) {
+            let mut pending = self
+                .state
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.len() >= MAX_PENDING_MCP_NOTIFICATIONS {
+                pending.pop_front();
+            }
+            pending.push_back(event);
+            return;
+        }
+        self.emit(event);
+    }
+
+    /// Session ctx wired: emit the frames that arrived earlier, in arrival order.
+    fn attach(&self) {
+        if self.state.attached.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let pending: Vec<LifecycleEvent> = self
+            .state
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        for event in pending {
+            self.emit(event);
+        }
+    }
+
+    /// Observe-only emit: the host runs the handlers serially in wire order and no
+    /// result is read back (`ext-host/host.ts` "everything else: observe").
+    fn emit(&self, event: LifecycleEvent) {
+        notify(&self.state.host, "mcp_notification", || event);
+    }
+}
+
+/// Sessions forwarding MCP notifications. Weak, so a dropped session unregisters itself.
+static MCP_NOTIFICATION_SINKS: Mutex<Vec<std::sync::Weak<McpNotificationState>>> =
+    Mutex::new(Vec::new());
+
+fn register_mcp_notifications(sink: McpNotificationSink) {
+    let mut sinks = MCP_NOTIFICATION_SINKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    sinks.retain(|weak| weak.strong_count() > 0);
+    sinks.push(Arc::downgrade(&sink.state));
+}
+
+/// Publish one server notification to every live extension session, like omp's
+/// `sdk.ts` bridge from `MCPManager.addNotificationListener` into each session's runner.
+pub fn publish_mcp_notification(notification: &omp_mcp::ServerNotification) {
+    let sinks: Vec<Arc<McpNotificationState>> = {
+        let mut list = MCP_NOTIFICATION_SINKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list.retain(|weak| weak.strong_count() > 0);
+        list.iter().filter_map(std::sync::Weak::upgrade).collect()
+    };
+    for state in sinks {
+        McpNotificationSink { state }.publish(
+            notification.server.clone(),
+            notification.method.clone(),
+            notification.params.clone(),
+        );
     }
 }
 
@@ -3349,6 +3472,159 @@ mod tests {
             !seen.contains(r#""method":"emit""#),
             "no emit without a subscriber: {seen}"
         );
+    }
+
+    /// Fake host that records every request line it receives into `$OUT` and
+    /// answers each one with an empty emit result (order == wire order).
+    const RECORD_HOST: &str = concat!(
+        "while IFS= read -r line; do\n",
+        "  printf '%s\\n' \"$line\" >> \"$OUT\"\n",
+        "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+        "  if [ -n \"$id\" ]; then\n",
+        "    printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":null,\"handlers\":[],\"errors\":[]}}\\n' \"$id\"\n",
+        "  fi\n",
+        "done\n",
+    );
+
+    /// `Extensions` over a fake host (no `start`: no bun, no extension load).
+    fn test_extensions(host: Arc<ExtHost>) -> Arc<Extensions> {
+        Arc::new(Extensions {
+            mcp: McpNotificationSink::new(host.clone()),
+            host: host.clone(),
+            hooks: ExtHooks::new(host),
+            sub: Mutex::new(None),
+            turn: Arc::new(AtomicU64::new(0)),
+            stop: Arc::new(Mutex::new(StopState::default())),
+            cwd: PathBuf::from("."),
+            extra: Vec::new(),
+            dir: None,
+            ctx: Mutex::new(SessionCtx::default()),
+            mode: Mutex::new(ExtMode::Print),
+            prompt_override: Mutex::new(None),
+            live: Arc::new(Live::default()),
+            rt: Mutex::new(None),
+            blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_agent_end: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Every recorded `emit` frame of `ty`, in wire order.
+    fn emitted_events(path: &std::path::Path, ty: &str) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|v| v["method"] == "emit" && v["params"]["event"]["type"] == ty)
+            .map(|v| v["params"]["event"].clone())
+            .collect()
+    }
+
+    /// MCP notifications received before the session ctx is wired are buffered and
+    /// then emitted in arrival order with the omp payload shape (omp
+    /// `emitMcpNotification` + `#pendingMcpNotifications` drain).
+    #[tokio::test]
+    async fn mcp_notification_buffers_until_session_ctx_then_emits() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("frames.jsonl");
+        let host = sh_host(
+            dir.path(),
+            RECORD_HOST,
+            vec![("OUT".into(), out.display().to_string())],
+        )
+        .await;
+        let ext = test_extensions(host.clone());
+        let sink = ext.mcp.clone();
+        sink.publish(
+            "srv".into(),
+            "notifications/tools/list_changed".into(),
+            json!({}),
+        );
+        sink.publish("srv".into(), "custom/progress".into(), json!({"pct": 7}));
+        assert!(
+            emitted_events(&out, "mcp_notification").is_empty(),
+            "nothing reaches the host before the session ctx is wired"
+        );
+
+        // Wiring the session ctx drains the buffer; the awaited `session_start`
+        // afterwards is the ordering barrier (the host runs queued emits first).
+        ext.set_session_ctx("s1", Some(std::path::Path::new("/s.jsonl")), "p/m")
+            .await
+            .unwrap();
+        ext.session_start().await;
+        let frames = emitted_events(&out, "mcp_notification");
+        assert_eq!(frames.len(), 2, "both buffered frames: {frames:?}");
+        assert_eq!(frames[0]["server"], json!("srv"));
+        assert_eq!(
+            frames[0]["method"],
+            json!("notifications/tools/list_changed")
+        );
+        assert_eq!(frames[0]["params"], json!({}));
+        assert_eq!(frames[1]["method"], json!("custom/progress"));
+        assert_eq!(frames[1]["params"], json!({"pct": 7}));
+
+        // Attached: a new frame goes out at once.
+        sink.publish("other".into(), "custom/late".into(), Value::Null);
+        ext.session_start().await;
+        let frames = emitted_events(&out, "mcp_notification");
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2]["server"], json!("other"));
+        assert_eq!(frames[2]["method"], json!("custom/late"));
+        host.shutdown().await.unwrap();
+    }
+
+    /// The pre-attach buffer is bounded at the omp cap (100), drop-oldest.
+    #[tokio::test]
+    async fn mcp_notification_buffer_drops_oldest_at_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("frames.jsonl");
+        let host = sh_host(
+            dir.path(),
+            RECORD_HOST,
+            vec![("OUT".into(), out.display().to_string())],
+        )
+        .await;
+        let ext = test_extensions(host.clone());
+        let sink = ext.mcp.clone();
+        for i in 0..MAX_PENDING_MCP_NOTIFICATIONS + 5 {
+            sink.publish("srv".into(), "custom/tick".into(), json!({"i": i}));
+        }
+        ext.set_session_ctx("s1", None, "p/m").await.unwrap();
+        ext.session_start().await;
+        let frames = emitted_events(&out, "mcp_notification");
+        assert_eq!(frames.len(), MAX_PENDING_MCP_NOTIFICATIONS);
+        assert_eq!(frames[0]["params"], json!({"i": 5}), "oldest dropped");
+        host.shutdown().await.unwrap();
+    }
+
+    /// The manager-side bridge: one published notification reaches every live
+    /// session's sink (omp `sdk.ts` `addNotificationListener` -> runner).
+    #[tokio::test]
+    async fn publish_mcp_notification_reaches_registered_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("frames.jsonl");
+        let host = sh_host(
+            dir.path(),
+            RECORD_HOST,
+            vec![("OUT".into(), out.display().to_string())],
+        )
+        .await;
+        let ext = test_extensions(host.clone());
+        ext.set_session_ctx("s1", None, "p/m").await.unwrap();
+        register_mcp_notifications(ext.mcp.clone());
+
+        publish_mcp_notification(&omp_mcp::ServerNotification {
+            server: "Fake Server.v1".into(),
+            method: "notifications/custom/ping".into(),
+            params: json!({"detail": "custom"}),
+        });
+        ext.session_start().await;
+
+        let frames = emitted_events(&out, "mcp_notification");
+        assert_eq!(frames.len(), 1, "frames: {frames:?}");
+        assert_eq!(frames[0]["server"], json!("Fake Server.v1"));
+        assert_eq!(frames[0]["method"], json!("notifications/custom/ping"));
+        assert_eq!(frames[0]["params"], json!({"detail": "custom"}));
+        host.shutdown().await.unwrap();
     }
 
     #[test]

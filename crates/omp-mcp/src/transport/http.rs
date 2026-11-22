@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use crate::config::McpServerConfig;
 use crate::errors::{Failure, JsonRpcError, McpError, McpTransportError, TransportKind};
 use crate::oauth::{bearer_challenge, OAuthSession, TokenStore};
-use crate::transport::{McpTransport, PendingRequests, TransportFut};
+use crate::transport::{McpTransport, NotificationCallback, PendingRequests, TransportFut};
 
 /// One SSE event.
 #[derive(Debug, Default)]
@@ -79,6 +79,8 @@ pub struct HttpTransport {
     client: reqwest::Client,
     state: Arc<Mutex<HttpState>>,
     oauth: Option<Arc<OAuthSession>>,
+    /// Server→client notification sink installed by the owner (`None`: dropped).
+    on_notification: Option<NotificationCallback>,
 }
 
 impl HttpTransport {
@@ -99,6 +101,7 @@ impl HttpTransport {
             client: reqwest::Client::new(),
             state: Arc::new(Mutex::new(HttpState::default())),
             oauth,
+            on_notification: None,
         }
     }
 
@@ -226,6 +229,7 @@ async fn send_request(
     timeout_ms: u64,
     state: Arc<Mutex<HttpState>>,
     oauth: Option<Arc<OAuthSession>>,
+    notification: Option<NotificationCallback>,
 ) -> Result<Value, McpError> {
     let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     let expected_key = PendingRequests::key(&id);
@@ -298,6 +302,20 @@ async fn send_request(
             for event in events {
                 match event {
                     Ok(msg) => {
+                        // A notification carried on the request's stream: the
+                        // runtime handles it first (no HTTP-side handling yet),
+                        // then it goes to the installed sink.
+                        if msg.get("method").is_some() && msg.get("id").is_none() {
+                            if let Some(on_notification) = &notification {
+                                on_notification(
+                                    msg.get("method")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default(),
+                                    msg.get("params").cloned().unwrap_or(Value::Null),
+                                );
+                            }
+                            continue;
+                        }
                         if let Some(response) = extract_response(&msg, &expected_key) {
                             return response;
                         }
@@ -370,6 +388,10 @@ impl Clone for HttpState {
 }
 
 impl McpTransport for HttpTransport {
+    fn set_notification_handler(&mut self, handler: NotificationCallback) {
+        self.on_notification = Some(handler);
+    }
+
     fn set_protocol_version(&mut self, version: &str) {
         self.set_protocol_version_sync(version);
     }
@@ -384,8 +406,18 @@ impl McpTransport for HttpTransport {
         let state = self.state.clone();
         let method = method.to_string();
         let oauth = self.oauth.clone();
+        let notification = self.on_notification.clone();
         Box::pin(send_request(
-            client, url, headers, id, method, params, timeout_ms, state, oauth,
+            client,
+            url,
+            headers,
+            id,
+            method,
+            params,
+            timeout_ms,
+            state,
+            oauth,
+            notification,
         ))
     }
 
@@ -437,8 +469,9 @@ impl McpTransport for HttpTransport {
 }
 
 /// Extract a JSON-RPC response destined for our request from one SSE event;
-/// server→client requests and notifications are ignored here (the streaming
-/// GET listener that answers them is not ported).
+/// notification frames are handed to the transport's sink by the caller, and
+/// server→client requests are ignored here (the streaming GET listener that
+/// answers them is not ported).
 fn extract_response(msg: &Value, expected_key: &str) -> Option<Result<Value, McpError>> {
     let obj = msg.as_object()?;
     if obj.contains_key("method") {

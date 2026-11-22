@@ -450,6 +450,18 @@ pub enum LifecycleEvent {
     /// transcript file survive (`/clear`, TS `SessionClearEvent`).
     #[serde(rename = "session_clear")]
     SessionClear,
+
+    /// A JSON-RPC notification received from a connected MCP server, after the
+    /// runtime's own handling of the frame (omp `McpNotificationEvent`).
+    #[serde(rename = "mcp_notification")]
+    McpNotification {
+        /// Server name exactly as declared in the MCP config (raw, unsanitized).
+        server: String,
+        /// JSON-RPC method (`notifications/tools/list_changed`, or server-custom).
+        method: String,
+        /// JSON-RPC params, opaque to the runtime.
+        params: Value,
+    },
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -797,6 +809,8 @@ impl ExtHost {
         /// `after_provider_response`.
         emit_after_provider_response(status: u16, headers: std::collections::BTreeMap<String, String>, request_id: Option<String>) => LifecycleEvent::AfterProviderResponse { status, headers, request_id };
     }
+        /// `mcp_notification`: a server→client MCP notification, after the runtime handled it.
+        emit_mcp_notification(server: String, method: String, params: Value) => LifecycleEvent::McpNotification { server, method, params };
 
     /// `before_subagent_spawn`: `block` refuses the spawn; `model` replaces the pattern list.
     ///
