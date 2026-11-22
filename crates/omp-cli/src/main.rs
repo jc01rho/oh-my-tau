@@ -17,6 +17,7 @@ mod methodology;
 mod model;
 mod notices;
 mod paging;
+mod pause;
 mod persist;
 mod rpc;
 mod rules;

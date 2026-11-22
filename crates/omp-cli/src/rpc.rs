@@ -226,6 +226,10 @@ pub const RPC_COMMANDS: &[&str] = &[
     "promote_queued_message",
     "abort",
     "abort_and_prompt",
+    "interrupt",
+    "set_client_info",
+    "reload",
+    "resume_session",
     "new_session",
     "switch_session",
     "open_session",
@@ -960,6 +964,32 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
         }
         "abort" => {
             rt.abort().await;
+            none()
+        }
+        "interrupt" => {
+            match crate::pause::parse_intent(cmd).map_err(CmdError::coded_params)? {
+                crate::pause::InterruptIntent::Stop => rt.pause_for_stop().await?,
+                crate::pause::InterruptIntent::Abort => rt.abort().await,
+            }
+            ok(json!({"interrupted": false}))
+        }
+        "set_client_info" => {
+            rt.set_client_info(cmd)?;
+            none()
+        }
+        "reload" => {
+            // Extensions reload; the session and any hold survive (the gateway reloads while
+            // holding a lane).
+            if let Some(ext) = crate::rpc::slash::extensions() {
+                if let Err(e) = ext.reload().await {
+                    eprintln!("omt: extension reload: {e:#}");
+                }
+            }
+            rt.announce_commands();
+            ok(json!({"cancelled": false}))
+        }
+        "resume_session" => {
+            rt.release_pause("resume_session");
             none()
         }
         "abort_and_prompt" => {
@@ -1805,9 +1835,9 @@ pub async fn run_with(
             });
             continue;
         }
-        if kind == "abort" && busy.load(std::sync::atomic::Ordering::SeqCst) {
-            // A command is in flight (possibly waiting on a dialog): abort the run now
-            // instead of queueing behind it.
+        if matches!(kind, "abort" | "interrupt") && busy.load(std::sync::atomic::Ordering::SeqCst) {
+            // A command is in flight (possibly waiting on a dialog): abort or hold the run now
+            // instead of queueing behind it — `interrupt` awaits `wait_for_idle`.
             let reply = handle(&rt, &cmd).await;
             rt.send(reply);
             continue;

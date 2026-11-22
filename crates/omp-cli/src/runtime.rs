@@ -51,6 +51,12 @@ impl CmdError {
             code: Some(code),
         }
     }
+
+    /// A malformed-parameter failure (`invalid_params`).
+    #[must_use]
+    pub fn coded_params(message: impl Into<String>) -> Self {
+        Self::coded(message, "invalid_params")
+    }
 }
 
 impl From<anyhow::Error> for CmdError {
@@ -153,6 +159,9 @@ pub struct Runtime {
     /// Set by `abort()` (TS `#advisors.autoResumeSuppressed`): a follow-up-only
     /// queued-message drain stays suppressed until the next explicit user prompt.
     user_interrupt: std::sync::atomic::AtomicBool,
+    /// Lane hold state behind `interrupt intent:stop`, `get_state`'s pause fields and
+    /// `resume_session` (`pieces/01`, `pieces/03`).
+    pause: Mutex<crate::pause::PauseState>,
     /// Set while a manual compaction aborts the live turn (TS
     /// `disconnectFromAgent` around that abort): the empty aborted stub is
     /// neither rendered nor journaled — the turn resumes after the summary.
@@ -519,6 +528,7 @@ impl Runtime {
             retry_task: Mutex::new(None),
             post_turn_task: Mutex::new(None),
             user_interrupt: std::sync::atomic::AtomicBool::new(false),
+            pause: Mutex::new(crate::pause::PauseState::default()),
             compaction_abort: std::sync::atomic::AtomicBool::new(false),
             compaction_stub_start: std::sync::atomic::AtomicBool::new(false),
             ui_context_frames: std::sync::atomic::AtomicBool::new(false),
@@ -1815,6 +1825,7 @@ impl Runtime {
             self.emit_notice("warning", &msg, Some("budget"));
             return Err(CmdError::new(msg));
         }
+        self.release_pause("input");
         // A prompt during in-flight compaction cancels it and waits for the
         // pass to settle first (TS prompt-side `abortCompaction` +
         // `waitForManualMaintenanceCleanup`): the turn must start on the
@@ -2006,6 +2017,60 @@ impl Runtime {
         self.agent.wait_for_idle().await;
     }
 
+    /// Apply `set_client_info` and answer its role/capability errors.
+    ///
+    /// # Errors
+    /// A missing `width`, or a role change after it was fixed.
+    pub fn set_client_info(&self, cmd: &Value) -> Result<(), CmdError> {
+        let mut pause = lock(&self.pause);
+        crate::pause::set_client_info(&mut pause, cmd).map_err(CmdError::coded_params)
+    }
+
+    /// `interrupt intent:"stop"`: abort the turn, stop the shell, then hold the lane.
+    ///
+    /// # Errors
+    /// The peer never declared `interactive_user`.
+    pub async fn pause_for_stop(&self) -> Result<(), CmdError> {
+        if let Err(message) = crate::pause::require_interactive(&lock(&self.pause)) {
+            return Err(CmdError::coded(message, "stop_requires_interactive_client"));
+        }
+        self.abort().await;
+        self.set(|s| s.abort_bash());
+        let at = crate::persist::now_iso();
+        let seq = crate::pause::hold(&mut lock(&self.pause), &at);
+        self.journal_hold("hold", seq, None, &at);
+        self.send(crate::pause::paused_frame(seq, &at));
+        Ok(())
+    }
+
+    /// Drop every hold and announce the resume.
+    pub fn release_pause(&self, cause: &str) {
+        let at = crate::persist::now_iso();
+        let seq = {
+            let mut pause = lock(&self.pause);
+            if !pause.paused() {
+                return;
+            }
+            crate::pause::release(&mut pause)
+        };
+        self.journal_hold("release", seq, Some(cause), &at);
+        self.send(crate::pause::resumed_frame(seq, cause, &at));
+    }
+
+    fn journal_hold(&self, op: &str, seq: u64, cause: Option<&str>, at: &str) {
+        if let Err(e) = self
+            .persist
+            .append_entry("custom", crate::pause::journal(op, seq, cause, at))
+        {
+            eprintln!("omt: session-hold journal: {e:#}");
+        }
+    }
+
+    /// The pause half of `get_state`.
+    pub fn pause_view(&self) -> Value {
+        crate::pause::view(&lock(&self.pause))
+    }
+
     pub fn steer(&self, message: &str) {
         self.agent.steer(user_message(message));
         self.emit_queue_update();
@@ -2137,6 +2202,12 @@ impl Runtime {
                 })).collect::<Vec<_>>(),
                 "goal": null,
             });
+            let pause = crate::pause::view(&lock(&self.pause));
+            if let Some(obj) = pause.as_object() {
+                v.as_object_mut()
+                    .expect("state is an object")
+                    .extend(obj.clone());
+            }
             if let Some(name) = &st.session_name {
                 v["sessionName"] = json!(name);
             }
