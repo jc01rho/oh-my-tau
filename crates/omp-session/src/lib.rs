@@ -33,16 +33,50 @@ pub fn header_additional_directories(path: &Path) -> Vec<String> {
     let Ok(file) = File::open(path) else {
         return Vec::new();
     };
-    let mut first = String::new();
-    if BufReader::new(file).read_line(&mut first).is_err() {
-        return Vec::new();
+    // The header is line 1, or line 2 behind the optional title slot.
+    let mut head = String::new();
+    let mut reader = BufReader::new(file);
+    for _ in 0..2 {
+        if reader.read_line(&mut head).is_err() {
+            return Vec::new();
+        }
     }
-    serde_json::from_str::<Value>(&first)
-        .ok()
-        .filter(|h| h.get("type").and_then(Value::as_str) == Some("session"))
+    split_header(&head)
+        .and_then(|(_, header, _)| serde_json::from_str::<Value>(header).ok())
         .and_then(|h| h.get("additionalDirectories").cloned())
         .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
         .unwrap_or_default()
+}
+
+/// Split session text into the optional leading title slot (with its newline),
+/// the `session` header line and everything after it.
+fn split_header(text: &str) -> Option<(&str, &str, &str)> {
+    let line_type = |line: &str| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_owned))
+    };
+    let (first, after_first) = text.split_once('\n').unwrap_or((text, ""));
+    match line_type(first).as_deref() {
+        Some("session") => Some(("", first, after_first)),
+        Some("title") => {
+            let (second, rest) = after_first.split_once('\n').unwrap_or((after_first, ""));
+            (line_type(second).as_deref() == Some("session"))
+                .then(|| (&text[..=first.len()], second, rest))
+        }
+        _ => None,
+    }
+}
+
+/// Persist a rename's directory entry (file `sync_all` alone does not).
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// One line of a session file: the parsed entry plus the raw text it came from.
@@ -346,31 +380,36 @@ impl SessionWriter {
     pub fn set_additional_directories(&mut self, directories: &[String]) -> Result<()> {
         let text = std::fs::read_to_string(&self.path)
             .with_context(|| format!("read {}", self.path.display()))?;
-        let (first, rest) = text.split_once('\n').unwrap_or((text.as_str(), ""));
-        let mut header: Map<String, Value> = serde_json::from_str(first)
-            .ok()
-            .filter(|h: &Map<String, Value>| {
-                h.get("type").and_then(Value::as_str) == Some("session")
-            })
+        // An optional title slot may precede the header; its bytes are kept as is.
+        let (title, first, rest) = split_header(&text)
             .with_context(|| format!("no session header in {}", self.path.display()))?;
+        let mut header: Map<String, Value> = serde_json::from_str(first)?;
         if directories.is_empty() {
             header.remove("additionalDirectories");
         } else {
             header.insert("additionalDirectories".into(), json!(directories));
         }
         let tmp = self.path.with_extension("jsonl.tmp");
-        {
-            let mut out =
-                File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-            out.write_all(format!("{}\n{rest}", Value::Object(header)).as_bytes())?;
-            out.sync_all()?;
-        }
+        // The append handle is opened on the temp file, so it already names the
+        // committed file once the rename lands; a failed rename keeps the old one.
+        let mut out = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        out.write_all(format!("{title}{}\n{rest}", Value::Object(header)).as_bytes())?;
+        out.sync_all()?;
+        drop(out);
+        let handle = OpenOptions::new()
+            .append(true)
+            .open(&tmp)
+            .with_context(|| format!("open {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("replace {}", self.path.display()))?;
-        self.file = OpenOptions::new()
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("open {}", self.path.display()))?;
+        self.file = handle;
+        sync_parent_dir(&self.path)?;
         Ok(())
     }
 
@@ -1245,6 +1284,25 @@ mod tests {
         let header: Value = serde_json::from_str(&raws(&w)[0]).unwrap();
         assert!(header.get("additionalDirectories").is_none());
         assert_eq!(header["cwd"], json!("/tmp"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn additional_directories_work_behind_a_title_slot() {
+        let dir = tmp();
+        let mut w = writer(&dir);
+        w.update_title_slot("Titled", Some("user"), T1).unwrap();
+        let slot_before = raws(&w)[0].clone();
+        let dirs = vec!["/srv/a".to_owned()];
+        w.set_additional_directories(&dirs).unwrap();
+        assert_eq!(header_additional_directories(w.path()), dirs);
+        let lines = raws(&w);
+        assert_eq!(lines[0], slot_before, "title slot bytes preserved");
+        let header: Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(header["type"], json!("session"));
+        // The fixed-width slot still patches in place after the rewrite.
+        w.update_title_slot("Renamed", Some("user"), T1).unwrap();
+        assert_eq!(header_additional_directories(w.path()), dirs);
         std::fs::remove_dir_all(dir).ok();
     }
 
