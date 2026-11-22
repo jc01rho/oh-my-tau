@@ -61,7 +61,10 @@ impl SessionMemory {
     /// Creates a subagent alias sharing bank/runtime state but suppressing
     /// every automatic hook.
     pub fn child(&self) -> Self {
-        Self { shared: Arc::clone(&self.shared), top_level: false }
+        Self {
+            shared: Arc::clone(&self.shared),
+            top_level: false,
+        }
     }
 
     /// Borrows the shared runtime for explicit child-invoked tools.
@@ -145,7 +148,12 @@ impl SessionMemory {
             return Ok(RetentionOutcome::default());
         }
         let borrowed = borrow_messages(messages);
-        let root = self.shared.runtime.identity_root()?.to_string_lossy().into_owned();
+        let root = self
+            .shared
+            .runtime
+            .identity_root()?
+            .to_string_lossy()
+            .into_owned();
         let retainer = Retainer::new(
             self.shared.runtime.retain_store()?,
             self.shared.runtime.session_id()?,
@@ -185,7 +193,8 @@ impl SessionMemory {
         {
             return Ok(ShutdownOutcome::default());
         }
-        let timeout = Duration::from_millis(self.shared.runtime.mnemopi_settings()?.shutdown_timeout_ms);
+        let timeout =
+            Duration::from_millis(self.shared.runtime.mnemopi_settings()?.shutdown_timeout_ms);
         let runtime = Arc::clone(&self.shared.runtime);
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         thread::Builder::new()
@@ -195,13 +204,19 @@ impl SessionMemory {
                 let _ = sender.send(result);
             })?;
         match receiver.recv_timeout(timeout) {
-            Ok(result) => Ok(ShutdownOutcome { retention: Some(result?), timed_out: false }),
+            Ok(result) => Ok(ShutdownOutcome {
+                retention: Some(result?),
+                timed_out: false,
+            }),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 tracing::warn!(
                     timeout_ms = timeout.as_millis() as u64,
                     "memory shutdown retention timed out; durable write detached"
                 );
-                Ok(ShutdownOutcome { retention: None, timed_out: true })
+                Ok(ShutdownOutcome {
+                    retention: None,
+                    timed_out: true,
+                })
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Error::ShutdownTimeout),
         }
@@ -334,7 +349,11 @@ mod tests {
     fn auto_retain_false_suppresses_settled_lifecycle_writes() {
         let runtime = start_runtime(
             "session-no-retain",
-            MnemopiSettings { auto_retain: false, retain_every_n_turns: 1, ..MnemopiSettings::default() },
+            MnemopiSettings {
+                auto_retain: false,
+                retain_every_n_turns: 1,
+                ..MnemopiSettings::default()
+            },
         );
         let session = SessionMemory::top_level(Arc::clone(&runtime));
         let outcome = session
@@ -348,7 +367,10 @@ mod tests {
     fn automatic_retention_durably_enqueues_once() {
         let runtime = start_runtime(
             "session-retain",
-            MnemopiSettings { retain_every_n_turns: 1, ..MnemopiSettings::default() },
+            MnemopiSettings {
+                retain_every_n_turns: 1,
+                ..MnemopiSettings::default()
+            },
         );
         let session = SessionMemory::top_level(Arc::clone(&runtime));
         let messages = [user("m1", "remember this durable preference")];
@@ -386,7 +408,10 @@ mod tests {
     fn children_suppress_every_automatic_hook_but_share_the_runtime() {
         let runtime = start_runtime(
             "session-child",
-            MnemopiSettings { retain_every_n_turns: 1, ..MnemopiSettings::default() },
+            MnemopiSettings {
+                retain_every_n_turns: 1,
+                ..MnemopiSettings::default()
+            },
         );
         let parent = SessionMemory::top_level(Arc::clone(&runtime));
         let child = parent.child();
@@ -395,10 +420,22 @@ mod tests {
         assert!(Arc::ptr_eq(parent.runtime(), child.runtime()));
 
         let messages = [user("m1", "child must not retain this")];
-        assert_eq!(child.retain_settled(&messages).expect("retain"), RetentionOutcome::default());
-        assert!(child.recall_first_turn(&messages, "hello").expect("recall").is_none());
-        assert_eq!(child.enqueue(&messages).expect("enqueue"), (RetentionOutcome::default(), 0));
-        assert_eq!(child.shutdown_flush(messages.to_vec()).expect("flush"), ShutdownOutcome::default());
+        assert_eq!(
+            child.retain_settled(&messages).expect("retain"),
+            RetentionOutcome::default()
+        );
+        assert!(child
+            .recall_first_turn(&messages, "hello")
+            .expect("recall")
+            .is_none());
+        assert_eq!(
+            child.enqueue(&messages).expect("enqueue"),
+            (RetentionOutcome::default(), 0)
+        );
+        assert_eq!(
+            child.shutdown_flush(messages.to_vec()).expect("flush"),
+            ShutdownOutcome::default()
+        );
         assert_eq!(runtime.stats().expect("stats").counts.working, 0);
     }
 
@@ -406,7 +443,12 @@ mod tests {
     fn first_turn_recall_runs_once_and_renders_background_framing() {
         let runtime = start_runtime("session-recall", MnemopiSettings::default());
         runtime
-            .save("User prefers the Rust programming language", "retain", 0.8, None)
+            .save(
+                "User prefers the Rust programming language",
+                "retain",
+                0.8,
+                None,
+            )
             .expect("save");
         let session = SessionMemory::top_level(Arc::clone(&runtime));
         let messages = [user("m1", "what language do I prefer?")];
@@ -432,9 +474,14 @@ mod tests {
     fn recall_is_skipped_when_auto_recall_is_disabled_or_the_prompt_is_blank() {
         let runtime = start_runtime(
             "session-no-recall",
-            MnemopiSettings { auto_recall: false, ..MnemopiSettings::default() },
+            MnemopiSettings {
+                auto_recall: false,
+                ..MnemopiSettings::default()
+            },
         );
-        runtime.save("some durable memory about Rust", "retain", 0.8, None).expect("save");
+        runtime
+            .save("some durable memory about Rust", "retain", 0.8, None)
+            .expect("save");
         let session = SessionMemory::top_level(Arc::clone(&runtime));
         assert!(session
             .recall_first_turn(&[user("m1", "Rust")], "Rust preferences")
@@ -442,9 +489,14 @@ mod tests {
             .is_none());
 
         let enabled = start_runtime("session-blank", MnemopiSettings::default());
-        enabled.save("some durable memory about Rust", "retain", 0.8, None).expect("save");
+        enabled
+            .save("some durable memory about Rust", "retain", 0.8, None)
+            .expect("save");
         let session = SessionMemory::top_level(Arc::clone(&enabled));
-        assert!(session.recall_first_turn(&[], "   ").expect("recall").is_none());
+        assert!(session
+            .recall_first_turn(&[], "   ")
+            .expect("recall")
+            .is_none());
     }
 
     #[test]
@@ -475,13 +527,19 @@ mod tests {
     fn enqueue_and_shutdown_flush_persist_a_final_window() {
         let runtime = start_runtime(
             "session-flush",
-            MnemopiSettings { retain_every_n_turns: 100, ..MnemopiSettings::default() },
+            MnemopiSettings {
+                retain_every_n_turns: 100,
+                ..MnemopiSettings::default()
+            },
         );
         let session = SessionMemory::top_level(Arc::clone(&runtime));
         let messages = [user("m1", "a short final session window worth keeping")];
         assert_eq!(
             session.retain_settled(&messages).expect("retain"),
-            RetentionOutcome { retained_through: 0, ..RetentionOutcome::default() },
+            RetentionOutcome {
+                retained_through: 0,
+                ..RetentionOutcome::default()
+            },
             "the periodic interval has not elapsed"
         );
 
@@ -492,15 +550,24 @@ mod tests {
         assert_eq!(retention.retained_through, 1);
         assert_eq!(runtime.stats().expect("stats").counts.working, 1);
 
-        let repeated = session.shutdown_flush(messages.to_vec()).expect("flush again");
-        assert_eq!(repeated, ShutdownOutcome::default(), "the session closes once");
+        let repeated = session
+            .shutdown_flush(messages.to_vec())
+            .expect("flush again");
+        assert_eq!(
+            repeated,
+            ShutdownOutcome::default(),
+            "the session closes once"
+        );
     }
 
     #[test]
     fn enqueue_forces_a_final_window_and_consolidates() {
         let runtime = start_runtime(
             "session-enqueue",
-            MnemopiSettings { retain_every_n_turns: 100, ..MnemopiSettings::default() },
+            MnemopiSettings {
+                retain_every_n_turns: 100,
+                ..MnemopiSettings::default()
+            },
         );
         let session = SessionMemory::top_level(Arc::clone(&runtime));
         let (retention, promoted) = session
@@ -525,10 +592,22 @@ mod tests {
         .expect("runtime");
         let session = SessionMemory::top_level(Arc::clone(&runtime));
         let messages = [user("m1", "nothing should be stored")];
-        assert!(session.recall_first_turn(&messages, "hello").expect("recall").is_none());
-        assert_eq!(session.retain_settled(&messages).expect("retain"), RetentionOutcome::default());
-        assert_eq!(session.enqueue(&messages).expect("enqueue"), (RetentionOutcome::default(), 0));
-        assert_eq!(session.shutdown_flush(messages.to_vec()).expect("flush"), ShutdownOutcome::default());
+        assert!(session
+            .recall_first_turn(&messages, "hello")
+            .expect("recall")
+            .is_none());
+        assert_eq!(
+            session.retain_settled(&messages).expect("retain"),
+            RetentionOutcome::default()
+        );
+        assert_eq!(
+            session.enqueue(&messages).expect("enqueue"),
+            (RetentionOutcome::default(), 0)
+        );
+        assert_eq!(
+            session.shutdown_flush(messages.to_vec()).expect("flush"),
+            ShutdownOutcome::default()
+        );
     }
 
     #[test]
@@ -548,7 +627,9 @@ mod tests {
         })
         .expect("runtime");
         let session = SessionMemory::top_level(Arc::clone(&runtime));
-        session.retain_settled(&[user("m1", "scoped retention content")]).expect("retain");
+        session
+            .retain_settled(&[user("m1", "scoped retention content")])
+            .expect("retain");
         let record = runtime
             .retain_store()
             .expect("store")
@@ -557,8 +638,14 @@ mod tests {
             .into_iter()
             .next()
             .expect("row");
-        assert_eq!(record.bank, *runtime.status().retain_bank.as_ref().expect("bank"));
-        assert_eq!(record.metadata["primary_root"], root.to_string_lossy().as_ref());
+        assert_eq!(
+            record.bank,
+            *runtime.status().retain_bank.as_ref().expect("bank")
+        );
+        assert_eq!(
+            record.metadata["primary_root"],
+            root.to_string_lossy().as_ref()
+        );
         assert_ne!(record.bank, BankId::configured("default").expect("bank"));
     }
 
@@ -566,27 +653,46 @@ mod tests {
     fn retained_content_never_exceeds_the_store_bound() {
         let runtime = start_runtime(
             "session-bound",
-            MnemopiSettings { retain_every_n_turns: 1, ..MnemopiSettings::default() },
+            MnemopiSettings {
+                retain_every_n_turns: 1,
+                ..MnemopiSettings::default()
+            },
         );
         let session = SessionMemory::top_level(Arc::clone(&runtime));
         let content = "x".repeat(MAX_MEMORY_CONTENT_BYTES * 2);
-        let outcome = session.retain_settled(&[user("m1", &content)]).expect("retain");
-        assert!(outcome.stored_id.is_some(), "retention is not a tool save and has its own bound");
-        let stored = runtime.retain_store().expect("store").list(1).expect("list");
+        let outcome = session
+            .retain_settled(&[user("m1", &content)])
+            .expect("retain");
+        assert!(
+            outcome.stored_id.is_some(),
+            "retention is not a tool save and has its own bound"
+        );
+        let stored = runtime
+            .retain_store()
+            .expect("store")
+            .list(1)
+            .expect("list");
         assert_eq!(stored.len(), 1);
     }
 
     #[test]
     fn a_runtime_save_is_visible_to_session_recall() {
         let runtime = start_runtime("session-visible", MnemopiSettings::default());
-        let id = runtime.save("User prefers tabs over spaces", "retain", 0.7, None).expect("save");
+        let id = runtime
+            .save("User prefers tabs over spaces", "retain", 0.7, None)
+            .expect("save");
         let session = SessionMemory::top_level(Arc::clone(&runtime));
         let rendered = session
             .recall_first_turn(&[], "tabs or spaces?")
             .expect("recall")
             .expect("recall content");
         assert!(rendered.contains("tabs over spaces"));
-        let projection = runtime.projection(id.id.as_deref().expect("id"), 10, 4096).expect("record");
-        assert!(matches!(projection, crate::runtime::MemoryProjection::Record { .. }));
+        let projection = runtime
+            .projection(id.id.as_deref().expect("id"), 10, 4096)
+            .expect("record");
+        assert!(matches!(
+            projection,
+            crate::runtime::MemoryProjection::Record { .. }
+        ));
     }
 }

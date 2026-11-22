@@ -842,16 +842,18 @@ pub async fn execute(
             "local-inference" => {
                 synthesize_local_audio(model, params, &ctx.settings, &output_path, &ctx.cwd)
             }
-            "xai-tts" | "openai-speech" => synthesize_cloud(
-                model,
-                params,
-                codec,
-                &output_path,
-                &display_path,
-                &client,
-                signal,
-            )
-            .await,
+            "xai-tts" | "openai-speech" => {
+                synthesize_cloud(
+                    model,
+                    params,
+                    codec,
+                    &output_path,
+                    &display_path,
+                    &client,
+                    signal,
+                )
+                .await
+            }
             other => bail!("Unsupported speech model API: {other}"),
         };
         match attempt {
@@ -1240,7 +1242,12 @@ mod tests {
     #[test]
     fn description_renders_the_three_substitutions() {
         let text = description();
-        assert!(text.starts_with("Generate a speech audio file from text and write it to output_path.\n"), "{text}");
+        assert!(
+            text.starts_with(
+                "Generate a speech audio file from text and write it to output_path.\n"
+            ),
+            "{text}"
+        );
         // `prompts/tools/tts.md` ends with a newline; the rendered text keeps it.
         assert!(text.ends_with("- Max 15,000 characters.\n"), "{text}");
         assert!(text.contains("harper (default)"), "{text}");
@@ -1248,7 +1255,10 @@ mod tests {
         assert!(text.contains("tts.localVoice"), "{text}");
         assert!(!text.contains('{'), "unrendered placeholder in {text}");
         // the nested bullets keep their two-space indent
-        assert!(text.contains("\n  - no network; always WAV/PCM16\n"), "{text}");
+        assert!(
+            text.contains("\n  - no network; always WAV/PCM16\n"),
+            "{text}"
+        );
         assert!(
             text.contains("\n  - built-in voices: ara, eve (default), leo, rex, sal; custom voice IDs accepted\n"),
             "{text}"
@@ -1449,10 +1459,7 @@ mod tests {
             candidate("xai-tts", false),
         ];
         let reordered = cloud_first(candidates);
-        let ordered: Vec<&str> = reordered
-            .iter()
-            .map(|c| c.model.api.as_str())
-            .collect();
+        let ordered: Vec<&str> = reordered.iter().map(|c| c.model.api.as_str()).collect();
         assert_eq!(ordered, vec!["openai-speech", "xai-tts", "local-inference"]);
     }
 
@@ -1729,7 +1736,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (base_url, server) = serve_once(200, mp3_bytes());
         let resolved = model("openai", "gpt-4o-mini-tts", "openai-speech", &base_url);
-        let params = params(json!({ "text": "hello", "output_path": "clip.mp3", "voice_id": "nova" }));
+        let params =
+            params(json!({ "text": "hello", "output_path": "clip.mp3", "voice_id": "nova" }));
         let bytes = post_once(
             &resolved,
             "/audio/speech",

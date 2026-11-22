@@ -389,7 +389,11 @@ fn backend_kind(settings: &Settings) -> BackendKind {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // finite, non-negative counts
 fn mnemopi_settings(settings: &Settings) -> MnemopiSettings {
     let defaults = MnemopiSettings::default();
-    let text = |id: &str| settings.get_string(id).filter(|value| !value.trim().is_empty());
+    let text = |id: &str| {
+        settings
+            .get_string(id)
+            .filter(|value| !value.trim().is_empty())
+    };
     let count = |id: &str, fallback: usize| {
         settings
             .get_number(id)
@@ -417,10 +421,7 @@ fn mnemopi_settings(settings: &Settings) -> MnemopiSettings {
         proactive_linking: settings
             .get_bool("mnemopi.proactiveLinking")
             .unwrap_or(defaults.proactive_linking),
-        retain_every_n_turns: count(
-            "mnemopi.retainEveryNTurns",
-            defaults.retain_every_n_turns,
-        ),
+        retain_every_n_turns: count("mnemopi.retainEveryNTurns", defaults.retain_every_n_turns),
         recall_limit: count("mnemopi.recallLimit", defaults.recall_limit),
         recall_context_turns: count("mnemopi.recallContextTurns", defaults.recall_context_turns),
         recall_max_query_chars: count(
@@ -544,10 +545,7 @@ impl OmpMemoryBackend {
     /// `verb` at all reports `Unavailable`, whether or not a runtime exists.
     fn engine(&self, verb: MemoryVerb) -> Result<&MemoryRuntime, MemorySlashError> {
         if !self.kind.supports(verb) {
-            return Err(MemorySlashError::unavailable(
-                self.kind.id(),
-                verb.as_str(),
-            ));
+            return Err(MemorySlashError::unavailable(self.kind.id(), verb.as_str()));
         }
         if let Some(runtime) = self.runtime.as_deref() {
             return Ok(runtime);
@@ -574,11 +572,10 @@ impl MemorySlashBackend for OmpMemoryBackend {
             return Ok(INACTIVE_MESSAGE.to_string());
         }
         let runtime = self.engine(MemoryVerb::View)?;
-        let budget = runtime
-            .mnemopi_settings()
-            .map_or_else(|_| MnemopiSettings::default().injection_token_limit, |settings| {
-                settings.injection_token_limit
-            });
+        let budget = runtime.mnemopi_settings().map_or_else(
+            |_| MnemopiSettings::default().injection_token_limit,
+            |settings| settings.injection_token_limit,
+        );
         let snapshot = runtime
             .prompt_snapshot(None, None, budget)
             .map_err(|err| MemorySlashError::runtime(self.kind.id(), "view", err.to_string()))?;
@@ -600,9 +597,9 @@ impl MemorySlashBackend for OmpMemoryBackend {
 
     fn diagnose(&self) -> Result<String, MemorySlashError> {
         let runtime = self.engine(MemoryVerb::Diagnose)?;
-        let report = runtime
-            .diagnose()
-            .map_err(|err| MemorySlashError::runtime(self.kind.id(), "diagnose", err.to_string()))?;
+        let report = runtime.diagnose().map_err(|err| {
+            MemorySlashError::runtime(self.kind.id(), "diagnose", err.to_string())
+        })?;
         Ok(render_json(&report))
     }
 

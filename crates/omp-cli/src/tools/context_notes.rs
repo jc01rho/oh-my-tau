@@ -147,9 +147,7 @@ pub fn get_context_notes(entries: &[Value]) -> Option<ContextNotesRevision> {
     for entry in entries.iter().rev() {
         match entry_str(entry, "type") {
             Some("reset_boundary") => return None,
-            Some("custom")
-                if entry_str(entry, "customType") == Some(CONTEXT_NOTES_ENTRY_TYPE) =>
-            {
+            Some("custom") if entry_str(entry, "customType") == Some(CONTEXT_NOTES_ENTRY_TYPE) => {
                 if let Some(text) = is_context_notes_data(entry.get("data")) {
                     return Some(ContextNotesRevision {
                         text: text.to_owned(),
@@ -198,7 +196,9 @@ impl ContextState {
             Self::Disposed => Some(
                 "Experimental context management is unavailable because this session is disposed.",
             ),
-            Self::NotOwned => Some("Experimental context management is unavailable for this session."),
+            Self::NotOwned => {
+                Some("Experimental context management is unavailable for this session.")
+            }
         }
     }
 }
@@ -540,7 +540,8 @@ mod tests {
 
     #[test]
     fn cleared_notes_read_back_as_empty_text() {
-        let host = FakeHost::new(vec![notes_entry("n1", "content"), notes_entry("n2", "")]).shared();
+        let host =
+            FakeHost::new(vec![notes_entry("n1", "content"), notes_entry("n2", "")]).shared();
         let result = run(context_notes_tool(host), json!({})).unwrap();
         assert_eq!(text_of(&result), "");
         assert_eq!(result.details["entryId"], "n2");
@@ -604,7 +605,10 @@ mod tests {
     #[test]
     fn every_unavailable_state_raises_its_own_message() {
         for (state, expected) in [
-            (ContextState::Disabled, "Experimental context management is disabled."),
+            (
+                ContextState::Disabled,
+                "Experimental context management is disabled.",
+            ),
             (
                 ContextState::Disposed,
                 "Experimental context management is unavailable because this session is disposed.",
@@ -647,7 +651,10 @@ mod tests {
     #[test]
     fn approval_splits_on_the_presence_of_text() {
         assert_eq!(context_notes_approval(&json!({})), Approval::Read);
-        assert_eq!(context_notes_approval(&json!({"text": ""})), Approval::Write);
+        assert_eq!(
+            context_notes_approval(&json!({"text": ""})),
+            Approval::Write
+        );
         assert_eq!(
             context_notes_approval(&json!({"text": "notes"})),
             Approval::Write
@@ -670,7 +677,10 @@ mod tests {
             "Entire replacement notebook text, up to 16384 UTF-8 bytes. Omit to read without \
              changing notes; use an empty string to clear."
         );
-        assert_eq!(schema_new_context(), json!({"type":"object","properties":{}}));
+        assert_eq!(
+            schema_new_context(),
+            json!({"type":"object","properties":{}})
+        );
         assert!(!CONTEXT_NOTES_STRICT);
         assert!(NEW_CONTEXT_STRICT);
     }

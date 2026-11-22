@@ -226,7 +226,12 @@ impl AgentTool for SecurityScanTool {
         _signal: AbortSignal,
         _on_update: AgentToolUpdateCallback,
     ) -> BoxFut<'static, Result<AgentToolResult>> {
-        Box::pin(async move { Ok(AgentToolResult::text(dispatch(self.backend.as_ref(), &params)?)) })
+        Box::pin(async move {
+            Ok(AgentToolResult::text(dispatch(
+                self.backend.as_ref(),
+                &params,
+            )?))
+        })
     }
 }
 
@@ -337,8 +342,14 @@ mod tests {
             assert_eq!(out, format!("ran {name}"));
         }
         let seen = backend.seen.lock().unwrap().clone();
-        let expected: Vec<Action> = ACTIONS.iter().map(|a| Action::parse(&json!({"action": a})).unwrap()).collect();
-        assert_eq!(seen, expected, "every action must reach the backend once, in order");
+        let expected: Vec<Action> = ACTIONS
+            .iter()
+            .map(|a| Action::parse(&json!({"action": a})).unwrap())
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "every action must reach the backend once, in order"
+        );
     }
 
     #[test]

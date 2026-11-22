@@ -176,7 +176,9 @@ impl Level {
 
 /// `calculateDepth`: directory levels from `cwd` up to `dir` (0 = `cwd`).
 fn calculate_depth(cwd: &Path, dir: &Path) -> usize {
-    cwd.components().count().saturating_sub(dir.components().count())
+    cwd.components()
+        .count()
+        .saturating_sub(dir.components().count())
 }
 
 /// `resolveCopilotHome`: `COPILOT_HOME` override, else `<home>/.copilot`.
@@ -242,11 +244,7 @@ pub fn standalone_context_files(cwd: &Path, home: &Path) -> Vec<ContextFile> {
 
 /// Push a context file unless an earlier, more authoritative provider already
 /// claimed its dedupe key (`contextFileCapability` first-wins semantics).
-fn push_scoped(
-    out: &mut Vec<ContextFile>,
-    claimed: &mut HashSet<String>,
-    file: ContextFile,
-) {
+fn push_scoped(out: &mut Vec<ContextFile>, claimed: &mut HashSet<String>, file: ContextFile) {
     let key = if file.additive {
         format!("additive:{}", file.path.display())
     } else {
@@ -312,13 +310,19 @@ pub fn context_files_with(
 
     // 1. `.omp/`-native: user `<agent>/AGENTS.md`, then the nearest project
     //    `.omp/AGENTS.md` (`discovery/builtin.ts`).
-    if let Some(file) = read_context_file(&agent.join("AGENTS.md"), agent, cwd, Level::User, false) {
+    if let Some(file) = read_context_file(&agent.join("AGENTS.md"), agent, cwd, Level::User, false)
+    {
         push_scoped(&mut out, &mut claimed, file);
     }
     if let Some(config_dir) = nearest_project_config_dir(cwd, home) {
         let scope = config_dir.parent().unwrap_or(cwd);
-        if let Some(file) = read_context_file(&config_dir.join("AGENTS.md"), scope, cwd, Level::Project, false)
-        {
+        if let Some(file) = read_context_file(
+            &config_dir.join("AGENTS.md"),
+            scope,
+            cwd,
+            Level::Project,
+            false,
+        ) {
             push_scoped(&mut out, &mut claimed, file);
         }
     }
@@ -350,17 +354,29 @@ pub fn context_files_with(
         push_scoped(&mut out, &mut claimed, file);
     }
     for dir in copilot_custom_instruction_dirs() {
-        if let Some(file) = read_context_file(&dir.join("AGENTS.md"), &dir, cwd, Level::User, false) {
+        if let Some(file) = read_context_file(&dir.join("AGENTS.md"), &dir, cwd, Level::User, false)
+        {
             push_scoped(&mut out, &mut claimed, file);
         }
     }
 
     // 4. Gemini CLI: project `.gemini/GEMINI.md`, user `~/.gemini/GEMINI.md`.
-    if let Some(file) = read_context_file(&cwd.join(".gemini/GEMINI.md"), cwd, cwd, Level::Project, false)
-    {
+    if let Some(file) = read_context_file(
+        &cwd.join(".gemini/GEMINI.md"),
+        cwd,
+        cwd,
+        Level::Project,
+        false,
+    ) {
         push_scoped(&mut out, &mut claimed, file);
     }
-    if let Some(file) = read_context_file(&home.join(".gemini/GEMINI.md"), home, cwd, Level::User, false) {
+    if let Some(file) = read_context_file(
+        &home.join(".gemini/GEMINI.md"),
+        home,
+        cwd,
+        Level::User,
+        false,
+    ) {
         push_scoped(&mut out, &mut claimed, file);
     }
 
@@ -417,7 +433,9 @@ fn standalone_named_context_files(cwd: &Path, home: &Path, name: &str) -> Vec<Co
         let at_boundary = current == boundary;
         let at_home = exclude_home && current == home;
         if !at_home && (!at_boundary || include_boundary) {
-            if let Some(file) = read_context_file(&current.join(name), &current, cwd, Level::Project, true) {
+            if let Some(file) =
+                read_context_file(&current.join(name), &current, cwd, Level::Project, true)
+            {
                 out.push(file);
             }
         }
@@ -530,13 +548,19 @@ fn expand_line(
                 }
             }
             let raw = &rest[..token_len];
-            let token = raw.trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
+            let token =
+                raw.trim_end_matches([',', '.', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
             let path_like = token.starts_with('/')
                 || token.starts_with('.')
                 || token.starts_with('~')
-                || token.chars().next().is_some_and(|ch| ch.is_ascii_alphanumeric());
+                || token
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric());
             if !token.is_empty() && path_like {
-                if let Some(expanded) = resolve_at_import(token, base_dir, depth, home, chain, budget) {
+                if let Some(expanded) =
+                    resolve_at_import(token, base_dir, depth, home, chain, budget)
+                {
                     out.push_str(&expanded);
                     i += 1 + token.len();
                     continue;
@@ -648,9 +672,7 @@ fn split_comparable_prompt_blocks(content: &str) -> Vec<String> {
 
 /// Whether `rule_blocks` is a contiguous run inside `source_blocks`.
 fn prompt_blocks_contain(source_blocks: &[String], rule_blocks: &[String]) -> bool {
-    if source_blocks.is_empty()
-        || rule_blocks.is_empty()
-        || rule_blocks.len() > source_blocks.len()
+    if source_blocks.is_empty() || rule_blocks.is_empty() || rule_blocks.len() > source_blocks.len()
     {
         return false;
     }
@@ -678,9 +700,12 @@ pub fn dedupe_contained_context_files(mut files: Vec<ContextFile>) -> Vec<Contex
         .collect();
     let mut kept = Vec::with_capacity(files.len());
     for (index, file) in files.into_iter().enumerate() {
-        let contained = blocks.iter().enumerate().any(|(candidate, candidate_blocks)| {
-            candidate > index && prompt_blocks_contain(candidate_blocks, &blocks[index])
-        });
+        let contained = blocks
+            .iter()
+            .enumerate()
+            .any(|(candidate, candidate_blocks)| {
+                candidate > index && prompt_blocks_contain(candidate_blocks, &blocks[index])
+            });
         if !contained {
             kept.push(file);
         }
@@ -1071,9 +1096,12 @@ fn lookup(ctx: &[&Value], path: &str) -> Value {
     // Handlebars loop metadata inside `each`: `@first` / `@last`.
     if path == "@first" || path == "@last" {
         return LOOP_FLAGS.with(|flags| {
-            flags.borrow().last().map_or(Value::Bool(false), |(first, last)| {
-                Value::Bool(if path == "@first" { *first } else { *last })
-            })
+            flags
+                .borrow()
+                .last()
+                .map_or(Value::Bool(false), |(first, last)| {
+                    Value::Bool(if path == "@first" { *first } else { *last })
+                })
         });
     }
     // `a.length` on arrays.
@@ -1605,7 +1633,14 @@ pub fn build_with(
     opts: &Options,
     available_tools: &[ToolMeta],
 ) -> Built {
-    build_full(cwd, home, agent, opts, &ContextOptions::default(), available_tools)
+    build_full(
+        cwd,
+        home,
+        agent,
+        opts,
+        &ContextOptions::default(),
+        available_tools,
+    )
 }
 
 /// [`build_with`] with the context/rule knobs spelled out.
@@ -1708,7 +1743,11 @@ pub fn build_full(
                 agent_name: Some(if opts.subagent { "sub" } else { "main" }),
             },
         );
-        let rulebook: Vec<Value> = buckets.rulebook.iter().map(rules::Rule::to_rulebook_entry).collect();
+        let rulebook: Vec<Value> = buckets
+            .rulebook
+            .iter()
+            .map(rules::Rule::to_rulebook_entry)
+            .collect();
         let always: Vec<Value> = buckets
             .always_apply
             .iter()
@@ -1820,7 +1859,7 @@ pub fn build_full(
     Built { blocks, tool_names }
 }
 
-    /// [`build`] with the context/rule knobs spelled out.
+/// [`build`] with the context/rule knobs spelled out.
 #[must_use]
 pub fn build_contextual(
     cwd: &Path,
@@ -1828,7 +1867,14 @@ pub fn build_contextual(
     ctx_opts: &ContextOptions,
     available_tools: &[ToolMeta],
 ) -> Built {
-    build_full(cwd, &home_dir(), &agent_dir(), opts, ctx_opts, available_tools)
+    build_full(
+        cwd,
+        &home_dir(),
+        &agent_dir(),
+        opts,
+        ctx_opts,
+        available_tools,
+    )
 }
 
 /// Build the system prompt using the process home/agent dirs.
@@ -2046,10 +2092,8 @@ mod tests {
         // `mid` is contained by `near`; `far` is not (alpha/beta run absent).
         assert_eq!(names, vec!["far/AGENTS.md", "near/AGENTS.md"]);
 
-        let stripped = without_agents_md(vec![
-            file("AGENTS.md", "a", 0),
-            file("CLAUDE.md", "b", 0),
-        ]);
+        let stripped =
+            without_agents_md(vec![file("AGENTS.md", "a", 0), file("CLAUDE.md", "b", 0)]);
         assert_eq!(stripped.len(), 1);
         assert_eq!(stripped[0].path, PathBuf::from("CLAUDE.md"));
     }
@@ -2220,7 +2264,13 @@ mod tests {
             "[ab][c]"
         );
         // Empty array still takes the else branch.
-        assert_eq!(render("{{#each items}}x{{else}}none{{/each}}", &json!({"items": []})), "none");
+        assert_eq!(
+            render(
+                "{{#each items}}x{{else}}none{{/each}}",
+                &json!({"items": []})
+            ),
+            "none"
+        );
     }
 
     /// Rules and `internalUrls` reach the rendered prompt: sticky `RULES.md`
@@ -2278,7 +2328,10 @@ mod tests {
         let project = &built.blocks[1];
         assert!(project.contains("project convention"), "{project}");
         assert!(project.contains("claude convention"), "{project}");
-        assert!(project.contains("NEVER `grep`/`glob` for `AGENTS.md`"), "{project}");
+        assert!(
+            project.contains("NEVER `grep`/`glob` for `AGENTS.md`"),
+            "{project}"
+        );
 
         let ctx_opts = ContextOptions {
             exclude_agents_md: true,

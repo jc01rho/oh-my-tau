@@ -113,9 +113,7 @@ impl Inner {
             guard.drain().map(|(_, p)| p).collect()
         };
         for entry in pending {
-            let _ = entry
-                .tx
-                .send(Err(DapError::Transport(error.to_string())));
+            let _ = entry.tx.send(Err(DapError::Transport(error.to_string())));
         }
         let waiters: Vec<EventWaiter> = {
             let mut guard = self.waiters.lock();
@@ -440,7 +438,10 @@ impl DapClient {
         client
     }
 
-    fn start_reader(client: &Arc<Self>, mut read: Box<dyn AsyncRead + Unpin + Send>) -> JoinHandle<()> {
+    fn start_reader(
+        client: &Arc<Self>,
+        mut read: Box<dyn AsyncRead + Unpin + Send>,
+    ) -> JoinHandle<()> {
         let inner = Arc::clone(&client.inner);
         tokio::spawn(async move {
             let mut framer = Framer::new();
@@ -529,7 +530,9 @@ impl DapClient {
         cancel: Option<&dyn Cancel>,
         timeout: Option<Duration>,
     ) -> DapResult<DapCapabilities> {
-        let body = self.send_request("initialize", Some(args), cancel, timeout).await?;
+        let body = self
+            .send_request("initialize", Some(args), cancel, timeout)
+            .await?;
         let capabilities: DapCapabilities = match body {
             Value::Null => DapCapabilities::default(),
             other => serde_json::from_value(other).unwrap_or_default(),
@@ -928,10 +931,10 @@ fn handle_response(inner: &Arc<Inner>, message: &Value) {
         let _ = pending.tx.send(Ok(body));
         return;
     }
-    let message_text = message
-        .get("message")
-        .and_then(Value::as_str)
-        .map_or_else(|| format!("DAP request {} failed", pending.command), ToString::to_string);
+    let message_text = message.get("message").and_then(Value::as_str).map_or_else(
+        || format!("DAP request {} failed", pending.command),
+        ToString::to_string,
+    );
     let _ = pending.tx.send(Err(DapError::Request(message_text)));
 }
 
@@ -987,7 +990,14 @@ async fn handle_adapter_request(inner: &Arc<Inner>, message: &Value) {
     let Some(handler) = handler else {
         let text = format!("Unsupported DAP request: {command}");
         let body = json!({"error": {"id": 1, "format": text}});
-        let frame = encode_response(request_seq, inner.next_seq(), &command, false, Some(body), Some(&text));
+        let frame = encode_response(
+            request_seq,
+            inner.next_seq(),
+            &command,
+            false,
+            Some(body),
+            Some(&text),
+        );
         if let Err(error) = write_frame(inner, &frame).await {
             warn!(adapter = %inner.adapter_name, "failed to refuse {command}: {error}");
         }
@@ -995,7 +1005,14 @@ async fn handle_adapter_request(inner: &Arc<Inner>, message: &Value) {
     };
     match handler(args).await {
         Ok(body) => {
-            let frame = encode_response(request_seq, inner.next_seq(), &command, true, Some(body), None);
+            let frame = encode_response(
+                request_seq,
+                inner.next_seq(),
+                &command,
+                true,
+                Some(body),
+                None,
+            );
             if let Err(error) = write_frame(inner, &frame).await {
                 warn!(adapter = %inner.adapter_name, "failed to answer {command}: {error}");
             }
@@ -1163,7 +1180,10 @@ mod tests {
     fn frame_encodes_content_length_in_bytes() {
         let frame = encode_frame(&json!({"seq": 1, "type": "request", "command": "threads"}));
         let body = r#"{"seq":1,"type":"request","command":"threads"}"#;
-        assert_eq!(frame, format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+        assert_eq!(
+            frame,
+            format!("Content-Length: {}\r\n\r\n{body}", body.len())
+        );
         assert!(frame.starts_with("Content-Length: 46\r\n\r\n"));
     }
 
@@ -1265,12 +1285,11 @@ mod tests {
             })],
         );
         let two = Arc::clone(&seen);
-        inner
-            .any_event_handlers
-            .lock()
-            .push(Arc::new(move |event: &str, _body: Option<&Value>| {
+        inner.any_event_handlers.lock().push(Arc::new(
+            move |event: &str, _body: Option<&Value>| {
                 two.lock().push(format!("any:{event}"));
-            }));
+            },
+        ));
         dispatch_event(&inner, "output", json!({"output": "hello"}));
         assert_eq!(*seen.lock(), ["output", "any:output"]);
     }
@@ -1378,8 +1397,18 @@ mod tests {
 
     #[test]
     fn encode_response_keeps_protocol_spelling() {
-        let frame = encode_response(3, 8, "runInTerminal", true, Some(json!({"processId": 42})), None);
+        let frame = encode_response(
+            3,
+            8,
+            "runInTerminal",
+            true,
+            Some(json!({"processId": 42})),
+            None,
+        );
         let body = r#"{"seq":8,"type":"response","request_seq":3,"success":true,"command":"runInTerminal","body":{"processId":42}}"#;
-        assert_eq!(frame, format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+        assert_eq!(
+            frame,
+            format!("Content-Length: {}\r\n\r\n{body}", body.len())
+        );
     }
 }

@@ -168,10 +168,7 @@ pub fn validate(params: &ImageGenParams) -> Result<()> {
     }
     if let Some(ratio) = params.aspect_ratio.as_deref() {
         if !ASPECT_RATIOS.contains(&ratio) {
-            bail!(
-                "aspect_ratio must be one of {}",
-                ASPECT_RATIOS.join(", ")
-            );
+            bail!("aspect_ratio must be one of {}", ASPECT_RATIOS.join(", "));
         }
     }
     if let Some(size) = params.image_size.as_deref() {
@@ -295,8 +292,8 @@ fn load_image_from_path(image_path: &str, cwd: &Path) -> Result<InputImage> {
     if metadata.len() > MAX_IMAGE_SIZE {
         bail!("Image file too large: {image_path}");
     }
-    let bytes = std::fs::read(&resolved)
-        .with_context(|| format!("reading {}", resolved.display()))?;
+    let bytes =
+        std::fs::read(&resolved).with_context(|| format!("reading {}", resolved.display()))?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_IMAGE_SIZE {
         bail!("Image file too large: {image_path}");
     }
@@ -422,9 +419,7 @@ pub fn resolved_size(image_size: Option<&str>, aspect_ratio: Option<&str>) -> Op
     if let Some(size) = image_size.filter(|s| IMAGE_SIZES.contains(s)) {
         return Some(size.to_string());
     }
-    aspect_ratio
-        .and_then(aspect_size)
-        .map(str::to_string)
+    aspect_ratio.and_then(aspect_size).map(str::to_string)
 }
 
 fn parse_size(size: &str) -> Option<(u32, u32)> {
@@ -675,9 +670,7 @@ pub fn parse_google_response(value: &Value) -> Result<RawImages> {
             }
             text.push_str(chunk);
         }
-        let inline = part
-            .get("inlineData")
-            .or_else(|| part.get("inline_data"));
+        let inline = part.get("inlineData").or_else(|| part.get("inline_data"));
         if let Some(inline) = inline {
             if let Some(data) = inline.get("data").and_then(Value::as_str) {
                 let mime_type = inline
@@ -720,8 +713,7 @@ async fn post_json(request: reqwest::RequestBuilder, name: &str) -> Result<Value
     if !status.is_success() {
         bail!("{name} API error ({}): {text}", status.as_u16());
     }
-    serde_json::from_str(&text)
-        .map_err(|e| anyhow!("{name} returned an unparsable body: {e}"))
+    serde_json::from_str(&text).map_err(|e| anyhow!("{name} returned an unparsable body: {e}"))
 }
 
 async fn send_openai(
@@ -848,14 +840,7 @@ async fn materialize(client: &reqwest::Client, raw: RawImage) -> Result<Generate
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(';')
-                .next()
-                .unwrap_or(value)
-                .trim()
-                .to_string()
-        })
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "image/png".to_string());
     let bytes = response
@@ -888,7 +873,10 @@ fn unique_id() -> String {
 ///
 /// # Errors
 /// The payload is not base64, is not a decodable image, or cannot be re-encoded.
-pub fn at_requested_size(image: &GeneratedImage, requested: Option<&str>) -> Result<GeneratedImage> {
+pub fn at_requested_size(
+    image: &GeneratedImage,
+    requested: Option<&str>,
+) -> Result<GeneratedImage> {
     let Some(requested) = requested else {
         return Ok(image.clone());
     };
@@ -1016,7 +1004,10 @@ pub fn exhausted_message(candidates: &[String], failures: &[String], skipped: &[
     }
     message.push('.');
     if !failures.is_empty() {
-        let reasons: Vec<String> = failures.iter().map(|reason| truncate_failure(reason)).collect();
+        let reasons: Vec<String> = failures
+            .iter()
+            .map(|reason| truncate_failure(reason))
+            .collect();
         message.push_str(" Failures: ");
         message.push_str(&reasons.join("; "));
         message.push('.');
@@ -1092,16 +1083,21 @@ pub struct ImageGenOutcome {
     pub text: String,
 }
 
-fn resolve_candidates(params: &ImageGenParams, ctx: &ImageGenContext) -> Result<Vec<ResolvedModel>> {
+fn resolve_candidates(
+    params: &ImageGenParams,
+    ctx: &ImageGenContext,
+) -> Result<Vec<ResolvedModel>> {
     if let Some(explicit) = params
         .model
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let model = omp_providers::resolve_in(&ctx.dir, explicit).ok().ok_or_else(|| {
-            anyhow!("Image model selector did not match an available image model: {explicit}")
-        })?;
+        let model = omp_providers::resolve_in(&ctx.dir, explicit)
+            .ok()
+            .ok_or_else(|| {
+                anyhow!("Image model selector did not match an available image model: {explicit}")
+            })?;
         return Ok(vec![model]);
     }
     let primary = omp_providers::resolve_in(&ctx.dir, "image")
@@ -1258,9 +1254,15 @@ mod tests {
             schema["properties"]["aspect_ratio"]["enum"],
             json!(ASPECT_RATIOS)
         );
-        assert_eq!(schema["properties"]["image_size"]["enum"], json!(IMAGE_SIZES));
+        assert_eq!(
+            schema["properties"]["image_size"]["enum"],
+            json!(IMAGE_SIZES)
+        );
         assert_eq!(schema["properties"]["input"]["type"], json!("array"));
-        assert_eq!(schema["properties"]["changes"]["items"]["type"], json!("string"));
+        assert_eq!(
+            schema["properties"]["changes"]["items"]["type"],
+            json!("string")
+        );
     }
 
     #[test]
@@ -1304,10 +1306,7 @@ mod tests {
             normalize_data_url("data:image/png;base64,AAAA"),
             ("AAAA".to_string(), Some("image/png".to_string()))
         );
-        assert_eq!(
-            normalize_data_url("AAAA"),
-            ("AAAA".to_string(), None)
-        );
+        assert_eq!(normalize_data_url("AAAA"), ("AAAA".to_string(), None));
         // not base64-marked: unchanged, mime comes from the parameter
         assert_eq!(
             normalize_data_url("data:image/png,AAAA"),
@@ -1345,9 +1344,18 @@ mod tests {
             resolved_size(Some("1536x1024"), Some("1:1")).as_deref(),
             Some("1536x1024")
         );
-        assert_eq!(resolved_size(None, Some("1:1")).as_deref(), Some("1024x1024"));
-        assert_eq!(resolved_size(None, Some("9:16")).as_deref(), Some("1024x1536"));
-        assert_eq!(resolved_size(None, Some("16:9")).as_deref(), Some("1536x1024"));
+        assert_eq!(
+            resolved_size(None, Some("1:1")).as_deref(),
+            Some("1024x1024")
+        );
+        assert_eq!(
+            resolved_size(None, Some("9:16")).as_deref(),
+            Some("1024x1536")
+        );
+        assert_eq!(
+            resolved_size(None, Some("16:9")).as_deref(),
+            Some("1536x1024")
+        );
         assert_eq!(resolved_size(None, Some("5:4")), None);
         assert_eq!(resolved_size(None, None), None);
         // an out-of-enum size is ignored rather than forwarded
@@ -1371,8 +1379,13 @@ mod tests {
         );
         // the session model is deduped against the role's own selector
         assert_eq!(
-            candidate_selectors(None, Some("openai/gpt-image-1"), "openai/gpt-image-1", &fallbacks)
-                .len(),
+            candidate_selectors(
+                None,
+                Some("openai/gpt-image-1"),
+                "openai/gpt-image-1",
+                &fallbacks
+            )
+            .len(),
             3
         );
         // an explicit selector replaces the chain entirely
@@ -1385,8 +1398,14 @@ mod tests {
     #[test]
     fn transport_table_covers_the_ported_apis() {
         assert_eq!(transport_for("openai-images"), Some(ImageApi::OpenAi));
-        assert_eq!(transport_for("openrouter-images"), Some(ImageApi::OpenRouter));
-        assert_eq!(transport_for("google-generative-ai"), Some(ImageApi::Google));
+        assert_eq!(
+            transport_for("openrouter-images"),
+            Some(ImageApi::OpenRouter)
+        );
+        assert_eq!(
+            transport_for("google-generative-ai"),
+            Some(ImageApi::Google)
+        );
         // hosted carriers and CCA are skipped, not guessed at
         assert_eq!(transport_for("openai-responses"), None);
         assert_eq!(transport_for("google-gemini-cli"), None);
@@ -1489,7 +1508,10 @@ mod tests {
         let raw = parse_openai_response(&body).unwrap();
         assert_eq!(raw.images.len(), 2);
         assert_eq!(raw.images[0].b64.as_deref(), Some("AAAA"));
-        assert_eq!(raw.images[1].url.as_deref(), Some("https://example.test/a.png"));
+        assert_eq!(
+            raw.images[1].url.as_deref(),
+            Some("https://example.test/a.png")
+        );
         assert_eq!(raw.text.as_deref(), Some("a fox"));
         assert_eq!(
             raw.usage,
@@ -1550,7 +1572,10 @@ mod tests {
         assert_eq!(same.size.as_deref(), Some("2x1"));
 
         // no requested size: pass through
-        assert_eq!(at_requested_size(&generated, None).unwrap().data, generated.data);
+        assert_eq!(
+            at_requested_size(&generated, None).unwrap().data,
+            generated.data
+        );
     }
 
     #[test]
@@ -1593,7 +1618,14 @@ mod tests {
             "Provider: openai\nModel: gpt-image-1\nGenerated 1 image(s):\n  /tmp/omp-image-1.png (1024x1024, quality high)\n\ndone"
         );
         // a hosted backend running a different model reports both
-        let text = render_result_text("openai", "gpt-image-1", "gpt-image-1-2025", &images, &paths, None);
+        let text = render_result_text(
+            "openai",
+            "gpt-image-1",
+            "gpt-image-1-2025",
+            &images,
+            &paths,
+            None,
+        );
         assert!(text.contains("Model: gpt-image-1-2025 (catalog entry openai/gpt-image-1)"));
     }
 
@@ -1602,7 +1634,10 @@ mod tests {
         assert_eq!(truncate_failure("  boom\n\n  happened.  "), "boom happened");
         let long = "x".repeat(MAX_FAILURE_REASON_CHARS + 50);
         let capped = truncate_failure(&long);
-        assert_eq!(capped.chars().filter(|c| *c == 'x').count(), MAX_FAILURE_REASON_CHARS);
+        assert_eq!(
+            capped.chars().filter(|c| *c == 'x').count(),
+            MAX_FAILURE_REASON_CHARS
+        );
         assert!(capped.ends_with("..."));
     }
 
@@ -1624,7 +1659,10 @@ mod tests {
         assert!(validate(&params(json!({"subject": "x", "aspect_ratio": "5:4"}))).is_err());
         assert!(validate(&params(json!({"subject": "x", "image_size": "512x512"}))).is_err());
         assert!(validate(&params(json!({"subject": "   "}))).is_err());
-        assert!(validate(&params(json!({"subject": "x", "input": [{"mime_type": "image/png"}]}))).is_err());
+        assert!(validate(&params(
+            json!({"subject": "x", "input": [{"mime_type": "image/png"}]})
+        ))
+        .is_err());
         assert!(validate(&params(json!({
             "subject": "x",
             "aspect_ratio": "1:1",
@@ -1647,7 +1685,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert_eq!(error, "mime_type is required when providing raw base64 data.");
+        assert_eq!(
+            error,
+            "mime_type is required when providing raw base64 data."
+        );
 
         let resolved = resolve_input_image(
             &ImageInput {

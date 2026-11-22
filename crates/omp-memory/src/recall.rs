@@ -137,7 +137,11 @@ pub struct RecallBounds {
 
 impl Default for RecallBounds {
     fn default() -> Self {
-        Self { limit: 8, token_budget: 5000, voice_limit: 32 }
+        Self {
+            limit: 8,
+            token_budget: 5000,
+            voice_limit: 32,
+        }
     }
 }
 
@@ -167,7 +171,11 @@ impl<'a> RecallEngine<'a> {
         project_bank: &'a BankId,
         shared_bank: Option<&'a BankId>,
     ) -> Self {
-        Self { stores, project_bank, shared_bank }
+        Self {
+            stores,
+            project_bank,
+            shared_bank,
+        }
     }
 
     /// Recalls through vector, graph, episodic, and working-memory voices.
@@ -224,10 +232,11 @@ impl<'a> RecallEngine<'a> {
     ) -> Result<()> {
         if let Some(query_vector) = query_embedding.and_then(normalize) {
             let vector = vector_candidates(store, &query_vector, limit)?;
-            voices
-                .entry(RecallVoice::Vector)
-                .or_default()
-                .extend(vector.into_iter().map(|candidate| VoiceCandidate::new(candidate, broadened)));
+            voices.entry(RecallVoice::Vector).or_default().extend(
+                vector
+                    .into_iter()
+                    .map(|candidate| VoiceCandidate::new(candidate, broadened)),
+            );
         }
         {
             let graph = voices.entry(RecallVoice::Graph).or_default();
@@ -279,7 +288,11 @@ struct VoiceCandidate {
 
 impl VoiceCandidate {
     fn new(candidate: RankedCandidate, broadened: bool) -> Self {
-        Self { record: candidate.record, native: candidate.score.clamp(0.0, 1.0), broadened }
+        Self {
+            record: candidate.record,
+            native: candidate.score.clamp(0.0, 1.0),
+            broadened,
+        }
     }
 }
 
@@ -307,13 +320,19 @@ fn vector_candidates(
         }
     }
     output.sort_by(|left, right| {
-        right.score.total_cmp(&left.score).then_with(|| left.record.id.cmp(&right.record.id))
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.record.id.cmp(&right.record.id))
     });
     output.truncate(limit);
     Ok(output)
 }
 
-fn fuse(mut voices: HashMap<RecallVoice, Vec<VoiceCandidate>>, bounds: RecallBounds) -> Vec<RecallResult> {
+fn fuse(
+    mut voices: HashMap<RecallVoice, Vec<VoiceCandidate>>,
+    bounds: RecallBounds,
+) -> Vec<RecallResult> {
     let mut fused = HashMap::<String, RecallResult>::new();
     for voice in RecallVoice::ALL {
         let Some(candidates) = voices.get_mut(&voice) else {
@@ -342,12 +361,14 @@ fn fuse(mut voices: HashMap<RecallVoice, Vec<VoiceCandidate>>, bounds: RecallBou
                 0.01,
                 voice.weight() / (RRF_K + (rank + 1) as f64),
             );
-            let result = fused.entry(candidate.record.id.clone()).or_insert_with(|| RecallResult {
-                memory: candidate.record.clone(),
-                score: 0.0,
-                voice_scores: VoiceScores::default(),
-                broadened: candidate.broadened,
-            });
+            let result = fused
+                .entry(candidate.record.id.clone())
+                .or_insert_with(|| RecallResult {
+                    memory: candidate.record.clone(),
+                    score: 0.0,
+                    voice_scores: VoiceScores::default(),
+                    broadened: candidate.broadened,
+                });
             result.score += contribution;
             result.voice_scores.add(voice, contribution);
             result.broadened |= candidate.broadened;
@@ -473,7 +494,11 @@ fn query_terms(query: &str) -> Vec<String> {
 }
 
 fn normalized_content(content: &str) -> String {
-    content.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn looks_temporal(query: &str) -> bool {
@@ -541,15 +566,26 @@ mod tests {
         assert!((RecallVoice::Episodic.weight() - 0.25).abs() < f64::EPSILON);
         assert!((RecallVoice::Working.weight() - 0.15).abs() < f64::EPSILON);
         assert!((RRF_K - 60.0).abs() < f64::EPSILON);
-        let sum = RecallVoice::ALL.iter().map(|voice| voice.weight()).sum::<f64>();
-        assert!((sum - 1.0).abs() < 1e-12, "weights form a convex combination");
+        let sum = RecallVoice::ALL
+            .iter()
+            .map(|voice| voice.weight())
+            .sum::<f64>();
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "weights form a convex combination"
+        );
         assert_eq!(RecallVoice::ALL.len(), 4);
     }
 
     #[test]
     fn a_working_hit_reports_only_its_own_voice_contribution() {
         let store = store("project");
-        save(&store, "mem-working", "User prefers Rust for systems work", 0.5);
+        save(
+            &store,
+            "mem-working",
+            "User prefers Rust for systems work",
+            0.5,
+        );
         let engine = RecallEngine::new(std::slice::from_ref(&store), store.bank(), None);
         let results = engine
             .recall("Rust systems", None, RecallBounds::default())
@@ -572,20 +608,34 @@ mod tests {
         save(&store, "mem-lexical", "SQLite WAL notes only", 0.5);
         let generation = store.generations().expect("generations").durable;
         store
-            .replace_vectors(generation, "test-model", &[VectorEntry {
-                memory_id: "mem-both",
-                vector: &[1.0, 0.0],
-            }])
+            .replace_vectors(
+                generation,
+                "test-model",
+                &[VectorEntry {
+                    memory_id: "mem-both",
+                    vector: &[1.0, 0.0],
+                }],
+            )
             .expect("vectors");
 
         let engine = RecallEngine::new(std::slice::from_ref(&store), store.bank(), None);
         let results = engine
-            .recall("SQLite WAL checkpoint", Some(&[1.0, 0.0]), RecallBounds::default())
+            .recall(
+                "SQLite WAL checkpoint",
+                Some(&[1.0, 0.0]),
+                RecallBounds::default(),
+            )
             .expect("recall");
 
         assert_eq!(results[0].memory.id, "mem-both");
-        assert!(results[0].voice_scores.vector > 0.0, "vector voice participated");
-        assert!(results[0].voice_scores.working > 0.0, "working voice participated");
+        assert!(
+            results[0].voice_scores.vector > 0.0,
+            "vector voice participated"
+        );
+        assert!(
+            results[0].voice_scores.working > 0.0,
+            "working voice participated"
+        );
         assert!(results[0].voice_scores.total() > 0.0);
 
         let lexical_only = results
@@ -602,8 +652,18 @@ mod tests {
     #[test]
     fn graph_and_fact_voices_contribute_after_reconciliation() {
         let store = store("project");
-        save(&store, "mem-a", "the retention cursor advances on settle", 0.6);
-        save(&store, "mem-b", "the retention cursor rewinds when evicted", 0.6);
+        save(
+            &store,
+            "mem-a",
+            "the retention cursor advances on settle",
+            0.6,
+        );
+        save(
+            &store,
+            "mem-b",
+            "the retention cursor rewinds when evicted",
+            0.6,
+        );
         link::reconcile(&store).expect("reconcile");
         assert!(store.counts().expect("counts").triples > 0);
 
@@ -620,7 +680,12 @@ mod tests {
     fn duplicate_content_across_banks_is_deduplicated_and_summed() {
         let project = store("project");
         let shared = store("default");
-        save(&project, "mem-project", "User prefers tabs over spaces", 0.5);
+        save(
+            &project,
+            "mem-project",
+            "User prefers tabs over spaces",
+            0.5,
+        );
         save(&shared, "mem-shared", "user  prefers TABS over spaces", 0.5);
 
         let stores = [project.clone(), shared.clone()];
@@ -636,11 +701,23 @@ mod tests {
     fn limit_and_token_budget_bound_the_projection() {
         let store = store("project");
         for index in 0..12 {
-            save(&store, &format!("mem-{index:02}"), &format!("budget token note {index}"), 0.5);
+            save(
+                &store,
+                &format!("mem-{index:02}"),
+                &format!("budget token note {index}"),
+                0.5,
+            );
         }
         let engine = RecallEngine::new(std::slice::from_ref(&store), store.bank(), None);
         let limited = engine
-            .recall("budget token note", None, RecallBounds { limit: 3, ..RecallBounds::default() })
+            .recall(
+                "budget token note",
+                None,
+                RecallBounds {
+                    limit: 3,
+                    ..RecallBounds::default()
+                },
+            )
             .expect("recall");
         assert_eq!(limited.len(), 3);
 
@@ -648,10 +725,17 @@ mod tests {
             .recall(
                 "budget token note",
                 None,
-                RecallBounds { limit: 12, token_budget: 1, ..RecallBounds::default() },
+                RecallBounds {
+                    limit: 12,
+                    token_budget: 1,
+                    ..RecallBounds::default()
+                },
             )
             .expect("recall");
-        assert!(tight.len() <= 1, "a one-token budget cannot admit every row");
+        assert!(
+            tight.len() <= 1,
+            "a one-token budget cannot admit every row"
+        );
     }
 
     #[test]
@@ -663,7 +747,9 @@ mod tests {
             .recall("what did we do recently", None, RecallBounds::default())
             .expect("recall");
         assert!(
-            results.iter().any(|result| result.memory.id == "mem-recent"),
+            results
+                .iter()
+                .any(|result| result.memory.id == "mem-recent"),
             "temporal wording pulls in recent working rows"
         );
     }
@@ -672,12 +758,8 @@ mod tests {
     fn shared_fallback_strips_project_bank_tokens() {
         let project = bank("alpha-0123456789ab");
         let shared = bank("default");
-        let fallback = derive_shared_fallback(
-            "alpha 0123456789ab prefers rust",
-            &project,
-            &shared,
-        )
-        .expect("fallback");
+        let fallback = derive_shared_fallback("alpha 0123456789ab prefers rust", &project, &shared)
+            .expect("fallback");
         assert_eq!(fallback, "prefers rust");
         assert!(derive_shared_fallback("alpha", &project, &shared).is_none());
         assert!(derive_shared_fallback("anything", &shared, &shared).is_none());
@@ -687,7 +769,12 @@ mod tests {
     fn broadened_shared_hits_are_marked() {
         let project = store("alpha-0123456789ab");
         let shared = store("default");
-        save(&project, "mem-project", "project local note about rust", 0.5);
+        save(
+            &project,
+            "mem-project",
+            "project local note about rust",
+            0.5,
+        );
         save(&shared, "mem-shared", "shared note about rust tooling", 0.5);
         let stores = [project.clone(), shared.clone()];
         let engine = RecallEngine::new(&stores, project.bank(), Some(shared.bank()));
@@ -698,7 +785,10 @@ mod tests {
             .iter()
             .find(|result| result.memory.id == "mem-shared")
             .expect("shared hit");
-        assert!(shared_hit.broadened, "shared-only evidence is marked broadened");
+        assert!(
+            shared_hit.broadened,
+            "shared-only evidence is marked broadened"
+        );
         let project_hit = results
             .iter()
             .find(|result| result.memory.id == "mem-project")
@@ -711,8 +801,14 @@ mod tests {
         let store = store("project");
         save(&store, "mem-any", "some durable content", 0.5);
         let engine = RecallEngine::new(std::slice::from_ref(&store), store.bank(), None);
-        assert!(engine.recall("", None, RecallBounds::default()).expect("recall").is_empty());
-        assert!(engine.recall("!!! ???", None, RecallBounds::default()).expect("recall").is_empty());
+        assert!(engine
+            .recall("", None, RecallBounds::default())
+            .expect("recall")
+            .is_empty());
+        assert!(engine
+            .recall("!!! ???", None, RecallBounds::default())
+            .expect("recall")
+            .is_empty());
     }
 
     #[test]

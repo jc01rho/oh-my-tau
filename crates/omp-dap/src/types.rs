@@ -1046,7 +1046,9 @@ mod tests {
         let message: DapMessage = serde_json::from_value(value).unwrap();
         match message {
             DapMessage::Response {
-                request_seq, success, ..
+                request_seq,
+                success,
+                ..
             } => {
                 assert_eq!(request_seq, 3);
                 assert!(success);
@@ -1094,7 +1096,10 @@ mod tests {
 
     #[test]
     fn access_type_and_context_parse_the_tool_spelling() {
-        assert_eq!(DapAccessType::parse("readWrite"), Some(DapAccessType::ReadWrite));
+        assert_eq!(
+            DapAccessType::parse("readWrite"),
+            Some(DapAccessType::ReadWrite)
+        );
         assert_eq!(DapAccessType::ReadWrite.as_str(), "readWrite");
         assert_eq!(
             serde_json::to_value(DapAccessType::ReadWrite).unwrap(),
@@ -1118,7 +1123,10 @@ mod tests {
             source.location(Some(42), Some(3)).as_deref(),
             Some("/tmp/main.c:42:3")
         );
-        assert_eq!(source.location(Some(42), None).as_deref(), Some("/tmp/main.c:42"));
+        assert_eq!(
+            source.location(Some(42), None).as_deref(),
+            Some("/tmp/main.c:42")
+        );
         assert_eq!(source.location(None, None).as_deref(), Some("/tmp/main.c"));
         assert_eq!(DapSource::default().location(Some(1), None), None);
     }

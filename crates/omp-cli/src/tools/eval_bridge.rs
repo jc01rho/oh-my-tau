@@ -1328,10 +1328,16 @@ mod tests {
         // name because this build has no tab supervisor / CDP transport.
         for action in ["tabs", "targets", "close"] {
             let err = b
-                .dispatch("__omp_prelude__", json!({"name": "browser", "parameters": {"action": action}}))
+                .dispatch(
+                    "__omp_prelude__",
+                    json!({"name": "browser", "parameters": {"action": action}}),
+                )
                 .await
                 .unwrap_err();
-            assert!(err.contains(&format!("browser.{action}")), "{action}: {err}");
+            assert!(
+                err.contains(&format!("browser.{action}")),
+                "{action}: {err}"
+            );
             assert!(err.contains("browser transport"), "{action}: {err}");
         }
         // The family's own schema runs first, so a bad call reports the schema
@@ -1345,7 +1351,10 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("unknown property \"name\""), "{err}");
         let err = b
-            .dispatch("__omp_prelude__", json!({"name": "browser", "parameters": {}}))
+            .dispatch(
+                "__omp_prelude__",
+                json!({"name": "browser", "parameters": {}}),
+            )
             .await
             .unwrap_err();
         assert!(err.contains("missing string property \"action\""), "{err}");
@@ -1365,7 +1374,10 @@ mod tests {
         // `capabilities` is a read-only probe: it answers with the desktop
         // report in the `{text, details}` shape the facade reads.
         let caps = b
-            .dispatch("__omp_prelude__", json!({"name": "computer", "parameters": {"action": "capabilities"}}))
+            .dispatch(
+                "__omp_prelude__",
+                json!({"name": "computer", "parameters": {"action": "capabilities"}}),
+            )
             .await
             .unwrap();
         assert!(caps["text"].is_string(), "{caps}");
@@ -1379,13 +1391,19 @@ mod tests {
 
         // `close` ends this cell's session; the next call reopens one.
         let closed = b
-            .dispatch("__omp_prelude__", json!({"name": "computer", "parameters": {"action": "close"}}))
+            .dispatch(
+                "__omp_prelude__",
+                json!({"name": "computer", "parameters": {"action": "close"}}),
+            )
             .await
             .unwrap();
         assert_eq!(closed["details"], json!({"closed": true}), "{closed}");
         assert_eq!(closed["text"], json!("Closed computer session"), "{closed}");
         let reopened = b
-            .dispatch("__omp_prelude__", json!({"name": "computer", "parameters": {"action": "capabilities"}}))
+            .dispatch(
+                "__omp_prelude__",
+                json!({"name": "computer", "parameters": {"action": "capabilities"}}),
+            )
             .await
             .unwrap();
         assert!(reopened["details"].is_object(), "{reopened}");
@@ -1400,7 +1418,10 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("computer.run"), "{err}");
         let err = b
-            .dispatch("__omp_prelude__", json!({"name": "computer", "parameters": {"action": "frobnicate"}}))
+            .dispatch(
+                "__omp_prelude__",
+                json!({"name": "computer", "parameters": {"action": "frobnicate"}}),
+            )
             .await
             .unwrap_err();
         assert!(err.contains("action must be one of"), "{err}");
@@ -1417,25 +1438,40 @@ mod tests {
                 after: None,
             },
         );
-        let browser = b.dispatch("__prelude__", json!({"name": "browser"})).await.unwrap();
+        let browser = b
+            .dispatch("__prelude__", json!({"name": "browser"}))
+            .await
+            .unwrap();
         assert_eq!(browser["name"], json!("browser"), "{browser}");
         assert_eq!(browser["exports"], json!(["browser"]), "{browser}");
         assert_eq!(browser["approval"], json!("exec"), "{browser}");
         assert_eq!(browser["languages"], json!(["js", "py"]), "{browser}");
 
-        let computer = b.dispatch("__prelude__", json!({"name": "computer"})).await.unwrap();
+        let computer = b
+            .dispatch("__prelude__", json!({"name": "computer"}))
+            .await
+            .unwrap();
         assert_eq!(computer["name"], json!("computer"), "{computer}");
         assert_eq!(computer["exports"], json!(["computer"]), "{computer}");
         assert_eq!(computer["inlineDocumentation"], json!(true), "{computer}");
 
         // Tool names still answer with the tool descriptor.
-        let read = b.dispatch("__prelude__", json!({"name": "read"})).await.unwrap();
+        let read = b
+            .dispatch("__prelude__", json!({"name": "read"}))
+            .await
+            .unwrap();
         assert_eq!(read["name"], json!("read"), "{read}");
         assert!(read["parameters"].is_object(), "{read}");
 
         // An unknown name is still refused.
-        let err = b.dispatch("__prelude__", json!({"name": "nope"})).await.unwrap_err();
-        assert!(err.contains("prelude capability not supported: nope"), "{err}");
+        let err = b
+            .dispatch("__prelude__", json!({"name": "nope"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("prelude capability not supported: nope"),
+            "{err}"
+        );
     }
 
     #[test]

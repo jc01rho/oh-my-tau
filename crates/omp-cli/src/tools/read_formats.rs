@@ -296,18 +296,16 @@ pub fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 3 <= bytes.len() => {
-                match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                    (Some(hi), Some(lo)) => {
-                        out.push(hi * 16 + lo);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' if i + 3 <= bytes.len() => match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi * 16 + lo);
+                    i += 3;
                 }
-            }
+                _ => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -397,7 +395,10 @@ pub enum SqliteSelector {
         filter: Option<String>,
     },
     /// `db.sqlite?q=SELECT ...`.
-    Raw { sql: String, page: Option<SqlitePage> },
+    Raw {
+        sql: String,
+        page: Option<SqlitePage>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,7 +413,14 @@ const FORBIDDEN_KEYWORD_ERROR: &str =
     "SQLite 'where' clause must not contain LIMIT/OFFSET/UNION/INTERSECT/EXCEPT/ATTACH/DETACH/PRAGMA; use '?q=SELECT ...' for raw SQL";
 
 const FORBIDDEN_WHERE_KEYWORDS: [&str; 8] = [
-    "limit", "offset", "union", "intersect", "except", "attach", "detach", "pragma",
+    "limit",
+    "offset",
+    "union",
+    "intersect",
+    "except",
+    "attach",
+    "detach",
+    "pragma",
 ];
 
 /// Scan a `where=` clause, tracking quoted literals, and reject the SQL
@@ -582,7 +590,10 @@ pub fn parse_sqlite_selector(sub_path: &str, query_string: &str) -> Result<Sqlit
     }
 
     let filter = validate_where(param(&params, "where"))?;
-    let order = param(&params, "order").map(str::trim).filter(|o| !o.is_empty()).map(str::to_string);
+    let order = param(&params, "order")
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .map(str::to_string);
     let has_query_params = has_param(&params, "limit")
         || has_param(&params, "offset")
         || order.is_some()
@@ -784,7 +795,10 @@ fn build_vertical_blocks(columns: &[String], rows: &[Vec<String>]) -> String {
             for (column_index, column) in columns.iter().enumerate() {
                 let name = sanitize_cell(column);
                 let value = sanitize_cell(row.get(column_index).map_or("", String::as_str));
-                block.push(truncate_width(&format!("{name}: {value}"), MAX_RENDER_WIDTH));
+                block.push(truncate_width(
+                    &format!("{name}: {value}"),
+                    MAX_RENDER_WIDTH,
+                ));
             }
             block.join("\n")
         })
@@ -888,7 +902,10 @@ pub fn render_table_list(tables: &[(String, u64, bool)]) -> String {
     tables
         .iter()
         .map(|(name, count, at_least)| {
-            truncate_width(&format!("{name} ({})", row_count_label(*count, *at_least)), MAX_RENDER_WIDTH)
+            truncate_width(
+                &format!("{name} ({})", row_count_label(*count, *at_least)),
+                MAX_RENDER_WIDTH,
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -974,7 +991,10 @@ pub fn sqlite_read(path: &Path, sub_path: &str, query_string: &str) -> Result<St
             }
             Ok(render_table_list(&tables))
         }
-        SqliteSelector::Schema { table, sample_limit } => {
+        SqliteSelector::Schema {
+            table,
+            sample_limit,
+        } => {
             let create_sql = table_master_sql(&conn, &table)?;
             let mut sample = format!("SELECT * FROM {} LIMIT {sample_limit}", quote_ident(&table));
             let (columns, rows) = {
@@ -986,7 +1006,11 @@ pub fn sqlite_read(path: &Path, sub_path: &str, query_string: &str) -> Result<St
                 .map(|line| truncate_width(&sanitize_cell(line), MAX_RENDER_WIDTH))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let _ = write!(out, "\n\nSample rows:\n{}", build_ascii_table(&columns, &rows));
+            let _ = write!(
+                out,
+                "\n\nSample rows:\n{}",
+                build_ascii_table(&columns, &rows)
+            );
             if rows.len() < sample_limit {
                 // Nothing to page; the hint would be noise.
             } else {
@@ -1026,7 +1050,11 @@ pub fn sqlite_read(path: &Path, sub_path: &str, query_string: &str) -> Result<St
             let sql = format!(
                 "SELECT * FROM {} WHERE {} = ? LIMIT 1",
                 quote_ident(&table),
-                if column.starts_with('"') { column.clone() } else { quote_ident(&column) }
+                if column.starts_with('"') {
+                    column.clone()
+                } else {
+                    quote_ident(&column)
+                }
             );
             let (columns, rows) = {
                 let mut stmt = conn.prepare(&sql)?;
@@ -1035,12 +1063,16 @@ pub fn sqlite_read(path: &Path, sub_path: &str, query_string: &str) -> Result<St
             };
             match rows.first() {
                 Some(row) => Ok(render_row(&columns, row)),
-                None => Ok(format!(
-                    "No row found in table '{table}' for key '{key}'."
-                )),
+                None => Ok(format!("No row found in table '{table}' for key '{key}'.")),
             }
         }
-        SqliteSelector::Query { table, limit, offset, order, filter } => {
+        SqliteSelector::Query {
+            table,
+            limit,
+            offset,
+            order,
+            filter,
+        } => {
             let columns = table_columns(&conn, &table)?;
             let where_clause = filter
                 .as_deref()
@@ -1062,10 +1094,8 @@ pub fn sqlite_read(path: &Path, sub_path: &str, query_string: &str) -> Result<St
                 rows.truncate(limit);
             }
             let total = if has_more {
-                let count_sql = format!(
-                    "SELECT COUNT(*) FROM {}{where_clause}",
-                    quote_ident(&table)
-                );
+                let count_sql =
+                    format!("SELECT COUNT(*) FROM {}{where_clause}", quote_ident(&table));
                 let mut stmt = conn.prepare(&count_sql)?;
                 stmt.query_row([], |row| row.get::<_, i64>(0)).unwrap_or(0)
             } else {
@@ -1123,7 +1153,10 @@ pub fn sqlite_read(path: &Path, sub_path: &str, query_string: &str) -> Result<St
                             page.limit,
                             page.offset + rows.len()
                         );
-                        let _ = write!(out, "\n[More rows; append ?{next} to the database path to continue]");
+                        let _ = write!(
+                            out,
+                            "\n[More rows; append ?{next} to the database path to continue]"
+                        );
                     }
                     None => {
                         let _ = write!(
@@ -1358,7 +1391,10 @@ fn parse_tar_octal(field: &[u8]) -> u64 {
 
 fn tar_field(bytes: &[u8], start: usize, len: usize) -> String {
     let slice = bytes.get(start..start + len).unwrap_or(&[]);
-    let end = slice.iter().position(|byte| *byte == 0).unwrap_or(slice.len());
+    let end = slice
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(slice.len());
     String::from_utf8_lossy(&slice[..end]).trim().to_string()
 }
 
@@ -1469,7 +1505,10 @@ pub fn render_entries<'a>(entries: impl IntoIterator<Item = &'a ArchiveEntry>) -
         .map(|(entry, label)| {
             let label = truncate_width(&label, width);
             if entry.is_dir {
-                format!("{label}{}", " ".repeat(width - label.chars().count().min(width)))
+                format!(
+                    "{label}{}",
+                    " ".repeat(width - label.chars().count().min(width))
+                )
             } else {
                 format!(
                     "{label}{}{:>8}",
@@ -1690,9 +1729,9 @@ fn parse_path_steps(path: &str) -> Result<Vec<PathStep>> {
                 } else if inner.len() >= 2 && inner.starts_with('"') && inner.ends_with('"') {
                     steps.push(PathStep::Key(inner[1..inner.len() - 1].to_string()));
                 } else {
-                    let index: isize = inner
-                        .parse()
-                        .with_context(|| format!("bad array index '[{inner}]' in JSON filter '{path}'"))?;
+                    let index: isize = inner.parse().with_context(|| {
+                        format!("bad array index '[{inner}]' in JSON filter '{path}'")
+                    })?;
                     steps.push(PathStep::Index(index));
                 }
                 i = end + 1;
@@ -1750,7 +1789,11 @@ fn apply_steps(steps: &[PathStep], value: &Value) -> Result<Vec<Value>> {
                 }
                 PathStep::Slice(from, to) => {
                     let Some(array) = value.as_array() else {
-                        bail!("cannot slice {} with [:{}]", json_type(value), to.map_or(0, |v| v));
+                        bail!(
+                            "cannot slice {} with [:{}]",
+                            json_type(value),
+                            to.map_or(0, |v| v)
+                        );
                     };
                     let len = isize::try_from(array.len()).unwrap_or(isize::MAX);
                     let resolve = |bound: isize| {
@@ -1790,7 +1833,9 @@ fn apply_function(name: &str, value: &Value) -> Result<Vec<Value>> {
                 let mut keys: Vec<&String> = map.keys().collect();
                 keys.sort();
                 Ok(vec![Value::Array(
-                    keys.into_iter().map(|key| Value::String(key.clone())).collect(),
+                    keys.into_iter()
+                        .map(|key| Value::String(key.clone()))
+                        .collect(),
                 )])
             }
             Value::Array(items) => Ok(vec![Value::Array(
@@ -1830,7 +1875,9 @@ fn apply_function(name: &str, value: &Value) -> Result<Vec<Value>> {
             .into_iter()
             .collect()),
         "empty" => Ok(Vec::new()),
-        other => bail!("JSON filter '{other}' is not supported by this build; supported: {SUPPORTED_FILTERS}"),
+        other => bail!(
+            "JSON filter '{other}' is not supported by this build; supported: {SUPPORTED_FILTERS}"
+        ),
     }
 }
 
@@ -1893,7 +1940,12 @@ fn render_json_value(value: &Value, selector: &JsonSelector) -> String {
     }
 }
 
-fn json_hint(selector: &JsonSelector, page: &JsonPage, next: usize, remaining: Option<usize>) -> String {
+fn json_hint(
+    selector: &JsonSelector,
+    page: &JsonPage,
+    next: usize,
+    remaining: Option<usize>,
+) -> String {
     let mut flags = String::new();
     if selector.raw {
         flags.push_str("&raw=true");
@@ -2010,8 +2062,8 @@ pub fn json_query(text: &str, selector: &JsonSelector) -> Result<String> {
 /// # Errors
 /// Unreadable file, invalid JSON, or a filter failure.
 pub fn json_read(path: &Path, selector: &JsonSelector) -> Result<String> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     json_query(&text, selector)
 }
 
@@ -2047,7 +2099,10 @@ fn join_source(value: Option<&Value>) -> String {
 pub fn format_notebook(text: &str) -> Result<String> {
     let doc: Value = serde_json::from_str(text).context("invalid notebook JSON")?;
     let major = doc.get("nbformat").and_then(Value::as_u64).unwrap_or(4);
-    let minor = doc.get("nbformat_minor").and_then(Value::as_u64).unwrap_or(0);
+    let minor = doc
+        .get("nbformat_minor")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let language = doc
         .pointer("/metadata/kernelspec/language")
         .or_else(|| doc.pointer("/metadata/language_info/name"))
@@ -2147,7 +2202,10 @@ fn render_notebook_output(out: &mut String, output: &Value) {
             }
         }
         "error" => {
-            let name = output.get("ename").and_then(Value::as_str).unwrap_or("Error");
+            let name = output
+                .get("ename")
+                .and_then(Value::as_str)
+                .unwrap_or("Error");
             let value = output.get("evalue").and_then(Value::as_str).unwrap_or("");
             let _ = writeln!(out, "[error] {name}: {value}");
             for line in output
@@ -2290,7 +2348,12 @@ pub fn binary_metadata(display_path: &str, bytes: &[u8]) -> String {
 
     let mut out = String::new();
     let _ = writeln!(out, "path: {display_path}");
-    let _ = writeln!(out, "size: {} ({} bytes)", fmt_bytes(bytes.len()), bytes.len());
+    let _ = writeln!(
+        out,
+        "size: {} ({} bytes)",
+        fmt_bytes(bytes.len()),
+        bytes.len()
+    );
     let _ = writeln!(out, "kind: {}", binary_kind_label(head));
     let _ = writeln!(out, "sha256: {}", sha256_hex(bytes));
     let _ = writeln!(out, "entropy: {:.2} bits/byte", shannon_entropy(bytes));
@@ -2408,7 +2471,9 @@ pub fn binary_read(display_path: &str, bytes: &[u8], view: &str) -> Result<Strin
             .trim()
             .parse()
             .with_context(|| format!("hexdump length must be an integer; got '{len}'"))?;
-        return Ok(hexdump(bytes, offset, len.min(MAX_BYTES)).trim_end().to_string());
+        return Ok(hexdump(bytes, offset, len.min(MAX_BYTES))
+            .trim_end()
+            .to_string());
     }
     bail!("Unsupported binary view ':{view}'; use :strings, :hex or :hex:OFFSET:LEN")
 }
@@ -2761,7 +2826,10 @@ pub struct SourceSummary {
 /// Render `pi_ast` summary segments with omp's elision marker and the
 /// "re-read needed ranges" footer.
 #[must_use]
-pub fn render_summary(result: &pi_ast::summary::SummaryResult, selector_base: &str) -> (String, u32) {
+pub fn render_summary(
+    result: &pi_ast::summary::SummaryResult,
+    selector_base: &str,
+) -> (String, u32) {
     let mut out = String::new();
     let mut elided = 0u32;
     let mut ranges: Vec<String> = Vec::new();
@@ -2877,12 +2945,21 @@ mod tests {
         assert_eq!(sniff_format(b"\x89PNG\r\n\x1a\n"), Some(Format::Image));
         assert_eq!(sniff_format(b"plain text"), None);
 
-        assert_eq!(extension_format(Path::new("nb.ipynb")), Some(Format::Notebook));
+        assert_eq!(
+            extension_format(Path::new("nb.ipynb")),
+            Some(Format::Notebook)
+        );
         assert_eq!(extension_format(Path::new("a.json")), Some(Format::Json));
-        assert_eq!(extension_format(Path::new("a.jsonl")), Some(Format::JsonLines));
+        assert_eq!(
+            extension_format(Path::new("a.jsonl")),
+            Some(Format::JsonLines)
+        );
         assert_eq!(extension_format(Path::new("a.tar.gz")), Some(Format::TarGz));
         assert_eq!(extension_format(Path::new("a.tgz")), Some(Format::TarGz));
-        assert_eq!(extension_format(Path::new("report.docx")), Some(Format::Zip));
+        assert_eq!(
+            extension_format(Path::new("report.docx")),
+            Some(Format::Zip)
+        );
 
         // Magic wins for containers; the notebook extension wins over JSON magic.
         assert_eq!(
@@ -2936,16 +3013,21 @@ mod tests {
             parse_sqlite_selector("", "q=SELECT%201&limit=2&offset=4").unwrap(),
             SqliteSelector::Raw {
                 sql: "SELECT 1".to_string(),
-                page: Some(SqlitePage { limit: 2, offset: 4 })
+                page: Some(SqlitePage {
+                    limit: 2,
+                    offset: 4
+                })
             }
         );
     }
 
     #[test]
     fn sqlite_selector_rejects_unsafe_where_and_mixed_forms() {
-        let err = parse_sqlite_selector("users", "where=1%3D1%3B%20DROP%20TABLE%20users").unwrap_err();
+        let err =
+            parse_sqlite_selector("users", "where=1%3D1%3B%20DROP%20TABLE%20users").unwrap_err();
         assert!(
-            err.to_string().contains("comments or statement terminators"),
+            err.to_string()
+                .contains("comments or statement terminators"),
             "{err}"
         );
         let err = parse_sqlite_selector("users", "where=id%3E1%20LIMIT%205").unwrap_err();
@@ -2970,7 +3052,10 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(sniff_format(&std::fs::read(&path).unwrap()), Some(Format::Sqlite));
+        assert_eq!(
+            sniff_format(&std::fs::read(&path).unwrap()),
+            Some(Format::Sqlite)
+        );
 
         let listing = sqlite_read(&path, "", "").unwrap();
         assert!(listing.contains("users (3 rows)"), "{listing}");
@@ -2991,7 +3076,10 @@ mod tests {
         assert!(missing.contains("No row found"), "{missing}");
 
         let filtered = sqlite_read(&path, "users", "where=score%3E8").unwrap();
-        assert!(filtered.contains("ada") && !filtered.contains("grace"), "{filtered}");
+        assert!(
+            filtered.contains("ada") && !filtered.contains("grace"),
+            "{filtered}"
+        );
 
         let raw = sqlite_read(&path, "", "q=SELECT%20count(*)%20AS%20n%20FROM%20users").unwrap();
         assert!(raw.contains("| n |"), "{raw}");
@@ -3119,7 +3207,10 @@ mod tests {
             .find(|entry| entry.path == "notes/readme.txt")
             .unwrap();
         assert_eq!(index.read(entry).unwrap(), b"hello zip");
-        assert!(index.entries().iter().any(|entry| entry.path == "notes/" && entry.is_dir));
+        assert!(index
+            .entries()
+            .iter()
+            .any(|entry| entry.path == "notes/" && entry.is_dir));
     }
 
     #[test]
@@ -3222,7 +3313,10 @@ mod tests {
 
         let selector = parse_json_selector("q=.a[]").unwrap();
         let err = json_query("{\"a\":1}", &selector).unwrap_err();
-        assert!(err.to_string().contains("cannot iterate over number"), "{err}");
+        assert!(
+            err.to_string().contains("cannot iterate over number"),
+            "{err}"
+        );
 
         let selector = parse_json_selector("q=map(.a)").unwrap();
         let err = json_query("{}", &selector).unwrap_err();
@@ -3273,7 +3367,10 @@ mod tests {
         assert!(meta.contains("entropy: "), "{meta}");
 
         let strings = extract_strings(&bytes, 4);
-        assert!(strings.iter().any(|text| text == "hello world"), "{strings:?}");
+        assert!(
+            strings.iter().any(|text| text == "hello world"),
+            "{strings:?}"
+        );
 
         let dump = hexdump(&bytes, 0, 16);
         assert!(dump.starts_with("00000000  7f 45 4c 46"), "{dump}");
@@ -3281,7 +3378,9 @@ mod tests {
 
         let view = binary_read("x.bin", &bytes, "strings").unwrap();
         assert!(view.contains("hello world"), "{view}");
-        assert!(binary_read("x.bin", &bytes, "hex:8:8").unwrap().starts_with("00000008"));
+        assert!(binary_read("x.bin", &bytes, "hex:8:8")
+            .unwrap()
+            .starts_with("00000008"));
         assert!(binary_read("x.bin", &bytes, "bogus").is_err());
     }
 
@@ -3291,7 +3390,8 @@ mod tests {
     fn pdf_metadata_and_text_fallback() {
         use std::io::Write as _;
         let content = b"BT /F1 12 Tf 72 720 Td (Hello PDF) Tj T* (Second line) Tj ET";
-        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(content).unwrap();
         let stream = encoder.finish().unwrap();
 
@@ -3326,7 +3426,11 @@ mod tests {
         let summary = summarize_source(code, Path::new("x.rs"), None)
             .unwrap()
             .expect("rust parses");
-        assert!(summary.rendered.contains("fn a() {"), "{}", summary.rendered);
+        assert!(
+            summary.rendered.contains("fn a() {"),
+            "{}",
+            summary.rendered
+        );
         assert!(
             summary.rendered.contains("lines elided"),
             "{}",
@@ -3337,20 +3441,15 @@ mod tests {
         assert_eq!(summary.total_lines, 5);
 
         // An unsupported language falls back rather than lying about elisions.
-        assert!(
-            summarize_source("plain\n", Path::new("x.txt"), None)
-                .unwrap()
-                .is_none()
-        );
+        assert!(summarize_source("plain\n", Path::new("x.txt"), None)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn resolves_blocks_and_boundaries_with_pi_ast() {
         let code = "fn a() {\n  work();\n}\n";
-        assert_eq!(
-            block_at(code, Path::new("x.rs"), 1).unwrap(),
-            Some((1, 3))
-        );
+        assert_eq!(block_at(code, Path::new("x.rs"), 1).unwrap(), Some((1, 3)));
         assert_eq!(block_at(code, Path::new("x.rs"), 3).unwrap(), None);
         assert_eq!(
             enclosing_boundaries(code, Path::new("x.rs"), &[(1, 1)]).unwrap(),

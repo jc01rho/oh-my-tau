@@ -76,7 +76,11 @@ pub fn summary(report: &BankDiagnostic) -> String {
         report.counts.facts,
         report.counts.triples,
         report.database_bytes,
-        if healthy(report) { "healthy" } else { "needs attention" }
+        if healthy(report) {
+            "healthy"
+        } else {
+            "needs attention"
+        }
     )
 }
 
@@ -116,7 +120,9 @@ fn remove_with_retry(path: &Path) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
     }
-    Err(crate::Error::Io(io::Error::other("database removal exhausted its retry window")))
+    Err(crate::Error::Io(io::Error::other(
+        "database removal exhausted its retry window",
+    )))
 }
 
 #[cfg(test)]
@@ -124,16 +130,16 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::{
-        bank::BankId,
-        store::NewMemory,
-        test_support::temp_root,
-    };
+    use crate::{bank::BankId, store::NewMemory, test_support::temp_root};
 
     fn store() -> BankStore {
         let root = temp_root("diagnose");
-        BankStore::open(root.join("mnemopi.db"), BankId::configured("test").expect("bank"), root)
-            .expect("store")
+        BankStore::open(
+            root.join("mnemopi.db"),
+            BankId::configured("test").expect("bank"),
+            root,
+        )
+        .expect("store")
     }
 
     #[test]
@@ -153,7 +159,9 @@ mod tests {
             })
             .expect("save");
         let generation = store.generations().expect("generations").durable;
-        store.replace_vectors(generation, "test-model", &[]).expect("vectors");
+        store
+            .replace_vectors(generation, "test-model", &[])
+            .expect("vectors");
         crate::link::reconcile(&store).expect("graph");
 
         let report = inspect(&store).expect("inspect");
@@ -190,7 +198,10 @@ mod tests {
             })
             .expect("save");
         let report = inspect(&store).expect("inspect");
-        assert!(!report.integrity.vector_current, "no vector rebuild has run yet");
+        assert!(
+            !report.integrity.vector_current,
+            "no vector rebuild has run yet"
+        );
         assert!(!healthy(&report));
         assert!(summary(&report).contains("needs attention"));
     }
@@ -200,8 +211,12 @@ mod tests {
         let root = temp_root("remove");
         fs::create_dir_all(&root).expect("root");
         let path = root.join("mnemopi.db");
-        let store = BankStore::open(&path, BankId::configured("test").expect("bank"), root.clone())
-            .expect("store");
+        let store = BankStore::open(
+            &path,
+            BankId::configured("test").expect("bank"),
+            root.clone(),
+        )
+        .expect("store");
         store
             .save(NewMemory {
                 content: "row",

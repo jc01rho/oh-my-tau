@@ -143,7 +143,10 @@ fn looks_like_executable(value: &str) -> bool {
         "firefox",
         "epiphany",
     ];
-    if value.contains('/') || value.contains('\\') || value.starts_with('~') || value.ends_with(".app")
+    if value.contains('/')
+        || value.contains('\\')
+        || value.starts_with('~')
+        || value.ends_with(".app")
     {
         return true;
     }
@@ -555,12 +558,19 @@ fn bool_field(obj: &Map<String, Value>, key: &str) -> Option<bool> {
     obj.get(key).and_then(Value::as_bool)
 }
 
-fn enum_field(obj: &Map<String, Value>, key: &str, values: &[&str]) -> Result<Option<String>, String> {
+fn enum_field(
+    obj: &Map<String, Value>,
+    key: &str,
+    values: &[&str],
+) -> Result<Option<String>, String> {
     let Some(value) = string_field(obj, key)? else {
         return Ok(None);
     };
     if !values.contains(&value.as_str()) {
-        return Err(format!("`{key}` must be one of {} (was \"{value}\")", values.join(", ")));
+        return Err(format!(
+            "`{key}` must be one of {} (was \"{value}\")",
+            values.join(", ")
+        ));
     }
     Ok(Some(value))
 }
@@ -643,7 +653,9 @@ fn run_params(obj: &Map<String, Value>) -> Result<BrowserParams, String> {
     reject_unknown(obj, &["action", "name", "code", "fn", "args", "timeout"])?;
     let code = string_field(obj, "code")?;
     let function = string_field(obj, "fn")?;
-    let has_code = code.as_deref().is_some_and(|value| !value.trim().is_empty());
+    let has_code = code
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
     let has_fn = function
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
@@ -733,9 +745,15 @@ pub fn validate(args: &Value) -> Result<BrowserParams, String> {
 pub fn resolve_run_code(params: &BrowserParams) -> Result<String, String> {
     match params {
         BrowserParams::Run {
-            code, function, args, ..
+            code,
+            function,
+            args,
+            ..
         } => {
-            let code = code.as_deref().map(str::trim).filter(|value| !value.is_empty());
+            let code = code
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
             let function = function
                 .as_deref()
                 .map(str::trim)
@@ -835,13 +853,16 @@ pub struct CdpMessage {
 /// Returns an error for invalid JSON or a payload that is neither a response
 /// nor an event.
 pub fn parse_cdp_message(text: &str) -> Result<CdpMessage, String> {
-    let value: Value = serde_json::from_str(text)
-        .map_err(|error| format!("invalid CDP frame: {error}"))?;
+    let value: Value =
+        serde_json::from_str(text).map_err(|error| format!("invalid CDP frame: {error}"))?;
     let Some(obj) = value.as_object() else {
         return Err("invalid CDP frame: expected a JSON object".to_string());
     };
     let id = obj.get("id").and_then(Value::as_u64);
-    let method = obj.get("method").and_then(Value::as_str).map(ToOwned::to_owned);
+    let method = obj
+        .get("method")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     if id.is_none() && method.is_none() {
         return Err("invalid CDP frame: expected `id` or `method`".to_string());
     }
@@ -903,7 +924,8 @@ pub fn dispatch_step(step: &BrowserCallStep) -> Result<Dispatch, String> {
             TAB_METHODS.join(", ")
         ));
     }
-    let cdp = |command: CdpCommand| -> Result<Dispatch, String> { Ok(Dispatch::Cdp(vec![command])) };
+    let cdp =
+        |command: CdpCommand| -> Result<Dispatch, String> { Ok(Dispatch::Cdp(vec![command])) };
     match method {
         "goto" | "navigate" => {
             let url = arg_string(step, 0)?;
@@ -1667,9 +1689,18 @@ mod tests {
 
     #[test]
     fn run_scope_matches_upstream() {
-        assert_eq!(BROWSER_RUN_SCOPE, ["tab", "page", "browser", "wait", "assert"]);
-        assert_eq!(BROWSER_ACTIONS, ["open", "close", "run", "call", "tabs", "targets"]);
-        assert_eq!(APP_KEYWORDS, ["relay", "tern", "webkit", "chromium", "own", "auto"]);
+        assert_eq!(
+            BROWSER_RUN_SCOPE,
+            ["tab", "page", "browser", "wait", "assert"]
+        );
+        assert_eq!(
+            BROWSER_ACTIONS,
+            ["open", "close", "run", "call", "tabs", "targets"]
+        );
+        assert_eq!(
+            APP_KEYWORDS,
+            ["relay", "tern", "webkit", "chromium", "own", "auto"]
+        );
     }
 
     #[test]
@@ -1708,7 +1739,12 @@ mod tests {
 
     #[test]
     fn resolve_executables() {
-        for raw in ["/usr/bin/chromium", "google-chrome", "~/bin/brave", "Safari.app"] {
+        for raw in [
+            "/usr/bin/chromium",
+            "google-chrome",
+            "~/bin/brave",
+            "Safari.app",
+        ] {
             assert!(
                 matches!(resolve_browser_kind(Some(raw)), Ok(BrowserKind::Executable(path)) if path == raw),
                 "app {raw}"
@@ -1729,7 +1765,10 @@ mod tests {
         assert_eq!(BrowserKind::CdpEndpoint("ws://x".into()).label(), "cdp");
         assert!(BrowserKind::Chromium.is_managed());
         assert!(!BrowserKind::Relay.is_managed());
-        assert_eq!(BrowserKind::CdpEndpoint("ws://x".into()).cdp_endpoint(), Some("ws://x"));
+        assert_eq!(
+            BrowserKind::CdpEndpoint("ws://x".into()).cdp_endpoint(),
+            Some("ws://x")
+        );
         assert_eq!(BrowserKind::Auto.cdp_endpoint(), None);
     }
 
@@ -1760,11 +1799,16 @@ mod tests {
             BrowserParams::Open(open) => {
                 assert_eq!(open.url.as_deref(), Some("https://example.com"));
                 assert_eq!(open.wait_until.as_deref(), Some("networkidle2"));
-                assert_eq!(parse_viewport(open.viewport.as_ref().unwrap()), Ok((800, 600)));
+                assert_eq!(
+                    parse_viewport(open.viewport.as_ref().unwrap()),
+                    Ok((800, 600))
+                );
             }
             other => panic!("expected open, got {other:?}"),
         }
-        assert!(validate(&json!({"action": "open", "viewport": {"width": 0, "height": 600}})).is_err());
+        assert!(
+            validate(&json!({"action": "open", "viewport": {"width": 0, "height": 600}})).is_err()
+        );
         assert!(validate(&json!({"action": "open", "wait_until": "idle"})).is_err());
         assert!(validate(&json!({"action": "open", "app": "netscape"})).is_err());
     }
@@ -1781,8 +1825,10 @@ mod tests {
         assert!(validate(&json!({"action": "run"})).is_err());
         assert!(validate(&json!({"action": "run", "code": "1", "fn": "() => 1"})).is_err());
         assert!(validate(&json!({"action": "run", "code": "1", "timeout": 0})).is_err());
-        let params = validate(&json!({"action": "run", "fn": "async ({ tab }) => tab.title()", "args": [1]}))
-            .expect("valid run");
+        let params = validate(
+            &json!({"action": "run", "fn": "async ({ tab }) => tab.title()", "args": [1]}),
+        )
+        .expect("valid run");
         let code = resolve_run_code(&params).expect("rendered code");
         assert!(code.starts_with("return await (async ({ tab }) => tab.title())({ tab, page, browser, wait, assert }, 1);"), "{code}");
     }
@@ -1790,7 +1836,10 @@ mod tests {
     #[test]
     fn call_chains_are_validated() {
         assert!(validate(&json!({"action": "call", "chain": []})).is_err());
-        assert!(validate(&json!({"action": "call", "chain": [{"method": "teleport", "args": []}]})).is_err());
+        assert!(validate(
+            &json!({"action": "call", "chain": [{"method": "teleport", "args": []}]})
+        )
+        .is_err());
         assert!(validate(&json!({
             "action": "call",
             "chain": [{"method": "goto", "args": ["https://a"]}, {"method": "goto", "args": []}]
@@ -1811,7 +1860,8 @@ mod tests {
     #[test]
     fn close_kill_requires_all() {
         assert!(validate(&json!({"action": "close", "kill": true})).is_err());
-        let params = validate(&json!({"action": "close", "all": true, "kill": true})).expect("close all");
+        let params =
+            validate(&json!({"action": "close", "all": true, "kill": true})).expect("close all");
         assert_eq!(
             params,
             BrowserParams::Close {
@@ -1825,7 +1875,10 @@ mod tests {
     #[test]
     fn approval_is_always_exec() {
         assert_eq!(approval(&json!({"action": "tabs"})), BrowserApproval::Exec);
-        assert_eq!(approval(&json!({"action": "open", "headed": false})), BrowserApproval::Exec);
+        assert_eq!(
+            approval(&json!({"action": "open", "headed": false})),
+            BrowserApproval::Exec
+        );
     }
 
     #[test]
@@ -1858,11 +1911,9 @@ mod tests {
             args: vec![json!(800), json!(600), json!({"is_mobile": true})],
         })
         .expect("viewport");
-        assert!(
-            matches!(viewport, Dispatch::Cdp(commands)
+        assert!(matches!(viewport, Dispatch::Cdp(commands)
                 if commands[0].method == "Emulation.setDeviceMetricsOverride"
-                    && commands[0].params["mobile"] == true)
-        );
+                    && commands[0].params["mobile"] == true));
     }
 
     #[test]
@@ -1932,16 +1983,16 @@ mod tests {
         assert_eq!(ok.result.unwrap()["frameId"], "F1");
         assert!(ok.error.is_none());
 
-        let failed = parse_cdp_message(
-            r#"{"id":4,"error":{"code":-32601,"message":"method not found"}}"#,
-        )
-        .expect("error frame");
+        let failed =
+            parse_cdp_message(r#"{"id":4,"error":{"code":-32601,"message":"method not found"}}"#)
+                .expect("error frame");
         let error = failed.error.expect("error payload");
         assert_eq!(error.code, -32601);
         assert_eq!(error.message, "method not found");
 
-        let event = parse_cdp_message(r#"{"method":"Page.loadEventFired","params":{"timestamp":1}}"#)
-            .expect("event");
+        let event =
+            parse_cdp_message(r#"{"method":"Page.loadEventFired","params":{"timestamp":1}}"#)
+                .expect("event");
         assert_eq!(event.method.as_deref(), Some("Page.loadEventFired"));
         assert!(parse_cdp_message("{}").is_err());
         assert!(parse_cdp_message("not json").is_err());
@@ -1969,12 +2020,18 @@ mod tests {
         assert!(BROWSER_PRELUDE_JS.contains(r#"globalThis.__omp_prelude__("browser""#));
         assert!(BROWSER_PRELUDE_JS.contains("globalThis.browser = Object.freeze(browser);"));
         for helper in ["open", "tab", "tabs", "targets", "close", "run"] {
-            assert!(BROWSER_PRELUDE_JS.contains(&format!("browser.{helper}")), "js {helper}");
+            assert!(
+                BROWSER_PRELUDE_JS.contains(&format!("browser.{helper}")),
+                "js {helper}"
+            );
         }
         assert!(BROWSER_PRELUDE_PY.contains(r#""browser""#));
         assert!(BROWSER_PRELUDE_PY.contains("browser = _make_browser()"));
         for helper in ["open", "tab", "tabs", "targets", "close", "run"] {
-            assert!(BROWSER_PRELUDE_PY.contains(&format!("def {helper}")), "py {helper}");
+            assert!(
+                BROWSER_PRELUDE_PY.contains(&format!("def {helper}")),
+                "py {helper}"
+            );
         }
     }
 }

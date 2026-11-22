@@ -11,7 +11,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::{Error, Result, config::BankScoping};
+use crate::{config::BankScoping, Error, Result};
 
 /// Shared bank used when no bank is configured.
 pub const DEFAULT_SHARED_BANK: &str = "default";
@@ -95,8 +95,10 @@ pub struct BankScope {
 impl BankScope {
     /// Resolves bank identity exclusively from caller-supplied roots.
     pub fn resolve(input: &BankScopeInput<'_>) -> Result<Self> {
-        let identity_root =
-            input.canonical_primary_root.unwrap_or(input.workspace_root).to_path_buf();
+        let identity_root = input
+            .canonical_primary_root
+            .unwrap_or(input.workspace_root)
+            .to_path_buf();
         let global = match input.configured_bank {
             Some(value) => BankId::configured(value)?,
             None => BankId::trusted(DEFAULT_SHARED_BANK),
@@ -108,7 +110,13 @@ impl BankScope {
             BankScoping::PerProjectTagged if project == global => (project.clone(), vec![project]),
             BankScoping::PerProjectTagged => (project.clone(), vec![project, global.clone()]),
         };
-        Ok(Self { identity_root, global, retain, recall, scoping: input.scoping })
+        Ok(Self {
+            identity_root,
+            global,
+            retain,
+            recall,
+            scoping: input.scoping,
+        })
     }
 
     /// Adds already-validated adopted legacy banks after the normal recall
@@ -188,9 +196,11 @@ fn legacy_bank_matches(path: &Path, identity: &str, workspace: &str) -> bool {
         return false;
     };
     let recorded = connection
-        .query_row("SELECT identity_root FROM bank_scope WHERE singleton = 1", [], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT identity_root FROM bank_scope WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
         .optional();
     if let Ok(Some(recorded)) = recorded {
         return recorded == identity;
@@ -328,7 +338,11 @@ mod tests {
 
     #[test]
     fn configured_bank_prefixes_the_project_bank_and_names_the_shared_bank() {
-        let resolved = scope("/srv/work/alpha", Some("team"), BankScoping::PerProjectTagged);
+        let resolved = scope(
+            "/srv/work/alpha",
+            Some("team"),
+            BankScoping::PerProjectTagged,
+        );
         assert_eq!(resolved.global.as_str(), "team");
         assert!(resolved.retain.as_str().starts_with("team-alpha-"));
         assert_eq!(resolved.recall[1].as_str(), "team");
@@ -349,13 +363,19 @@ mod tests {
 
     #[test]
     fn bank_names_are_sanitized_bounded_and_digest_suffixed() {
-        assert_eq!(BankId::configured("  my bank!! ").expect("bank").as_str(), "my-bank");
+        assert_eq!(
+            BankId::configured("  my bank!! ").expect("bank").as_str(),
+            "my-bank"
+        );
         assert!(BankId::configured("   ").is_err());
         assert!(BankId::configured("...").is_err());
         let long = "a".repeat(200);
         let bank = BankId::configured(&long).expect("bank");
         assert_eq!(bank.as_str().len(), MAX_BANK_BYTES);
-        assert_ne!(bank.as_str(), BankId::configured(&"a".repeat(199)).expect("bank").as_str());
+        assert_ne!(
+            bank.as_str(),
+            BankId::configured(&"a".repeat(199)).expect("bank").as_str()
+        );
     }
 
     #[test]
@@ -363,10 +383,15 @@ mod tests {
         let dir = PathBuf::from("/data/mnemopi");
         let global = BankId::configured("default").expect("bank");
         let project = BankId::configured("alpha-0123456789ab").expect("bank");
-        assert_eq!(database_path(&dir, &global, &global), dir.join("mnemopi.db"));
+        assert_eq!(
+            database_path(&dir, &global, &global),
+            dir.join("mnemopi.db")
+        );
         assert_eq!(
             database_path(&dir, &global, &project),
-            dir.join("banks").join("alpha-0123456789ab").join("mnemopi.db")
+            dir.join("banks")
+                .join("alpha-0123456789ab")
+                .join("mnemopi.db")
         );
     }
 

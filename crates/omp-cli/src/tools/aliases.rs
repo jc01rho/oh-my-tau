@@ -112,7 +112,11 @@ mod tests {
         assert_eq!(LEGACY_BUILTIN_TOOL_NAME_ALIASES[0], ("search", "grep"));
         assert_eq!(legacy_alias("search"), Some("grep"));
         assert_eq!(legacy_alias("grep"), None);
-        assert_eq!(legacy_alias("SEARCH"), None, "lookup is on the caller's casing");
+        assert_eq!(
+            legacy_alias("SEARCH"),
+            None,
+            "lookup is on the caller's casing"
+        );
     }
 
     #[test]

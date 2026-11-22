@@ -690,11 +690,13 @@ pub fn tool_decision(name: &str, args: &Value, settings: &omp_settings::Settings
         } else {
             Tier::Exec
         }),
-        "security_scan" => Decision::tier(if crate::tools::security_scan::approval(args) == "read" {
-            Tier::Read
-        } else {
-            Tier::Exec
-        }),
+        "security_scan" => {
+            Decision::tier(if crate::tools::security_scan::approval(args) == "read" {
+                Tier::Read
+            } else {
+                Tier::Exec
+            })
+        }
         "context_notes" => {
             let tier = match crate::tools::context_notes::context_notes_approval(args) {
                 crate::tools::context_notes::Approval::Write => Tier::Write,

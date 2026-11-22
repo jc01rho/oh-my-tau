@@ -128,9 +128,8 @@ fn glob_search_path(args: &serde_json::Value) -> Option<String> {
     let mut scoped: Vec<String> = Vec::new();
     for dir in &bases {
         for pattern in &patterns {
-            let standalone = pattern.starts_with('/')
-                || pattern.starts_with('~')
-                || is_url_like(pattern);
+            let standalone =
+                pattern.starts_with('/') || pattern.starts_with('~') || is_url_like(pattern);
             let entry = if standalone {
                 pattern.clone()
             } else {

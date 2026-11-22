@@ -236,7 +236,10 @@ impl RolloverCompaction {
 
 /// `rollover_compaction` over a plain first-kept id.
 #[must_use]
-pub fn rollover_compaction(first_kept_entry_id: Option<&str>, tokens_before: i64) -> RolloverCompaction {
+pub fn rollover_compaction(
+    first_kept_entry_id: Option<&str>,
+    tokens_before: i64,
+) -> RolloverCompaction {
     RolloverCompaction::new(first_kept_entry_id.map(str::to_owned), tokens_before)
 }
 
@@ -321,7 +324,11 @@ mod tests {
     #[test]
     fn request_is_found_on_a_direct_new_context_result() {
         let details = requested();
-        let results = [RolloverToolResult::new("new_context", false, Some(&details))];
+        let results = [RolloverToolResult::new(
+            "new_context",
+            false,
+            Some(&details),
+        )];
         assert!(take_experimental_context_rollover_request(&results));
     }
 
@@ -406,7 +413,11 @@ mod tests {
     #[test]
     fn a_vanished_capability_drops_the_request() {
         let details = requested();
-        let results = [RolloverToolResult::new("new_context", false, Some(&details))];
+        let results = [RolloverToolResult::new(
+            "new_context",
+            false,
+            Some(&details),
+        )];
         let both = ["context_notes", "new_context"];
         assert!(accepted_rollover_request(true, &both, &both, &results));
         // Setting turned off between the result and dispatch.
@@ -522,7 +533,10 @@ mod tests {
         assert!(due(80_000, None), "exactly the lead is inside it");
         assert!(!due(79_999, None), "outside the lead");
         assert!(!due(100_000, None), "at the threshold compaction owns it");
-        assert!(!due(90_000, Some("c1")), "already reminded for this boundary");
+        assert!(
+            !due(90_000, Some("c1")),
+            "already reminded for this boundary"
+        );
         assert!(due(90_000, Some("c0")), "a new boundary re-arms it");
     }
 
@@ -530,7 +544,15 @@ mod tests {
     fn reminder_is_never_due_without_experimental_rollover() {
         let base = |experimental: bool, tools: bool, enabled: bool, compacting: bool| {
             notes_reminder_due(
-                experimental, tools, enabled, compacting, 95_000, 100_000, 20_000, "c1", None,
+                experimental,
+                tools,
+                enabled,
+                compacting,
+                95_000,
+                100_000,
+                20_000,
+                "c1",
+                None,
             )
         };
         assert!(base(true, true, true, false));

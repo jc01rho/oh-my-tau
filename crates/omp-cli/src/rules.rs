@@ -123,7 +123,9 @@ fn string_list(value: Option<&serde_yaml_ng::Value>, split_commas: bool) -> Vec<
 /// Canonical rule from Markdown; `None` when `enabled: false` disables it.
 fn rule_from_markdown(name: &str, content: &str, path: &Path) -> Option<Rule> {
     let (frontmatter, body) = split_frontmatter(content);
-    let map = frontmatter.as_ref().and_then(serde_yaml_ng::Value::as_mapping);
+    let map = frontmatter
+        .as_ref()
+        .and_then(serde_yaml_ng::Value::as_mapping);
     let field = |key: &str| map.and_then(|m| m.get(serde_yaml_ng::Value::String(key.to_string())));
     if field("enabled")
         .and_then(serde_yaml_ng::Value::as_bool)
@@ -315,8 +317,7 @@ pub fn rule_applies_to_agent(rule: &Rule, agent_name: Option<&str>) -> bool {
     let name = name.trim().to_lowercase();
     rule.agents.iter().any(|pattern| {
         pattern == &name
-            || globset::Glob::new(pattern)
-                .is_ok_and(|glob| glob.compile_matcher().is_match(&name))
+            || globset::Glob::new(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(&name))
     })
 }
 

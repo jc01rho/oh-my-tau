@@ -112,7 +112,11 @@ pub async fn extract_and_store<L: ExtractionLane>(
         })
         .collect::<Vec<_>>();
     let inserted = store.complete_extraction(request.source_id.as_str(), &borrowed)?;
-    Ok(ExtractionReport { parsed: facts.len(), inserted, rejected })
+    Ok(ExtractionReport {
+        parsed: facts.len(),
+        inserted,
+        rejected,
+    })
 }
 
 /// Parses the compact extraction line format:
@@ -205,7 +209,8 @@ mod tests {
 
     #[test]
     fn parse_facts_accepts_the_line_protocol_and_counts_rejections() {
-        let output = "# comment\n\nFACT\tUser\tprefers\tRust\t0.9\nFACT\tUser\tprefers\tSQLite\t0.5\n\
+        let output =
+            "# comment\n\nFACT\tUser\tprefers\tRust\t0.9\nFACT\tUser\tprefers\tSQLite\t0.5\n\
                       BROKEN\tUser\tprefers\tRust\t0.9\nFACT\tonly\ttwo\n\
                       FACT\tUser\tprefers\tRust\tNaN\nFACT\t\tprefers\tRust\t0.5";
         let (facts, rejected) = parse_facts(output, "mem-source");
@@ -231,9 +236,12 @@ mod tests {
     #[tokio::test]
     async fn extract_and_store_persists_facts_and_acks_the_job() {
         let root = temp_root("extract");
-        let store =
-            BankStore::open(root.join("mnemopi.db"), BankId::configured("test").expect("bank"), root)
-                .expect("store");
+        let store = BankStore::open(
+            root.join("mnemopi.db"),
+            BankId::configured("test").expect("bank"),
+            root,
+        )
+        .expect("store");
         store
             .save(NewMemory {
                 content: "durable transcript",
@@ -269,7 +277,14 @@ mod tests {
         .await
         .expect("extract");
 
-        assert_eq!(report, ExtractionReport { parsed: 1, inserted: 1, rejected: 0 });
+        assert_eq!(
+            report,
+            ExtractionReport {
+                parsed: 1,
+                inserted: 1,
+                rejected: 0
+            }
+        );
         assert_eq!(store.counts().expect("counts").facts, 1);
         assert_eq!(store.pending_extraction_count().expect("pending"), 0);
         let facts = store.search_facts("User Rust", 8).expect("search");
@@ -280,9 +295,12 @@ mod tests {
     #[tokio::test]
     async fn a_failed_completion_leaves_the_job_queued_for_retry() {
         let root = temp_root("extract-fail");
-        let store =
-            BankStore::open(root.join("mnemopi.db"), BankId::configured("test").expect("bank"), root)
-                .expect("store");
+        let store = BankStore::open(
+            root.join("mnemopi.db"),
+            BankId::configured("test").expect("bank"),
+            root,
+        )
+        .expect("store");
         store
             .connection()
             .expect("connection")
@@ -310,9 +328,12 @@ mod tests {
     #[tokio::test]
     async fn empty_input_and_oversized_output_are_refused() {
         let root = temp_root("extract-bounds");
-        let store =
-            BankStore::open(root.join("mnemopi.db"), BankId::configured("test").expect("bank"), root)
-                .expect("store");
+        let store = BankStore::open(
+            root.join("mnemopi.db"),
+            BankId::configured("test").expect("bank"),
+            root,
+        )
+        .expect("store");
         let request = |input: String| ExtractionRequest {
             input,
             session_id: "session".to_owned(),
@@ -320,11 +341,17 @@ mod tests {
         };
 
         assert!(
-            extract_and_store(&FixedLane(""), &store, request(String::new())).await.is_err(),
+            extract_and_store(&FixedLane(""), &store, request(String::new()))
+                .await
+                .is_err(),
             "empty input is refused before inference"
         );
 
         let oversized = "x".repeat(MAX_EXTRACTION_INPUT_BYTES + 1);
-        assert!(extract_and_store(&FixedLane(""), &store, request(oversized)).await.is_err());
+        assert!(
+            extract_and_store(&FixedLane(""), &store, request(oversized))
+                .await
+                .is_err()
+        );
     }
 }

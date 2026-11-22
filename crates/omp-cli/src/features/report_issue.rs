@@ -92,7 +92,9 @@ impl std::fmt::Display for ReportIssueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyReport => write!(f, "Empty report. {}", report_issue_device_usage()),
-            Self::InvalidFormat => write!(f, "Invalid report format. {}", report_issue_device_usage()),
+            Self::InvalidFormat => {
+                write!(f, "Invalid report format. {}", report_issue_device_usage())
+            }
         }
     }
 }
@@ -111,7 +113,10 @@ const JSON_REPORT_KEYS: &[&str] = &[
     "body",
 ];
 
-fn first_string(record: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+fn first_string(
+    record: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
     for key in keys {
         if let Some(serde_json::Value::String(value)) = record.get(*key) {
             let trimmed = value.trim();
@@ -298,8 +303,8 @@ fn user_occurrence_matches(hay: &str, start: usize, end: usize) -> bool {
     let after = next_char(hay, end);
 
     let prefixes = [
-        "Users/", "Users\\", "Users-", "home/", "home\\", "home-", "~", "com.", "org.", "net.", "io.",
-        "dev.",
+        "Users/", "Users\\", "Users-", "home/", "home\\", "home-", "~", "com.", "org.", "net.",
+        "io.", "dev.",
     ];
     for pat in prefixes {
         if !ends_with_ci(before, pat) {
@@ -366,7 +371,10 @@ pub fn redact_identity(text: &str, home: Option<&str>, user: Option<&str>) -> St
                         continue;
                     }
                 }
-                let c = redacted[i..].chars().next().expect("index is a char boundary");
+                let c = redacted[i..]
+                    .chars()
+                    .next()
+                    .expect("index is a char boundary");
                 out.push(c);
                 i += c.len_utf8();
             }
@@ -393,14 +401,16 @@ fn env_string(name: &str) -> Option<String> {
 /// Redact the current process's home directory and login name.
 pub fn redact_user_identity(text: &str) -> String {
     let home = env_string("HOME").or_else(|| env_string("USERPROFILE"));
-    let user = env_string("USER").or_else(|| env_string("USERNAME")).or_else(|| {
-        env_string("HOME").and_then(|h| {
-            h.rsplit(['/', '\\'])
-                .next()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        })
-    });
+    let user = env_string("USER")
+        .or_else(|| env_string("USERNAME"))
+        .or_else(|| {
+            env_string("HOME").and_then(|h| {
+                h.rsplit(['/', '\\'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
+        });
     redact_identity(text, home.as_deref(), user.as_deref())
 }
 
@@ -637,7 +647,9 @@ fn consent_in_flight() -> &'static Mutex<Option<SharedConsent>> {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Register the consent handler and the persistence hook. Passing `None` for
@@ -807,7 +819,11 @@ pub fn open_auto_qa_db_at(path: &Path) -> rusqlite::Result<Connection> {
         "push_error",
         "ALTER TABLE grievances ADD COLUMN push_error TEXT;",
     )?;
-    ensure_column(&conn, "source", "ALTER TABLE grievances ADD COLUMN source TEXT;")?;
+    ensure_column(
+        &conn,
+        "source",
+        "ALTER TABLE grievances ADD COLUMN source TEXT;",
+    )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS grievances_pushed_created_at_idx
          ON grievances (pushed, created_at, id);",
@@ -858,9 +874,11 @@ pub fn record_grievance(
 /// Number of rows still waiting to be shipped.
 pub fn pending_count(db: &Mutex<Connection>) -> rusqlite::Result<i64> {
     let conn = db_guard(db);
-    conn.query_row("SELECT COUNT(*) FROM grievances WHERE pushed = 0", [], |row| {
-        row.get(0)
-    })
+    conn.query_row(
+        "SELECT COUNT(*) FROM grievances WHERE pushed = 0",
+        [],
+        |row| row.get(0),
+    )
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1003,7 +1021,11 @@ pub fn reset_auto_qa_flush_state_for_tests() {
 
 fn clamp_error_text(mut detail: String) -> String {
     if detail.chars().count() > MAX_PUSH_ERROR_CHARS {
-        detail = detail.chars().take(MAX_PUSH_ERROR_CHARS).collect::<String>() + "…";
+        detail = detail
+            .chars()
+            .take(MAX_PUSH_ERROR_CHARS)
+            .collect::<String>()
+            + "…";
     }
     detail
 }
@@ -1072,7 +1094,10 @@ fn entry_json(row: &GrievanceRow) -> serde_json::Value {
         "report": normalized.report,
     });
     if let (Some(source), Some(map)) = (row.source.as_ref(), entry.as_object_mut()) {
-        map.insert("source".to_string(), serde_json::Value::String(source.clone()));
+        map.insert(
+            "source".to_string(),
+            serde_json::Value::String(source.clone()),
+        );
     }
     entry
 }
@@ -1402,7 +1427,8 @@ impl AutoQa {
     ) -> Result<DispatchOutcome, ReportIssueError> {
         if is_auto_qa_enabled(Some(&self.settings)) {
             let grievance = parse_report_issue_body(text)?;
-            self.record(catalog, &grievance.tool, &grievance.report).await;
+            self.record(catalog, &grievance.tool, &grievance.report)
+                .await;
         }
         Ok(DispatchOutcome::new(text))
     }
@@ -1435,7 +1461,6 @@ mod tests {
         Box::pin(async move { value })
     }
 
-
     // ── parsing ────────────────────────────────────────────────────────────
 
     #[test]
@@ -1447,7 +1472,10 @@ mod tests {
     #[test]
     fn parses_two_line_body() {
         let parsed = parse_report_issue_body("bash\ncwd was lost after cd\nsecond line").unwrap();
-        assert_eq!(parsed, grievance("bash", "cwd was lost after cd\nsecond line"));
+        assert_eq!(
+            parsed,
+            grievance("bash", "cwd was lost after cd\nsecond line")
+        );
     }
 
     #[test]
@@ -1459,14 +1487,16 @@ mod tests {
     #[test]
     fn parses_json_body() {
         let parsed =
-            parse_report_issue_body(r#"{"tool":"edit","description":"patch did not apply"}"#).unwrap();
+            parse_report_issue_body(r#"{"tool":"edit","description":"patch did not apply"}"#)
+                .unwrap();
         assert_eq!(parsed, grievance("edit", "patch did not apply"));
     }
 
     #[test]
     fn parses_json_alternate_keys() {
         let parsed =
-            parse_report_issue_body(r#"{"tool_name":"glob","message":"ignored .gitignore"}"#).unwrap();
+            parse_report_issue_body(r#"{"tool_name":"glob","message":"ignored .gitignore"}"#)
+                .unwrap();
         assert_eq!(parsed, grievance("glob", "ignored .gitignore"));
     }
 
@@ -1546,14 +1576,21 @@ mod tests {
 
     #[test]
     fn short_tool_is_untouched() {
-        assert_eq!(normalize_grievance("read", "fine"), grievance("read", "fine"));
+        assert_eq!(
+            normalize_grievance("read", "fine"),
+            grievance("read", "fine")
+        );
     }
 
     // ── redaction ──────────────────────────────────────────────────────────
 
     #[test]
     fn home_directory_becomes_tilde() {
-        let out = redact_identity("/home/will/proj/src/main.rs", Some("/home/will"), Some("will"));
+        let out = redact_identity(
+            "/home/will/proj/src/main.rs",
+            Some("/home/will"),
+            Some("will"),
+        );
         assert_eq!(out, "~/proj/src/main.rs");
     }
 
@@ -1841,10 +1878,22 @@ mod tests {
 
     #[test]
     fn detects_report_issue_writes() {
-        assert!(is_report_issue_tool_call("write", Some("xd://report_issue")));
-        assert!(is_report_issue_tool_call("write", Some("xd://report_issue/")));
-        assert!(!is_report_issue_tool_call("write", Some("xd://report_issue/x")));
-        assert!(!is_report_issue_tool_call("edit", Some("xd://report_issue")));
+        assert!(is_report_issue_tool_call(
+            "write",
+            Some("xd://report_issue")
+        ));
+        assert!(is_report_issue_tool_call(
+            "write",
+            Some("xd://report_issue/")
+        ));
+        assert!(!is_report_issue_tool_call(
+            "write",
+            Some("xd://report_issue/x")
+        ));
+        assert!(!is_report_issue_tool_call(
+            "edit",
+            Some("xd://report_issue")
+        ));
         assert!(!is_report_issue_tool_call("write", None));
     }
 
@@ -1922,7 +1971,11 @@ mod tests {
         record_grievance(&db, "m", "1", "read", "body", "builtin").unwrap();
 
         let settings = AutoQaSettings::default();
-        let result = block_on(flush_grievances(db.clone(), Some(&settings), FlushOptions::default()));
+        let result = block_on(flush_grievances(
+            db.clone(),
+            Some(&settings),
+            FlushOptions::default(),
+        ));
         assert!(result.skipped);
         assert_eq!(result.pushed, 0);
         assert_eq!(pending_count(&db).unwrap(), 1);

@@ -727,9 +727,8 @@ mod tests {
         ];
         let text = format_variables(&variables);
         assert!(text.contains("  x = 1 (int)"));
-        assert!(text.contains(
-            "  items = []int len: 3 ([]int) [ref 5, 0 named, 3 indexed] @ 0xc000010000"
-        ));
+        assert!(text
+            .contains("  items = []int len: 3 ([]int) [ref 5, 0 named, 3 indexed] @ 0xc000010000"));
     }
 
     #[test]

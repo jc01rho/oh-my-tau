@@ -125,10 +125,12 @@ impl<'a> Retainer<'a> {
     )]
     fn retain(&self, messages: &[RetentionMessage<'_>], force: bool) -> Result<RetentionOutcome> {
         let cursor = self.store.retention_cursor(self.session_id)?;
-        let user_turns =
-            messages.iter().filter(|message| message.role == RetentionRole::User).count() as u64;
-        let due =
-            user_turns > cursor && (force || user_turns - cursor >= self.retain_every_n_turns as u64);
+        let user_turns = messages
+            .iter()
+            .filter(|message| message.role == RetentionRole::User)
+            .count() as u64;
+        let due = user_turns > cursor
+            && (force || user_turns - cursor >= self.retain_every_n_turns as u64);
         tracing::debug!(
             force,
             user_turns,
@@ -138,16 +140,28 @@ impl<'a> Retainer<'a> {
             "memory retention evaluated"
         );
         if !due {
-            return Ok(RetentionOutcome { retained_through: cursor, ..RetentionOutcome::default() });
+            return Ok(RetentionOutcome {
+                retained_through: cursor,
+                ..RetentionOutcome::default()
+            });
         }
         let suffix = slice_unretained(messages, cursor);
         let Some(transcript) = format_durable_transcript(suffix) else {
-            return Ok(RetentionOutcome { retained_through: cursor, ..RetentionOutcome::default() });
+            return Ok(RetentionOutcome {
+                retained_through: cursor,
+                ..RetentionOutcome::default()
+            });
         };
-        let extraction_text =
-            if self.extraction_enabled { format_extraction_text(suffix) } else { None };
+        let extraction_text = if self.extraction_enabled {
+            format_extraction_text(suffix)
+        } else {
+            None
+        };
         let embedding_text = format_embedding_text(suffix);
-        let ids = suffix.iter().map(|message| message.stable_id).collect::<Vec<_>>();
+        let ids = suffix
+            .iter()
+            .map(|message| message.stable_id)
+            .collect::<Vec<_>>();
         let metadata = serde_json::json!({
             "session_id": self.session_id,
             "source_ids": ids,
@@ -187,7 +201,10 @@ pub fn format_durable_transcript(messages: &[RetentionMessage<'_>]) -> Option<St
 /// Frames only user-authored messages for fact/entity extraction.
 pub fn format_extraction_text(messages: &[RetentionMessage<'_>]) -> Option<String> {
     let text = format_messages(
-        messages.iter().copied().filter(|message| message.role == RetentionRole::User),
+        messages
+            .iter()
+            .copied()
+            .filter(|message| message.role == RetentionRole::User),
         true,
     )?;
     Some(bound_extraction_text(text))
@@ -326,8 +343,12 @@ mod tests {
 
     fn store() -> BankStore {
         let root = temp_root("retain");
-        BankStore::open(root.join("mnemopi.db"), BankId::configured("test").expect("bank"), root)
-            .expect("store")
+        BankStore::open(
+            root.join("mnemopi.db"),
+            BankId::configured("test").expect("bank"),
+            root,
+        )
+        .expect("store")
     }
 
     fn messages() -> Vec<OwnedRetentionMessage> {
@@ -432,7 +453,10 @@ mod tests {
         let owned = messages();
         let retainer = Retainer::new(&store, "session", "/root", 3, true);
         let skipped = retainer.retain_periodic(&borrow(&owned)).expect("retain");
-        assert!(skipped.stored_id.is_none(), "two user turns are below the interval of three");
+        assert!(
+            skipped.stored_id.is_none(),
+            "two user turns are below the interval of three"
+        );
         assert_eq!(skipped.retained_through, 0);
         assert_eq!(store.counts().expect("counts").working, 0);
 
@@ -451,8 +475,13 @@ mod tests {
         let retainer = Retainer::new(&store, "session", "/root", 1, true);
         let first = retainer.retain_periodic(&borrow(&owned)).expect("retain");
         assert!(first.stored_id.is_some());
-        let second = retainer.retain_periodic(&borrow(&owned)).expect("retain again");
-        assert!(second.stored_id.is_none(), "the durable cursor prevents a second write");
+        let second = retainer
+            .retain_periodic(&borrow(&owned))
+            .expect("retain again");
+        assert!(
+            second.stored_id.is_none(),
+            "the durable cursor prevents a second write"
+        );
         assert_eq!(store.counts().expect("counts").working, 1);
     }
 
@@ -470,12 +499,22 @@ mod tests {
             role: RetentionRole::User,
             content: "one more durable preference".to_owned(),
         });
-        let outcome = retainer.retain_force(&borrow(&second)).expect("retain suffix");
+        let outcome = retainer
+            .retain_force(&borrow(&second))
+            .expect("retain suffix");
         assert!(outcome.stored_id.is_some());
         assert_eq!(outcome.retained_through, 3);
         assert_eq!(store.counts().expect("counts").working, 2);
-        let newest = store.list(1).expect("list").into_iter().next().expect("row");
-        assert!(!newest.content.contains("WAL pragma"), "the retained prefix is not re-stored");
+        let newest = store
+            .list(1)
+            .expect("list")
+            .into_iter()
+            .next()
+            .expect("row");
+        assert!(
+            !newest.content.contains("WAL pragma"),
+            "the retained prefix is not re-stored"
+        );
         assert!(newest.content.contains("one more durable preference"));
     }
 

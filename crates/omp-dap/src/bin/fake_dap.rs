@@ -99,9 +99,13 @@ impl Server {
     fn set_breakpoints(&mut self, request: &Value) {
         let arguments = request.get("arguments").cloned().unwrap_or(Value::Null);
         let source = arguments.get("source").cloned().unwrap_or(Value::Null);
-        let path = source.get("path").and_then(Value::as_str).map(str::to_string);
+        let path = source
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         // A `setBreakpoints` call replaces the breakpoints of its own file only.
-        self.breakpoints.retain(|breakpoint| breakpoint.path != path);
+        self.breakpoints
+            .retain(|breakpoint| breakpoint.path != path);
         let requested = arguments
             .get("breakpoints")
             .and_then(Value::as_array)
@@ -331,20 +335,21 @@ fn request_seq(request: &Value) -> u64 {
 }
 
 fn string_arg(arguments: &Value, key: &str) -> Option<String> {
-    arguments.get(key).and_then(Value::as_str).map(str::to_string)
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn bool_arg(arguments: &Value, key: &str) -> bool {
-    arguments
-        .get(key)
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    arguments.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn file_name(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_name()
-        .map_or_else(|| path.to_string(), |name| name.to_string_lossy().into_owned())
+    std::path::Path::new(path).file_name().map_or_else(
+        || path.to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 fn read_message(reader: &mut impl BufRead) -> Option<Value> {

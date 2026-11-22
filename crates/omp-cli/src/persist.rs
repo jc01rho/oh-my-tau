@@ -326,8 +326,10 @@ impl Persistence {
         timestamp_iso: &str,
         commit: &omp_compact::handoff::HandoffCommit<'_>,
     ) -> Result<String> {
-        self.with_writer(|w| omp_compact::handoff::append_handoff(w, document, timestamp_iso, commit))
-            .inspect(|_| self.clear_nav())
+        self.with_writer(|w| {
+            omp_compact::handoff::append_handoff(w, document, timestamp_iso, commit)
+        })
+        .inspect(|_| self.clear_nav())
     }
 
     /// Append one seeded branch line (fresh id chained to the writer's leaf,

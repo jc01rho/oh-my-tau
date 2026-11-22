@@ -1070,7 +1070,11 @@ async fn fetch_bytes(
 }
 
 fn binary_notice(url: &str, mime: &str, size: u64) -> String {
-    let kind = if mime.is_empty() { "unknown type" } else { mime };
+    let kind = if mime.is_empty() {
+        "unknown type"
+    } else {
+        mime
+    };
     format!(
         "[{url} is a binary response ({kind}, {}); download it and read the file instead]",
         format_bytes(usize::try_from(size).unwrap_or(usize::MAX))
@@ -1085,8 +1089,13 @@ pub async fn probe_llms_txt(
     max_bytes: usize,
 ) -> Option<(String, String)> {
     for endpoint in llms_txt_candidates(url) {
-        let Ok(response) =
-            fetch_bytes(client, &endpoint, max_bytes.min(LLMS_MAX_BYTES), ACCEPT_TEXT).await
+        let Ok(response) = fetch_bytes(
+            client,
+            &endpoint,
+            max_bytes.min(LLMS_MAX_BYTES),
+            ACCEPT_TEXT,
+        )
+        .await
         else {
             continue;
         };
@@ -1149,7 +1158,9 @@ pub async fn fetch_url(input: &str, options: &FetchOptions) -> Result<FetchResul
 
     let mime = normalize_mime(&response.content_type);
     let body_text = String::from_utf8_lossy(&response.body).to_string();
-    let total_bytes = response.content_length.unwrap_or(response.body.len() as u64);
+    let total_bytes = response
+        .content_length
+        .unwrap_or(response.body.len() as u64);
 
     let (method, content, content_type) = if options.raw {
         (FetchMethod::Raw, body_text, mime)
@@ -1580,10 +1591,7 @@ mod tests {
 
     #[test]
     fn cleans_feed_text_from_cdata_and_markup() {
-        assert_eq!(
-            clean_feed_text("<![CDATA[<p>hi   there</p>]]>"),
-            "hi there"
-        );
+        assert_eq!(clean_feed_text("<![CDATA[<p>hi   there</p>]]>"), "hi there");
         assert_eq!(clean_feed_text("  plain   text "), "plain text");
         assert_eq!(clean_feed_text("<b>bold</b> &amp; <i>it</i>"), "bold & it");
     }
@@ -1638,8 +1646,9 @@ mod tests {
             ],
         };
         let out = render_url_read_output(&result, false);
-        assert!(out
-            .contains("Notes: Used llms.txt fallback: https://example.com/llms.txt; second\n"));
+        assert!(
+            out.contains("Notes: Used llms.txt fallback: https://example.com/llms.txt; second\n")
+        );
         assert!(out.contains("Method: llms.txt"));
     }
 

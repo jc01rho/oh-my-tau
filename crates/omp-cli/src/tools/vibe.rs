@@ -588,7 +588,11 @@ impl VibeSessionRegistry {
             .records
             .values()
             .filter(|record| record.matches(scope))
-            .filter(|record| wanted.as_ref().is_none_or(|set| set.contains(record.id.as_str())))
+            .filter(|record| {
+                wanted
+                    .as_ref()
+                    .is_none_or(|set| set.contains(record.id.as_str()))
+            })
             .collect();
         // Stable TV-wall ordering: spawn order, not activity order.
         records.sort_by_key(|record| record.created_at_ms);
@@ -748,10 +752,7 @@ impl VibeSessionRegistry {
             }
             running
         });
-        Ok(VibeKillOutcome {
-            id,
-            cancelled_turn,
-        })
+        Ok(VibeKillOutcome { id, cancelled_turn })
     }
 
     /// Block until one watched session's in-flight turn settles, the timeout
@@ -807,7 +808,9 @@ impl VibeSessionRegistry {
             }
             on_tick();
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let slice = remaining.min(SETTLE_SLICE_MAX).max(Duration::from_millis(1));
+            let slice = remaining
+                .min(SETTLE_SLICE_MAX)
+                .max(Duration::from_millis(1));
             let _ = tokio::time::timeout(slice, self.settle.notified()).await;
         }
         let settled = collect_settled(jobs, self, &snapshots);
@@ -856,7 +859,12 @@ impl VibeSessionRegistry {
     }
 
     /// Register one background job that runs a single worker turn.
-    fn start_turn(self: &Arc<Self>, jobs: &JobRegistry, key: &str, message: String) -> Result<String> {
+    fn start_turn(
+        self: &Arc<Self>,
+        jobs: &JobRegistry,
+        key: &str,
+        message: String,
+    ) -> Result<String> {
         let (id, cli, cwd, prompt) = {
             let mut inner = self.inner.lock();
             let Some(record) = inner.records.get_mut(key) else {
@@ -872,12 +880,7 @@ impl VibeSessionRegistry {
             record.state = VibeSessionState::Running;
             record.last_activity = Some("turn started".to_string());
             record.last_activity_at_ms = now_ms();
-            (
-                record.id.clone(),
-                record.cli,
-                record.cwd.clone(),
-                prompt,
-            )
+            (record.id.clone(), record.cli, record.cwd.clone(), prompt)
         };
         let spec = turn_spec(&id, cli, &cwd, prompt)?;
         let job_id = jobs.insert(Job {
@@ -915,7 +918,13 @@ impl VibeSessionRegistry {
 
     /// Settle one turn: publish the job result, fold the exchange into the
     /// session history, then start any queued follow-up turn.
-    fn finish_turn(self: &Arc<Self>, jobs: &JobRegistry, key: &str, job_id: &str, output: RunOutput) {
+    fn finish_turn(
+        self: &Arc<Self>,
+        jobs: &JobRegistry,
+        key: &str,
+        job_id: &str,
+        output: RunOutput,
+    ) {
         let completed = output.status == RunStatus::Completed;
         let body = response_text(&output);
         let failure = failure_text(&output);
@@ -1624,9 +1633,9 @@ impl VibeWaitTool {
         let mut last_frame: Option<Instant> = None;
         let mut on_tick = || {
             let now = Instant::now();
-            if last_frame
-                .is_some_and(|at| now.duration_since(at) < Duration::from_millis(WAIT_PROGRESS_INTERVAL_MS))
-            {
+            if last_frame.is_some_and(|at| {
+                now.duration_since(at) < Duration::from_millis(WAIT_PROGRESS_INTERVAL_MS)
+            }) {
                 return;
             }
             last_frame = Some(now);
@@ -1886,7 +1895,13 @@ mod tests {
     fn tool_names_match_omp() {
         assert_eq!(
             VIBE_TOOL_NAMES,
-            ["vibe_spawn", "vibe_send", "vibe_wait", "vibe_kill", "vibe_list"]
+            [
+                "vibe_spawn",
+                "vibe_send",
+                "vibe_wait",
+                "vibe_kill",
+                "vibe_list"
+            ]
         );
     }
 
@@ -2137,7 +2152,8 @@ mod tests {
         let bare = unknown_session_error("ghost", &[]);
         assert!(bare.contains("Unknown vibe session \"ghost\"."), "{bare}");
         assert!(bare.contains("spawn one with vibe_spawn"), "{bare}");
-        let with_roster = unknown_session_error("ghost", &["alpha".to_string(), "beta".to_string()]);
+        let with_roster =
+            unknown_session_error("ghost", &["alpha".to_string(), "beta".to_string()]);
         assert!(
             with_roster.contains("Active sessions: alpha, beta"),
             "{with_roster}"
@@ -2197,7 +2213,12 @@ mod tests {
 
     /// Attach a real registry job to a test record so `kill`/`collect_settled`
     /// observe the same job id the registry holds.
-    fn attach_job(registry: &VibeSessionRegistry, scope: &VibeOwnerScope, id: &str, jobs: &JobRegistry) -> String {
+    fn attach_job(
+        registry: &VibeSessionRegistry,
+        scope: &VibeOwnerScope,
+        id: &str,
+        jobs: &JobRegistry,
+    ) -> String {
         let job_id = jobs.insert(Job {
             command: format!("vibe fast {id}"),
             started: Instant::now(),
@@ -2324,7 +2345,13 @@ mod tests {
 
     #[test]
     fn turn_specs_use_the_flavor_agent() {
-        let spec = turn_spec("alpha", VibeCli::Fast, Path::new("/tmp"), "work".to_string()).unwrap();
+        let spec = turn_spec(
+            "alpha",
+            VibeCli::Fast,
+            Path::new("/tmp"),
+            "work".to_string(),
+        )
+        .unwrap();
         assert_eq!(spec.agent, "sonic");
         assert_eq!(spec.prompt, "work");
         assert_eq!(spec.cwd, PathBuf::from("/tmp"));

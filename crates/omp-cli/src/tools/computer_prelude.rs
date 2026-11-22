@@ -321,7 +321,9 @@ pub fn schema() -> Value {
 fn reject_unknown(args: &serde_json::Map<String, Value>, allowed: &[&str]) -> Result<(), String> {
     for key in args.keys() {
         if !allowed.contains(&key.as_str()) {
-            return Err(format!("computer received invalid arguments: unknown property \"{key}\""));
+            return Err(format!(
+                "computer received invalid arguments: unknown property \"{key}\""
+            ));
         }
     }
     Ok(())
@@ -356,14 +358,19 @@ pub fn validate(args: &Value) -> Result<ComputerParams, String> {
     let Some(obj) = args.as_object() else {
         return Err("computer received invalid arguments: expected an object".to_string());
     };
-    let action = obj
-        .get("action")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "computer received invalid arguments: missing string property \"action\"".to_string())?;
+    let action = obj.get("action").and_then(Value::as_str).ok_or_else(|| {
+        "computer received invalid arguments: missing string property \"action\"".to_string()
+    })?;
     match action {
         "run" => {
-            reject_unknown(obj, &["action", "code", "fn", "args", "read_only", "timeout"])?;
-            let code = obj.get("code").and_then(Value::as_str).map(ToOwned::to_owned);
+            reject_unknown(
+                obj,
+                &["action", "code", "fn", "args", "read_only", "timeout"],
+            )?;
+            let code = obj
+                .get("code")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
             let function = obj.get("fn").and_then(Value::as_str).map(ToOwned::to_owned);
             let has_code = code.as_deref().is_some_and(|c| !c.trim().is_empty());
             let has_fn = function.as_deref().is_some_and(|f| !f.trim().is_empty());
@@ -420,17 +427,15 @@ pub fn resolve_run_code(params: &ComputerParams) -> Result<String, String> {
             let code = code.as_deref().map(str::trim).filter(|c| !c.is_empty());
             let function = function.as_deref().map(str::trim).filter(|f| !f.is_empty());
             match (code, function) {
-                (Some(_), Some(_)) | (None, None) => Err(
-                    "Action 'run' requires exactly one of 'code' or 'fn'.".to_string(),
-                ),
+                (Some(_), Some(_)) | (None, None) => {
+                    Err("Action 'run' requires exactly one of 'code' or 'fn'.".to_string())
+                }
                 (Some(code), None) => Ok(code.to_string()),
                 (None, Some(function)) => {
                     let scope = COMPUTER_RUN_SCOPE.join(", ");
                     Ok(format!(
                         "return await ({function})({{ {scope} }}{});",
-                        args.iter()
-                            .map(|a| format!(", {}", a))
-                            .collect::<String>()
+                        args.iter().map(|a| format!(", {}", a)).collect::<String>()
                     ))
                 }
             }
@@ -1414,7 +1419,9 @@ fn first_present(candidates: &[&str], which: &dyn Fn(&str) -> Option<String>) ->
 }
 
 fn detect_display_server(env: &dyn Fn(&str) -> Option<String>) -> DisplayServer {
-    let session = env("XDG_SESSION_TYPE").unwrap_or_default().to_ascii_lowercase();
+    let session = env("XDG_SESSION_TYPE")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if session == "wayland" || env("WAYLAND_DISPLAY").is_some() {
         return DisplayServer::Wayland;
     }
@@ -1433,10 +1440,7 @@ pub fn detect_with(
     let backend = detect_display_server(env);
     let (capture, input, ax) = match backend {
         DisplayServer::X11 => (
-            first_present(
-                &["import", "gnome-screenshot"],
-                which,
-            ),
+            first_present(&["import", "gnome-screenshot"], which),
             first_present(X11_INPUT_CANDIDATES, which),
             first_present(X11_AX_CANDIDATES, which),
         ),
@@ -1528,10 +1532,7 @@ impl DesktopSession {
     /// A session over already-probed capabilities.
     #[must_use]
     pub fn new(caps: DesktopCapabilities) -> Self {
-        let capture = caps
-            .capture_tool
-            .as_deref()
-            .and_then(CaptureTool::for_tool);
+        let capture = caps.capture_tool.as_deref().and_then(CaptureTool::for_tool);
         Self {
             caps,
             capture,
@@ -1650,7 +1651,11 @@ impl DesktopSession {
     }
 
     /// Dispatch one direct helper by name (a single-step call chain's method).
-    pub fn dispatch_method(&self, method: &str, _args: &[Value]) -> Result<DispatchOutcome, String> {
+    pub fn dispatch_method(
+        &self,
+        method: &str,
+        _args: &[Value],
+    ) -> Result<DispatchOutcome, String> {
         if self.closed {
             return Err("computer session is closed; the next call opens a new one".to_string());
         }
@@ -1772,7 +1777,11 @@ mod tests {
         obj
     }
 
-    fn caps(backend: DisplayServer, capture: Option<&str>, input: Option<&str>) -> DesktopCapabilities {
+    fn caps(
+        backend: DisplayServer,
+        capture: Option<&str>,
+        input: Option<&str>,
+    ) -> DesktopCapabilities {
         DesktopCapabilities {
             backend,
             capture_tool: capture.map(str::to_string),
@@ -1798,7 +1807,12 @@ mod tests {
         let mut actions = Vec::new();
         for arm in arms {
             assert_eq!(arm["additionalProperties"], json!(false), "{arm}");
-            actions.push(arm["properties"]["action"]["enum"][0].as_str().unwrap().to_string());
+            actions.push(
+                arm["properties"]["action"]["enum"][0]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
         }
         assert_eq!(actions, COMPUTER_ACTIONS.to_vec());
     }
@@ -1807,12 +1821,20 @@ mod tests {
     fn run_requires_exactly_one_of_code_and_fn() {
         let err = validate(&run(json!({}))).unwrap_err();
         assert!(err.contains("exactly one of 'code' or 'fn'"), "{err}");
-        let err = validate(&run(json!({"code": "await desktop.displays()", "fn": "async () => 1"})))
-            .unwrap_err();
+        let err = validate(&run(
+            json!({"code": "await desktop.displays()", "fn": "async () => 1"}),
+        ))
+        .unwrap_err();
         assert!(err.contains("exactly one of 'code' or 'fn'"), "{err}");
         // Whitespace-only arms do not count, matching the TS trim.
         let err = validate(&run(json!({"code": "   ", "fn": "async () => 1"}))).unwrap();
-        assert!(matches!(err, ComputerParams::Run { function: Some(_), .. }));
+        assert!(matches!(
+            err,
+            ComputerParams::Run {
+                function: Some(_),
+                ..
+            }
+        ));
         let params = validate(&run(json!({"code": "await desktop.displays()"}))).unwrap();
         assert_eq!(
             params,
@@ -1858,13 +1880,17 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("one handle hop at most"), "{err}");
         // Unknown root method names the allowlist.
-        let err = validate(&json!({"action": "call", "chain": [step("nope", json!([]))]})).unwrap_err();
+        let err =
+            validate(&json!({"action": "call", "chain": [step("nope", json!([]))]})).unwrap_err();
         assert!(err.contains("Unknown desktop method \"nope\""), "{err}");
         assert!(err.contains("clipboard.write"), "{err}");
         // A chained call only follows a handle root.
         let err = validate(&json!({"action": "call", "chain": [step("click", json!([1, 2])), step("ax", json!([]))]}))
             .unwrap_err();
-        assert!(err.contains("Only desktop.window(id)/desktop.display(id)/desktop.ref(ref)"), "{err}");
+        assert!(
+            err.contains("Only desktop.window(id)/desktop.display(id)/desktop.ref(ref)"),
+            "{err}"
+        );
         // Unknown handle method names the handle's allowlist.
         let err = validate(&json!({"action": "call", "chain": [
             step("window", json!(["74"])), step("nope", json!([]))
@@ -1902,7 +1928,10 @@ mod tests {
 
     #[test]
     fn approval_tiers_match_upstream() {
-        assert_eq!(approval(&json!({"action": "capabilities"})), ApprovalTier::Read);
+        assert_eq!(
+            approval(&json!({"action": "capabilities"})),
+            ApprovalTier::Read
+        );
         assert_eq!(approval(&json!({"action": "close"})), ApprovalTier::Exec);
         assert_eq!(
             approval(&run(json!({"code": "1", "read_only": true}))),
@@ -1944,7 +1973,10 @@ mod tests {
         assert_eq!(approval(&json!("capabilities")), ApprovalTier::Exec);
         assert_eq!(approval(&json!({"action": "unknown"})), ApprovalTier::Exec);
         // The tier is independent of schema validity.
-        assert_eq!(approval(&run(json!({"read_only": true}))), ApprovalTier::Read);
+        assert_eq!(
+            approval(&run(json!({"read_only": true}))),
+            ApprovalTier::Read
+        );
         assert!(validate(&run(json!({"read_only": true}))).is_err());
     }
 
@@ -2024,17 +2056,24 @@ mod tests {
 
     #[test]
     fn capabilities_action_returns_the_probe_json() {
-        let mut session = DesktopSession::new(caps(DisplayServer::Wayland, Some("grim"), Some("ydotool")));
+        let mut session =
+            DesktopSession::new(caps(DisplayServer::Wayland, Some("grim"), Some("ydotool")));
         let out = session.execute(&ComputerParams::Capabilities).unwrap();
         assert_eq!(out.details["backend"], json!("wayland"));
         assert_eq!(out.details["captureTool"], json!("grim"));
-        assert!(out.text.contains("\"backend\": \"wayland\""), "{}", out.text);
+        assert!(
+            out.text.contains("\"backend\": \"wayland\""),
+            "{}",
+            out.text
+        );
     }
 
     #[test]
     fn input_actions_fail_explicitly_without_an_automation_binary() {
         let session = DesktopSession::new(caps(DisplayServer::Wayland, Some("grim"), None));
-        let err = session.dispatch_method("click", &[json!(10), json!(20)]).unwrap_err();
+        let err = session
+            .dispatch_method("click", &[json!(10), json!(20)])
+            .unwrap_err();
         assert!(err.contains("no Wayland input automation binary"), "{err}");
         assert!(err.contains("ydotool"), "{err}");
         assert!(err.contains("wtype"), "{err}");
@@ -2043,16 +2082,22 @@ mod tests {
         assert!(err.contains("no X11 input automation binary"), "{err}");
         assert!(err.contains("xdotool"), "{err}");
         let session = DesktopSession::new(caps(DisplayServer::None, None, None));
-        let err = session.dispatch_method("press", &[json!("ctrl+c")]).unwrap_err();
+        let err = session
+            .dispatch_method("press", &[json!("ctrl+c")])
+            .unwrap_err();
         assert!(err.contains("no display server"), "{err}");
         // Unknown helpers list the allowlist instead of guessing.
         let err = session.dispatch_method("frobnicate", &[]).unwrap_err();
-        assert!(err.contains("Unknown desktop method \"frobnicate\""), "{err}");
+        assert!(
+            err.contains("Unknown desktop method \"frobnicate\""),
+            "{err}"
+        );
     }
 
     #[test]
     fn ax_reads_fail_explicitly_without_the_native_bridge() {
-        let session = DesktopSession::new(caps(DisplayServer::Wayland, Some("grim"), Some("ydotool")));
+        let session =
+            DesktopSession::new(caps(DisplayServer::Wayland, Some("grim"), Some("ydotool")));
         let err = session.dispatch_method("windows", &[]).unwrap_err();
         assert!(err.contains("AT-SPI"), "{err}");
         let session = DesktopSession::new(caps(DisplayServer::X11, None, None));
@@ -2062,7 +2107,8 @@ mod tests {
 
     #[test]
     fn run_and_handle_hops_are_refused_by_name() {
-        let mut session = DesktopSession::new(caps(DisplayServer::X11, Some("import"), Some("xdotool")));
+        let mut session =
+            DesktopSession::new(caps(DisplayServer::X11, Some("import"), Some("xdotool")));
         let params = validate(&run(json!({"code": "await desktop.displays()"}))).unwrap();
         let err = session.execute(&params).unwrap_err();
         assert!(err.contains("computer.run"), "{err}");
@@ -2097,10 +2143,8 @@ mod tests {
                     .to_string(),
             ],
         };
-        let session = DesktopSession::with_capture(
-            caps(DisplayServer::Wayland, None, None),
-            Some(stub),
-        );
+        let session =
+            DesktopSession::with_capture(caps(DisplayServer::Wayland, None, None), Some(stub));
         let out = session.dispatch_method("screenshot", &[]).unwrap();
         let path = out.details["path"].as_str().expect("path").to_string();
         assert!(Path::new(&path).is_file(), "{path}");
@@ -2108,7 +2152,11 @@ mod tests {
         assert_eq!(out.details["width"], json!(16));
         assert_eq!(out.details["height"], json!(8));
         assert_eq!(out.details["coordinateWidth"], json!(16));
-        assert!(out.text.contains("desktop screenshot saved to"), "{}", out.text);
+        assert!(
+            out.text.contains("desktop screenshot saved to"),
+            "{}",
+            out.text
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2170,7 +2218,9 @@ mod tests {
         assert!(def.inline_documentation);
         assert!(def.documentation.contains("Control the host desktop"));
         assert!(def.javascript.contains("/* COMPUTER_OPTION_VALIDATOR */"));
-        assert!(def.javascript.contains("globalThis.computer = Object.freeze(computer);"));
+        assert!(def
+            .javascript
+            .contains("globalThis.computer = Object.freeze(computer);"));
         assert!(def.python.contains("computer = _make_computer()"));
         assert!(def.python.contains("del _make_computer"));
         assert_eq!(def.javascript, COMPUTER_PRELUDE_JS);
@@ -2207,11 +2257,20 @@ mod tests {
             "press",
         ] {
             assert!(js.contains(&format!("\"{method}\"")), "js missing {method}");
-            assert!(py.contains(&format!("async def {method}(")), "py missing {method}");
+            assert!(
+                py.contains(&format!("async def {method}(")),
+                "py missing {method}"
+            );
         }
         for method in ["capabilities", "close", "run"] {
-            assert!(js.contains(&format!("computer.{method} =")), "js missing {method}");
-            assert!(py.contains(&format!("async def {method}(")), "py missing {method}");
+            assert!(
+                js.contains(&format!("computer.{method} =")),
+                "js missing {method}"
+            );
+            assert!(
+                py.contains(&format!("async def {method}(")),
+                "py missing {method}"
+            );
         }
     }
 }

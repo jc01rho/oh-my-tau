@@ -391,7 +391,11 @@ fn resolve_cli_cache_auth_key(
     {
         let memo = AUTH_KEY_MEMO.lock().unwrap_or_else(PoisonError::into_inner);
         for (key, sig, path, mtime, value) in memo.iter() {
-            if key == memo_key && sig == &env_sig && path == config_path && *mtime == config_mtime_ms {
+            if key == memo_key
+                && sig == &env_sig
+                && path == config_path
+                && *mtime == config_mtime_ms
+            {
                 return value.clone();
             }
         }
@@ -462,7 +466,10 @@ pub fn default_gh_host() -> String {
     std::env::var("GH_HOST")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .map_or_else(|| "github.com".to_string(), |value| value.trim().to_lowercase())
+        .map_or_else(
+            || "github.com".to_string(),
+            |value| value.trim().to_lowercase(),
+        )
 }
 
 /// Split `[HOST/]OWNER/REPO`; anything with another shape is taken as a slug.
@@ -471,7 +478,10 @@ pub fn parse_repo_ref(repo: &str) -> (Option<String>, String) {
     let Some(first_slash) = repo.find('/') else {
         return (None, repo.to_string());
     };
-    let Some(second_slash) = repo[first_slash + 1..].find('/').map(|i| i + first_slash + 1) else {
+    let Some(second_slash) = repo[first_slash + 1..]
+        .find('/')
+        .map(|i| i + first_slash + 1)
+    else {
         return (None, repo.to_string());
     };
     if repo[second_slash + 1..].contains('/') {
@@ -992,7 +1002,12 @@ fn is_open_view(kind: CacheKind, payload: &Value) -> bool {
         .is_some_and(|state| state.eq_ignore_ascii_case("OPEN"))
 }
 
-fn store_result(auth_key: &str, options: &CacheLookupOptions, fresh: &FreshResult, fetched_at: i64) {
+fn store_result(
+    auth_key: &str,
+    options: &CacheLookupOptions,
+    fresh: &FreshResult,
+    fetched_at: i64,
+) {
     put_cached(&PutCachedInput {
         auth_key: Some(auth_key.to_string()),
         repo: options.repo.clone(),
@@ -1378,9 +1393,14 @@ mod tests {
         }))
         .expect("lookup");
         assert_eq!(result.status, CacheStatus::Disabled);
-        assert!(
-            get_cached("owner/repo", CacheKind::Issue, 3, true, DEFAULT_CACHE_AUTH_KEY).is_none()
-        );
+        assert!(get_cached(
+            "owner/repo",
+            CacheKind::Issue,
+            3,
+            true,
+            DEFAULT_CACHE_AUTH_KEY
+        )
+        .is_none());
     }
 
     #[test]
@@ -1403,9 +1423,14 @@ mod tests {
         }))
         .expect("lookup");
         assert_eq!(result.status, CacheStatus::Disabled);
-        assert!(
-            get_cached("owner/repo", CacheKind::Issue, 4, true, DEFAULT_CACHE_AUTH_KEY).is_none()
-        );
+        assert!(get_cached(
+            "owner/repo",
+            CacheKind::Issue,
+            4,
+            true,
+            DEFAULT_CACHE_AUTH_KEY
+        )
+        .is_none());
     }
 
     #[test]
@@ -1450,17 +1475,32 @@ mod tests {
         }
         invalidate_pull_requests_for_repo("owner/repo");
         assert!(get_cached("owner/repo", CacheKind::Pr, 1, true, DEFAULT_CACHE_AUTH_KEY).is_none());
-        assert!(
-            get_cached("owner/repo", CacheKind::PrDiff, 1, true, DEFAULT_CACHE_AUTH_KEY).is_none()
-        );
-        assert!(
-            get_cached("owner/repo", CacheKind::Issue, 1, true, DEFAULT_CACHE_AUTH_KEY).is_some()
-        );
+        assert!(get_cached(
+            "owner/repo",
+            CacheKind::PrDiff,
+            1,
+            true,
+            DEFAULT_CACHE_AUTH_KEY
+        )
+        .is_none());
+        assert!(get_cached(
+            "owner/repo",
+            CacheKind::Issue,
+            1,
+            true,
+            DEFAULT_CACHE_AUTH_KEY
+        )
+        .is_some());
 
         invalidate_all_for_number(1, None);
-        assert!(
-            get_cached("owner/repo", CacheKind::Issue, 1, true, DEFAULT_CACHE_AUTH_KEY).is_none()
-        );
+        assert!(get_cached(
+            "owner/repo",
+            CacheKind::Issue,
+            1,
+            true,
+            DEFAULT_CACHE_AUTH_KEY
+        )
+        .is_none());
     }
 
     #[test]
@@ -1500,7 +1540,14 @@ mod tests {
         assert_eq!(row.view.rendered, "diff");
         assert!(row.retained_at > 0);
         // The live row is untouched by retention.
-        assert!(get_cached("owner/repo", CacheKind::PrDiff, 5, false, DEFAULT_CACHE_AUTH_KEY).is_none());
+        assert!(get_cached(
+            "owner/repo",
+            CacheKind::PrDiff,
+            5,
+            false,
+            DEFAULT_CACHE_AUTH_KEY
+        )
+        .is_none());
     }
 
     #[test]
@@ -1604,7 +1651,10 @@ mod tests {
             parse_repo_ref("github.com/owner/repo"),
             (Some("github.com".to_string()), "owner/repo".to_string())
         );
-        assert_eq!(parse_repo_ref("owner/repo"), (None, "owner/repo".to_string()));
+        assert_eq!(
+            parse_repo_ref("owner/repo"),
+            (None, "owner/repo".to_string())
+        );
         assert_eq!(parse_repo_ref("repo"), (None, "repo".to_string()));
         assert_eq!(
             parse_repo_ref("host/owner/repo/extra"),

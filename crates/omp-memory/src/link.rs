@@ -48,7 +48,10 @@ pub fn reconcile(store: &BankStore) -> Result<usize> {
     for record in &records {
         let terms = content_terms(record.content.as_str());
         for term in &terms {
-            ids_by_term.entry(term.clone()).or_default().push(record.id.clone());
+            ids_by_term
+                .entry(term.clone())
+                .or_default()
+                .push(record.id.clone());
             triples.push(OwnedTriple {
                 subject: term.clone(),
                 predicate: "mentioned_in",
@@ -81,7 +84,10 @@ pub fn reconcile(store: &BankStore) -> Result<usize> {
         if weight < MIN_LINK_WEIGHT {
             continue;
         }
-        candidates.entry(left.clone()).or_default().push((right.clone(), weight));
+        candidates
+            .entry(left.clone())
+            .or_default()
+            .push((right.clone(), weight));
         candidates.entry(right).or_default().push((left, weight));
     }
     let mut links = Vec::<OwnedLink>::new();
@@ -92,7 +98,10 @@ pub fn reconcile(store: &BankStore) -> Result<usize> {
             continue;
         };
         targets.sort_by(|left, right| {
-            right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
         });
         targets.truncate(MAX_LINKS_PER_MEMORY);
         for (target, weight) in targets.iter() {
@@ -138,16 +147,16 @@ fn content_terms(content: &str) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        bank::BankId,
-        store::NewMemory,
-        test_support::temp_root,
-    };
+    use crate::{bank::BankId, store::NewMemory, test_support::temp_root};
 
     fn store() -> BankStore {
         let root = temp_root("link");
-        BankStore::open(root.join("mnemopi.db"), BankId::configured("test").expect("bank"), root)
-            .expect("store")
+        BankStore::open(
+            root.join("mnemopi.db"),
+            BankId::configured("test").expect("bank"),
+            root,
+        )
+        .expect("store")
     }
 
     fn save(store: &BankStore, id: &str, content: &str) {

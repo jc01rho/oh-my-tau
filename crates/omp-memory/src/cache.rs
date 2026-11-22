@@ -136,8 +136,10 @@ impl RecallCache {
         let mut entries = self.entries.lock();
         entries.retain(|entry| entry.stamps == current);
         let mut best: Option<(usize, f32)> = None;
-        for (index, entry) in
-            entries.iter().enumerate().filter(|(_, entry)| entry.bounds == bounds)
+        for (index, entry) in entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.bounds == bounds)
         {
             let both_dense = embedding.is_some() && entry.embedding.is_some();
             let score = match (embedding.as_deref(), entry.embedding.as_deref()) {
@@ -169,7 +171,10 @@ impl RecallCache {
         bounds: RecallBounds,
         results: Vec<RecallResult>,
     ) {
-        let bytes = results.iter().map(|result| result.memory.content.len()).sum::<usize>();
+        let bytes = results
+            .iter()
+            .map(|result| result.memory.content.len())
+            .sum::<usize>();
         if bytes > MAX_CACHED_RESULT_BYTES {
             return;
         }
@@ -197,7 +202,11 @@ impl RecallCache {
 }
 
 fn normalize_query(query: &str) -> String {
-    query.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn token_set(query: &str) -> HashSet<String> {
@@ -220,7 +229,10 @@ fn normalize_embedding(vector: &[f32]) -> Option<Vec<f32>> {
 }
 
 fn cosine(left: &[f32], right: &[f32]) -> f32 {
-    left.iter().zip(right).map(|(left, right)| left * right).sum()
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum()
 }
 
 fn jaccard(left: &HashSet<String>, right: &HashSet<String>) -> f32 {
@@ -244,8 +256,12 @@ mod tests {
 
     fn store() -> BankStore {
         let root = temp_root("cache");
-        BankStore::open(root.join("mnemopi.db"), BankId::configured("test").expect("bank"), root)
-            .expect("store")
+        BankStore::open(
+            root.join("mnemopi.db"),
+            BankId::configured("test").expect("bank"),
+            root,
+        )
+        .expect("store")
     }
 
     fn result(id: &str) -> RecallResult {
@@ -299,13 +315,19 @@ mod tests {
             bounds,
             vec![result("mem-1")],
         );
-        let hit = cache.exact("  user   prefers RUST ", &current, bounds).expect("hit");
+        let hit = cache
+            .exact("  user   prefers RUST ", &current, bounds)
+            .expect("hit");
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].memory.id, "mem-1");
         assert!(cache.exact("unrelated", &current, bounds).is_none());
         assert!(
             cache
-                .exact("user prefers rust", &current, RecallBounds { limit: 3, ..bounds })
+                .exact(
+                    "user prefers rust",
+                    &current,
+                    RecallBounds { limit: 3, ..bounds }
+                )
                 .is_none(),
             "bounds are part of the key"
         );
@@ -317,14 +339,22 @@ mod tests {
         let bounds = RecallBounds::default();
         let cache = RecallCache::new();
         let before = stamps(std::slice::from_ref(&store)).expect("stamps");
-        cache.insert("user prefers rust", None, before.clone(), bounds, vec![result("mem-1")]);
+        cache.insert(
+            "user prefers rust",
+            None,
+            before.clone(),
+            bounds,
+            vec![result("mem-1")],
+        );
         assert!(cache.exact("user prefers rust", &before, bounds).is_some());
 
         save(&store, "mem-2");
         let after = stamps(std::slice::from_ref(&store)).expect("stamps");
         assert_ne!(before, after);
         assert!(cache.exact("user prefers rust", &after, bounds).is_none());
-        assert!(cache.similar("user prefers rust", None, &after, bounds).is_none());
+        assert!(cache
+            .similar("user prefers rust", None, &after, bounds)
+            .is_none());
         assert!(cache.is_empty(), "stale entries are dropped on lookup");
     }
 
@@ -343,19 +373,36 @@ mod tests {
         );
         assert!(
             cache
-                .similar("user prefers rust for systems programming daily", None, &current, bounds)
+                .similar(
+                    "user prefers rust for systems programming daily",
+                    None,
+                    &current,
+                    bounds
+                )
                 .is_some(),
             "six of seven shared tokens clears the Jaccard floor"
         );
         assert!(
-            cache.similar("user prefers python for data pipelines", None, &current, bounds).is_none(),
+            cache
+                .similar(
+                    "user prefers python for data pipelines",
+                    None,
+                    &current,
+                    bounds
+                )
+                .is_none(),
             "a half-overlapping token set is below the floor"
         );
         assert!(
-            cache.similar("completely different question", None, &current, bounds).is_none(),
+            cache
+                .similar("completely different question", None, &current, bounds)
+                .is_none(),
             "unrelated token sets never hit"
         );
-        assert!(cache.similar("", None, &current, bounds).is_none(), "empty token set never hits");
+        assert!(
+            cache.similar("", None, &current, bounds).is_none(),
+            "empty token set never hits"
+        );
     }
 
     #[test]
@@ -376,11 +423,15 @@ mod tests {
             .expect("dense hit");
         assert_eq!(hit[0].memory.id, "mem-dense");
         assert!(
-            cache.similar("gamma delta", Some(&[0.0, 1.0]), &current, bounds).is_none(),
+            cache
+                .similar("gamma delta", Some(&[0.0, 1.0]), &current, bounds)
+                .is_none(),
             "an orthogonal embedding must not hit"
         );
         assert!(
-            cache.similar("gamma delta", Some(&[f32::NAN, 0.0]), &current, bounds).is_none(),
+            cache
+                .similar("gamma delta", Some(&[f32::NAN, 0.0]), &current, bounds)
+                .is_none(),
             "non-finite embeddings are discarded"
         );
     }
@@ -428,7 +479,13 @@ mod tests {
         assert_eq!(current.len(), 2);
         save(&left, "mem-left");
         let after = stamps(&[left, right]).expect("stamps");
-        assert_ne!(after[0].generation().durable, current[0].generation().durable);
-        assert_eq!(after[1].generation().durable, current[1].generation().durable);
+        assert_ne!(
+            after[0].generation().durable,
+            current[0].generation().durable
+        );
+        assert_eq!(
+            after[1].generation().durable,
+            current[1].generation().durable
+        );
     }
 }

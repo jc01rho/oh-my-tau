@@ -681,7 +681,8 @@ pub async fn compact_now(
             let context = params.handoff.ok_or_else(|| {
                 anyhow!("Handoff compaction needs a handoff context (system prompt + history)")
             })?;
-            let max_tokens = omp_compact::summary::summary_max_tokens(summary_params.reserve_tokens);
+            let max_tokens =
+                omp_compact::summary::summary_max_tokens(summary_params.reserve_tokens);
             let request = omp_compact::handoff::build_handoff_request(context.clone(), max_tokens);
             let document =
                 omp_compact::handoff::generate_handoff_from_context(completer, request).await?;
@@ -1494,7 +1495,10 @@ mod tests {
         talk(&mut h, 3).await;
 
         let result = h.rt.compact(None, Some("handoff")).await.expect("handoff");
-        assert!(calls.load(Ordering::SeqCst) >= 1, "the document oneshot ran");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "the document oneshot ran"
+        );
         assert!(
             result["summary"].as_str().unwrap().contains("## Goal"),
             "{result}"
@@ -1546,11 +1550,10 @@ mod tests {
             talk(&mut h, 3).await;
             let before = h.rt.messages().await.len();
 
-            let err = h
-                .rt
-                .compact(None, Some("handoff"))
-                .await
-                .expect_err("invalid handoff document");
+            let err =
+                h.rt.compact(None, Some("handoff"))
+                    .await
+                    .expect_err("invalid handoff document");
             assert!(
                 err.message.contains("Handoff generation produced"),
                 "{document:?}: {}",
@@ -1578,7 +1581,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_compaction_fires_after_a_turn_over_threshold_and_emits_events() {        let mut h = harness(4).await;
+    async fn auto_compaction_fires_after_a_turn_over_threshold_and_emits_events() {
+        let mut h = harness(4).await;
         let (fake, _) = fake_summarizer("AUTO SUMMARY");
         h.rt.set_summarizer(Some(fake));
         h.rt.set_compaction_settings(CompactionSettings {

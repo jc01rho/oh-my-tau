@@ -225,7 +225,8 @@ pub struct GithubParams {
 impl GithubParams {
     /// Parse from the raw tool arguments.
     pub fn from_value(params: &Value) -> Result<Self> {
-        serde_json::from_value(params.clone()).map_err(|e| anyhow!("invalid github parameters: {e}"))
+        serde_json::from_value(params.clone())
+            .map_err(|e| anyhow!("invalid github parameters: {e}"))
     }
 }
 
@@ -342,7 +343,11 @@ pub fn repo_from_url(value: Option<&str>) -> Option<String> {
     let trimmed = value?.trim();
     let captures = REPO_URL_PATTERN.captures(trimmed)?;
     let host = captures.get(1)?.as_str().to_lowercase();
-    let slug = format!("{}/{}", captures.get(2)?.as_str(), captures.get(3)?.as_str());
+    let slug = format!(
+        "{}/{}",
+        captures.get(2)?.as_str(),
+        captures.get(3)?.as_str()
+    );
     Some(if host == cache::default_gh_host() {
         slug
     } else {
@@ -354,7 +359,8 @@ static PR_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^https://([^/]+)/([^/]+/[^/]+)/pull/(\d+)(?:[/?#].*)?$").expect("pr url regex")
 });
 static ISSUE_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^https://([^/]+)/([^/]+/[^/]+)/issues/(\d+)(?:[/?#].*)?$").expect("issue url regex")
+    Regex::new(r"^https://([^/]+)/([^/]+/[^/]+)/issues/(\d+)(?:[/?#].*)?$")
+        .expect("issue url regex")
 });
 static RUN_URL_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/actions/runs/(\d+)").expect("run url regex"));
@@ -758,9 +764,8 @@ pub fn which(bin: &str) -> Option<PathBuf> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::metadata(candidate).is_ok_and(|meta| {
-                    meta.is_file() && meta.permissions().mode() & 0o111 != 0
-                })
+                std::fs::metadata(candidate)
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
             }
             #[cfg(not(unix))]
             {
@@ -935,14 +940,22 @@ fn describe_github_api_error(value: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    let field = object.get("field").and_then(Value::as_str).unwrap_or("").trim();
+    let field = object
+        .get("field")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     let target = [resource, field]
         .iter()
         .filter(|part| !part.is_empty())
         .copied()
         .collect::<Vec<_>>()
         .join(".");
-    let code = object.get("code").and_then(Value::as_str).unwrap_or("").trim();
+    let code = object
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     match (target.is_empty(), code.is_empty()) {
         (false, false) => Some(format!("{target}: {code}")),
         (false, true) => Some(target),
@@ -975,7 +988,12 @@ fn parse_github_api_error_messages(stdout: &str) -> Vec<String> {
     messages
 }
 
-fn format_gh_failure(args: &[String], stdout: &str, stderr: &str, options: GhCommandOptions) -> String {
+fn format_gh_failure(
+    args: &[String],
+    stdout: &str,
+    stderr: &str,
+    options: GhCommandOptions,
+) -> String {
     let message = if stderr.trim().is_empty() {
         stdout.trim()
     } else {
@@ -1019,7 +1037,10 @@ fn format_gh_json_failure(
     if details.is_empty() {
         return fallback;
     }
-    let rendered: Vec<String> = details.iter().map(|message| format!("- {message}")).collect();
+    let rendered: Vec<String> = details
+        .iter()
+        .map(|message| format!("- {message}"))
+        .collect();
     format!("{fallback}\nGitHub details:\n{}", rendered.join("\n"))
 }
 
@@ -1051,7 +1072,8 @@ pub async fn gh_json<T: serde::de::DeserializeOwned>(
     if result.stdout.is_empty() {
         bail!("GitHub CLI returned empty output.");
     }
-    serde_json::from_str(&result.stdout).map_err(|_| anyhow!("GitHub CLI returned invalid JSON output."))
+    serde_json::from_str(&result.stdout)
+        .map_err(|_| anyhow!("GitHub CLI returned invalid JSON output."))
 }
 
 /// Run `gh` and return stdout as text.
@@ -1099,11 +1121,7 @@ pub async fn glab_text(
 
 // ─── git helpers ───────────────────────────────────────────────────────────
 
-async fn git(
-    cwd: &Path,
-    args: &[&str],
-    signal: &AbortSignal,
-) -> Result<std::process::Output> {
+async fn git(cwd: &Path, args: &[&str], signal: &AbortSignal) -> Result<std::process::Output> {
     let mut command = tokio::process::Command::new("git");
     command
         .args(args)
@@ -1113,7 +1131,9 @@ async fn git(
         .env("GIT_ASKPASS", "true")
         .env("GIT_EDITOR", "true")
         .kill_on_drop(true);
-    let child = command.spawn().map_err(|e| anyhow!("failed to start git: {e}"))?;
+    let child = command
+        .spawn()
+        .map_err(|e| anyhow!("failed to start git: {e}"))?;
     tokio::select! {
         () = signal.aborted() => bail!("aborted"),
         output = child.wait_with_output() => output.map_err(|e| anyhow!("git failed: {e}")),
@@ -1161,9 +1181,13 @@ pub async fn require_git_repo_root(cwd: &Path, signal: &AbortSignal) -> Result<P
 
 /// The primary checkout's root (the common dir's parent) for a linked worktree.
 pub async fn require_primary_git_repo_root(cwd: &Path, signal: &AbortSignal) -> Result<PathBuf> {
-    let common = git_stdout(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"], signal)
-        .await
-        .unwrap_or_default();
+    let common = git_stdout(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        signal,
+    )
+    .await
+    .unwrap_or_default();
     if let Some(root) = Path::new(&common).parent() {
         if !common.is_empty() {
             return Ok(root.to_path_buf());
@@ -1195,15 +1219,23 @@ pub async fn require_current_git_head(cwd: &Path, signal: &AbortSignal) -> Resul
 }
 
 async fn ref_exists(cwd: &Path, reference: &str, signal: &AbortSignal) -> bool {
-    git(cwd, &["rev-parse", "--verify", "--quiet", reference], signal)
-        .await
-        .is_ok_and(|output| output.status.success())
+    git(
+        cwd,
+        &["rev-parse", "--verify", "--quiet", reference],
+        signal,
+    )
+    .await
+    .is_ok_and(|output| output.status.success())
 }
 
 fn short_hash(value: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(value.as_bytes());
-    digest.iter().take(6).map(|byte| format!("{byte:02x}")).collect()
+    digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// omp `getWorktreeDir`: the per-session worktree root for `name`.
@@ -1280,8 +1312,7 @@ fn effective_host(reference: &RepoRef) -> String {
 pub fn repo_refs_equal(left: &str, right: &str) -> bool {
     let left = parse_repo_ref(left);
     let right = parse_repo_ref(right);
-    effective_host(&left) == effective_host(&right)
-        && left.slug.eq_ignore_ascii_case(&right.slug)
+    effective_host(&left) == effective_host(&right) && left.slug.eq_ignore_ascii_case(&right.slug)
 }
 
 /// Best-effort cached cwd → repo resolution that swallows any failure.
@@ -1473,15 +1504,12 @@ pub fn format_repo_view(data: &Value, repo: Option<&str>, branch: Option<&str>) 
             topics
                 .iter()
                 .filter_map(|topic| {
-                    topic
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .or_else(|| {
-                            topic
-                                .get("topic")
-                                .and_then(|value| value.get("name"))
-                                .and_then(Value::as_str)
-                        })
+                    topic.get("name").and_then(Value::as_str).or_else(|| {
+                        topic
+                            .get("topic")
+                            .and_then(|value| value.get("name"))
+                            .and_then(Value::as_str)
+                    })
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -1492,7 +1520,10 @@ pub fn format_repo_view(data: &Value, repo: Option<&str>, branch: Option<&str>) 
 }
 
 fn format_comments_section(comments: Option<&Value>) -> Vec<String> {
-    let Some(comments) = comments.and_then(Value::as_array).filter(|list| !list.is_empty()) else {
+    let Some(comments) = comments
+        .and_then(Value::as_array)
+        .filter(|list| !list.is_empty())
+    else {
         return Vec::new();
     };
     let visible: Vec<&Value> = comments
@@ -1535,7 +1566,10 @@ fn format_comments_section(comments: Option<&Value>) -> Vec<String> {
 }
 
 fn format_reviews_section(reviews: Option<&Value>) -> Vec<String> {
-    let Some(reviews) = reviews.and_then(Value::as_array).filter(|list| !list.is_empty()) else {
+    let Some(reviews) = reviews
+        .and_then(Value::as_array)
+        .filter(|list| !list.is_empty())
+    else {
         return Vec::new();
     };
     let mut lines = vec![format!("## Reviews ({})", reviews.len()), String::new()];
@@ -1572,7 +1606,10 @@ fn format_reviews_section(reviews: Option<&Value>) -> Vec<String> {
 }
 
 fn format_review_comments_section(comments: Option<&Value>) -> Vec<String> {
-    let Some(comments) = comments.and_then(Value::as_array).filter(|list| !list.is_empty()) else {
+    let Some(comments) = comments
+        .and_then(Value::as_array)
+        .filter(|list| !list.is_empty())
+    else {
         return Vec::new();
     };
     let mut lines = vec![
@@ -1587,11 +1624,11 @@ fn format_review_comments_section(comments: Option<&Value>) -> Vec<String> {
             .unwrap_or_default();
         lines.push(format!("### {author}{created_at}"));
         lines.push(String::new());
-        let location = json_string(comment, "path").map(|path| match json_i64(comment, "line")
-            .or_else(|| json_i64(comment, "originalLine"))
-        {
-            Some(line) => format!("{path}:{line}"),
-            None => path.to_string(),
+        let location = json_string(comment, "path").map(|path| {
+            match json_i64(comment, "line").or_else(|| json_i64(comment, "originalLine")) {
+                Some(line) => format!("{path}:{line}"),
+                None => path.to_string(),
+            }
         });
         push_line(&mut lines, "Location", location);
         push_line(&mut lines, "Side", json_string(comment, "side"));
@@ -1610,7 +1647,10 @@ fn format_review_comments_section(comments: Option<&Value>) -> Vec<String> {
 }
 
 fn format_pr_files(files: Option<&Value>) -> Vec<String> {
-    let Some(files) = files.and_then(Value::as_array).filter(|list| !list.is_empty()) else {
+    let Some(files) = files
+        .and_then(Value::as_array)
+        .filter(|list| !list.is_empty())
+    else {
         return Vec::new();
     };
     let mut lines = vec![format!("## Files ({})", files.len()), String::new()];
@@ -1690,8 +1730,16 @@ pub fn format_pr_view(data: &Value, pr: Option<&str>, comments: bool) -> String 
     );
     push_line(&mut lines, "Base", json_string(data, "baseRefName"));
     push_line(&mut lines, "Head", json_string(data, "headRefName"));
-    push_line(&mut lines, "Review decision", json_string(data, "reviewDecision"));
-    push_line(&mut lines, "Merge state", json_string(data, "mergeStateStatus"));
+    push_line(
+        &mut lines,
+        "Review decision",
+        json_string(data, "reviewDecision"),
+    );
+    push_line(
+        &mut lines,
+        "Merge state",
+        json_string(data, "mergeStateStatus"),
+    );
     push_line(&mut lines, "Created", json_string(data, "createdAt"));
     push_line(&mut lines, "Updated", json_string(data, "updatedAt"));
     push_line(&mut lines, "Labels", format_labels(data.get("labels")));
@@ -1728,7 +1776,12 @@ pub fn format_pr_view(data: &Value, pr: Option<&str>, comments: bool) -> String 
 
 /// omp `formatSearchResults`.
 #[must_use]
-pub fn format_search_results(kind: &str, query: &str, repo: Option<&str>, items: &[Value]) -> String {
+pub fn format_search_results(
+    kind: &str,
+    query: &str,
+    repo: Option<&str>,
+    items: &[Value],
+) -> String {
     let mut lines = vec![
         format!("# GitHub {kind} search"),
         String::new(),
@@ -1797,7 +1850,11 @@ pub fn format_search_code_results(query: &str, repo: Option<&str>, items: &[Valu
                 .and_then(|value| value.get("nameWithOwner"))
                 .and_then(Value::as_str),
         );
-        push_line(&mut lines, "  Commit", format_short_sha(json_string(item, "sha")));
+        push_line(
+            &mut lines,
+            "  Commit",
+            format_short_sha(json_string(item, "sha")),
+        );
         push_line(&mut lines, "  URL", json_string(item, "url"));
         let fragment = item
             .get("textMatches")
@@ -1837,7 +1894,8 @@ pub fn format_search_commits_results(query: &str, repo: Option<&str>, items: &[V
     }
     for item in items {
         lines.push(String::new());
-        let sha = format_short_sha(json_string(item, "sha")).unwrap_or_else(|| "(unknown sha)".to_string());
+        let sha = format_short_sha(json_string(item, "sha"))
+            .unwrap_or_else(|| "(unknown sha)".to_string());
         let subject = item
             .get("commit")
             .and_then(|commit| commit.get("message"))
@@ -1915,7 +1973,11 @@ pub fn format_search_repos_results(query: &str, items: &[Value]) -> String {
         push_line(&mut lines, "  Language", json_string(item, "language"));
         push_line(&mut lines, "  Stars", json_i64(item, "stargazersCount"));
         push_line(&mut lines, "  Forks", json_i64(item, "forksCount"));
-        push_line(&mut lines, "  Open issues", json_i64(item, "openIssuesCount"));
+        push_line(
+            &mut lines,
+            "  Open issues",
+            json_i64(item, "openIssuesCount"),
+        );
         push_line(&mut lines, "  Visibility", json_string(item, "visibility"));
         push_line(&mut lines, "  Archived", json_bool(item, "isArchived"));
         push_line(&mut lines, "  Fork", json_bool(item, "isFork"));
@@ -1952,9 +2014,8 @@ fn api_labels(value: Option<&Value>) -> Value {
     Value::Array(labels)
 }
 
-static REPOSITORY_API_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"/repos/([^/]+/[^/]+)$").expect("repository api url regex")
-});
+static REPOSITORY_API_URL_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/repos/([^/]+/[^/]+)$").expect("repository api url regex"));
 
 /// Enterprise API roots prefix the path with `/api/v3`, so match the tail.
 #[must_use]
@@ -1976,7 +2037,9 @@ pub fn api_issue_to_search_result(item: &Value) -> Value {
     let state = if merged {
         Some("merged".to_string())
     } else {
-        item.get("state").and_then(Value::as_str).map(str::to_string)
+        item.get("state")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     };
     json!({
         "author": api_user(item.get("user")),
@@ -2179,7 +2242,11 @@ pub async fn fetch_issue_view_fresh(
     include_comments: bool,
     signal: &AbortSignal,
 ) -> Result<FreshResult> {
-    let mut args = vec!["issue".to_string(), "view".to_string(), identifier.to_string()];
+    let mut args = vec![
+        "issue".to_string(),
+        "view".to_string(),
+        identifier.to_string(),
+    ];
     append_repo_flag(&mut args, repo, Some(identifier));
     let fields = if include_comments {
         GH_ISSUE_FIELDS.join(",")
@@ -2291,7 +2358,14 @@ pub async fn get_or_fetch_issue(
                 // happens at the surrounding call, so an already-aborted turn
                 // never reaches here.
                 let signal = pa_agent::abort::AbortController::new().signal();
-                fetch_issue_view_fresh(&cwd, repo.as_deref(), &identifier, include_comments, &signal).await
+                fetch_issue_view_fresh(
+                    &cwd,
+                    repo.as_deref(),
+                    &identifier,
+                    include_comments,
+                    &signal,
+                )
+                .await
             })
         })
     };
@@ -2339,14 +2413,15 @@ pub async fn get_or_fetch_pr(
     }
     let cwd = cwd.to_path_buf();
     let repo_owned = repo.to_string();
-    let fetcher: Arc<dyn Fn() -> cache::BoxFut<'static, Result<FreshResult>> + Send + Sync> = Arc::new(move || {
-        let repo = repo_owned.clone();
-        let cwd = cwd.clone();
-        Box::pin(async move {
-            let signal = pa_agent::abort::AbortController::new().signal();
-            fetch_pr_view_fresh(&cwd, &repo, number, include_comments, &signal).await
-        })
-    });
+    let fetcher: Arc<dyn Fn() -> cache::BoxFut<'static, Result<FreshResult>> + Send + Sync> =
+        Arc::new(move || {
+            let repo = repo_owned.clone();
+            let cwd = cwd.clone();
+            Box::pin(async move {
+                let signal = pa_agent::abort::AbortController::new().signal();
+                fetch_pr_view_fresh(&cwd, &repo, number, include_comments, &signal).await
+            })
+        });
     cache::get_or_fetch_view(CacheLookupOptions {
         repo: repo.to_string(),
         kind: CacheKind::Pr,
@@ -2435,7 +2510,11 @@ impl GithubTool {
 
 // ─── Ops ───────────────────────────────────────────────────────────────────
 
-async fn repo_view(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Result<AgentToolResult> {
+async fn repo_view(
+    cwd: &Path,
+    params: &GithubParams,
+    signal: &AbortSignal,
+) -> Result<AgentToolResult> {
     let repo = normalize_optional_string(params.repo.as_deref());
     let branch = normalize_optional_string(params.branch.as_deref());
     let mut args = vec!["repo".to_string(), "view".to_string()];
@@ -2498,7 +2577,11 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-async fn file_read(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Result<AgentToolResult> {
+async fn file_read(
+    cwd: &Path,
+    params: &GithubParams,
+    signal: &AbortSignal,
+) -> Result<AgentToolResult> {
     let repo = resolve_github_repo(
         cwd,
         normalize_optional_string(params.repo.as_deref()).as_deref(),
@@ -2566,11 +2649,10 @@ async fn file_read(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> R
         .map_or(fallback_source_url, str::to_string);
 
     let size = response.get("size").and_then(Value::as_i64);
-    let size_label = size
-        .filter(|size| *size >= 0)
-        .map_or_else(|| "unknown size".to_string(), |size| {
-            format_bytes(usize::try_from(size).unwrap_or(usize::MAX))
-        });
+    let size_label = size.filter(|size| *size >= 0).map_or_else(
+        || "unknown size".to_string(),
+        |size| format_bytes(usize::try_from(size).unwrap_or(usize::MAX)),
+    );
     let (Some(encoding), Some(content)) = (
         response.get("encoding").and_then(Value::as_str),
         response.get("content").and_then(Value::as_str),
@@ -2650,7 +2732,11 @@ fn urlencode_segment(segment: &str) -> String {
     out
 }
 
-async fn pr_create(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Result<AgentToolResult> {
+async fn pr_create(
+    cwd: &Path,
+    params: &GithubParams,
+    signal: &AbortSignal,
+) -> Result<AgentToolResult> {
     let repo = normalize_optional_string(params.repo.as_deref());
     let title = normalize_optional_string(params.title.as_deref());
     let body = params.body.as_deref();
@@ -2814,7 +2900,11 @@ fn format_pr_create_result(
         .filter(|value| !value.is_empty())
         .unwrap_or(url);
     push_line(&mut lines, "URL", Some(resolved_url));
-    push_line(&mut lines, "State", data.and_then(|d| json_string(d, "state")));
+    push_line(
+        &mut lines,
+        "State",
+        data.and_then(|d| json_string(d, "state")),
+    );
     push_line(
         &mut lines,
         "Draft",
@@ -2852,7 +2942,11 @@ fn format_pr_create_result(
     lines.join("\n").trim().to_string()
 }
 
-async fn pr_checkout(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Result<AgentToolResult> {
+async fn pr_checkout(
+    cwd: &Path,
+    params: &GithubParams,
+    signal: &AbortSignal,
+) -> Result<AgentToolResult> {
     let repo = normalize_optional_string(params.repo.as_deref());
     let force = params.force.unwrap_or(false);
     let pr_list = normalize_pr_identifier_list(params.pr.as_ref());
@@ -2968,7 +3062,12 @@ fn join_sections(sections: &[String]) -> String {
             if idx == 0 {
                 vec![section.clone()]
             } else {
-                vec![String::new(), "---".to_string(), String::new(), section.clone()]
+                vec![
+                    String::new(),
+                    "---".to_string(),
+                    String::new(),
+                    section.clone(),
+                ]
             }
         })
         .collect::<Vec<_>>()
@@ -2990,7 +3089,11 @@ fn format_pr_checkout_result(outcome: &Value) -> String {
     push_line(&mut lines, "URL", json_string(outcome, "url"));
     push_line(&mut lines, "Base", json_string(outcome, "baseRefName"));
     push_line(&mut lines, "Head", json_string(outcome, "headRefName"));
-    push_line(&mut lines, "Local branch", json_string(outcome, "localBranch"));
+    push_line(
+        &mut lines,
+        "Local branch",
+        json_string(outcome, "localBranch"),
+    );
     push_line(&mut lines, "Worktree", json_string(outcome, "worktreePath"));
     push_line(&mut lines, "Remote", json_string(outcome, "remoteName"));
     push_line(&mut lines, "Remote URL", json_string(outcome, "remoteUrl"));
@@ -3017,7 +3120,13 @@ fn format_pr_checkout_result(outcome: &Value) -> String {
 fn sanitize_remote_name(value: &str) -> String {
     let slug: String = value
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     let trimmed = slug.trim_matches('-').to_string();
     if trimmed.is_empty() {
@@ -3065,7 +3174,10 @@ async fn checkout_pull_request(
     let repo_root = require_git_repo_root(cwd, signal).await?;
     let primary_root = require_primary_git_repo_root(&repo_root, signal).await?;
     let local_branch = format!("pr-{pr_number}");
-    let worktree_path = worktree_dir(&format!("{pr_number}-{}", short_hash(&primary_root.display().to_string())));
+    let worktree_path = worktree_dir(&format!(
+        "{pr_number}-{}",
+        short_hash(&primary_root.display().to_string())
+    ));
 
     // Which remote holds the PR head: `origin` for a same-repo PR, else the fork.
     let is_cross_repository = json_bool(&data, "isCrossRepository").unwrap_or(false);
@@ -3177,13 +3289,9 @@ async fn checkout_pull_request(
         }
     }
 
-    let fetch_refspec = format!("refs/heads/{head_ref_name}:refs/remotes/{remote_name}/{head_ref_name}");
-    git_stdout(
-        &repo_root,
-        &["fetch", &remote_name, &fetch_refspec],
-        signal,
-    )
-    .await?;
+    let fetch_refspec =
+        format!("refs/heads/{head_ref_name}:refs/remotes/{remote_name}/{head_ref_name}");
+    git_stdout(&repo_root, &["fetch", &remote_name, &fetch_refspec], signal).await?;
 
     if existing_worktree.is_none() {
         let local_ref = format!("refs/heads/{local_branch}");
@@ -3193,14 +3301,20 @@ async fn checkout_pull_request(
                 .unwrap_or_default();
             if existing_oid != head_ref_oid {
                 if !force {
-                    let short = format_short_sha(Some(&existing_oid)).unwrap_or_else(|| existing_oid.clone());
+                    let short = format_short_sha(Some(&existing_oid))
+                        .unwrap_or_else(|| existing_oid.clone());
                     bail!(
                         "local branch {local_branch} already exists at {short}; pass force=true to reset it"
                     );
                 }
                 git_stdout(
                     &repo_root,
-                    &["branch", "-f", &local_branch, &format!("refs/remotes/{remote_name}/{head_ref_name}")],
+                    &[
+                        "branch",
+                        "-f",
+                        &local_branch,
+                        &format!("refs/remotes/{remote_name}/{head_ref_name}"),
+                    ],
                     signal,
                 )
                 .await?;
@@ -3208,7 +3322,11 @@ async fn checkout_pull_request(
         } else {
             git_stdout(
                 &repo_root,
-                &["branch", &local_branch, &format!("refs/remotes/{remote_name}/{head_ref_name}")],
+                &[
+                    "branch",
+                    &local_branch,
+                    &format!("refs/remotes/{remote_name}/{head_ref_name}"),
+                ],
                 signal,
             )
             .await?;
@@ -3221,20 +3339,24 @@ async fn checkout_pull_request(
         ("merge", format!("refs/heads/{head_ref_name}")),
         ("pushRemote", remote_name.clone()),
         ("ompPrHeadRef", head_ref_name.clone()),
-        ("ompPrUrl", json_string(&data, "url").unwrap_or("").to_string()),
         (
-            "ompPrIsCrossRepository",
-            is_cross_repository.to_string(),
+            "ompPrUrl",
+            json_string(&data, "url").unwrap_or("").to_string(),
         ),
+        ("ompPrIsCrossRepository", is_cross_repository.to_string()),
         (
             "ompPrMaintainerCanModify",
-            json_bool(&data, "maintainerCanModify").unwrap_or(false).to_string(),
+            json_bool(&data, "maintainerCanModify")
+                .unwrap_or(false)
+                .to_string(),
         ),
     ] {
         git_config_set(&repo_root, &format!("{config_prefix}{key}"), &value, signal).await?;
     }
 
-    let mut final_worktree_path = existing_worktree.as_deref().map_or(worktree_path, PathBuf::from);
+    let mut final_worktree_path = existing_worktree
+        .as_deref()
+        .map_or(worktree_path, PathBuf::from);
     if existing_worktree.is_none() {
         if let Some(parent) = final_worktree_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -3291,7 +3413,11 @@ pub fn pr_checkout_branch(pr: Option<&PrArg>) -> Option<String> {
     number.map(|number| format!("pr-{number}"))
 }
 
-async fn pr_push(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Result<AgentToolResult> {
+async fn pr_push(
+    cwd: &Path,
+    params: &GithubParams,
+    signal: &AbortSignal,
+) -> Result<AgentToolResult> {
     let repo_root = require_git_repo_root(cwd, signal).await?;
     let local_branch = match normalize_optional_string(params.branch.as_deref()) {
         Some(branch) => branch,
@@ -3305,11 +3431,15 @@ async fn pr_push(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Res
     }
 
     let config_prefix = format!("branch.{local_branch}.");
-    let head_ref = git_config_get(&repo_root, &format!("{config_prefix}ompPrHeadRef"), signal).await;
+    let head_ref =
+        git_config_get(&repo_root, &format!("{config_prefix}ompPrHeadRef"), signal).await;
     let Some(head_ref) = head_ref else {
-        bail!("branch {local_branch} has no PR push metadata; check it out via op: pr_checkout first");
+        bail!(
+            "branch {local_branch} has no PR push metadata; check it out via op: pr_checkout first"
+        );
     };
-    let push_remote = git_config_get(&repo_root, &format!("{config_prefix}pushRemote"), signal).await;
+    let push_remote =
+        git_config_get(&repo_root, &format!("{config_prefix}pushRemote"), signal).await;
     let remote = match push_remote {
         Some(remote) => Some(remote),
         None => git_config_get(&repo_root, &format!("{config_prefix}remote"), signal).await,
@@ -3369,11 +3499,19 @@ async fn pr_push(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Res
     ))
 }
 
-async fn search_issues(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Result<AgentToolResult> {
+async fn search_issues(
+    cwd: &Path,
+    params: &GithubParams,
+    signal: &AbortSignal,
+) -> Result<AgentToolResult> {
     search_issue_like(cwd, params, signal, "issues", "is:issue").await
 }
 
-async fn search_prs(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Result<AgentToolResult> {
+async fn search_prs(
+    cwd: &Path,
+    params: &GithubParams,
+    signal: &AbortSignal,
+) -> Result<AgentToolResult> {
     search_issue_like(cwd, params, signal, "pull requests", "is:pr").await
 }
 
@@ -3386,7 +3524,11 @@ async fn search_issue_like(
 ) -> Result<AgentToolResult> {
     let limit = resolve_search_limit(params.limit)?;
     let date_field = resolve_search_date_field(
-        if type_qualifier == "is:pr" { "prs" } else { "issues" },
+        if type_qualifier == "is:pr" {
+            "prs"
+        } else {
+            "issues"
+        },
         params.date_field.as_deref(),
     );
     let date_qualifier = build_search_date_qualifier(
@@ -3395,7 +3537,8 @@ async fn search_issue_like(
         params.until.as_deref(),
         cache::now_ms(),
     )?;
-    let display_query = compose_search_query(&[params.query.as_deref(), date_qualifier.as_deref()])?;
+    let display_query =
+        compose_search_query(&[params.query.as_deref(), date_qualifier.as_deref()])?;
     let repo = resolve_search_repo_scope(
         cwd,
         normalize_optional_string(params.repo.as_deref()).as_deref(),
@@ -3417,11 +3560,7 @@ async fn search_issue_like(
         .map(api_issue_to_search_result)
         .collect();
     let text = format_search_results(kind, &display_query, repo.as_deref(), &items);
-    Ok(text_result(
-        text,
-        None,
-        json!({"results": items.len()}),
-    ))
+    Ok(text_result(text, None, json!({"results": items.len()})))
 }
 
 async fn resolve_search_repo_scope(
@@ -3441,12 +3580,18 @@ async fn resolve_search_repo_scope(
     try_resolve_current_repo(cwd, signal).await
 }
 
-async fn search_code(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Result<AgentToolResult> {
+async fn search_code(
+    cwd: &Path,
+    params: &GithubParams,
+    signal: &AbortSignal,
+) -> Result<AgentToolResult> {
     let query = require_non_empty(params.query.as_deref(), "query")?;
     let since = normalize_optional_string(params.since.as_deref());
     let until = normalize_optional_string(params.until.as_deref());
     if since.is_some() || until.is_some() {
-        bail!("search_code does not support since/until; GitHub code search has no date qualifier.");
+        bail!(
+            "search_code does not support since/until; GitHub code search has no date qualifier."
+        );
     }
     let limit = resolve_search_limit(params.limit)?;
     let repo = resolve_search_repo_scope(
@@ -3474,7 +3619,11 @@ async fn search_code(cwd: &Path, params: &GithubParams, signal: &AbortSignal) ->
     Ok(text_result(text, None, json!({"results": items.len()})))
 }
 
-async fn search_commits(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Result<AgentToolResult> {
+async fn search_commits(
+    cwd: &Path,
+    params: &GithubParams,
+    signal: &AbortSignal,
+) -> Result<AgentToolResult> {
     let limit = resolve_search_limit(params.limit)?;
     let date_field = resolve_search_date_field("commits", params.date_field.as_deref());
     let date_qualifier = build_search_date_qualifier(
@@ -3483,7 +3632,8 @@ async fn search_commits(cwd: &Path, params: &GithubParams, signal: &AbortSignal)
         params.until.as_deref(),
         cache::now_ms(),
     )?;
-    let display_query = compose_search_query(&[params.query.as_deref(), date_qualifier.as_deref()])?;
+    let display_query =
+        compose_search_query(&[params.query.as_deref(), date_qualifier.as_deref()])?;
     let repo = resolve_search_repo_scope(
         cwd,
         normalize_optional_string(params.repo.as_deref()).as_deref(),
@@ -3503,7 +3653,11 @@ async fn search_commits(cwd: &Path, params: &GithubParams, signal: &AbortSignal)
     Ok(text_result(text, None, json!({"results": items.len()})))
 }
 
-async fn search_repos(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Result<AgentToolResult> {
+async fn search_repos(
+    cwd: &Path,
+    params: &GithubParams,
+    signal: &AbortSignal,
+) -> Result<AgentToolResult> {
     let limit = resolve_search_limit(params.limit)?;
     let date_field = resolve_search_date_field("repos", params.date_field.as_deref());
     let date_qualifier = build_search_date_qualifier(
@@ -3589,7 +3743,9 @@ async fn fetch_run_jobs(
         let page_len = page_jobs.len();
         jobs.extend(page_jobs);
         let total = response.get("total_count").and_then(Value::as_i64);
-        if page_len < 100 || total.is_some_and(|total| i64::try_from(jobs.len()).unwrap_or(i64::MAX) >= total) {
+        if page_len < 100
+            || total.is_some_and(|total| i64::try_from(jobs.len()).unwrap_or(i64::MAX) >= total)
+        {
             break;
         }
         page += 1;
@@ -3654,7 +3810,11 @@ fn tail_lines(text: &str, limit: usize) -> String {
     lines[start..].join("\n")
 }
 
-async fn run_watch(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> Result<AgentToolResult> {
+async fn run_watch(
+    cwd: &Path,
+    params: &GithubParams,
+    signal: &AbortSignal,
+) -> Result<AgentToolResult> {
     let repo = resolve_github_repo(
         cwd,
         normalize_optional_string(params.repo.as_deref()).as_deref(),
@@ -3811,7 +3971,14 @@ async fn run_watch(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> R
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            jobs = fetch_run_jobs(cwd, &reference.slug, reference.host.as_deref(), run_id, signal).await?;
+            jobs = fetch_run_jobs(
+                cwd,
+                &reference.slug,
+                reference.host.as_deref(),
+                run_id,
+                signal,
+            )
+            .await?;
 
             if is_terminal_status(&run_status) {
                 break;
@@ -3835,12 +4002,24 @@ async fn run_watch(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> R
         let mut lines = vec![
             format!(
                 "# Actions Run {run_id}: {}",
-                if run_title.is_empty() { "(untitled)" } else { &run_title }
+                if run_title.is_empty() {
+                    "(untitled)"
+                } else {
+                    &run_title
+                }
             ),
             String::new(),
         ];
-        push_line(&mut lines, "URL", Some(run_url.clone()).filter(|url| !url.is_empty()));
-        push_line(&mut lines, "Status", Some(run_status.clone()).filter(|s| !s.is_empty()));
+        push_line(
+            &mut lines,
+            "URL",
+            Some(run_url.clone()).filter(|url| !url.is_empty()),
+        );
+        push_line(
+            &mut lines,
+            "Status",
+            Some(run_status.clone()).filter(|s| !s.is_empty()),
+        );
         push_line(
             &mut lines,
             "Conclusion",
@@ -3851,7 +4030,10 @@ async fn run_watch(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> R
         let mut job_lines: Vec<String> = Vec::new();
         for job in &jobs {
             let (status, conclusion) = job_state(job);
-            let name = job.get("name").and_then(Value::as_str).unwrap_or("(unnamed job)");
+            let name = job
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("(unnamed job)");
             let marker = if is_failed_conclusion(conclusion) {
                 "FAIL"
             } else if conclusion == "success" {
@@ -3885,8 +4067,18 @@ async fn run_watch(cwd: &Path, params: &GithubParams, signal: &AbortSignal) -> R
             let Some(job_id) = job.get("id").and_then(Value::as_i64) else {
                 continue;
             };
-            let name = job.get("name").and_then(Value::as_str).unwrap_or("(unnamed job)");
-            let logs = fetch_job_logs(cwd, &reference.slug, reference.host.as_deref(), job_id, signal).await;
+            let name = job
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("(unnamed job)");
+            let logs = fetch_job_logs(
+                cwd,
+                &reference.slug,
+                reference.host.as_deref(),
+                job_id,
+                signal,
+            )
+            .await;
             let tail = tail_lines(&logs, tail);
             failures.push(format!("### {name}\n\n```\n{tail}\n```"));
         }
@@ -4068,7 +4260,10 @@ mod tests {
     #[test]
     fn date_bound_iso_date_and_datetime() {
         let now = 1_778_284_800_000;
-        assert_eq!(parse_search_date_bound("2024-01-31", now).unwrap(), "2024-01-31");
+        assert_eq!(
+            parse_search_date_bound("2024-01-31", now).unwrap(),
+            "2024-01-31"
+        );
         assert_eq!(
             parse_search_date_bound("2024-01-31T10:11:12.345Z", now).unwrap(),
             "2024-01-31T10:11:12Z"
@@ -4111,8 +4306,14 @@ mod tests {
             resolve_search_date_field("commits", Some("updated")),
             "committer-date"
         );
-        assert_eq!(resolve_search_date_field("repos", Some("updated")), "pushed");
-        assert_eq!(resolve_search_date_field("repos", Some("created")), "created");
+        assert_eq!(
+            resolve_search_date_field("repos", Some("updated")),
+            "pushed"
+        );
+        assert_eq!(
+            resolve_search_date_field("repos", Some("created")),
+            "created"
+        );
         assert_eq!(resolve_search_date_field("issues", None), "created");
         assert_eq!(resolve_search_date_field("prs", Some("updated")), "updated");
     }
@@ -4182,7 +4383,10 @@ mod tests {
     fn search_scope_splits_host_from_qualifier() {
         assert_eq!(
             search_scope(Some("github.com/owner/repo")),
-            (Some("repo:owner/repo".to_string()), Some("github.com".to_string()))
+            (
+                Some("repo:owner/repo".to_string()),
+                Some("github.com".to_string())
+            )
         );
         assert_eq!(
             search_scope(Some("owner/repo")),
@@ -4203,7 +4407,10 @@ mod tests {
         let bare = parse_repo_ref("owner/repo");
         assert!(bare.host.is_none());
         assert!(gh_api_host_args(&bare).is_empty());
-        assert_eq!(format_repo_ref(Some("ghe.example.com"), "owner/repo"), "ghe.example.com/owner/repo");
+        assert_eq!(
+            format_repo_ref(Some("ghe.example.com"), "owner/repo"),
+            "ghe.example.com/owner/repo"
+        );
         assert_eq!(format_repo_ref(None, "owner/repo"), "owner/repo");
     }
 
@@ -4272,7 +4479,9 @@ mod tests {
         );
         assert_eq!(parse_pull_request_url(Some("17")), (None, None));
         assert_eq!(
-            parse_issue_url(Some("https://ghe.example.com/owner/repo/issues/3#issuecomment-1")),
+            parse_issue_url(Some(
+                "https://ghe.example.com/owner/repo/issues/3#issuecomment-1"
+            )),
             (Some("ghe.example.com/owner/repo".to_string()), Some(3))
         );
         assert_eq!(parse_issue_url(None), (None, None));
@@ -4313,7 +4522,10 @@ mod tests {
 
     #[test]
     fn text_helpers_normalize_like_ts() {
-        assert_eq!(normalize_optional_string(Some("  x  ")), Some("x".to_string()));
+        assert_eq!(
+            normalize_optional_string(Some("  x  ")),
+            Some("x".to_string())
+        );
         assert_eq!(normalize_optional_string(Some("   ")), None);
         assert_eq!(normalize_text(Some("a\r\nb\tc\r")), "a\nb    c");
         assert_eq!(normalize_block(Some("a\r\n\tb\n\n")), "a\n    b");
@@ -4327,7 +4539,10 @@ mod tests {
         assert_eq!(format_bytes(999), "999 B");
         assert_eq!(format_bytes(2048), "2.0 KB");
         assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
-        assert_eq!(format_short_sha(Some("abcdef1234567")), Some("abcdef1".to_string()));
+        assert_eq!(
+            format_short_sha(Some("abcdef1234567")),
+            Some("abcdef1".to_string())
+        );
         assert_eq!(format_short_sha(Some("")), None);
         assert_eq!(format_short_sha(None), None);
     }
@@ -4558,8 +4773,14 @@ mod tests {
         assert!(is_probably_binary(&[0x00, 0x01, 0x02, 0x03]));
         assert!(!is_probably_binary(b"plain text\n"));
         assert!(!is_probably_binary(b""));
-        assert_eq!(sniff_image_mime(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]), Some("image/png"));
-        assert_eq!(sniff_image_mime(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
+        assert_eq!(
+            sniff_image_mime(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+            Some("image/png")
+        );
+        assert_eq!(
+            sniff_image_mime(&[0xff, 0xd8, 0xff, 0xe0]),
+            Some("image/jpeg")
+        );
         assert_eq!(sniff_image_mime(b"GIF89a"), Some("image/gif"));
         assert_eq!(sniff_image_mime(b"RIFF1234WEBPVP8 "), Some("image/webp"));
         assert_eq!(sniff_image_mime(b"hello"), None);
@@ -4609,7 +4830,13 @@ mod tests {
     fn job_state_helpers_classify_conclusions() {
         assert!(is_terminal_status("completed"));
         assert!(!is_terminal_status("in_progress"));
-        for conclusion in ["failure", "cancelled", "timed_out", "action_required", "startup_failure"] {
+        for conclusion in [
+            "failure",
+            "cancelled",
+            "timed_out",
+            "action_required",
+            "startup_failure",
+        ] {
             assert!(is_failed_conclusion(conclusion), "{conclusion}");
         }
         assert!(!is_failed_conclusion("success"));
@@ -4625,9 +4852,14 @@ mod tests {
 
     #[test]
     fn description_is_the_ts_prompt() {
-        assert!(DESCRIPTION.starts_with("`gh` op wrapper: repos/files, PRs, search, checkout, push, Actions watch."));
+        assert!(DESCRIPTION.starts_with(
+            "`gh` op wrapper: repos/files, PRs, search, checkout, push, Actions watch."
+        ));
         assert!(DESCRIPTION.contains("<critical>\nGitHub-hosted repository file: MUST use `file_read`; NEVER `curl`/`wget`.\n</critical>"));
-        assert_eq!(SUMMARY, "Interact with GitHub repositories, files, pull requests, and Actions");
+        assert_eq!(
+            SUMMARY,
+            "Interact with GitHub repositories, files, pull requests, and Actions"
+        );
     }
 
     #[test]

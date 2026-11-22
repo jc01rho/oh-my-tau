@@ -38,7 +38,8 @@ Native `security_scan` actions (preflight, start, status, cancel, validate) do n
 and are unaffected. Cloud actions never fall back to a native scan.";
 
 /// Error text when `security` is off in settings.
-pub const SECURITY_DISABLED: &str = "Security is disabled in settings. Enable security before running \
+pub const SECURITY_DISABLED: &str =
+    "Security is disabled in settings. Enable security before running \
 security scans (preflight/start/cloud_* are refused while it is off).";
 
 /// Target kinds accepted by `preflight`.
@@ -278,7 +279,13 @@ impl SecurityStore {
                 "INSERT INTO security_plans (plan_id, created_at, target_kind, snapshot, plan_json)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(plan_id) DO UPDATE SET plan_json = excluded.plan_json",
-                params![plan.plan_id, plan.created_at, plan.target_kind, plan.snapshot, payload],
+                params![
+                    plan.plan_id,
+                    plan.created_at,
+                    plan.target_kind,
+                    plan.snapshot,
+                    payload
+                ],
             )?;
             Ok(())
         })
@@ -729,7 +736,10 @@ impl std::fmt::Debug for SecurityCoordinator {
             .field("store", &self.store)
             .field("repository_root", &self.repository_root)
             .field("security_enabled", &self.security_enabled)
-            .field("codex_token", &self.codex_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "codex_token",
+                &self.codex_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -988,7 +998,9 @@ impl SecurityCoordinator {
                         .and_then(Value::as_str)
                         .map(str::trim)
                         .filter(|l| !l.is_empty())
-                        .ok_or_else(|| anyhow!("validation_evidence item needs a non-empty `label`"))?;
+                        .ok_or_else(|| {
+                            anyhow!("validation_evidence item needs a non-empty `label`")
+                        })?;
                     let explanation = item
                         .get("explanation")
                         .and_then(Value::as_str)
@@ -1406,7 +1418,9 @@ impl SecurityCoordinator {
                 Ok(out.trim_end().to_string())
             }
             "plan" => {
-                let plan_id = argv.get(1).ok_or_else(|| anyhow!("usage: /security plan <plan_id>"))?;
+                let plan_id = argv
+                    .get(1)
+                    .ok_or_else(|| anyhow!("usage: /security plan <plan_id>"))?;
                 let plan = self
                     .store
                     .plan(plan_id)?
@@ -1431,7 +1445,9 @@ impl SecurityCoordinator {
                 ))
             }
             "start" => {
-                let plan_id = argv.get(1).ok_or_else(|| anyhow!("usage: /security start <plan_id>"))?;
+                let plan_id = argv
+                    .get(1)
+                    .ok_or_else(|| anyhow!("usage: /security start <plan_id>"))?;
                 let started = self.start(&json!({"action": "start", "plan_id": plan_id}))?;
                 Ok(format!(
                     "queued {}\n  plan: {}\n  next: /security status {}",
@@ -1462,22 +1478,29 @@ impl SecurityCoordinator {
                     };
                     out.push_str(&format!(
                         "{:<8} {:<12} {}  {}  [{}]\n",
-                        finding.severity, finding.validation_status, finding.finding_id, location, finding.title
+                        finding.severity,
+                        finding.validation_status,
+                        finding.finding_id,
+                        location,
+                        finding.title
                     ));
                 }
                 Ok(out.trim_end().to_string())
             }
             "validate" => {
-                let finding_id = argv
-                    .get(1)
-                    .ok_or_else(|| anyhow!("usage: /security validate <finding_id> <status> [summary]"))?;
+                let finding_id = argv.get(1).ok_or_else(|| {
+                    anyhow!("usage: /security validate <finding_id> <status> [summary]")
+                })?;
                 let status = argv.get(2).ok_or_else(|| {
                     anyhow!(
                         "usage: /security validate <finding_id> <status> [summary]; status: {}",
                         VALIDATION_STATES.join("|")
                     )
                 })?;
-                let summary = argv.get(3..).map(|rest| rest.join(" ")).filter(|s| !s.is_empty());
+                let summary = argv
+                    .get(3..)
+                    .map(|rest| rest.join(" "))
+                    .filter(|s| !s.is_empty());
                 let mut params = json!({
                     "action": "validate",
                     "finding_id": finding_id,
@@ -1494,14 +1517,19 @@ impl SecurityCoordinator {
                 ))
             }
             "sarif" => {
-                let scan_id = argv.get(1).ok_or_else(|| anyhow!("usage: /security sarif <scan_id>"))?;
+                let scan_id = argv
+                    .get(1)
+                    .ok_or_else(|| anyhow!("usage: /security sarif <scan_id>"))?;
                 Ok(serde_json::to_string_pretty(&self.sarif(scan_id)?)?)
             }
             "cloud" => match self.cloud_scans(&json!({"action": "cloud_scans"})) {
                 Ok(value) => Ok(serde_json::to_string_pretty(&value)?),
                 Err(err) => Ok(format!("security: {err:#}")),
             },
-            other => Ok(format!("unknown /security subcommand `{other}`\n\n{}", help_text())),
+            other => Ok(format!(
+                "unknown /security subcommand `{other}`\n\n{}",
+                help_text()
+            )),
         }
     }
 }
@@ -1533,7 +1561,10 @@ mod tests {
 
     fn sample_finding(scan_id: &str) -> Finding {
         Finding {
-            finding_id: format!("fnd_{}", digest(&[scan_id.to_string(), "src/lib.rs".into()])),
+            finding_id: format!(
+                "fnd_{}",
+                digest(&[scan_id.to_string(), "src/lib.rs".into()])
+            ),
             scan_id: scan_id.to_string(),
             source: "omp-native".to_string(),
             severity: "high".to_string(),
@@ -1574,7 +1605,10 @@ mod tests {
             repository_root: dir.to_string_lossy().to_string(),
         };
         store.upsert_plan(&plan).expect("insert plan");
-        assert_eq!(store.plan("plan_test").expect("read plan"), Some(plan.clone()));
+        assert_eq!(
+            store.plan("plan_test").expect("read plan"),
+            Some(plan.clone())
+        );
         assert_eq!(store.plans().expect("list plans").len(), 1);
 
         // Re-planning the same tree must not duplicate the row.
@@ -1594,7 +1628,10 @@ mod tests {
         assert_eq!(first["plan_id"], second["plan_id"]);
         assert_eq!(first["snapshot"], second["snapshot"]);
         assert_eq!(first["target_kind"], "repository");
-        assert!(first["plan_id"].as_str().unwrap_or_default().starts_with("plan_"));
+        assert!(first["plan_id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("plan_"));
     }
 
     #[test]
@@ -1663,8 +1700,11 @@ mod tests {
             .expect("preflight");
         let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
 
-        fs::write(coord.repository_root().join("src/lib.rs"), "fn changed() {}\n")
-            .expect("mutate tree");
+        fs::write(
+            coord.repository_root().join("src/lib.rs"),
+            "fn changed() {}\n",
+        )
+        .expect("mutate tree");
 
         let err = coord
             .start(&json!({"action": "start", "plan_id": plan_id}))
@@ -1676,7 +1716,10 @@ mod tests {
     fn validate_records_verdict_and_evidence() {
         let coord = coordinator("validate");
         let finding = sample_finding("op_1");
-        coord.store().upsert_finding(&finding).expect("insert finding");
+        coord
+            .store()
+            .upsert_finding(&finding)
+            .expect("insert finding");
 
         let out = coord
             .validate(&json!({
@@ -1759,7 +1802,10 @@ mod tests {
             run["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
             "src/lib.rs"
         );
-        assert_eq!(run["tool"]["driver"]["rules"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            run["tool"]["driver"]["rules"].as_array().map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1811,7 +1857,9 @@ mod tests {
         assert_eq!(started["state"], "enabled");
         assert_eq!(started["lookback_days"], "30");
 
-        let listed = coord.cloud_scans(&json!({"action": "cloud_scans"})).expect("scans");
+        let listed = coord
+            .cloud_scans(&json!({"action": "cloud_scans"}))
+            .expect("scans");
         assert_eq!(listed["count"], 1);
 
         let status = coord
@@ -1850,13 +1898,18 @@ mod tests {
             .expect_err("must refuse")
             .to_string()
             .contains("disabled in settings"));
-        assert!(coord.cloud_scans(&json!({"action": "cloud_scans"})).is_err());
+        assert!(coord
+            .cloud_scans(&json!({"action": "cloud_scans"}))
+            .is_err());
     }
 
     #[test]
     fn slash_command_surfaces_help_and_auth_state() {
         let coord = coordinator("slash");
-        assert!(coord.run_command("help").expect("help").contains("/security preflight"));
+        assert!(coord
+            .run_command("help")
+            .expect("help")
+            .contains("/security preflight"));
         assert!(coord.run_command("").expect("empty").contains("OMP-native"));
         let status = coord.run_command("status").expect("status");
         assert!(status.contains("security enabled: yes"));
@@ -1882,9 +1935,15 @@ mod tests {
             .expect("plan id from output")
             .to_string();
         assert!(coord.run_command(&format!("plan {plan_id}")).is_ok());
-        assert!(coord.run_command(&format!("start {plan_id}")).expect("start").contains("queued"));
+        assert!(coord
+            .run_command(&format!("start {plan_id}"))
+            .expect("start")
+            .contains("queued"));
         assert!(coord.run_command("sarif op_missing").is_ok());
-        assert!(coord.run_command("plans").expect("plans").contains(&plan_id));
+        assert!(coord
+            .run_command("plans")
+            .expect("plans")
+            .contains(&plan_id));
     }
 
     #[test]

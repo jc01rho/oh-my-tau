@@ -5,27 +5,27 @@
 //! sessions, hashline mode included) and the file walks are `omp-xfs` over `pi-vfs`.
 //! Failures are returned as `Err` so the agent loop reports `isError: true`.
 
+pub(crate) mod aliases;
 pub mod ask;
 mod ast;
 pub mod bash;
+pub(crate) mod browser_prelude;
 pub mod checkpoint;
+pub(crate) mod computer_prelude;
+pub(crate) mod context_notes;
+pub(crate) mod context_rollover;
+pub(crate) mod debug;
 mod edit;
 mod eval;
 pub(crate) mod eval_agents;
 pub(crate) mod eval_bridge;
 pub(crate) mod eval_journal;
 mod find;
-mod jobs;
-pub mod mcp;
-pub(crate) mod aliases;
-pub(crate) mod browser_prelude;
-pub(crate) mod computer_prelude;
-pub(crate) mod context_notes;
-pub(crate) mod context_rollover;
-pub(crate) mod debug;
 pub(crate) mod github;
 pub(crate) mod github_cache;
 pub(crate) mod image_gen;
+mod jobs;
+pub mod mcp;
 pub(crate) mod memory_tools;
 mod read;
 pub(crate) mod read_fetch;
@@ -475,9 +475,7 @@ pub fn enabled_by_settings(settings: &omp_settings::Settings, name: &str) -> boo
         "edit" => string("edit.mode").as_deref() != Some("none"),
         // `editDisabled || bash.enabled`: without an edit tool, bash is the only
         // way to modify existing files, so it stays on.
-        "bash" => {
-            string("edit.mode").as_deref() == Some("none") || flag("bash.enabled", true)
-        }
+        "bash" => string("edit.mode").as_deref() == Some("none") || flag("bash.enabled", true),
         // `allowEval`: any eval backend reachable. The port always has one, so
         // this is the reference's truthy branch.
         "eval" => true,
@@ -508,9 +506,7 @@ pub fn enabled_by_settings(settings: &omp_settings::Settings, name: &str) -> boo
         "ask" => flag("ask.enabled", true),
         // Inert until the context-management tools land (they need the session
         // journal as a `ContextNotesHost`).
-        "context_notes" | "new_context" => {
-            flag("compaction.experimentalContextManagement", false)
-        }
+        "context_notes" | "new_context" => flag("compaction.experimentalContextManagement", false),
         // `checkpoint.enabled && (taskDepth == 0 || requestedTools !== undefined)`;
         // the depth leg needs session state, so the setting is the gate here.
         "checkpoint" | "rewind" => flag("checkpoint.enabled", false),
@@ -536,10 +532,7 @@ pub fn enabled_by_settings(settings: &omp_settings::Settings, name: &str) -> boo
         }
         // `canSpawnAtDepth(task.maxRecursionDepth, taskDepth)`: a non-positive
         // ceiling disables spawning everywhere (the depth leg is session state).
-        "task" => settings
-            .get_number("task.maxRecursionDepth")
-            .unwrap_or(2.0)
-            > 0.0,
+        "task" => settings.get_number("task.maxRecursionDepth").unwrap_or(2.0) > 0.0,
         _ => true,
     }
 }
@@ -851,7 +844,10 @@ mod tests {
             assert!(defaults.iter().any(|n| n == on), "{on} off by default");
         }
         // `github.enabled` is off by default (no `gh`/`glab` assumption).
-        assert!(!defaults.iter().any(|n| n == "github"), "github on by default");
+        assert!(
+            !defaults.iter().any(|n| n == "github"),
+            "github on by default"
+        );
         let with_github = names("github:\n  enabled: true\n");
         assert!(
             with_github.iter().any(|n| n == "github"),
@@ -868,7 +864,10 @@ mod tests {
         assert!(!no_wait.iter().any(|n| n == "wait"), "wait gate ignored");
         // `task.maxRecursionDepth: 0` disables spawning everywhere.
         let no_task = names("task:\n  maxRecursionDepth: 0\n");
-        assert!(!no_task.iter().any(|n| n == "task"), "task depth gate ignored");
+        assert!(
+            !no_task.iter().any(|n| n == "task"),
+            "task depth gate ignored"
+        );
         // `ask.enabled: false` hides `ask`.
         let no_ask = names("ask:\n  enabled: false\n");
         assert!(!no_ask.iter().any(|n| n == "ask"), "ask gate ignored");
@@ -905,7 +904,13 @@ mod tests {
     fn hidden_vibe_tools_resolve_with_a_session_env() {
         let dir = tempfile::tempdir().unwrap();
         let (env, tools) = builtin_tools_with_env(dir.path(), EditMode::Hashline);
-        for name in ["vibe_spawn", "vibe_send", "vibe_wait", "vibe_kill", "vibe_list"] {
+        for name in [
+            "vibe_spawn",
+            "vibe_send",
+            "vibe_wait",
+            "vibe_kill",
+            "vibe_list",
+        ] {
             let tool = hidden_tool_with_env_by_name(name, &env)
                 .unwrap_or_else(|| panic!("{name} not constructible"));
             assert_eq!(tool.name(), name);
@@ -936,7 +941,11 @@ mod tests {
         }
 
         let cfg = dir.path().join("config.yml");
-        std::fs::write(&cfg, "autolearn:\n  enabled: true\nmemory:\n  backend: mnemopi\n").unwrap();
+        std::fs::write(
+            &cfg,
+            "autolearn:\n  enabled: true\nmemory:\n  backend: mnemopi\n",
+        )
+        .unwrap();
         let on = omp_settings::Settings::load_from(Some(&cfg), dir.path());
         for name in ["learn", "manage_skill"] {
             let tool = hidden_memory_tool_by_name(name, &env, backend.clone(), &on)

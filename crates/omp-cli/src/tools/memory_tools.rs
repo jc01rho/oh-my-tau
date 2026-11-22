@@ -203,7 +203,12 @@ pub trait MemoryToolBackend: Send + Sync {
         self.recall(&composed, limit)
     }
 
-    fn update(&self, id: &str, content: Option<&str>, importance: Option<f32>) -> Result<EditOutcome>;
+    fn update(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        importance: Option<f32>,
+    ) -> Result<EditOutcome>;
 
     fn forget(&self, id: &str) -> Result<EditOutcome>;
 
@@ -335,7 +340,12 @@ impl MemoryToolBackend for InMemoryBackend {
         Ok(hits)
     }
 
-    fn update(&self, id: &str, content: Option<&str>, importance: Option<f32>) -> Result<EditOutcome> {
+    fn update(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        importance: Option<f32>,
+    ) -> Result<EditOutcome> {
         let mut inner = self.lock();
         let now = now_secs();
         let Some(item) = inner.items.iter_mut().find(|item| item.id == id) else {
@@ -372,12 +382,7 @@ impl MemoryToolBackend for InMemoryBackend {
     }
 
     fn get(&self, id: &str) -> Result<Option<RetainedMemory>> {
-        Ok(self
-            .lock()
-            .items
-            .iter()
-            .find(|item| item.id == id)
-            .cloned())
+        Ok(self.lock().items.iter().find(|item| item.id == id).cloned())
     }
 }
 
@@ -524,7 +529,9 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
-    args.get(key).and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
 }
 
 fn opt_usize(args: &Value, key: &str) -> Option<usize> {
@@ -669,7 +676,9 @@ impl SkillStore {
                     }
                 })?;
                 if meta.file_type().is_symlink() {
-                    bail!("Managed skill \"{name}\" SKILL.md is a symlink; refusing to overwrite it.");
+                    bail!(
+                        "Managed skill \"{name}\" SKILL.md is a symlink; refusing to overwrite it."
+                    );
                 }
                 if !meta.is_file() {
                     bail!("Managed skill \"{name}\" SKILL.md is not a regular file; refusing to overwrite it.");
@@ -679,9 +688,9 @@ impl SkillStore {
             }
             // Deleting is `SkillStore::delete`; callers reject it before
             // reaching the write path, so this arm only guards the invariant.
-            SkillAction::Delete => bail!(
-                "Managed skill \"{name}\" cannot be written with action \"delete\"."
-            ),
+            SkillAction::Delete => {
+                bail!("Managed skill \"{name}\" cannot be written with action \"delete\".")
+            }
         }
         Ok(file)
     }
@@ -1385,9 +1394,7 @@ impl MemoryEditTool {
         }
         // TS clamps instead of rejecting: a model that passes 1.5 means "very
         // important", not "fail the call".
-        let importance = parsed
-            .importance
-            .map(|value| value.clamp(0.0, 1.0) as f32);
+        let importance = parsed.importance.map(|value| value.clamp(0.0, 1.0) as f32);
 
         let outcome = match parsed.op {
             EditOp::Update => self
@@ -1550,16 +1557,25 @@ impl LearnTool {
             bail!("`skill.action` for learn must be \"create\" or \"update\".");
         }
         let Some(description) = skill.description.as_deref() else {
-            bail!("\"{}\" requires both \"description\" and \"body\".", skill.action.verb());
+            bail!(
+                "\"{}\" requires both \"description\" and \"body\".",
+                skill.action.verb()
+            );
         };
         let Some(body) = skill.body.as_deref() else {
-            bail!("\"{}\" requires both \"description\" and \"body\".", skill.action.verb());
+            bail!(
+                "\"{}\" requires both \"description\" and \"body\".",
+                skill.action.verb()
+            );
         };
         let safe_name = match sanitize_skill_name(&skill.name) {
             Ok(name) => name,
             Err(err) => {
                 return Ok(soft_error(
-                    format!("Lesson stored. Did not write managed skill \"{}\": {err}", skill.name),
+                    format!(
+                        "Lesson stored. Did not write managed skill \"{}\": {err}",
+                        skill.name
+                    ),
                     json!({"memory_id": memory_id, "skill": Value::Null}),
                 ));
             }
@@ -1737,7 +1753,10 @@ impl ManageSkillTool {
             }
         }
 
-        let path = self.ctx.skills.write(parsed.action, &name, description, body)?;
+        let path = self
+            .ctx
+            .skills
+            .write(parsed.action, &name, description, body)?;
         Ok(result_with(
             format!(
                 "{} managed skill \"{name}\" ({}).",
@@ -1862,7 +1881,11 @@ pub fn approval(name: &str, args: &Value, settings: &omp_settings::Settings) -> 
             })
     };
     match name {
-        "retain" => Decision::tier(if global_scope(args) { Tier::Write } else { Tier::Read }),
+        "retain" => Decision::tier(if global_scope(args) {
+            Tier::Write
+        } else {
+            Tier::Read
+        }),
         "learn" => {
             let skill = args.get("skill").is_some_and(|v| !v.is_null());
             let local_backend = settings.get_string("memory.backend").as_deref() == Some("local");
@@ -1927,7 +1950,10 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let skills = Arc::new(SkillStore::at(
             dir.path().join("managed-skills"),
-            vec![dir.path().join("user-skills"), dir.path().join("project/.omp/skills")],
+            vec![
+                dir.path().join("user-skills"),
+                dir.path().join("project/.omp/skills"),
+            ],
         ));
         let ctx = ToolContext::new(dir.path().to_path_buf(), backend.clone(), skills.clone());
         Harness {
@@ -1966,7 +1992,8 @@ mod tests {
             insert_setting(&mut root, &segments, value);
         }
         std::fs::write(&global, root.to_string()).unwrap();
-        let settings = omp_settings::Settings::load_from(Some(&global), &dir.path().join("project"));
+        let settings =
+            omp_settings::Settings::load_from(Some(&global), &dir.path().join("project"));
         drop(dir);
         settings
     }
@@ -1999,7 +2026,10 @@ mod tests {
             "ok"
         );
         // Unterminated: drop the tag, keep the words.
-        assert_eq!(strip_tag_blocks("<memories>still here", MEMORY_TAGS), "still here");
+        assert_eq!(
+            strip_tag_blocks("<memories>still here", MEMORY_TAGS),
+            "still here"
+        );
     }
 
     #[test]
@@ -2014,7 +2044,11 @@ mod tests {
     fn query_terms_dedupe_and_ignore_short_tokens() {
         assert_eq!(
             query_terms("Deploy the DEPLOY a b pipeline"),
-            vec!["deploy".to_string(), "the".to_string(), "pipeline".to_string()]
+            vec![
+                "deploy".to_string(),
+                "the".to_string(),
+                "pipeline".to_string()
+            ]
         );
     }
 
@@ -2123,7 +2157,10 @@ mod tests {
         let tool = RecallTool::new(h.ctx.clone());
         let out = tool.run(&json!({"query": "release tag workflow"})).unwrap();
         let text = text_of(&out);
-        assert!(text.starts_with("Found 2 relevant memories (as of "), "{text}");
+        assert!(
+            text.starts_with("Found 2 relevant memories (as of "),
+            "{text}"
+        );
         // mem_a matches three terms, mem_b one.
         let first = text.find("[mem_a]").unwrap();
         let second = text.find("[mem_b]").unwrap();
@@ -2141,7 +2178,11 @@ mod tests {
         let text = text_of(&out);
         let preview = text.split("[mem_long] ").nth(1).unwrap();
         // 500 chars of preview plus the ellipsis marker.
-        assert_eq!(preview.chars().count(), RECALL_PREVIEW_CHARS + 1, "{preview}");
+        assert_eq!(
+            preview.chars().count(),
+            RECALL_PREVIEW_CHARS + 1,
+            "{preview}"
+        );
         assert!(preview.ends_with('…'));
         assert_eq!(out.details["cut"], true);
     }
@@ -2157,7 +2198,9 @@ mod tests {
             ));
         }
         let tool = RecallTool::new(h.ctx.clone());
-        let out = tool.run(&json!({"query": "budget filler", "token_budget": 100})).unwrap();
+        let out = tool
+            .run(&json!({"query": "budget filler", "token_budget": 100}))
+            .unwrap();
         // 100 tokens ≈ 400 chars: fewer than all five fit.
         let rendered = out.details["count"].as_u64().unwrap();
         assert!(rendered < 5, "{}", text_of(&out));
@@ -2268,7 +2311,10 @@ mod tests {
 
         let out = tool.run(&json!({"op": "forget", "id": "mem_f"})).unwrap();
         assert_eq!(text_of(&out), "Memory mem_f forgotten.");
-        assert_eq!(h.backend.get("mem_f").unwrap().unwrap().status, MemoryStatus::Forgotten);
+        assert_eq!(
+            h.backend.get("mem_f").unwrap().unwrap().status,
+            MemoryStatus::Forgotten
+        );
 
         let out = tool
             .run(&json!({"op": "invalidate", "id": "mem_i", "replacement_id": "mem_r"}))
@@ -2289,9 +2335,7 @@ mod tests {
         h.backend.forget("mem_d").unwrap();
         let tool = MemoryEditTool::new(h.ctx.clone());
 
-        let missing = tool
-            .run(&json!({"op": "forget", "id": "mem_zzz"}))
-            .unwrap();
+        let missing = tool.run(&json!({"op": "forget", "id": "mem_zzz"})).unwrap();
         assert_eq!(text_of(&missing), "Memory mem_zzz was not found.");
         assert_eq!(missing.is_error, Some(true));
 
@@ -2322,10 +2366,16 @@ mod tests {
             }))
             .unwrap();
         let text = text_of(&out);
-        assert!(text.starts_with("Lesson stored. Created managed skill \"toolchain-pinning\""), "{text}");
+        assert!(
+            text.starts_with("Lesson stored. Created managed skill \"toolchain-pinning\""),
+            "{text}"
+        );
         let file = h.skills.path_for("toolchain-pinning");
         let content = std::fs::read_to_string(&file).unwrap();
-        assert!(content.starts_with("---\nname: toolchain-pinning\n"), "{content}");
+        assert!(
+            content.starts_with("---\nname: toolchain-pinning\n"),
+            "{content}"
+        );
         assert!(content.contains("description: \"Use when a build breaks after an upgrade\""));
         assert!(content.contains("# Pinning"));
         assert_eq!(h.backend.len(), 1);
@@ -2374,7 +2424,9 @@ mod tests {
     fn learn_rejects_an_empty_lesson_and_a_delete_skill_action() {
         let h = harness();
         let tool = LearnTool::new(h.ctx.clone());
-        assert!(tool.run(&json!({"memory": "<memories>x</memories>"})).is_err());
+        assert!(tool
+            .run(&json!({"memory": "<memories>x</memories>"}))
+            .is_err());
         let err = tool
             .run(&json!({
                 "memory": "lesson",
@@ -2415,7 +2467,9 @@ mod tests {
         assert!(text_of(&out).starts_with("Updated managed skill"));
         assert!(std::fs::read_to_string(&file).unwrap().contains("twice"));
 
-        let out = tool.run(&json!({"action": "delete", "name": "release-checks"})).unwrap();
+        let out = tool
+            .run(&json!({"action": "delete", "name": "release-checks"}))
+            .unwrap();
         assert_eq!(text_of(&out), "Deleted managed skill \"release-checks\".");
         assert!(!file.exists());
     }
@@ -2428,9 +2482,14 @@ mod tests {
             .run(&json!({"action": "create", "name": "x", "description": "d"}))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("requires both \"description\" and \"body\""), "{err}");
+        assert!(
+            err.contains("requires both \"description\" and \"body\""),
+            "{err}"
+        );
         // delete needs only the name.
-        assert!(tool.run(&json!({"action": "delete", "name": "absent"})).is_err());
+        assert!(tool
+            .run(&json!({"action": "delete", "name": "absent"}))
+            .is_err());
     }
 
     #[test]
@@ -2439,7 +2498,13 @@ mod tests {
         let tool = ManageSkillTool::new(h.ctx.clone());
         // Names are lowercased and space-folded before the allowlist runs, so
         // only characters outside the allowlist are rejected.
-        for name in ["../escape", "with/slash", "", "-leading", "a".repeat(65).as_str()] {
+        for name in [
+            "../escape",
+            "with/slash",
+            "",
+            "-leading",
+            "a".repeat(65).as_str(),
+        ] {
             let err = tool
                 .run(&json!({"action": "delete", "name": name}))
                 .unwrap_err()
@@ -2557,7 +2622,10 @@ mod tests {
             json!(["update", "forget", "invalidate"])
         );
         assert_eq!(by_name["learn"]["required"], json!(["memory"]));
-        assert_eq!(by_name["manage_skill"]["required"], json!(["action", "name"]));
+        assert_eq!(
+            by_name["manage_skill"]["required"],
+            json!(["action", "name"])
+        );
         assert_eq!(
             by_name["manage_skill"]["properties"]["action"]["enum"],
             json!(["create", "update", "delete"])
@@ -2567,8 +2635,14 @@ mod tests {
     #[test]
     fn memory_tools_exist_only_with_a_live_backend() {
         assert!(!memory_enabled(&settings(&[("memory.backend", "\"off\"")])));
-        assert!(memory_enabled(&settings(&[("memory.backend", "\"local\"")])));
-        assert!(memory_enabled(&settings(&[("memory.backend", "\"hindsight\"")])));
+        assert!(memory_enabled(&settings(&[(
+            "memory.backend",
+            "\"local\""
+        )])));
+        assert!(memory_enabled(&settings(&[(
+            "memory.backend",
+            "\"hindsight\""
+        )])));
         // Default is off (the schema default), so an empty config hides them.
         assert!(!memory_enabled(&settings(&[])));
     }
@@ -2578,8 +2652,14 @@ mod tests {
         let local = settings(&[("memory.backend", "\"mnemopi\"")]);
         let local_backend = settings(&[("memory.backend", "\"local\"")]);
 
-        assert_eq!(approval("recall", &json!({"query": "x"}), &local).tier, Tier::Read);
-        assert_eq!(approval("reflect", &json!({"query": "x"}), &local).tier, Tier::Read);
+        assert_eq!(
+            approval("recall", &json!({"query": "x"}), &local).tier,
+            Tier::Read
+        );
+        assert_eq!(
+            approval("reflect", &json!({"query": "x"}), &local).tier,
+            Tier::Read
+        );
         assert_eq!(
             approval("memory_edit", &json!({"op": "forget", "id": "m"}), &local).tier,
             Tier::Read
@@ -2589,7 +2669,12 @@ mod tests {
             Tier::Read
         );
         assert_eq!(
-            approval("retain", &json!({"items": [{"content": "c", "scope": "global"}]}), &local).tier,
+            approval(
+                "retain",
+                &json!({"items": [{"content": "c", "scope": "global"}]}),
+                &local
+            )
+            .tier,
             Tier::Write
         );
         assert_eq!(
@@ -2614,7 +2699,12 @@ mod tests {
             Tier::Write
         );
         assert_eq!(
-            approval("manage_skill", &json!({"action": "delete", "name": "n"}), &local).tier,
+            approval(
+                "manage_skill",
+                &json!({"action": "delete", "name": "n"}),
+                &local
+            )
+            .tier,
             Tier::Write
         );
     }
@@ -2634,7 +2724,14 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["retain", "recall", "reflect", "memory_edit", "learn", "manage_skill"]
+            vec![
+                "retain",
+                "recall",
+                "reflect",
+                "memory_edit",
+                "learn",
+                "manage_skill"
+            ]
         );
 
         let memory_only = settings(&[("memory.backend", "\"mnemopi\"")]);

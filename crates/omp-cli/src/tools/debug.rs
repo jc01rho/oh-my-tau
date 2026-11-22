@@ -16,8 +16,7 @@ use anyhow::{anyhow, Result};
 use omp_dap::session::{parse_access_type, SHARED};
 use omp_dap::types::{
     DapAttachSessionOptions, DapAttachTarget, DapDataBreakpoint, DapFunctionBreakpoint,
-    DapInstructionBreakpoint, DapLaunchSessionOptions, DapSourceBreakpoint,
-    LaunchAdapterSelection,
+    DapInstructionBreakpoint, DapLaunchSessionOptions, DapSourceBreakpoint, LaunchAdapterSelection,
 };
 use omp_dap::{config, format, Cancel};
 use pa_agent::abort::{is_abort_error, AbortSignal};
@@ -457,9 +456,7 @@ impl DebugTool {
             "attach" => {
                 let port = params.port.and_then(|port| u16::try_from(port).ok());
                 if params.pid.is_none() && port.is_none() {
-                    return Err(anyhow!(
-                        "`pid` or `port` is required for `attach`."
-                    ));
+                    return Err(anyhow!("`pid` or `port` is required for `attach`."));
                 }
                 let adapter = config::select_attach_adapter(
                     &cwd,
@@ -471,9 +468,7 @@ impl DebugTool {
                     },
                 )
                 .await
-                .ok_or_else(|| {
-                    anyhow!("No debug adapter is available for this attach target.")
-                })?;
+                .ok_or_else(|| anyhow!("No debug adapter is available for this attach target."))?;
                 let outcome = SHARED
                     .attach(
                         DapAttachSessionOptions {
@@ -543,7 +538,8 @@ impl DebugTool {
                 let line = required(params.line, "line", action)?;
                 let path = resolve(&cwd, file);
                 let key = path.to_string_lossy().into_owned();
-                let mut breakpoints = with_mirror(|m| m.sources.get(&key).cloned().unwrap_or_default());
+                let mut breakpoints =
+                    with_mirror(|m| m.sources.get(&key).cloned().unwrap_or_default());
                 breakpoints.retain(|entry| entry.line != line);
                 breakpoints.push(DapSourceBreakpoint {
                     line,
@@ -581,7 +577,8 @@ impl DebugTool {
                 let file = required(params.file.as_deref(), "file", action)?;
                 let path = resolve(&cwd, file);
                 let key = path.to_string_lossy().into_owned();
-                let mut breakpoints = with_mirror(|m| m.sources.get(&key).cloned().unwrap_or_default());
+                let mut breakpoints =
+                    with_mirror(|m| m.sources.get(&key).cloned().unwrap_or_default());
                 match params.line {
                     Some(line) => breakpoints.retain(|entry| entry.line != line),
                     None => breakpoints.clear(),
@@ -602,8 +599,11 @@ impl DebugTool {
             // Instruction breakpoints
             // -----------------------------------------------------------------
             "set_instruction_breakpoint" => {
-                let reference =
-                    required(params.instruction_reference.as_deref(), "instruction_reference", action)?;
+                let reference = required(
+                    params.instruction_reference.as_deref(),
+                    "instruction_reference",
+                    action,
+                )?;
                 let mut breakpoints = with_mirror(|m| m.instructions.clone());
                 breakpoints.retain(|entry| entry.instruction_reference != reference);
                 breakpoints.push(DapInstructionBreakpoint {
@@ -622,8 +622,11 @@ impl DebugTool {
                 ))
             }
             "remove_instruction_breakpoint" => {
-                let reference =
-                    required(params.instruction_reference.as_deref(), "instruction_reference", action)?;
+                let reference = required(
+                    params.instruction_reference.as_deref(),
+                    "instruction_reference",
+                    action,
+                )?;
                 let mut breakpoints = with_mirror(|m| m.instructions.clone());
                 breakpoints.retain(|entry| entry.instruction_reference != reference);
                 let mutation = SHARED
@@ -642,9 +645,18 @@ impl DebugTool {
             "data_breakpoint_info" => {
                 let name = required(params.name.as_deref(), "name", action)?;
                 let response = SHARED
-                    .data_breakpoint_info(None, name, params.variable_ref, params.frame_id, Some(cancel))
+                    .data_breakpoint_info(
+                        None,
+                        name,
+                        params.variable_ref,
+                        params.frame_id,
+                        Some(cancel),
+                    )
                     .await?;
-                let mut lines = vec![format!("dataId: {}", response.data_id.as_deref().unwrap_or("<none>"))];
+                let mut lines = vec![format!(
+                    "dataId: {}",
+                    response.data_id.as_deref().unwrap_or("<none>")
+                )];
                 if !response.description.is_empty() {
                     lines.push(format!("description: {}", response.description));
                 }
@@ -703,7 +715,9 @@ impl DebugTool {
             // Execution control
             // -----------------------------------------------------------------
             "continue" => {
-                let outcome = SHARED.continue_exec(None, None, false, Some(cancel)).await?;
+                let outcome = SHARED
+                    .continue_exec(None, None, false, Some(cancel))
+                    .await?;
                 let output = SHARED
                     .output(Some(&outcome.snapshot.id))
                     .ok()
@@ -774,10 +788,7 @@ impl DebugTool {
             }
             "threads" => {
                 let threads = SHARED.threads(None, Some(cancel)).await?;
-                let current = SHARED
-                    .status()
-                    .ok()
-                    .and_then(|summary| summary.thread_id);
+                let current = SHARED.status().ok().and_then(|summary| summary.thread_id);
                 Ok(text_result(
                     format::format_threads(&threads, current),
                     details(json!({"count": threads.len()})),
@@ -791,10 +802,9 @@ impl DebugTool {
                 ))
             }
             "variables" => {
-                let reference = params
-                    .variable_ref
-                    .or(params.scope_id)
-                    .ok_or_else(|| anyhow!("`variable_ref` or `scope_id` is required for `variables`."))?;
+                let reference = params.variable_ref.or(params.scope_id).ok_or_else(|| {
+                    anyhow!("`variable_ref` or `scope_id` is required for `variables`.")
+                })?;
                 let variables = SHARED
                     .variables(None, reference, None, None, Some(cancel))
                     .await?;
@@ -817,7 +827,9 @@ impl DebugTool {
                         reference,
                         params.offset,
                         params.instruction_offset,
-                        params.instruction_count.unwrap_or(DEFAULT_INSTRUCTION_COUNT),
+                        params
+                            .instruction_count
+                            .unwrap_or(DEFAULT_INSTRUCTION_COUNT),
                         params.resolve_symbols.unwrap_or(true),
                         Some(cancel),
                     )
@@ -828,8 +840,11 @@ impl DebugTool {
                 ))
             }
             "read_memory" => {
-                let reference =
-                    required(params.memory_reference.as_deref(), "memory_reference", action)?;
+                let reference = required(
+                    params.memory_reference.as_deref(),
+                    "memory_reference",
+                    action,
+                )?;
                 let response = SHARED
                     .read_memory(
                         None,
@@ -845,8 +860,11 @@ impl DebugTool {
                 ))
             }
             "write_memory" => {
-                let reference =
-                    required(params.memory_reference.as_deref(), "memory_reference", action)?;
+                let reference = required(
+                    params.memory_reference.as_deref(),
+                    "memory_reference",
+                    action,
+                )?;
                 let data = required(params.data.as_deref(), "data", action)?;
                 let response = SHARED
                     .write_memory(
@@ -1208,9 +1226,6 @@ mod tests {
             render_instruction_breakpoints(&[]),
             "instruction breakpoints: 0\n  none"
         );
-        assert_eq!(
-            render_data_breakpoints(&[]),
-            "data breakpoints: 0\n  none"
-        );
+        assert_eq!(render_data_breakpoints(&[]), "data breakpoints: 0\n  none");
     }
 }

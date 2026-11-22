@@ -26,14 +26,14 @@ use tokio::sync::Notify;
 
 use crate::client::{DapClient, DapSpawnOptions};
 use crate::types::{
-    DapAccessType, DapAttachSessionOptions, DapBreakpoint, DapBreakpointRecord, DapBreakpointMutation,
-    DapCapabilities, DapCapability, DapContinueOutcome, DapDataBreakpoint, DapDataBreakpointInfoResponse,
-    DapDataBreakpointRecord, DapDisassembledInstruction, DapEvaluateResponse, DapFunctionBreakpoint,
-    DapFunctionBreakpointRecord, DapInstructionBreakpoint, DapInstructionBreakpointRecord,
-    DapLaunchSessionOptions, DapModule, DapOutputSnapshot, DapReadMemoryResponse, DapResolvedAdapter,
-    DapRunState, DapScope, DapSessionStatus, DapSessionSummary, DapSource, DapSourceBreakpoint,
-    DapStackFrame, DapStopLocation, DapThread, DapTypedBreakpointMutation, DapVariable,
-    DapWriteMemoryResponse,
+    DapAccessType, DapAttachSessionOptions, DapBreakpoint, DapBreakpointMutation,
+    DapBreakpointRecord, DapCapabilities, DapCapability, DapContinueOutcome, DapDataBreakpoint,
+    DapDataBreakpointInfoResponse, DapDataBreakpointRecord, DapDisassembledInstruction,
+    DapEvaluateResponse, DapFunctionBreakpoint, DapFunctionBreakpointRecord,
+    DapInstructionBreakpoint, DapInstructionBreakpointRecord, DapLaunchSessionOptions, DapModule,
+    DapOutputSnapshot, DapReadMemoryResponse, DapResolvedAdapter, DapRunState, DapScope,
+    DapSessionStatus, DapSessionSummary, DapSource, DapSourceBreakpoint, DapStackFrame,
+    DapStopLocation, DapThread, DapTypedBreakpointMutation, DapVariable, DapWriteMemoryResponse,
 };
 use crate::{Cancel, DapError, DapResult};
 
@@ -673,7 +673,10 @@ impl DapSessionManager {
     /// Session summaries in creation order, for `sessions`.
     #[must_use]
     pub fn session_summaries(&self) -> Vec<DapSessionSummary> {
-        self.sessions().iter().map(|s| self.build_summary(s)).collect()
+        self.sessions()
+            .iter()
+            .map(|s| self.build_summary(s))
+            .collect()
     }
 
     /// One session by id.
@@ -700,9 +703,9 @@ impl DapSessionManager {
     /// [`DapError::State`] when the session has terminated.
     pub fn resolve_session(&self, id: Option<&str>) -> DapResult<Arc<DapSessionState>> {
         let state = match id {
-            Some(id) => self.session_state(id).ok_or_else(|| {
-                DapError::State(format!("No debug session with id {id}."))
-            })?,
+            Some(id) => self
+                .session_state(id)
+                .ok_or_else(|| DapError::State(format!("No debug session with id {id}.")))?,
             None => self.active_session()?,
         };
         if state.status() == DapSessionStatus::Terminated {
@@ -868,7 +871,8 @@ impl DapSessionManager {
             .send_request("launch", Some(arguments), cancel, Some(BOOKKEEPING_TIMEOUT))
             .await?;
 
-        self.complete_configuration(&state, &capabilities, cancel).await?;
+        self.complete_configuration(&state, &capabilities, cancel)
+            .await?;
         let prepared = PreparedStopOutcome {
             session_id: id,
             waiter,
@@ -925,7 +929,10 @@ impl DapSessionManager {
             arguments.insert("port".to_string(), json!(port));
             arguments.insert(
                 "host".to_string(),
-                json!(options.host.clone().unwrap_or_else(|| "127.0.0.1".to_string())),
+                json!(options
+                    .host
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1".to_string())),
             );
         }
         if let Some(cwd) = Some(options.cwd.clone()) {
@@ -946,7 +953,8 @@ impl DapSessionManager {
                 .await?;
         }
 
-        self.complete_configuration(&state, &capabilities, cancel).await?;
+        self.complete_configuration(&state, &capabilities, cancel)
+            .await?;
         let prepared = PreparedStopOutcome {
             session_id: id,
             waiter,
@@ -994,7 +1002,8 @@ impl DapSessionManager {
             state.set_status(DapSessionStatus::Configuring);
             return Ok(());
         }
-        state.client
+        state
+            .client
             .send_request("configurationDone", None, cancel, Some(BOOKKEEPING_TIMEOUT))
             .await?;
         state.mark_configuration_done();
@@ -1059,31 +1068,35 @@ impl DapSessionManager {
         // The reverse handler must be `'static`, so it cannot borrow `self`; child
         // sessions are registered on the process-wide manager.
         let manager: &'static DapSessionManager = &SHARED;
-        state.client.on_reverse_request("startDebugging", move |args| {
-            let weak = weak.clone();
-            async move {
-                let Some(parent) = weak.upgrade() else {
-                    return Err(DapError::State("parent session is gone".to_string()));
-                };
-                manager.start_child_session(&parent, args).await
-            }
-        });
+        state
+            .client
+            .on_reverse_request("startDebugging", move |args| {
+                let weak = weak.clone();
+                async move {
+                    let Some(parent) = weak.upgrade() else {
+                        return Err(DapError::State("parent session is gone".to_string()));
+                    };
+                    manager.start_child_session(&parent, args).await
+                }
+            });
 
         let weak = Arc::downgrade(state);
-        state.client.on_reverse_request("runInTerminal", move |args| {
-            let weak = weak.clone();
-            async move {
-                let Some(state) = weak.upgrade() else {
-                    return Err(DapError::State("session is gone".to_string()));
-                };
-                // The adapter's terminal request is answered with no process: the
-                // target inherits our stdio, which is what every adapter we ship
-                // tolerates when no terminal client is available.
-                let _ = args;
-                let _ = state;
-                Ok(json!({}))
-            }
-        });
+        state
+            .client
+            .on_reverse_request("runInTerminal", move |args| {
+                let weak = weak.clone();
+                async move {
+                    let Some(state) = weak.upgrade() else {
+                        return Err(DapError::State("session is gone".to_string()));
+                    };
+                    // The adapter's terminal request is answered with no process: the
+                    // target inherits our stdio, which is what every adapter we ship
+                    // tolerates when no terminal client is available.
+                    let _ = args;
+                    let _ = state;
+                    Ok(json!({}))
+                }
+            });
     }
 
     /// Spawn the child session an adapter's `startDebugging` request asks for.
@@ -1213,12 +1226,18 @@ impl DapSessionManager {
     /// Returns the ids that were reaped. Sessions that are still running are
     /// left alone: an idle clock is not evidence that a debuggee is abandoned.
     pub async fn reap_idle(&self) -> Vec<String> {
-        let cutoff = now_millis().saturating_sub(u64::try_from(self.idle_timeout.as_millis()).unwrap_or(u64::MAX));
+        let cutoff = now_millis()
+            .saturating_sub(u64::try_from(self.idle_timeout.as_millis()).unwrap_or(u64::MAX));
         let stale: Vec<String> = self
             .sessions()
             .iter()
             .filter(|state| state.last_used_millis() < cutoff)
-            .filter(|state| matches!(state.status(), DapSessionStatus::Stopped | DapSessionStatus::Terminated))
+            .filter(|state| {
+                matches!(
+                    state.status(),
+                    DapSessionStatus::Stopped | DapSessionStatus::Terminated
+                )
+            })
             .map(|state| state.id().to_string())
             .collect();
         for id in &stale {
@@ -1591,7 +1610,8 @@ impl DapSessionManager {
             ));
         };
         let arguments = json!({ "threadId": thread, "singleThread": single_thread });
-        self.resume(&state, "continue", Some(arguments), cancel).await
+        self.resume(&state, "continue", Some(arguments), cancel)
+            .await
     }
 
     /// Pause a running thread.
@@ -1651,7 +1671,8 @@ impl DapSessionManager {
         granularity: Option<&str>,
         cancel: Option<&dyn Cancel>,
     ) -> DapResult<DapContinueOutcome> {
-        self.step(id, "stepIn", thread_id, granularity, cancel).await
+        self.step(id, "stepIn", thread_id, granularity, cancel)
+            .await
     }
 
     /// Step out.
@@ -1666,7 +1687,8 @@ impl DapSessionManager {
         granularity: Option<&str>,
         cancel: Option<&dyn Cancel>,
     ) -> DapResult<DapContinueOutcome> {
-        self.step(id, "stepOut", thread_id, granularity, cancel).await
+        self.step(id, "stepOut", thread_id, granularity, cancel)
+            .await
     }
 
     async fn step(
@@ -2265,7 +2287,10 @@ mod tests {
     fn access_type_parsing_matches_the_tool_spelling() {
         assert_eq!(parse_access_type("read"), Some(DapAccessType::Read));
         assert_eq!(parse_access_type("write"), Some(DapAccessType::Write));
-        assert_eq!(parse_access_type("readWrite"), Some(DapAccessType::ReadWrite));
+        assert_eq!(
+            parse_access_type("readWrite"),
+            Some(DapAccessType::ReadWrite)
+        );
         assert_eq!(parse_access_type("READ"), None);
     }
 

@@ -705,13 +705,11 @@ fn read_peeled_format(env: &Env, raw_path: &str) -> Result<Option<AgentToolResul
             // `db.sqlite?q=SELECT …` addresses rows; `?q=` on JSON is a filter.
             if read_formats::detect_format(&absolute, &head) == read_formats::Format::Sqlite {
                 let text = read_formats::sqlite_read(&absolute, "", &query)?;
-                return format_converted(env, &text, raw_path, &display, &Selector::None)
-                    .map(Some);
+                return format_converted(env, &text, raw_path, &display, &Selector::None).map(Some);
             }
             if let Some(selector) = read_formats::parse_json_selector(&query) {
                 let text = read_formats::json_read(&absolute, &selector)?;
-                return format_converted(env, &text, raw_path, &display, &Selector::None)
-                    .map(Some);
+                return format_converted(env, &text, raw_path, &display, &Selector::None).map(Some);
             }
         }
     }
@@ -722,8 +720,7 @@ fn read_peeled_format(env: &Env, raw_path: &str) -> Result<Option<AgentToolResul
             if let Some(kind) = read_formats::archive_kind_for_path(&archive) {
                 let text = read_formats::archive_read(&absolute, kind, Some(&member))?;
                 let display = display_path(&absolute, &env.cwd);
-                return format_converted(env, &text, raw_path, &display, &Selector::None)
-                    .map(Some);
+                return format_converted(env, &text, raw_path, &display, &Selector::None).map(Some);
             }
         }
     }
@@ -767,8 +764,8 @@ fn read_detected_format(
             &std::fs::read(absolute).with_context(|| format!("cannot read {selector_base}"))?,
         ),
         Format::Binary | Format::Gzip => {
-            let bytes = std::fs::read(absolute)
-                .with_context(|| format!("cannot read {selector_base}"))?;
+            let bytes =
+                std::fs::read(absolute).with_context(|| format!("cannot read {selector_base}"))?;
             read_formats::binary_read(&display, &bytes, "")?
         }
     };
@@ -840,7 +837,13 @@ fn maybe_summarize(
         return None;
     }
     let total = u32::try_from(lines).unwrap_or(u32::MAX);
-    if total < number_setting(&settings, "read.summarize.minTotalLines", DEFAULT_MIN_TOTAL_LINES) {
+    if total
+        < number_setting(
+            &settings,
+            "read.summarize.minTotalLines",
+            DEFAULT_MIN_TOTAL_LINES,
+        )
+    {
         return None;
     }
     let unfold = number_setting(
@@ -848,8 +851,8 @@ fn maybe_summarize(
         "read.summarize.unfoldUntil",
         DEFAULT_UNFOLD_UNTIL,
     );
-    let summary = super::read_formats::summarize_source(normalized, absolute, Some(unfold))
-        .ok()??;
+    let summary =
+        super::read_formats::summarize_source(normalized, absolute, Some(unfold)).ok()??;
     if summary.elided_lines == 0 {
         return None;
     }
@@ -1648,7 +1651,9 @@ mod tests {
 
     #[test]
     fn url_dispatch_recognizes_http_and_www() {
-        assert!(crate::tools::read_fetch::is_fetch_url("https://example.com/x"));
+        assert!(crate::tools::read_fetch::is_fetch_url(
+            "https://example.com/x"
+        ));
         assert!(crate::tools::read_fetch::is_fetch_url("www.example.com/x"));
         assert!(!crate::tools::read_fetch::is_fetch_url("/tmp/x.txt"));
         assert_eq!(
@@ -1673,7 +1678,8 @@ mod tests {
             r##"{"nbformat":4,"nbformat_minor":5,"metadata":{"kernelspec":{"language":"python"}},"cells":[{"cell_type":"markdown","source":["# Title\n"]},{"cell_type":"code","source":["print(1)\n"],"outputs":[],"execution_count":1}]}"##,
         )
         .unwrap();
-        let out = text_of(&read(&env(dir.path()), &serde_json::json!({"path": "nb.ipynb"})).unwrap());
+        let out =
+            text_of(&read(&env(dir.path()), &serde_json::json!({"path": "nb.ipynb"})).unwrap());
         assert!(out.contains("# Notebook v4.5"), "{out}");
         assert!(out.contains("# Title"), "{out}");
         assert!(out.contains("print(1)"), "{out}");
@@ -1713,7 +1719,8 @@ mod tests {
         );
         assert!(out.contains("ada"), "{out}");
         // A query-less JSON read stays a plain text read.
-        let out = text_of(&read(&env(dir.path()), &serde_json::json!({"path": "data.json"})).unwrap());
+        let out =
+            text_of(&read(&env(dir.path()), &serde_json::json!({"path": "data.json"})).unwrap());
         assert!(out.contains("\"users\""), "{out}");
     }
 
@@ -1725,20 +1732,25 @@ mod tests {
             b"%PDF-1.4\n1 0 obj\n<</Type/Page>>\nendobj\ntrailer\n%%EOF\n",
         )
         .unwrap();
-        let out = text_of(&read(&env(dir.path()), &serde_json::json!({"path": "doc.pdf"})).unwrap());
+        let out =
+            text_of(&read(&env(dir.path()), &serde_json::json!({"path": "doc.pdf"})).unwrap());
         assert!(out.to_lowercase().contains("pdf"), "{out}");
 
         let mut elf = b"\x7fELF\x02\x01\x01\x00".to_vec();
         elf.extend_from_slice(&[0u8; 64]);
         elf.extend_from_slice(b"main\0");
         std::fs::write(dir.path().join("prog.bin"), &elf).unwrap();
-        let out = text_of(&read(&env(dir.path()), &serde_json::json!({"path": "prog.bin"})).unwrap());
+        let out =
+            text_of(&read(&env(dir.path()), &serde_json::json!({"path": "prog.bin"})).unwrap());
         assert!(!out.is_empty(), "binary read produced no content");
         assert!(!out.contains("binary file"), "{out}");
         // `:raw` still refuses to shape binary bytes.
-        let err = read(&env(dir.path()), &serde_json::json!({"path": "prog.bin:raw"}))
-            .unwrap_err()
-            .to_string();
+        let err = read(
+            &env(dir.path()),
+            &serde_json::json!({"path": "prog.bin:raw"}),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("binary file"), "{err}");
     }
 

@@ -479,7 +479,10 @@ impl BankStore {
         let id = new_memory_id(self.bank.as_str(), window.session_id, &stable_material);
         let timestamp = utc_timestamp();
         let metadata = serde_json::to_string(window.metadata)?;
-        if window.extraction_text.is_some_and(|text| text.len() > MAX_EXTRACTION_INPUT_BYTES) {
+        if window
+            .extraction_text
+            .is_some_and(|text| text.len() > MAX_EXTRACTION_INPUT_BYTES)
+        {
             return Err(Error::InputTooLarge);
         }
         let mut connection = self.connection()?;
@@ -595,7 +598,11 @@ impl BankStore {
     pub fn consolidate(&self, session_id: Option<&str>) -> Result<usize> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let predicate = if session_id.is_some() { "WHERE session_id = ?1" } else { "" };
+        let predicate = if session_id.is_some() {
+            "WHERE session_id = ?1"
+        } else {
+            ""
+        };
         let sql = format!(
             "INSERT OR IGNORE INTO episodic_memory\n(id, content, source, timestamp, session_id, \
              importance, metadata_json, veracity, memory_type, scope, channel_id, \
@@ -730,9 +737,10 @@ impl BankStore {
             }
         }
         if let Some(source_memory_id) = completed_source {
-            transaction.execute("DELETE FROM extraction_jobs WHERE source_memory_id = ?1", [
-                source_memory_id,
-            ])?;
+            transaction.execute(
+                "DELETE FROM extraction_jobs WHERE source_memory_id = ?1",
+                [source_memory_id],
+            )?;
         }
         if inserted > 0 {
             bump_durable(&transaction)?;
@@ -796,12 +804,24 @@ impl BankStore {
 
     /// FTS-ranked working-memory candidates.
     pub fn search_working(&self, query: &str, limit: usize) -> Result<Vec<RankedCandidate>> {
-        self.search_fts("fts_working", "working_memory", MemoryTier::Working, query, limit)
+        self.search_fts(
+            "fts_working",
+            "working_memory",
+            MemoryTier::Working,
+            query,
+            limit,
+        )
     }
 
     /// FTS-ranked episodic candidates with a mild importance merge.
     pub fn search_episodic(&self, query: &str, limit: usize) -> Result<Vec<RankedCandidate>> {
-        self.search_fts("fts_episodes", "episodic_memory", MemoryTier::Episodic, query, limit)
+        self.search_fts(
+            "fts_episodes",
+            "episodic_memory",
+            MemoryTier::Episodic,
+            query,
+            limit,
+        )
     }
 
     /// FTS-ranked immutable extracted facts.
@@ -826,7 +846,8 @@ impl BankStore {
                 record,
             })
         })?;
-        rows.collect::<result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Recent working-memory candidates used when the query is temporal.
@@ -839,10 +860,13 @@ impl BankStore {
              INTEGER) ELSE COALESCE(unixepoch(timestamp) * 1000, 0) END DESC, id LIMIT ?1",
         )?;
         let rows = statement.query_map([limit.clamp(1, 100)], |row| {
-            row_to_record(row, &self.bank, MemoryTier::Working)
-                .map(|record| RankedCandidate { score: record.importance, record })
+            row_to_record(row, &self.bank, MemoryTier::Working).map(|record| RankedCandidate {
+                score: record.importance,
+                record,
+            })
         })?;
-        rows.collect::<result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Graph candidates whose triples match query terms, including one-hop
@@ -909,9 +933,10 @@ impl BankStore {
             return Err(Error::InvalidIdentifier);
         }
         let connection = self.connection()?;
-        for (table, tier) in
-            [("working_memory", MemoryTier::Working), ("episodic_memory", MemoryTier::Episodic)]
-        {
+        for (table, tier) in [
+            ("working_memory", MemoryTier::Working),
+            ("episodic_memory", MemoryTier::Episodic),
+        ] {
             let sql = format!(
                 "SELECT id, content, source, session_id, timestamp, importance, veracity, \
                  memory_type, metadata_json, superseded_by FROM {table} WHERE id = ?1"
@@ -1000,7 +1025,8 @@ impl BankStore {
             let tier = tier_from_name(row.get::<_, String>(10)?.as_str());
             row_to_record(row, &self.bank, tier)
         })?;
-        rows.collect::<result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Loads one deterministic page of unsuperseded rows for a complete vector
@@ -1022,7 +1048,8 @@ impl BankStore {
             let tier = tier_from_name(row.get::<_, String>(10)?.as_str());
             row_to_record(row, &self.bank, tier)
         })?;
-        rows.collect::<result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Counts durable rows and graph triples.
@@ -1052,7 +1079,9 @@ impl BankStore {
             connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
         let generations = self.generations()?;
         let vector_rows =
-            connection.query_row("SELECT COUNT(*) FROM memory_embeddings", [], |row| row.get(0))?;
+            connection.query_row("SELECT COUNT(*) FROM memory_embeddings", [], |row| {
+                row.get(0)
+            })?;
         let graph_rows =
             connection.query_row("SELECT COUNT(*) FROM triples", [], |row| row.get(0))?;
         Ok(IntegrityReport {
@@ -1150,14 +1179,15 @@ impl BankStore {
                 record,
             })
         })?;
-        rows.collect::<result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Opens one short-lived connection with WAL and the documented pragmas.
     pub fn connection(&self) -> Result<Connection> {
-        let flags =
-            OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let flags = OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let connection = Connection::open_with_flags(&self.path, flags)?;
         connection.busy_timeout(time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
         connection.execute_batch(
@@ -1168,7 +1198,8 @@ impl BankStore {
 
     fn migrate(&self, connection: &mut Connection) -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-        let version = transaction.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+        let version =
+            transaction.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
         if version > SCHEMA_VERSION {
             return Err(Error::Sqlite(rusqlite::Error::InvalidQuery));
         }
@@ -1283,10 +1314,16 @@ fn is_fact(transaction: &rusqlite::Transaction<'_>, id: &str) -> Result<bool> {
 
 fn ineligible(transaction: &rusqlite::Transaction<'_>, id: &str) -> Result<EditResult> {
     let episodic = transaction
-        .query_row("SELECT 1 FROM episodic_memory WHERE id = ?1", [id], |_| Ok(()))
+        .query_row("SELECT 1 FROM episodic_memory WHERE id = ?1", [id], |_| {
+            Ok(())
+        })
         .optional()?
         .is_some();
-    Ok(if episodic { EditResult::Ineligible(MemoryTier::Episodic) } else { EditResult::NotFound })
+    Ok(if episodic {
+        EditResult::Ineligible(MemoryTier::Episodic)
+    } else {
+        EditResult::NotFound
+    })
 }
 
 fn tier_from_name(name: &str) -> MemoryTier {
@@ -1332,7 +1369,11 @@ fn bump_durable(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()>
 }
 
 fn durable_generation(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<u64> {
-    transaction.query_row("SELECT durable_generation FROM index_generations WHERE singleton = 1", [], |row| row.get(0))
+    transaction.query_row(
+        "SELECT durable_generation FROM index_generations WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )
 }
 
 fn encode_vector(vector: &[f32]) -> Vec<u8> {
@@ -1389,7 +1430,10 @@ fn valid_memory_id(id: &str) -> bool {
 
 fn new_memory_id(bank: &str, session: &str, content: &str) -> String {
     let serial = NEXT_MEMORY_ID.fetch_add(1, Ordering::Relaxed);
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     let material = format!("{bank}\0{session}\0{content}\0{now}\0{serial}");
     let hex = sha256_hex(material.as_bytes());
     format!("mem_{}", &hex[..24])
@@ -1407,7 +1451,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Returns the current UTC instant as RFC3339 with millisecond precision.
 pub fn utc_timestamp() -> String {
-    let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let seconds = duration.as_secs();
     let millis = duration.subsec_millis();
     let days = i64::try_from(seconds / 86_400).unwrap_or(0);
@@ -1440,7 +1486,10 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn unix_millis() -> Result<u128> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH).map_err(io::Error::other)?.as_millis())
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_millis())
 }
 
 fn prune_working_transaction(
@@ -1452,8 +1501,10 @@ fn prune_working_transaction(
     if limit == 0 {
         return Ok(0);
     }
-    let ttl_millis =
-        u128::from(ttl_hours).saturating_mul(60).saturating_mul(60).saturating_mul(1000);
+    let ttl_millis = u128::from(ttl_hours)
+        .saturating_mul(60)
+        .saturating_mul(60)
+        .saturating_mul(1000);
     let cutoff = unix_millis()?.saturating_sub(ttl_millis).to_string();
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     transaction.execute_batch(
@@ -1497,9 +1548,10 @@ fn prune_working_transaction(
             OR target_memory_id IN (SELECT id FROM working_eviction_ids)",
         [],
     )?;
-    let removed = transaction
-        .execute("DELETE FROM working_memory WHERE id IN (SELECT id FROM working_eviction_ids)", [
-        ])?;
+    let removed = transaction.execute(
+        "DELETE FROM working_memory WHERE id IN (SELECT id FROM working_eviction_ids)",
+        [],
+    )?;
     if removed != 0 {
         transaction.execute(
             "UPDATE retention_cursors
@@ -1739,8 +1791,10 @@ fn migrate_authoritative_tables(transaction: &rusqlite::Transaction<'_>) -> Resu
     if table_exists(transaction, "facts")? {
         add_column_if_missing(transaction, "facts", "source_memory_id", "TEXT")?;
         if column_exists(transaction, "facts", "source_msg_id")? {
-            transaction
-                .execute("UPDATE facts SET source_memory_id = COALESCE(source_memory_id, source_msg_id)", [])?;
+            transaction.execute(
+                "UPDATE facts SET source_memory_id = COALESCE(source_memory_id, source_msg_id)",
+                [],
+            )?;
         }
     }
     Ok(())
@@ -1769,9 +1823,11 @@ fn normalize_authoritative_rows(transaction: &rusqlite::Transaction<'_>) -> Resu
 
 fn table_exists(transaction: &rusqlite::Transaction<'_>, table: &str) -> Result<bool> {
     transaction
-        .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [table], |_| {
-            Ok(())
-        })
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
         .optional()
         .map(|opt| opt.is_some())
         .map_err(Into::into)
@@ -1799,7 +1855,9 @@ fn add_column_if_missing(
     definition: &str,
 ) -> Result<()> {
     if !column_exists(transaction, table, column)? {
-        transaction.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))?;
+        transaction.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
     }
     Ok(())
 }
@@ -1813,9 +1871,13 @@ mod tests {
 
     fn store_with(limit: usize, ttl_hours: u64) -> BankStore {
         let root = temp_root("store");
-        BankStore::open(root.join("mnemopi.db"), BankId::configured("test").expect("bank"), root)
-            .expect("store")
-            .with_working_policy(limit, ttl_hours)
+        BankStore::open(
+            root.join("mnemopi.db"),
+            BankId::configured("test").expect("bank"),
+            root,
+        )
+        .expect("store")
+        .with_working_policy(limit, ttl_hours)
     }
 
     fn store() -> BankStore {
@@ -1874,7 +1936,10 @@ mod tests {
             "retention_cursors",
             "scope_adoptions",
         ] {
-            assert!(names.iter().any(|name| name == expected), "missing table {expected}");
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing table {expected}"
+            );
         }
         let connection = store.connection().expect("connection");
         let version = connection
@@ -1883,9 +1948,11 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(SCHEMA_VERSION, 3);
         let scope = connection
-            .query_row("SELECT identity_root, bank FROM bank_scope WHERE singleton = 1", [], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_row(
+                "SELECT identity_root, bank FROM bank_scope WHERE singleton = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
             .expect("bank scope row");
         assert_eq!(scope.1, "test");
         assert_eq!(
@@ -1911,7 +1978,11 @@ mod tests {
     #[test]
     fn fts5_search_ranks_and_skips_superseded_rows() {
         let store = store();
-        save_content(&store, "mem-rust", "User strongly prefers the Rust programming language");
+        save_content(
+            &store,
+            "mem-rust",
+            "User strongly prefers the Rust programming language",
+        );
         save_content(&store, "mem-python", "User once mentioned Python packaging");
         save_content(&store, "mem-other", "Unrelated note about lunch");
 
@@ -1924,7 +1995,10 @@ mod tests {
         assert_eq!(python.len(), 1);
         assert_eq!(python[0].record.id, "mem-python");
 
-        assert!(store.search_working("zzzznomatch", 8).expect("search").is_empty());
+        assert!(store
+            .search_working("zzzznomatch", 8)
+            .expect("search")
+            .is_empty());
         assert!(
             store.search_working("a", 8).expect("search").is_empty(),
             "single-character terms produce no FTS query"
@@ -1932,7 +2006,10 @@ mod tests {
 
         store.invalidate("mem-rust", None).expect("invalidate");
         assert!(
-            store.search_working("Rust programming", 8).expect("search").is_empty(),
+            store
+                .search_working("Rust programming", 8)
+                .expect("search")
+                .is_empty(),
             "superseded rows leave the FTS recall path"
         );
     }
@@ -1956,7 +2033,11 @@ mod tests {
     #[test]
     fn episodic_search_and_fact_search_use_their_own_fts_tables() {
         let store = store();
-        save_content(&store, "mem-episode", "Retained episode about SQLite WAL mode");
+        save_content(
+            &store,
+            "mem-episode",
+            "Retained episode about SQLite WAL mode",
+        );
         assert_eq!(store.consolidate(None).expect("consolidate"), 1);
         assert_eq!(store.counts().expect("counts").working, 0);
         assert_eq!(store.counts().expect("counts").episodic, 1);
@@ -1995,8 +2076,14 @@ mod tests {
             metadata: &metadata,
             retained_through_user_turn: 2,
         };
-        let id = store.retain_window(window()).expect("retain").expect("stored");
-        assert!(store.retain_window(window()).expect("retain again").is_none());
+        let id = store
+            .retain_window(window())
+            .expect("retain")
+            .expect("stored");
+        assert!(store
+            .retain_window(window())
+            .expect("retain again")
+            .is_none());
         assert_eq!(store.retention_cursor("session").expect("cursor"), 2);
         assert_eq!(store.counts().expect("counts").working, 1);
         let record = store.get(&id).expect("lookup").expect("record");
@@ -2004,19 +2091,17 @@ mod tests {
         assert_eq!(record.memory_type, "episode");
 
         let next_metadata = serde_json::json!({"retained_through_user_turn": 4});
-        assert!(
-            store
-                .retain_window(RetainedWindow {
-                    session_id: "session",
-                    transcript: "[role: user]\nand the busy timeout\n[user:end]",
-                    embed_text: "and the busy timeout",
-                    extraction_text: Some("[role: user]\nand the busy timeout\n[user:end]"),
-                    metadata: &next_metadata,
-                    retained_through_user_turn: 4,
-                })
-                .expect("retain")
-                .is_some()
-        );
+        assert!(store
+            .retain_window(RetainedWindow {
+                session_id: "session",
+                transcript: "[role: user]\nand the busy timeout\n[user:end]",
+                embed_text: "and the busy timeout",
+                extraction_text: Some("[role: user]\nand the busy timeout\n[user:end]"),
+                metadata: &next_metadata,
+                retained_through_user_turn: 4,
+            })
+            .expect("retain")
+            .is_some());
         assert_eq!(store.retention_cursor("session").expect("cursor"), 4);
         assert_eq!(store.pending_extraction_count().expect("pending"), 1);
     }
@@ -2030,7 +2115,10 @@ mod tests {
             EditResult::Changed(MemoryTier::Working)
         );
         assert!(store.get("mem-working").expect("lookup").is_none());
-        assert_eq!(store.forget_working("mem-working").expect("forget"), EditResult::NotFound);
+        assert_eq!(
+            store.forget_working("mem-working").expect("forget"),
+            EditResult::NotFound
+        );
 
         save(&store, "mem-episodic");
         store.consolidate(None).expect("consolidate");
@@ -2057,7 +2145,9 @@ mod tests {
             EditResult::ImmutableFact
         );
         assert_eq!(
-            store.update_working("fact-immutable", Some("x"), None).expect("update"),
+            store
+                .update_working("fact-immutable", Some("x"), None)
+                .expect("update"),
             EditResult::ImmutableFact
         );
     }
@@ -2067,7 +2157,9 @@ mod tests {
         let store = store();
         save(&store, "mem-old");
         assert_eq!(
-            store.invalidate("mem-old", Some("mem-new")).expect("invalidate"),
+            store
+                .invalidate("mem-old", Some("mem-new"))
+                .expect("invalidate"),
             EditResult::Changed(MemoryTier::Working)
         );
         let record = store.get("mem-old").expect("lookup").expect("record");
@@ -2082,7 +2174,10 @@ mod tests {
         let episode = store.get("mem-episode").expect("lookup").expect("record");
         assert_eq!(episode.superseded_by.as_deref(), Some("mem-episode"));
 
-        assert_eq!(store.invalidate("mem-missing", None).expect("invalidate"), EditResult::NotFound);
+        assert_eq!(
+            store.invalidate("mem-missing", None).expect("invalidate"),
+            EditResult::NotFound
+        );
         assert!(store.invalidate("../escape", None).is_err());
     }
 
@@ -2092,7 +2187,9 @@ mod tests {
         save(&store, "mem-edit");
         let before = store.generations().expect("generations").durable;
         assert_eq!(
-            store.update_working("mem-edit", Some("revised content"), Some(0.9)).expect("update"),
+            store
+                .update_working("mem-edit", Some("revised content"), Some(0.9))
+                .expect("update"),
             EditResult::Changed(MemoryTier::Working)
         );
         let record = store.get("mem-edit").expect("lookup").expect("record");
@@ -2108,10 +2205,14 @@ mod tests {
         save(&store, "mem-vector");
         let generation = store.generations().expect("generations").durable;
         store
-            .replace_vectors(generation, "test-model", &[VectorEntry {
-                memory_id: "mem-vector",
-                vector: &[1.0, 0.0, 0.5],
-            }])
+            .replace_vectors(
+                generation,
+                "test-model",
+                &[VectorEntry {
+                    memory_id: "mem-vector",
+                    vector: &[1.0, 0.0, 0.5],
+                }],
+            )
             .expect("replace");
         let vectors = store.vectors().expect("vectors");
         assert_eq!(vectors.len(), 1);
@@ -2174,7 +2275,10 @@ mod tests {
         let ids = store.save_batch(&inputs).expect("atomic save");
         assert_eq!(ids[0], ids[1]);
         assert_eq!(store.counts().expect("counts").working, 1);
-        let record = store.get(&ids[0]).expect("lookup").expect("deduplicated row");
+        let record = store
+            .get(&ids[0])
+            .expect("lookup")
+            .expect("deduplicated row");
         assert!((record.importance - 0.9).abs() < f64::EPSILON);
         assert!(record.timestamp.ends_with('Z'));
         assert_eq!(record.metadata["context"], "newer");
@@ -2235,10 +2339,14 @@ mod tests {
             .expect("legacy schema");
         drop(connection);
 
-        let store =
-            BankStore::open(&path, BankId::configured("default").expect("bank"), root).expect("migration");
+        let store = BankStore::open(&path, BankId::configured("default").expect("bank"), root)
+            .expect("migration");
         assert_eq!(
-            store.get("legacy-memory").expect("lookup").expect("memory").content,
+            store
+                .get("legacy-memory")
+                .expect("lookup")
+                .expect("memory")
+                .content,
             "Rust is preferred"
         );
         let facts = store.search_facts("User Rust", 8).expect("fact search");
@@ -2252,9 +2360,11 @@ mod tests {
             SCHEMA_VERSION
         );
         let source = connection
-            .query_row("SELECT source_memory_id FROM facts WHERE fact_id = 'legacy-fact'", [], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_row(
+                "SELECT source_memory_id FROM facts WHERE fact_id = 'legacy-fact'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
             .expect("source migration");
         assert_eq!(source, "legacy-memory");
     }
@@ -2310,9 +2420,14 @@ mod tests {
         assert!(timestamp.as_bytes()[4] == b'-');
         let connection = Connection::open_in_memory().expect("memory database");
         let parsed = connection
-            .query_row("SELECT unixepoch(?1)", [timestamp.as_str()], |row| row.get::<_, i64>(0))
+            .query_row("SELECT unixepoch(?1)", [timestamp.as_str()], |row| {
+                row.get::<_, i64>(0)
+            })
             .expect("sqlite parses our timestamps");
-        assert!(parsed > 1_700_000_000, "timestamp must be a plausible epoch second");
+        assert!(
+            parsed > 1_700_000_000,
+            "timestamp must be a plausible epoch second"
+        );
     }
 
     #[test]

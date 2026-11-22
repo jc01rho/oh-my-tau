@@ -280,7 +280,11 @@ const fn default_min_tool_calls() -> usize {
 
 impl Default for AutolearnSettings {
     fn default() -> Self {
-        Self { enabled: false, auto_continue: false, min_tool_calls: default_min_tool_calls() }
+        Self {
+            enabled: false,
+            auto_continue: false,
+            min_tool_calls: default_min_tool_calls(),
+        }
     }
 }
 
@@ -366,10 +370,16 @@ mod tests {
 
     #[test]
     fn backend_and_scoping_parsers_accept_persisted_spellings() {
-        assert_eq!(MemoryBackend::parse("MnemoPi"), Some(MemoryBackend::Mnemopi));
+        assert_eq!(
+            MemoryBackend::parse("MnemoPi"),
+            Some(MemoryBackend::Mnemopi)
+        );
         assert_eq!(MemoryBackend::parse("off"), Some(MemoryBackend::Off));
         assert_eq!(MemoryBackend::parse("hindsight"), None);
-        assert_eq!(BankScoping::parse("per-project-tagged"), Some(BankScoping::PerProjectTagged));
+        assert_eq!(
+            BankScoping::parse("per-project-tagged"),
+            Some(BankScoping::PerProjectTagged)
+        );
         assert_eq!(MemoryLlmMode::parse("none"), Some(MemoryLlmMode::None));
         assert!(!MemoryLlmMode::None.extraction_enabled());
         assert!(MemoryLlmMode::Smol.extraction_enabled());

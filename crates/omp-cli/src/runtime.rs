@@ -888,7 +888,8 @@ impl Runtime {
             .and_then(|usage| usage.get("contextTokens"))
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        let compaction = crate::tools::context_rollover::rollover_compaction(first_kept, tokens_before);
+        let compaction =
+            crate::tools::context_rollover::rollover_compaction(first_kept, tokens_before);
         let _ = self
             .persist
             .append_entry("compaction", compaction.to_entry_payload());

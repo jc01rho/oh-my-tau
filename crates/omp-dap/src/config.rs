@@ -213,7 +213,9 @@ fn merge_adapters(
             Some(cfg) => {
                 merged.insert(name.clone(), cfg);
             }
-            None => warn!("Ignoring invalid DAP adapter override (keeping previous config): {name}"),
+            None => {
+                warn!("Ignoring invalid DAP adapter override (keeping previous config): {name}")
+            }
         }
     }
     merged
@@ -506,13 +508,12 @@ fn resolve_js_debug_server_path(cwd: &Path) -> Option<PathBuf> {
     if let Some(configured) = std::env::var_os(JS_DEBUG_SERVER_ENV) {
         candidates.push(normalize_path(&cwd.join(configured)));
     }
-    let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| {
-        home_dir().map(|h| h.join(".local").join("share"))
-    });
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".local").join("share")));
     if let Some(data_home) = data_home {
         candidates.push(
-            data_home
-                .join("nvim/mason/packages/js-debug-adapter/js-debug/src/dapDebugServer.js"),
+            data_home.join("nvim/mason/packages/js-debug-adapter/js-debug/src/dapDebugServer.js"),
         );
     }
     if let Some(home) = home_dir() {
@@ -532,12 +533,19 @@ fn resolve_default_js_debug_adapter(
     }
     let server_path = resolve_js_debug_server_path(cwd)?;
     let node_command = resolve_command("node", cwd, local_roots);
-    let resolved_command = node_command
-        .clone()
-        .or_else(|| std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned()))?;
+    let resolved_command = node_command.clone().or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    })?;
     Some(Some(DapResolvedAdapter {
         name: adapter_name.to_string(),
-        command: if node_command.is_some() { "node" } else { "bun" }.to_string(),
+        command: if node_command.is_some() {
+            "node"
+        } else {
+            "bun"
+        }
+        .to_string(),
         args: vec![
             server_path.to_string_lossy().into_owned(),
             DAP_PORT_ARGUMENT.to_string(),
@@ -565,7 +573,8 @@ fn resolve_adapter_from_config(
     local_roots: &[PathBuf],
 ) -> Option<DapResolvedAdapter> {
     let config = configs.get(adapter_name)?;
-    if let Some(js_debug) = resolve_default_js_debug_adapter(adapter_name, config, cwd, local_roots) {
+    if let Some(js_debug) = resolve_default_js_debug_adapter(adapter_name, config, cwd, local_roots)
+    {
         return js_debug;
     }
     let normalized_command = normalize_command_for_cwd(&config.command, cwd);
@@ -693,9 +702,11 @@ fn sort_adapters_for_launch(
             };
         }
         let left_root =
-            find_root_marker_in_launch_ancestry(program, &left.root_markers, program_kind).is_some();
+            find_root_marker_in_launch_ancestry(program, &left.root_markers, program_kind)
+                .is_some();
         let right_root =
-            find_root_marker_in_launch_ancestry(program, &right.root_markers, program_kind).is_some();
+            find_root_marker_in_launch_ancestry(program, &right.root_markers, program_kind)
+                .is_some();
         if left_root != right_root {
             return if left_root {
                 std::cmp::Ordering::Less
@@ -724,7 +735,8 @@ fn select_automatic_launch_adapter(
             if !config.file_types.contains(&extension) {
                 continue;
             }
-            let root_dir = find_root_marker_in_launch_ancestry(program, &config.root_markers, program_kind);
+            let root_dir =
+                find_root_marker_in_launch_ancestry(program, &config.root_markers, program_kind);
             configured.push(name.clone());
             if let Some(adapter) =
                 resolve_adapter_for_launch(name, configs, cwd, root_dir.as_deref())
@@ -732,7 +744,8 @@ fn select_automatic_launch_adapter(
                 available.push(adapter);
             }
         }
-        if let Some(selected) = sort_adapters_for_launch(program, cwd, program_kind, available).first()
+        if let Some(selected) =
+            sort_adapters_for_launch(program, cwd, program_kind, available).first()
         {
             return LaunchAdapterSelection::Adapter(selected.clone());
         }
@@ -754,7 +767,8 @@ fn select_automatic_launch_adapter(
     let mut root_matches: Vec<String> = Vec::new();
     let mut directory_matches: Vec<String> = Vec::new();
     for (name, config) in configs {
-        let root_dir = find_root_marker_in_launch_ancestry(program, &config.root_markers, program_kind);
+        let root_dir =
+            find_root_marker_in_launch_ancestry(program, &config.root_markers, program_kind);
         if root_dir.is_some() {
             root_matches.push(name.clone());
             if config.accepts_directory_program {
@@ -774,8 +788,8 @@ fn select_automatic_launch_adapter(
             .into_iter()
             .filter(|a| a.accepts_directory_program && directory_matches.contains(&a.name))
             .collect();
-        if let Some(selected) = sort_adapters_for_launch(program, cwd, program_kind, directory_adapters)
-            .first()
+        if let Some(selected) =
+            sort_adapters_for_launch(program, cwd, program_kind, directory_adapters).first()
         {
             return LaunchAdapterSelection::Adapter(selected.clone());
         }
@@ -800,7 +814,8 @@ fn select_automatic_launch_adapter(
     } else {
         available
     };
-    if let Some(selected) = sort_adapters_for_launch(program, cwd, program_kind, candidates).first() {
+    if let Some(selected) = sort_adapters_for_launch(program, cwd, program_kind, candidates).first()
+    {
         return LaunchAdapterSelection::Adapter(selected.clone());
     }
     root_matches
@@ -823,7 +838,8 @@ pub fn select_launch_adapter(
         let Some(config) = configs.get(name) else {
             return LaunchAdapterSelection::None;
         };
-        let root_dir = find_root_marker_in_launch_ancestry(program, &config.root_markers, program_kind);
+        let root_dir =
+            find_root_marker_in_launch_ancestry(program, &config.root_markers, program_kind);
         return match resolve_adapter_for_launch(name, &configs, cwd, root_dir.as_deref()) {
             Some(adapter) => LaunchAdapterSelection::Adapter(adapter),
             None => LaunchAdapterSelection::Unavailable {
@@ -852,7 +868,9 @@ const RUNTIME_ADAPTERS: [(&str, &str); 5] = [
 async fn process_image_name(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        let comm = tokio::fs::read_to_string(format!("/proc/{pid}/comm")).await.ok()?;
+        let comm = tokio::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .await
+            .ok()?;
         let name = comm.trim();
         return (!name.is_empty()).then(|| name.to_string());
     }
@@ -895,8 +913,7 @@ async fn is_v8_inspector(host: &str, port: u16) -> bool {
             .next()
             .is_some_and(|line| line.contains(" 200"));
         Some(
-            status_ok
-                && (text.contains("\"V8-Version\"") || text.contains("\"Protocol-Version\"")),
+            status_ok && (text.contains("\"V8-Version\"") || text.contains("\"Protocol-Version\"")),
         )
     };
     matches!(
@@ -918,9 +935,9 @@ fn runtime_adapter_for(image: &str) -> Option<&'static str> {
             p if p.starts_with("^python") => {
                 let stem = image.trim_end_matches(".exe");
                 stem == "python"
-                    || stem
-                        .strip_prefix("python")
-                        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
+                    || stem.strip_prefix("python").is_some_and(|rest| {
+                        !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+                    })
             }
             p if p.contains("dotnet") => image.trim_end_matches(".exe") == "dotnet",
             p if p.contains("ruby") => image.trim_end_matches(".exe") == "ruby",
@@ -1086,10 +1103,19 @@ mod tests {
         let debugpy = &merged["debugpy"];
         assert_eq!(debugpy.command, "python3");
         // Scalar replaced, sibling default kept.
-        assert_eq!(debugpy.launch_defaults.get("justMyCode"), Some(&json!(true)));
-        assert_eq!(debugpy.launch_defaults.get("stopOnEntry"), Some(&json!(true)));
+        assert_eq!(
+            debugpy.launch_defaults.get("justMyCode"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            debugpy.launch_defaults.get("stopOnEntry"),
+            Some(&json!(true))
+        );
         // Existing attach defaults survive, new key added.
-        assert_eq!(debugpy.attach_defaults.get("request"), Some(&json!("attach")));
+        assert_eq!(
+            debugpy.attach_defaults.get("request"),
+            Some(&json!("attach"))
+        );
         assert_eq!(debugpy.attach_defaults.get("extra"), Some(&json!(1)));
         // Unrelated adapters untouched.
         assert_eq!(merged["gdb"].command, "gdb");
@@ -1106,14 +1132,12 @@ mod tests {
 
     #[test]
     fn yaml_and_json_configs_parse() {
-        let yaml = parse_config_content(
-            "gdb:\n  command: my-gdb\n",
-            Path::new("/tmp/dap.yaml"),
-        )
-        .unwrap();
+        let yaml =
+            parse_config_content("gdb:\n  command: my-gdb\n", Path::new("/tmp/dap.yaml")).unwrap();
         assert_eq!(yaml["gdb"]["command"], json!("my-gdb"));
-        let json = parse_config_content(r#"{"gdb": {"command": "g2"}}"#, Path::new("/tmp/dap.json"))
-            .unwrap();
+        let json =
+            parse_config_content(r#"{"gdb": {"command": "g2"}}"#, Path::new("/tmp/dap.json"))
+                .unwrap();
         assert_eq!(json["gdb"]["command"], json!("g2"));
     }
 
@@ -1184,7 +1208,10 @@ mod tests {
     #[test]
     fn resolve_to_cwd_normalizes() {
         let cwd = Path::new("/work/project");
-        assert_eq!(resolve_to_cwd("a/./b/../c", cwd), PathBuf::from("/work/project/a/c"));
+        assert_eq!(
+            resolve_to_cwd("a/./b/../c", cwd),
+            PathBuf::from("/work/project/a/c")
+        );
         assert_eq!(resolve_to_cwd("/abs/x", cwd), PathBuf::from("/abs/x"));
     }
 
@@ -1221,14 +1248,20 @@ mod tests {
             Some(&json!("debug"))
         );
         assert_eq!(
-            resolve_launch_overrides(&adapter, Path::new("/src/app"), LaunchProgramKind::File).get("mode"),
+            resolve_launch_overrides(&adapter, Path::new("/src/app"), LaunchProgramKind::File)
+                .get("mode"),
             Some(&json!("exec"))
         );
-        assert!(resolve_launch_overrides(&adapter, Path::new("/src/app"), LaunchProgramKind::Missing)
-            .is_empty());
+        assert!(resolve_launch_overrides(
+            &adapter,
+            Path::new("/src/app"),
+            LaunchProgramKind::Missing
+        )
+        .is_empty());
         adapter.name = "gdb".to_string();
         assert!(
-            resolve_launch_overrides(&adapter, Path::new("/src/app"), LaunchProgramKind::File).is_empty()
+            resolve_launch_overrides(&adapter, Path::new("/src/app"), LaunchProgramKind::File)
+                .is_empty()
         );
     }
 
