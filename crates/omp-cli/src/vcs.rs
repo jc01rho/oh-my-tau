@@ -523,9 +523,8 @@ pub fn pid_alive(pid: u32, start_time: Option<u64>) -> bool {
         if raw <= 0 {
             return true;
         }
-        match kill(Pid::from_raw(raw), None) {
-            Err(Errno::ESRCH) => return false,
-            Ok(()) | Err(_) => {}
+        if let Err(Errno::ESRCH) = kill(Pid::from_raw(raw), None) {
+            return false;
         }
         match (start_time, process_start_time(pid)) {
             (Some(recorded), Some(current)) => recorded == current,
