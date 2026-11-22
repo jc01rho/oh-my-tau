@@ -741,22 +741,7 @@ async fn dispatch_builtin_more(
             }
             Some(crate::slash_extra::interactive::jobs_command(rt, verb == "full").await)
         }
-        "advisor" => {
-            let (verb, _rest) = subcommand(args);
-            match verb.as_str() {
-                "" | "toggle" | "on" => output(rt, ADVISOR_INACTIVE_ON),
-                "off" | "status" => output(rt, "Advisor disabled."),
-                "dump" => output(rt, "Advisor is not active for this session."),
-                "configure" => output(
-                    rt,
-                    "/advisor configure opens an interactive editor and is only available in the interactive TUI.",
-                ),
-                _ => return Some(usage(rt, "Usage: /advisor [on|off|status|dump [raw]|configure]")),
-            }
-            Some(Handled {
-                agent_invoked: false,
-            })
-        }
+        "advisor" => Some(crate::features::advisor::command(rt, args).await),
         "memory" => {
             match crate::features::memory::handle_memory_command(&rt.cwd, args) {
                 crate::features::memory::MemoryCommandOutput::Output(text) => {
@@ -3109,9 +3094,6 @@ async fn handoff_command(rt: &Arc<Runtime>, args: &str) -> Outcome {
         agent_invoked: false,
     }
 }
-
-const ADVISOR_INACTIVE_ON: &str =
-    "Advisor setting enabled, but no model is assigned to the 'advisor' role.";
 
 /// Compact context report (simplified TS `buildContextReportText`).
 fn context_report(_state: &Value, usage: &Value) -> String {

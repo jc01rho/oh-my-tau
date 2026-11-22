@@ -134,6 +134,8 @@ pub struct Runtime {
     resolver: Resolver,
     /// Slash-command catalog behind `get_available_commands` / `available_commands_update`.
     commands: Mutex<Vec<Value>>,
+    /// The session's advisor (`/advisor`, `features::advisor`).
+    pub(crate) advisor: crate::features::advisor::Advisor,
     announced: std::sync::atomic::AtomicBool,
     settled: tokio::sync::Notify,
     /// The task running the current retry saga (`recover`); awaited after cancelling it.
@@ -523,6 +525,7 @@ impl Runtime {
             recovery: Mutex::new(recovery),
             resolver,
             commands: Mutex::new(Vec::new()),
+            advisor: crate::features::advisor::Advisor::default(),
             announced: std::sync::atomic::AtomicBool::new(false),
             settled: tokio::sync::Notify::new(),
             retry_task: Mutex::new(None),
@@ -854,8 +857,10 @@ impl Runtime {
             } => {
                 self.on_tool_result_settled(tr);
             }
-            AgentEvent::TurnEnd { .. } => {
+            AgentEvent::TurnEnd { tool_results, .. } => {
                 self.maybe_apply_rewind();
+                // TS `onPrimaryTurnEnd`: the advisor reviews the update.
+                crate::features::advisor::on_primary_turn_end(self, tool_results.is_empty());
             }
             _ => {}
         }
@@ -1889,7 +1894,11 @@ impl Runtime {
                 .flatten();
             injected = hook(message.to_string(), images_json).await;
         }
-        let notices = self.prompt_notices(message, true).await;
+        let mut notices = self.prompt_notices(message, true).await;
+        // Advisor notes held since the last run ride ahead of the prompt.
+        if let Some(advice) = crate::features::advisor::take_pending_message(self) {
+            notices.insert(0, advice);
+        }
         let input = prompt_input(message, images, notices, injected);
         let pua = self.agent.prompt_until_accepted(input).await;
         if let Err(e) = pua {
@@ -2467,6 +2476,7 @@ impl Runtime {
         self.agent.reset().await;
         // A forced tool choice belongs to the session it was set in.
         crate::tool_choice::clear();
+        crate::features::advisor::reset_for_new_session(self).await;
         self.persist.start_new(&self.cwd, dir)?;
         self.bump_generation();
         self.publish_session_file();
@@ -6152,6 +6162,91 @@ mod compaction_guard_tests {
         .await;
         std::mem::forget(provider);
         Harness { rt, rx, _dir: dir }
+    }
+
+    #[tokio::test]
+    async fn advisor_command_reports_the_real_state() {
+        let mut h = harness(0).await;
+        for args in ["off", "status", "dump", "bogus"] {
+            crate::features::advisor::command(&h.rt, args).await;
+        }
+        let texts: Vec<String> = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter(|f| f["type"] == "command_output")
+            .filter_map(|f| f["text"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Advisor disabled.",
+                "Advisor is disabled.",
+                "Advisor is not active for this session.",
+                "Usage: /advisor [on|off|status|dump [raw]|configure]",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn advisor_review_sends_the_delta_and_its_concern_continues_the_run() {
+        let mut h = harness_scripted(|p| {
+            p.push_text_turn("first answer");
+            p.push_text_turn("addressed the advice");
+        })
+        .await;
+        h.rt.prompt(None, "build the feature", None, Vec::new())
+            .await
+            .unwrap();
+        until_settled(&mut h.rx).await;
+        let advisor_model: pa_agent::types::Model = json_round_trip(&model()).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(advisor_model.clone()));
+        provider.push_tool_call_turn(
+            None,
+            vec![(
+                "c1",
+                "advise",
+                json!({"note": "Run the tests before calling it done", "severity": "concern"}),
+            )],
+        );
+        provider.push_text_turn("silent now");
+        let live = crate::features::advisor::install_live(
+            &h.rt,
+            advisor_model,
+            "p/a".into(),
+            provider.stream_fn(),
+            None,
+            4,
+        )
+        .await;
+        let tuning =
+            crate::features::advisor::Tuning::load(&omp_settings::Settings::load(&h.rt.cwd));
+        crate::features::advisor::review(&h.rt, &live, &tuning, true).await;
+        until_settled(&mut h.rx).await;
+        let sent = provider.calls()[0].messages.clone();
+        let delta = serde_json::to_string(&sent).unwrap();
+        assert!(
+            delta.contains("## User") && delta.contains("build the feature"),
+            "{delta}"
+        );
+        assert!(
+            !delta.contains("in progress"),
+            "a terminal review is not marked in progress"
+        );
+        let messages = h.rt.agent.messages_snapshot().await.into_vec();
+        let advisory = messages
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .find(|m| m["customType"] == "advisor")
+            .expect("advisory delivered to the primary");
+        let text = advisory["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("severity=\"concern\""), "{text}");
+        assert!(
+            text.contains("Run the tests before calling it done"),
+            "{text}"
+        );
+        assert!(
+            crate::runtime::message_text(messages.last().unwrap()).contains("addressed the advice"),
+            "the concern continued the run"
+        );
+        std::mem::forget(provider);
     }
 
     #[tokio::test]

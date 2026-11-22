@@ -1,6 +1,7 @@
 //! omt feature commands. Each module exposes `command(rt, args)`, wired from
 //! `rpc/slash.rs` (`dispatch_ported`) and `slash_extra.rs` (`dispatch_extra`).
 
+pub mod advisor;
 pub mod browser;
 pub mod btw;
 pub mod budget;
