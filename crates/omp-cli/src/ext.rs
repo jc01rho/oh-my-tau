@@ -20,7 +20,9 @@ use pa_agent::types::{
 use serde_json::{json, Value};
 
 use omp_ext::hooks::ExtHooks;
-use omp_ext::lifecycle::{self, InputSource, LifecycleEvent, SwitchReason};
+use omp_ext::lifecycle::{
+    self, CacheWarmingDecisionEvent, CacheWarmingOutcome, InputSource, LifecycleEvent, SwitchReason,
+};
 use omp_ext::{ExtHost, HostConfig, HostMessage, ToolInfo};
 
 use crate::events::{message_value, ExtUpdateEncoder};
@@ -833,6 +835,24 @@ impl Extensions {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Whether any loaded extension subscribes to `cache_warming_decision`: the warmer emits
+    /// nothing otherwise.
+    #[must_use]
+    pub fn cache_warming_handlers(&self) -> bool {
+        self.host.has_handlers("cache_warming_decision")
+    }
+
+    /// Emit `cache_warming_decision`; the last handler's `action` overrides the warmer's own.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn cache_warming_decision(
+        &self,
+        event: &CacheWarmingDecisionEvent,
+    ) -> Result<CacheWarmingOutcome> {
+        self.host.emit_cache_warming_decision(event, None).await
     }
 
     /// Extension tools as `AgentTool` wrappers (`list_tools` -> `call_tool`).

@@ -251,6 +251,11 @@ pub fn build_agent(
     };
     // Eval cells' `tool.<name>`/`read`/`write` pass the same tool-call policy.
     crate::tools::eval_bridge::set_session_hooks(before_tool_call.clone(), after_tool_call.clone());
+    let emitter = ext_hooks.map(|ext| {
+        Arc::new(crate::cache_warmer::ExtDecisionEmitter(Arc::clone(ext)))
+            as Arc<dyn crate::cache_warmer::DecisionEmitter>
+    });
+    let warmer = crate::cache_warmer::install(emitter);
     let agent = Agent::new(AgentOptions {
         initial_state: AgentInitialState {
             system_prompt: Some(prompt),
@@ -288,7 +293,11 @@ pub fn build_agent(
             })
         }),
         stream_fn: Some(crate::methodology::wrap_stream(
-            switchable_stream_fn(target.clone()),
+            crate::cache_warmer::warm_stream(
+                switchable_stream_fn(target.clone()),
+                target.clone(),
+                Arc::clone(&warmer),
+            ),
             core_profile,
             ext_hooks.cloned(),
         )),
