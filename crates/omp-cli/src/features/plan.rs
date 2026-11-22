@@ -665,6 +665,16 @@ mod review_tests {
         }
     }
 
+    /// Leaves plan mode for `session` when the test ends: plan state is process-wide, and a session
+    /// left in plan mode makes every later `/plan <task>` refuse with "already active".
+    struct Leave(&'static str);
+
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            set_session(self.0, false, "");
+        }
+    }
+
     fn open(rec: &Recorder, session: &str, plan: &str) -> PlanReviewRequest {
         set_session(session, true, "task");
         let request = review_request(session, plan);
@@ -675,6 +685,7 @@ mod review_tests {
     #[test]
     fn requested_payload_matches_ts_shape() {
         let _g = TEST_LOCK.blocking_lock();
+        let _leave = Leave("pr-shape");
         let rec = Recorder::default();
         let req = open(&rec, "pr-shape", "intro\n# Migrate the auth layer\n- step");
         let events = rec.take();
@@ -729,6 +740,7 @@ mod review_tests {
     #[test]
     fn local_approve_and_off_resolve_locally() {
         let _g = TEST_LOCK.blocking_lock();
+        let _leave = Leave("pr-local");
         let rec = Recorder::default();
         let req = open(&rec, "pr-local", "# A");
         rec.take();
@@ -765,6 +777,7 @@ mod review_tests {
     #[test]
     fn replacing_review_and_cancel_close_unanswered() {
         let _g = TEST_LOCK.blocking_lock();
+        let _leave = Leave("pr-replace");
         let rec = Recorder::default();
         let first = open(&rec, "pr-replace", "# One");
         let second = open(&rec, "pr-replace", "# Two");
@@ -787,6 +800,7 @@ mod review_tests {
     #[test]
     fn extension_answers_follow_resolve_plan_review_rules() {
         let _g = TEST_LOCK.blocking_lock();
+        let _leave = Leave("pr-ext");
         let rec = Recorder::default();
         let req = open(&rec, "pr-ext", "# Ext");
         let id = req.review_id.as_str();
