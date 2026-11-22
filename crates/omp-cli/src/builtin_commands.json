@@ -645,6 +645,24 @@
   "source": "builtin"
  },
  {
+  "name": "unpin",
+  "description": "Remove a session from the pinned top of the resume list",
+  "input": {
+   "hint": "[session id]"
+  },
+  "source": "builtin"
+ },
+ {
+  "name": "clear",
+  "description": "Close the current session and start a fresh one",
+  "source": "builtin"
+ },
+ {
+  "name": "hotkeys",
+  "description": "List keybindings (defaults merged with keybindings.yml)",
+  "source": "builtin"
+ },
+ {
   "name": "retry",
   "description": "Retry the last failed agent turn",
   "source": "builtin"

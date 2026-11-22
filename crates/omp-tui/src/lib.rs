@@ -43,6 +43,7 @@ pub mod overlays;
 pub mod port;
 pub mod render;
 pub mod status_line;
+pub mod terminal_capabilities;
 pub mod theme;
 pub mod tools;
 pub mod word_completion;

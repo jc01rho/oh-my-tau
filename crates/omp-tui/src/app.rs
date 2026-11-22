@@ -47,7 +47,7 @@ use serde_json::Value;
 use crate::action::{Action, QueueKind, SubmitBehavior};
 use crate::autocomplete::Autocomplete;
 use crate::chat::Messages;
-use crate::chrome::notify::{send_notification, NotifyProtocol, TerminalNotification};
+use crate::chrome::notify::{send_notification, TerminalNotification};
 use crate::chrome::title::{TerminalTitle, TitleState};
 use crate::chrome::welcome;
 use crate::component::Component;
@@ -157,7 +157,10 @@ impl NotifySink {
         self.record.lock().push(notification_to_line(n));
         match &self.hook {
             Some(hook) => hook(n),
-            None => send_notification(NotifyProtocol::Bell, n),
+            None => send_notification(
+                crate::terminal_capabilities::TerminalCapabilities::detect().notify,
+                n,
+            ),
         }
     }
 
