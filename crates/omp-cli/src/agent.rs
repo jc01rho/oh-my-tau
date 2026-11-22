@@ -160,6 +160,13 @@ pub fn build_agent(
     let session_jobs = Some(builtin_env.jobs.clone()).or_else(crate::tools::take_last_jobs);
     tools.extend(crate::tools::mcp::mcp_tools(cwd));
     tools.extend(crate::tools::wasm::wasm_tools(cwd));
+    tools.extend(crate::features::security::session_tools(&settings, cwd));
+    tools.extend(crate::tools::context_host::session_tools(&settings));
+    tools.extend(crate::tools::memory_backend::session_tools(
+        &builtin_env,
+        cwd,
+        &settings,
+    ));
     // Hidden tools (TS `HIDDEN_TOOLS`): the active legs (think) are appended
     // after the built-ins; a `--tools <csv>` list admits hidden names too
     // (subagent runs carry `yield` in their csv), like TS's requestedTools

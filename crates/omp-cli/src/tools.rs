@@ -12,6 +12,7 @@ pub mod bash;
 pub(crate) mod browser_prelude;
 pub mod checkpoint;
 pub(crate) mod computer_prelude;
+pub(crate) mod context_host;
 pub(crate) mod context_notes;
 pub(crate) mod context_rollover;
 pub(crate) mod debug;
@@ -26,6 +27,7 @@ pub(crate) mod github_cache;
 pub(crate) mod image_gen;
 mod jobs;
 pub mod mcp;
+pub(crate) mod memory_backend;
 pub(crate) mod memory_tools;
 mod read;
 pub(crate) mod read_fetch;
@@ -433,6 +435,8 @@ pub fn builtin_tools_with_env_and_jobs(
         github::tool(cwd.to_path_buf()),
         // Gated off by default (`speechgen.enabled`).
         tts::tool(env.clone()),
+        // Gated off by default (`generate_image.enabled`).
+        image_gen::tool(env.clone()),
     ];
     env.set_dyn_tools(&tools);
     (env, tools)
@@ -504,6 +508,8 @@ pub fn enabled_by_settings(settings: &omp_settings::Settings, name: &str) -> boo
         "think" => flag("externalThinking", false),
         // `speechgen.enabled`; off by default.
         "tts" => flag("speechgen.enabled", false),
+        // `generate_image.enabled`; off by default.
+        "generate_image" => flag("generate_image.enabled", false),
         "ask" => flag("ask.enabled", true),
         // Inert until the context-management tools land (they need the session
         // journal as a `ContextNotesHost`).
@@ -989,7 +995,8 @@ mod tests {
                 "rewind",
                 "debug",
                 "github",
-                "tts"
+                "tts",
+                "generate_image"
             ]
         );
         let edit = tools.iter().find(|t| t.name() == "edit").unwrap();

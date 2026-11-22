@@ -25,12 +25,14 @@
 //! `openai-responses` / `openai-codex-responses` hosted carrier (the Rust `Model` has no
 //! `hostedImage`/`imageModel` fields to resolve one), `google-gemini-cli` (Cloud Code Assist
 //! credentials), and the resample path's `Bun.Image` (replaced by the `image` crate). The
-//! tool description lives in `prompts/tools/image-gen.md` upstream and is not carried here.
+//! tool description lives in `prompts/tools/image-gen.md` upstream; [`DESCRIPTION`] is a concise
+//! stand-in.
 
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -40,6 +42,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use omp_providers::{AgentDir, ResolvedModel};
+use pa_agent::abort::AbortSignal;
+use pa_agent::types::{
+    AgentTool, AgentToolResult, AgentToolUpdateCallback, ImageContent, ToolResultContent,
+};
+use pa_agent::BoxFut;
+
+use super::Env;
 
 /// Whole-request budget (`IMAGE_TIMEOUT`): three minutes per candidate.
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
@@ -1228,6 +1237,100 @@ pub async fn execute(params: &ImageGenParams, ctx: &ImageGenContext) -> Result<I
     Err(anyhow!(exhausted_message(&attempted, &failures, &skipped)))
 }
 
+// ---------------------------------------------------------------- tool
+
+const NAME: &str = "generate_image";
+
+const DESCRIPTION: &str = "Generates or edits images from a structured description (subject, action, scene, composition, lighting, style, text, changes) and optional reference images in `input`. Returns the saved file paths and attaches the generated images.";
+
+/// The `generate_image` tool. Gated by `generate_image.enabled` (off by default).
+pub struct GenerateImageTool {
+    env: Arc<Env>,
+    schema: Value,
+}
+
+impl GenerateImageTool {
+    #[must_use]
+    pub fn new(env: Arc<Env>) -> Self {
+        Self {
+            env,
+            schema: schema(),
+        }
+    }
+}
+
+impl std::fmt::Debug for GenerateImageTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerateImageTool")
+            .finish_non_exhaustive()
+    }
+}
+
+/// The LLM-facing content: the text first, then one image block per generated image.
+fn result_content(outcome: &ImageGenOutcome) -> Vec<ToolResultContent> {
+    let mut content = vec![ToolResultContent::text(outcome.text.clone())];
+    content.extend(outcome.images.iter().map(|image| {
+        ToolResultContent::Image(ImageContent {
+            data: image.data.clone(),
+            mime_type: image.mime_type.clone(),
+        })
+    }));
+    content
+}
+
+impl AgentTool for GenerateImageTool {
+    fn name(&self) -> &'static str {
+        NAME
+    }
+
+    fn description(&self) -> &str {
+        DESCRIPTION
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.schema
+    }
+
+    fn label(&self) -> &'static str {
+        "Generate Image"
+    }
+
+    fn execute(
+        self: Arc<Self>,
+        _tool_call_id: String,
+        params: Value,
+        _signal: AbortSignal,
+        _on_update: AgentToolUpdateCallback,
+    ) -> BoxFut<'static, Result<AgentToolResult>> {
+        let cwd = self.env.cwd.clone();
+        Box::pin(async move {
+            let params: ImageGenParams = serde_json::from_value(params)
+                .map_err(|e| anyhow!("invalid generate_image parameters: {e}"))?;
+            let ctx = ImageGenContext {
+                dir: AgentDir::default(),
+                cwd,
+                offline: false,
+                active_provider: None,
+                session_model: None,
+            };
+            let outcome = execute(&params, &ctx).await?;
+            Ok(AgentToolResult {
+                content: result_content(&outcome),
+                details: serde_json::to_value(&outcome).unwrap_or(Value::Null),
+                terminate: None,
+                is_error: None,
+            })
+        })
+    }
+}
+
+/// The `generate_image` tool (one line in the builtin table).
+#[must_use]
+pub fn tool(env: Arc<Env>) -> Arc<dyn AgentTool> {
+    Arc::new(GenerateImageTool::new(env))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1719,5 +1822,68 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert_eq!(error, "Image file not found: definitely-not-here-omp.png");
+    }
+
+    #[test]
+    fn tool_exposes_name_and_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(Arc::new(Env::new(dir.path(), false)));
+        assert_eq!(tool.name(), "generate_image");
+        assert_eq!(tool.parameters(), &schema());
+        assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn result_content_is_text_then_one_image_per_generated_image() {
+        let image = |data: &str, mime: &str| GeneratedImage {
+            data: data.to_string(),
+            mime_type: mime.to_string(),
+            size: None,
+            quality: None,
+        };
+        let outcome = ImageGenOutcome {
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            image_count: 2,
+            image_paths: Vec::new(),
+            images: vec![image("QUJD", "image/png"), image("REVG", "image/webp")],
+            response_text: None,
+            usage: ImageUsage::default(),
+            text: "done".to_string(),
+        };
+        let content = result_content(&outcome);
+        assert_eq!(content.len(), 3);
+        assert!(matches!(&content[0], ToolResultContent::Text(t) if t.text == "done"));
+        assert!(matches!(
+            &content[1],
+            ToolResultContent::Image(i) if i.data == "QUJD" && i.mime_type == "image/png"
+        ));
+        assert!(matches!(
+            &content[2],
+            ToolResultContent::Image(i) if i.data == "REVG" && i.mime_type == "image/webp"
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_params_without_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = Arc::new(GenerateImageTool::new(Arc::new(Env::new(
+            dir.path(),
+            false,
+        ))));
+        let error = tool
+            .execute(
+                "call".to_string(),
+                json!({}),
+                AbortSignal::default(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("invalid generate_image parameters"),
+            "{error}"
+        );
     }
 }
