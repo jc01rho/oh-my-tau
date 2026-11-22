@@ -26,6 +26,7 @@ pub mod shell_host;
 mod task;
 mod todo;
 pub mod wasm;
+pub(crate) use read::url_registry;
 pub use todo::{phases_from_entries, TodoPhase, TodoTool};
 #[cfg(test)]
 pub use todo::{Status, TodoItem};
