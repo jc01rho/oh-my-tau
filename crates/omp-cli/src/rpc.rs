@@ -90,6 +90,27 @@ static PENDING_UI_REQUESTS: LazyLock<Mutex<HashMap<String, tokio::sync::oneshot:
 /// Mirrors the `set_ask_dialog` RPC command (TS `askDialogEnabled`).
 static ASK_DIALOG_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Disambiguates dialog ids minted in the same nanosecond.
+static UI_REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Set once stdin closes: no answer can arrive any more, so new dialogs fail at once.
+static UI_REQUESTS_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Fail every in-flight and future dialog (stdin closed).
+fn close_ui_requests() {
+    UI_REQUESTS_CLOSED.store(true, Ordering::SeqCst);
+    lock(&PENDING_UI_REQUESTS).clear();
+}
+
+/// Removes a dialog's waiter when its request ends or is dropped mid-wait.
+struct PendingUiGuard(String);
+
+impl Drop for PendingUiGuard {
+    fn drop(&mut self) {
+        lock(&PENDING_UI_REQUESTS).remove(&self.0);
+    }
+}
+
 /// RPC transport for the `ask` tool dialog (TS `RpcExtensionUIContext`):
 /// emits `extension_ui_request` frames and resolves from the matching
 /// `extension_ui_response` (routed by id in the run loop).
@@ -101,16 +122,21 @@ impl RpcAskUi {
     async fn request(method: &str, mut frame: Map<String, Value>) -> Result<Option<Value>> {
         let (tx, rx) = tokio::sync::oneshot::channel::<Value>();
         let id = format!(
-            "ui-{}",
+            "ui-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
+                .map_or(0, |d| d.as_nanos()),
+            UI_REQUEST_SEQ.fetch_add(1, Ordering::SeqCst)
         );
         let timeout_ms = frame.get("timeout").and_then(Value::as_u64);
         frame.insert("id".into(), json!(id));
         frame.insert("type".into(), json!("extension_ui_request"));
         frame.insert("method".into(), json!(method));
+        let _pending = PendingUiGuard(id.clone());
         lock(&PENDING_UI_REQUESTS).insert(id.clone(), tx);
+        if UI_REQUESTS_CLOSED.load(Ordering::SeqCst) {
+            anyhow::bail!("RPC client disconnected before the dialog was answered");
+        }
         // Emit through the runtime's frame channel via a task-local runtime;
         // `RpcAskUi` is only constructed inside the RPC loop.
         RUNTIME_TX.with(|tx| {
@@ -133,7 +159,6 @@ impl RpcAskUi {
             }
             None => wait.await,
         };
-        lock(&PENDING_UI_REQUESTS).remove(&id);
         result
     }
 }
@@ -166,6 +191,31 @@ impl AskUi for RpcAskUi {
             // Cancelled responses are passed through: the tool interprets
             // `cancelled`/`timedOut` (TS `parseAskDialogResponse`).
             Self::request("ask", frame).await
+        })
+    }
+
+    // The gateway's dialog parser only knows `confirm|select|input|editor|question`
+    // (omo-nyang `dialogs.ts`) and it never sends `set_ask_dialog`. A client that did
+    // send it speaks tau's own `ask` dialog, which is what it can render, so only the
+    // others get `question` frames.
+    fn has_question_dialog(&self) -> bool {
+        !ASK_DIALOG_ENABLED.load(Ordering::SeqCst)
+    }
+
+    fn question(
+        &self,
+        title: String,
+        questions: Value,
+        timeout_ms: Option<u64>,
+    ) -> BoxFut<'static, anyhow::Result<Option<Value>>> {
+        Box::pin(async move {
+            let mut frame = Map::new();
+            frame.insert("title".into(), json!(title));
+            frame.insert("questions".into(), questions);
+            if let Some(ms) = timeout_ms {
+                frame.insert("timeout".into(), json!(ms));
+            }
+            Self::request("question", frame).await
         })
     }
 
@@ -1764,6 +1814,7 @@ pub async fn run_with(
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     let agent = Arc::new(agent);
     RUNTIME_TX.with(|slot| *slot.borrow_mut() = Some(tx.clone()));
+    UI_REQUESTS_CLOSED.store(false, Ordering::SeqCst);
     let rt = Runtime::start(agent.clone(), target, cwd, persist, tx.clone()).await;
     if let Some(path) = resume {
         rt.load_session(&path, None).await?;
@@ -1778,9 +1829,42 @@ pub async fn run_with(
         let mut tools = rt.agent.tools().await;
         if let Some(slot) = tools.iter_mut().find(|t| t.name() == "ask") {
             *slot = crate::tools::tool_with_ui(Arc::new(RpcAskUi));
-            crate::tools::republish_dyn_tools(&tools);
-            rt.agent.set_tools(tools).await;
         }
+        if let Some(slot) = tools.iter_mut().find(|t| t.name() == "ask_user_question") {
+            // `waitForAnswer: false` returns at once and delivers the answer later
+            // as a user message (a follow-up when a turn is running, a new turn when
+            // idle), but only into the session that asked.
+            let weak_rt = Arc::downgrade(&rt);
+            let follow_up: crate::tools::FollowUpSink = Arc::new(move || {
+                let asked_in = weak_rt.upgrade().map(|rt| rt.switch_generation());
+                let weak_rt = weak_rt.clone();
+                Box::new(move |message: String| {
+                    let Some(rt) = weak_rt.upgrade() else { return };
+                    let Some(asked_in) = asked_in else { return };
+                    tokio::spawn(async move {
+                        match rt.prompt_in_generation(asked_in, &message, Some("followUp")).await {
+                            Some(Err(e)) => rt.emit_notice(
+                                "warning",
+                                &format!(
+                                    "ask_user_question answer was not delivered: {}",
+                                    e.message
+                                ),
+                                Some("ask_user_question"),
+                            ),
+                            Some(Ok(())) => {}
+                            None => rt.emit_notice(
+                                "warning",
+                                "ask_user_question answer dropped: the session changed while it was pending",
+                                Some("ask_user_question"),
+                            ),
+                        }
+                    });
+                })
+            });
+            *slot = crate::tools::ask_user_question_with_ui(Arc::new(RpcAskUi), Some(follow_up));
+        }
+        crate::tools::republish_dyn_tools(&tools);
+        rt.agent.set_tools(tools).await;
     }
     let writer = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
@@ -1898,6 +1982,7 @@ pub async fn run_with(
     // stdin closed: let accepted work finish and flush its frames. Host tool calls can no
     // longer be answered, so fail them instead of waiting on the agent forever.
     close_host_tools();
+    close_ui_requests();
     drop(cmd_tx);
     let _ = worker.await;
     while background.join_next().await.is_some() {}
@@ -2379,8 +2464,11 @@ mod ask_ui_tests {
         let _ = tx.send(response);
         let result = ui_task.await.unwrap().unwrap().unwrap();
         assert_eq!(result["answers"][0]["value"], json!("ok"));
+        // A client that opted into tau's ask dialog does not get gateway `question` frames.
+        assert!(!AskUi::has_question_dialog(&ui));
         ASK_DIALOG_ENABLED.store(false, Ordering::SeqCst);
         assert!(!AskUi::has_ask_dialog(&ui));
+        assert!(AskUi::has_question_dialog(&ui));
     }
 
     #[tokio::test]

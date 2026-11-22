@@ -159,6 +159,9 @@ pub struct Runtime {
     /// Bumped by every session switch (`new_session`, `load_session*`): part of
     /// the compaction guard's identity (TS `sessionId()` + generation).
     switch_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Held across a session switch identity change, so a message admitted for the
+    /// old session cannot interleave with it.
+    switch_serial: tokio::sync::Mutex<()>,
     /// Injected summarizer (default: the live model).
     summarizer: Mutex<Option<crate::compact::SummarizeFn>>,
     /// Set by `abort()` (TS `#advisors.autoResumeSuppressed`): a follow-up-only
@@ -575,6 +578,7 @@ impl Runtime {
             compaction_guard: Mutex::new(None),
             compaction_done: tokio::sync::Notify::new(),
             switch_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            switch_serial: tokio::sync::Mutex::new(()),
             summarizer: Mutex::new(None),
             reported_mode: Mutex::new(omp_ext::lifecycle::SessionModeState::default()),
         });
@@ -2048,6 +2052,29 @@ impl Runtime {
     fn bump_generation(&self) {
         self.switch_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // A goal belongs to the session that created it.
+        crate::tools::reset_session_goal();
+    }
+
+    /// Prompt a message bound to session generation `generation`: `None` when the
+    /// session changed first, so a late answer never lands in another session.
+    pub async fn prompt_in_generation(
+        self: &Arc<Self>,
+        generation: u64,
+        message: &str,
+        behavior: Option<&str>,
+    ) -> Option<Result<(), CmdError>> {
+        let _serial = self.switch_serial.lock().await;
+        if self.switch_generation() != generation {
+            return None;
+        }
+        Some(self.prompt(None, message, behavior, Vec::new()).await)
+    }
+
+    /// Counts session switches (new, resume, fork); a value kept across a switch is stale.
+    pub fn switch_generation(&self) -> u64 {
+        self.switch_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Abort the run and wait until the agent is idle.
@@ -2509,6 +2536,7 @@ impl Runtime {
     }
 
     pub async fn new_session(&self, dir: Option<&Path>) -> Result<()> {
+        let _serial = self.switch_serial.lock().await;
         self.check_switch("new", None).await?;
         let previous = self.persist.file();
         // An in-flight compaction must not write into the old file (or swap the
@@ -2641,6 +2669,7 @@ impl Runtime {
         fork: bool,
         branched: bool,
     ) -> Result<()> {
+        let _serial = self.switch_serial.lock().await;
         if !branched {
             self.check_switch(
                 if fork { "fork" } else { "resume" },
