@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use omp_ext::lifecycle::{ApprovalMode, CompactionAction, CompactionReason, LifecycleEvent};
+use omp_ext::lifecycle::{
+    ApprovalMode, CompactionAction, CompactionReason, GoalModeState, LifecycleEvent, ModeStatus,
+    PlanModeState, SessionModeState,
+};
 use omp_ext::{ExtHost, HostConfig, HostMessage};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -230,6 +233,31 @@ async fn retry_compaction_goal_approval_and_user_shell_payloads() {
                 message: json!({"role":"assistant","content":[{"type":"text","text":"a"}]}),
             },
             r#"{"type":"assistant_message","message":{"role":"assistant","content":[{"type":"text","text":"a"}]}}"#,
+        ),
+        (
+            LifecycleEvent::ModeChanged {
+                previous: SessionModeState::default(),
+                state: SessionModeState::default(),
+            },
+            r#"{"type":"mode_changed","previous":{"plan":{"status":"inactive"},"vibe":{"status":"inactive"},"goal":{"status":"inactive"},"loop":{"status":"inactive"}},"state":{"plan":{"status":"inactive"},"vibe":{"status":"inactive"},"goal":{"status":"inactive"},"loop":{"status":"inactive"}}}"#,
+        ),
+        (
+            LifecycleEvent::ModeChanged {
+                previous: SessionModeState::default(),
+                state: SessionModeState {
+                    plan: PlanModeState {
+                        status: ModeStatus::Active,
+                        plan_file_path: Some(s("/tmp/plan.md")),
+                    },
+                    goal: GoalModeState {
+                        status: ModeStatus::Paused,
+                        objective: Some(s("ship it")),
+                        token_budget: Some(50_000),
+                    },
+                    ..SessionModeState::default()
+                },
+            },
+            r#"{"type":"mode_changed","previous":{"plan":{"status":"inactive"},"vibe":{"status":"inactive"},"goal":{"status":"inactive"},"loop":{"status":"inactive"}},"state":{"plan":{"status":"active","planFilePath":"/tmp/plan.md"},"vibe":{"status":"inactive"},"goal":{"status":"paused","objective":"ship it","tokenBudget":50000},"loop":{"status":"inactive"}}}"#,
         ),
     ];
     for (ev, expected) in cases {

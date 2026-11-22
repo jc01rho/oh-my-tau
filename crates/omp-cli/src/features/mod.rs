@@ -6,6 +6,7 @@ pub mod btw;
 pub mod budget;
 pub mod loop_mode;
 pub mod memory;
+pub mod modes;
 pub mod plan;
 pub mod report_issue;
 pub mod restart;

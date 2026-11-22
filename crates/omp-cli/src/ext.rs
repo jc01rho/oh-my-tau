@@ -1165,6 +1165,7 @@ impl Extensions {
             tokio::spawn(async move {
                 let Some(rt) = weak.upgrade() else { return };
                 ext.push_session_ctx(&rt).await;
+                crate::features::modes::notify(&rt);
                 // A branch/fork-into-file move emits `session_branch` from the caller (TS).
                 if reason == "branch" {
                     return;
@@ -1201,6 +1202,7 @@ impl Extensions {
             })
         })));
         self.push_session_ctx(&rt).await;
+        crate::features::modes::notify(&rt);
         self.session_start().await;
     }
 
