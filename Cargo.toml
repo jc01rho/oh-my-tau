@@ -11,6 +11,7 @@ members = [
     "vendor/pi-vfs",
     "vendor/pi-predict",
     "vendor/omp-xfs",
+    "vendor/omp-utok",
     # oh-my-pi (omp2) shell stack, vendored verbatim from the pinned omp2 commit
     # (see vendor-src.lock). vendor/omp-proto is deliberately absent: it ships its
     # own `[workspace]` table and reaches the graph as a path dependency instead,
@@ -71,6 +72,7 @@ omp-macros = { path = "vendor/omp-macros" }
 omp-vocab = { path = "vendor/omp-vocab" }
 omp-walker = { path = "vendor/omp-walker" }
 omp-xfs = { path = "vendor/omp-xfs" }
+omp-utok = { path = "vendor/omp-utok" }
 omp-tool = { path = "vendor/omp-tool" }
 omp-proto = { path = "vendor/omp-proto" }
 omp-shell = { path = "vendor/omp-shell" }

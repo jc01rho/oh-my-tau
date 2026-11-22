@@ -3232,6 +3232,14 @@ impl Runtime {
             .unwrap_or(0)
     }
 
+    /// Tokenizer family of the live model (`Model::resolved_tokenizer`); `None` when unknown.
+    fn live_tokenizer(&self) -> Option<pa_types::ai::ModelTokenizer> {
+        self.target
+            .read()
+            .ok()
+            .and_then(|t| t.as_ref().and_then(|t| t.model.resolved_tokenizer()))
+    }
+
     /// rpc `compact`: summarize the older history into a `compaction` entry and swap the agent's
     /// messages for the rebuilt context. Returns the `CompactionResult` the response carries.
     ///
@@ -3413,6 +3421,7 @@ impl Runtime {
             settings: &settings,
             model_id: &model_id,
             context_window: Some(self.live_window()).filter(|w| *w > 0),
+            tokenizer: self.live_tokenizer(),
             custom_instructions,
             method: mode,
             handoff: handoff_context.as_ref(),
@@ -3485,6 +3494,7 @@ impl Runtime {
         if !settings.enabled || window == 0 {
             return false;
         }
+        let tokenizer = omp_compact::FamilyTokenizer::new(self.live_tokenizer());
         // Read the live context in place (no snapshot copy of the messages).
         let mut usage = None;
         let mut stored = 0;
@@ -3498,7 +3508,7 @@ impl Runtime {
                     }
                     _ => None,
                 });
-                stored = crate::compact::estimate_context_tokens(messages);
+                stored = crate::compact::estimate_context_tokens(messages, &tokenizer);
             })
             .await;
         crate::compact::auto_check(usage, stored, window, &settings)

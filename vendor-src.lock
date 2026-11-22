@@ -65,6 +65,15 @@ import-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 reference-commit = "b636e19d10b664950d600505d194337bbeef42f0"
 modifications = "replaces retired pi-walker; manifest uses flume 0.11, omp-vfs -> pi-vfs package alias, bare `[lints]` (unsafe blocks), `grep/render.rs` uses `.chars().count()` for UTF-32 column count, watch doc example tabs converted to spaces, and formatted with workspace default rustfmt"
 
+[crates.omp-utok]
+path = "vendor/omp-utok"
+version = "19.1.0"
+source = "can1357/oh-my-pi (main, crates/natives/src/utok + crates/natives/data + crates/natives/fixtures)"
+import-commit = "efcbef6dd0a190b82ea8811db3526a97101fbbb3"
+reference-commit = "efcbef6dd0a190b82ea8811db3526a97101fbbb3"
+license = "MIT (code: Stencil Labs, Inc.; Claude vocabularies: sanderland/ctok, data/LICENSE.ctok)"
+modifications = "extracted from the omp-natives napi crate into a standalone crate (utok/mod.rs -> src/lib.rs, crate::utok:: -> crate::, include paths re-rooted); the TypeSafe Jev encoding (jev.rs, jev_*.bin.zst, fixtures/jev.json) is dropped; only the data blobs and fixtures the remaining families use are copied; test-only String::from_utf8_lossy_owned (nightly) -> from_utf8_lossy(..).into_owned(); scan::cls in_upper_set/in_lower_set use group(c) instead of GeneralCategory::group (the stable xutf shim re-exports unicode-properties' enum, which has no group()); zstd 0.13 instead of 0.14 (already in the lock); manifest carries upstream's mismatched_lifetime_syntaxes / too_many_arguments allowances; formatted with workspace default rustfmt"
+
 [crates.pi-predict]
 path = "vendor/pi-predict"
 version = "19.0.1"
@@ -140,7 +149,7 @@ version = "0.1.0"
 source = "first-party shim (not vendored): stable-Rust replacement for crates.io xutf"
 reference-commit = "n/a"
 license = "MIT"
-modifications = "replaces xutf 2.3.0 (and earlier 1.6.0), which requires nightly (core::simd) and a generated Unicode property trie. Covers the surface consumed by the omp2 shell stack (BufReadCharsExt/Chars/CharsRaw/ReadCharError, strip_ansi, width_char/width_str/width_ansi_str) and the Phase 2.5 19.0.1 stack (Encoding/Unit/Utf8/Utf16, Text::transcoded_len/unit_offset, LineEnds/lines/lines_str/Line::with_end, UnitSet, find_iter, IntoUnicodeNormalized::into_nfc via unicode-normalization)"
+modifications = "replaces xutf 2.3.0 (and earlier 1.6.0), which requires nightly (core::simd) and a generated Unicode property trie. Covers the surface consumed by the omp2 shell stack (BufReadCharsExt/Chars/CharsRaw/ReadCharError, strip_ansi, width_char/width_str/width_ansi_str) and the Phase 2.5 19.0.1 stack (Encoding/Unit/Utf8/Utf16, Text::transcoded_len/unit_offset, LineEnds/lines/lines_str/Line::with_end, UnitSet, find_iter, IntoUnicodeNormalized::into_nfc via unicode-normalization) and the omp-utok tokenizer (GeneralCategory/GeneralCategoryGroup via unicode-properties =0.1.3, Script via unicode-script =0.5.7, both UCD 16.0.0, Ucd trait, UCD_VERSION, canonical_combining_class, ToUnicodeNormalized::to_nfc, is_nfc_codepoints)"
 
 # Local shims, not upstream code. Recorded here because they occupy the omp-*
 # crate names the rest of the tree imports.

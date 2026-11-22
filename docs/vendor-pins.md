@@ -35,7 +35,7 @@ tooling will catch it for you.
 ## workspace members from `vendor/`
 
 `Cargo.toml` lists `vendor/pa-{types,ai,models,agent}`, `vendor/pi-{edit,ast,diff,vfs,predict}`,
-`vendor/omp-xfs`, the Phase 2 `vendor/omp-*` shell stack (`omp-{core,macros,vocab,walker,tool,shell,shell-builtins}`),
+`vendor/omp-xfs`, `vendor/omp-utok`, the Phase 2 `vendor/omp-*` shell stack (`omp-{core,macros,vocab,walker,tool,shell,shell-builtins}`),
 `vendor/xutf`, and `vendor/laya-ort` as workspace members. `vendor/crossterm` and `vendor/omp-proto` are not members (`crossterm` enters via `[patch.crates-io]`, `omp-proto` as a standalone path dependency).
 
 ## 1. `pi-*` and `omp-xfs` — synced from oh-my-pi (`main` @ `b636e19d10`)
@@ -51,6 +51,7 @@ Each manifest carries the provenance line `Vendored from can1357/oh-my-pi (MIT),
 | `pi-edit` | `19.0.1` | `can1357/oh-my-pi` (`main`, `crates/edit`) | `b636e19d10` (`main`) | `b636e19d10` (`main`) | depends on `pi-ast`, `pi-diff`, `omp-xfs`, `xutf`; `Rejection` + `max_columns` + 5 prompts |
 | `pi-vfs` | `19.0.1` | `can1357/oh-my-pi` (`main`, `crates/vfs`) | `b636e19d10` (`main`) | `b636e19d10` (`main`) | `read_until_cancelled` + `ScopedOpen` + `Fs::with_provider` |
 | `omp-xfs` | `19.0.1` | `can1357/oh-my-pi` (`main`, `crates/xfs`) | `b636e19d10` (`main`) | `b636e19d10` (`main`) | replaces retired `pi-walker`; async walk/tree/grep/glob over `pi-vfs` |
+| `omp-utok` | `19.1.0` | `can1357/oh-my-pi` (`main`, `crates/natives/src/utok` + `data/` + `fixtures/`) | `efcbef6dd0` (`main`) | `efcbef6dd0` (`main`) | exact offline token counts (o200k/cl100k/Qwen3/DeepSeek/Kimi/GLM BPE, Claude ctok reconstructions); Jev dropped; 4.3 MB zstd tables; links `vendor/xutf` (UCD 16.0.0) |
 | `pi-predict` | `19.0.1` | `can1357/oh-my-pi` (`main`, `crates/predict`, n-gram only) | `b636e19d10` (`main`) | `b636e19d10` (`main`) | n-gram engine only; `smollm`/`apple` return explicit fallback errors without pulling ML deps |
 
 All five `pi-*` crates and `omp-xfs` come from the `main` track (`b636e19d10`). `pi-predict`

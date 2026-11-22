@@ -6,9 +6,12 @@
 //! `omp-shell` and `omp-shell-builtins` (strict UTF-8 char iteration over
 //! `BufRead`, `width_char`, `width_str`, `width_ansi_str`) and in the vendored
 //! `pi-*` file/edit/predict crates (line splitting, transcoded lengths,
-//! codepoint offsets, byte-set scans, substring search and NFC normalization),
-//! while delegating table lookups to `unicode-width` and cluster segmentation
-//! to `unicode-segmentation`.
+//! codepoint offsets, byte-set scans, substring search and NFC normalization)
+//! and in the vendored `omp-utok` tokenizer (general category, script and
+//! canonical combining class lookups, NFC checks over codepoints), while
+//! delegating table lookups to `unicode-width`, `unicode-properties`,
+//! `unicode-script` and `unicode-normalization` and cluster segmentation to
+//! `unicode-segmentation`.
 //!
 //! Compatibility notes:
 //!
@@ -37,18 +40,22 @@ mod read;
 mod set;
 mod strip;
 mod text;
+mod ucd;
 mod width;
 
 pub use convert::transcoded_len;
 pub use encoding::{Encoding, Kind, Unit};
 pub use find::{FindIter, find_iter};
 pub use lines::{Line, LineEnds, Lines, StrLines, lines, lines_str};
-pub use normalize::{IntoUnicodeNormalized, is_nfc};
+pub use normalize::{IntoUnicodeNormalized, ToUnicodeNormalized, is_nfc, is_nfc_codepoints};
 pub use offset::unit_offset;
 pub use read::{BufReadCharsExt, Chars, CharsRaw, ReadCharError};
 pub use set::UnitSet;
 pub use strip::{strip_ansi, width_ansi_str};
 pub use text::Text;
+pub use ucd::{
+    GeneralCategory, GeneralCategoryGroup, Script, UCD_VERSION, Ucd, canonical_combining_class,
+};
 pub use width::{width_char, width_str};
 
 /// UTF-8 encoding marker.
