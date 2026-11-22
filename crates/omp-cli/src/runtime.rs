@@ -1829,6 +1829,9 @@ impl Runtime {
             // (it reads it as the "run is fully idle" marker before it releases a lane).
             self.send(json!({"type": "session_settled"}));
             self.send(json!({"type": "agent_settled"}));
+            // The gateway reads the next lifecycle record to tell a finished
+            // session from one still waiting on background children.
+            crate::tools::subagents::on_session_settled(self);
         }
         self.settled.notify_waiters();
     }
@@ -1843,12 +1846,63 @@ impl Runtime {
         behavior: Option<&str>,
         images: Vec<pa_agent::types::ImageContent>,
     ) -> Result<(), CmdError> {
+        self.prompt_guarded(id, message, behavior, images, None)
+            .await
+    }
+
+    /// [`Self::prompt`] for a message addressed to one session (a background
+    /// completion): it is admitted only while `session` is still the live
+    /// session, checked right before the agent takes it, and it never
+    /// releases a Stop hold.
+    ///
+    /// # Errors
+    /// `session_mismatch` after a session switch, `session_paused` under a
+    /// hold, or any [`Self::prompt`] refusal.
+    pub async fn prompt_in_session(
+        self: &Arc<Self>,
+        session: &str,
+        message: &str,
+        behavior: Option<&str>,
+    ) -> Result<(), CmdError> {
+        self.prompt_guarded(None, message, behavior, Vec::new(), Some(session))
+            .await
+    }
+
+    fn ensure_session(&self, session: Option<&str>) -> Result<(), CmdError> {
+        match session {
+            Some(expected) if self.session_id() != expected => Err(CmdError::coded(
+                "The session changed before the message was admitted.",
+                "session_mismatch",
+            )),
+            Some(_) if self.is_paused() => Err(CmdError::coded(
+                "The session is held; the message waits for the resume.",
+                "session_paused",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    async fn prompt_guarded(
+        self: &Arc<Self>,
+        id: Option<Value>,
+        message: &str,
+        behavior: Option<&str>,
+        images: Vec<pa_agent::types::ImageContent>,
+        session: Option<&str>,
+    ) -> Result<(), CmdError> {
         // Budget gate: once the session budget is exceeded, refuse to start a
         // new turn (slash commands are dispatched earlier and still work).
         if let Some(msg) = crate::features::budget::prompt_refusal() {
             self.emit_notice("warning", &msg, Some("budget"));
             return Err(CmdError::new(msg));
         }
+        if session.is_some() && self.is_paused() {
+            return Err(CmdError::coded(
+                "The session is held; the message waits for the resume.",
+                "session_paused",
+            ));
+        }
+        self.ensure_session(session)?;
         self.release_pause("input");
         // A prompt during in-flight compaction cancels it and waits for the
         // pass to settle first (TS prompt-side `abortCompaction` +
@@ -1857,7 +1911,9 @@ impl Runtime {
         // before the auto-title spawn so the title task cannot append its way
         // into a running pass.
         self.cancel_compaction_and_wait().await;
-        self.spawn_auto_title(message);
+        if session.is_none() {
+            self.spawn_auto_title(message);
+        }
         if self.agent.is_streaming().await {
             let steer = match behavior {
                 Some("steer") => true,
@@ -1883,6 +1939,7 @@ impl Runtime {
                 batch.push(user_message(message));
                 pa_agent::agent::AgentMessageBatch::Batch(batch)
             };
+            self.ensure_session(session)?;
             if steer {
                 self.agent.steer(queued);
             } else {
@@ -1934,6 +1991,12 @@ impl Runtime {
         }
         let notices = self.prompt_notices(message, true).await;
         let input = prompt_input(message, images, notices, injected);
+        if let Err(e) = self.ensure_session(session) {
+            lock(&self.prompts)
+                .open
+                .retain(|t| !(t.starts_at_begin == starts && t.id == id && !t.waiting));
+            return Err(e);
+        }
         let pua = self.agent.prompt_until_accepted(input).await;
         if let Err(e) = pua {
             lock(&self.prompts)
@@ -2116,6 +2179,23 @@ impl Runtime {
         };
         self.journal_hold("release", seq, Some(cause), &at);
         self.send(crate::pause::resumed_frame(seq, cause, &at));
+        // Background completions held back during the Stop go out now.
+        crate::tools::subagents::flush_pending();
+    }
+
+    /// Whether a Stop hold is in place (`interrupt intent:"stop"`).
+    pub fn is_paused(&self) -> bool {
+        lock(&self.pause).paused()
+    }
+
+    /// Append a `custom` session entry `{customType, data}` (best effort).
+    pub(crate) fn journal_custom(&self, custom_type: &str, data: Value) {
+        if let Err(e) = self
+            .persist
+            .append_entry("custom", json!({"customType": custom_type, "data": data}))
+        {
+            eprintln!("omt: {custom_type} journal: {e:#}");
+        }
     }
 
     fn journal_hold(&self, op: &str, seq: u64, cause: Option<&str>, at: &str) {

@@ -11,6 +11,9 @@
 // - todo: schema is omp's `todoSchema` exactly (7-value op, no `reason`);
 //   `block`/`unblock` + `reason` are runtime-only extensions
 // - task: top-level `model` removed (model selectors are per-item only)
+//
+// OmOMeow gateway superset (the engine contract the gateway drives, not in omp TS):
+// - task: optional top-level `run_in_background` (background `st_...` tasks)
 // - glob: `additionalProperties:false` dropped; the reference's `pattern` key is
 //   a runtime-only extension (`globSearchPath` scoping in `search::glob`)
 //
@@ -35,6 +38,8 @@ const ALLOWED_DELTAS: Record<string, RegExp[]> = {
 	edit: [/^description first line differs:$/],
 	eval: [/^description first line differs:$/],
 	web_search: [/^description first line differs:$/],
+	// OmOMeow `run_in_background` (optional): background tasks with `st_...` ids.
+	task: [/^extra in rust: run_in_background$/],
 };
 
 interface CompareReport {
