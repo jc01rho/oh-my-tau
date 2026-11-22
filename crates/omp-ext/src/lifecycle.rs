@@ -302,6 +302,25 @@ pub enum LifecycleEvent {
         exclude_from_context: bool,
         cwd: String,
     },
+    /// The auth store automatically soft-disabled a credential (TS `CredentialDisabledEvent`):
+    /// a definitive OAuth refresh failure (`invalid_grant`, `revoked`, ...) or an auth-broker
+    /// disable. A user-initiated removal, a logout and the duplicate-credential purge stay
+    /// silent, like upstream. `disabled_cause` is the verbatim error kept for forensics.
+    #[serde(rename = "credential_disabled", rename_all = "camelCase")]
+    CredentialDisabled {
+        provider: String,
+        disabled_cause: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credential_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        org_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        org_name: Option<String>,
+    },
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -522,6 +541,9 @@ impl ExtHost {
         emit_tool_approval_requested(session_id: String, tool_name: String, tool_call_id: String, reason: Option<String>, approval_mode: ApprovalMode) => LifecycleEvent::ToolApprovalRequested { session_id, tool_name, tool_call_id, reason, approval_mode };
         /// `tool_approval_resolved`.
         emit_tool_approval_resolved(session_id: String, tool_name: String, tool_call_id: String, approved: bool, reason: Option<String>) => LifecycleEvent::ToolApprovalResolved { session_id, tool_name, tool_call_id, approved, reason };
+        /// `credential_disabled`: the auth store tore down a credential on its own.
+        #[allow(clippy::too_many_arguments)] // one argument per omp payload field
+        emit_credential_disabled(provider: String, disabled_cause: String, credential_id: Option<i64>, email: Option<String>, account_id: Option<String>, org_id: Option<String>, org_name: Option<String>) => LifecycleEvent::CredentialDisabled { provider, disabled_cause, credential_id, email, account_id, org_id, org_name };
     }
 
     /// `assistant_message`: a handler may rewrite the text of the finalized message (text blocks only).

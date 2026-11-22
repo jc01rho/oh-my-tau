@@ -2963,6 +2963,7 @@ dependencies = [
  "pa-ai",
  "pa-types",
  "parking_lot",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",
