@@ -1050,6 +1050,7 @@ fn start_background(
     _signal: &AbortSignal,
 ) -> AgentToolResult {
     let output: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let cancel = Arc::new(pa_agent::abort::AbortController::new());
     let job = jobs::Job {
         command: command.clone(),
         started: Instant::now(),
@@ -1058,6 +1059,8 @@ fn start_background(
         result: None,
         error: None,
         ended: None,
+        read_at: Arc::new(Mutex::new(0)),
+        cancel: cancel.clone(),
     };
     let job_id = registry.insert(job);
     let registry = registry.clone();
@@ -1074,12 +1077,11 @@ fn start_background(
     tokio::spawn(async move {
         // Held for the whole job; released when this task ends.
         let _keep = keep_alive;
-        let controller = pa_agent::abort::AbortController::new();
         let raw = run_with_dyn(
             &dir,
             &command,
             timeout,
-            &controller.signal(),
+            &cancel.signal(),
             task_notify.as_deref(),
             Some(output),
             dyn_tools,
@@ -1095,7 +1097,9 @@ fn start_background(
                 if let Some(report) = task_notify.as_ref().and_then(|n| n.report()) {
                     text = append_notify_report(&text, &report, &spill);
                 }
-                let status = if outcome.is_none() && *code == Some(0) {
+                let status = if cancel.signal().is_aborted() {
+                    JobStatus::Killed
+                } else if outcome.is_none() && *code == Some(0) {
                     JobStatus::Completed
                 } else {
                     JobStatus::Failed
@@ -1132,7 +1136,9 @@ fn start_background(
             notify.source
         ));
     }
-    AgentToolResult::text(lines.join("\n"))
+    let mut result = AgentToolResult::text(lines.join("\n"));
+    result.details = serde_json::json!({"bash_id": job_id, "status": "running"});
+    result
 }
 
 #[cfg(test)]

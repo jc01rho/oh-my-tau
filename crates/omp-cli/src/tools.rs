@@ -9,6 +9,7 @@ pub(crate) mod aliases;
 pub mod ask;
 mod ast;
 pub mod bash;
+pub(crate) mod bash_output;
 pub(crate) mod browser_prelude;
 pub mod checkpoint;
 pub(crate) mod computer_prelude;
@@ -408,6 +409,18 @@ pub fn builtin_tools_with_env_and_jobs(
             Arc::new(|env, args, _| Box::pin(task::task(env, args))),
         ),
         wait::tool(env.clone()),
+        mk(
+            "bash_output",
+            bash_output::description().to_string(),
+            bash_output::schema(),
+            blocking(bash_output::bash_output),
+        ),
+        mk(
+            "kill_bash",
+            bash_output::kill_description().to_string(),
+            bash_output::kill_schema(),
+            blocking(bash_output::kill_bash),
+        ),
         // Own AgentTool: eval needs the abort signal (cell cancel) and on_update
         // (bridge status events), which the `mk` closure signature drops.
         Arc::new(eval::EvalTool::new(env.clone())),
@@ -729,6 +742,8 @@ mod tests {
             result: None,
             error: None,
             ended: None,
+            read_at: Arc::new(std::sync::Mutex::new(0)),
+            cancel: Arc::new(pa_agent::abort::AbortController::new()),
         });
         let (before, tools) = session_builtin_tools_with_env_and_jobs(
             dir.path(),
@@ -984,6 +999,8 @@ mod tests {
                 "find",
                 "task",
                 "wait",
+                "bash_output",
+                "kill_bash",
                 "eval",
                 "ast_grep",
                 "ast_edit",

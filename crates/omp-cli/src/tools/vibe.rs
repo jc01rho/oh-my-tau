@@ -892,6 +892,8 @@ impl VibeSessionRegistry {
             result: None,
             error: None,
             ended: None,
+            read_at: Arc::new(StdMutex::new(0)),
+            cancel: Arc::new(pa_agent::abort::AbortController::new()),
         });
         {
             let mut inner = self.inner.lock();
@@ -1209,6 +1211,7 @@ fn collect_settled(
                     JobStatus::Running => return None,
                     JobStatus::Completed => "completed".to_string(),
                     JobStatus::Failed => "failed".to_string(),
+                    JobStatus::Killed => "cancelled".to_string(),
                 }
             };
             Some(VibeSettledTurn {
@@ -2228,6 +2231,8 @@ mod tests {
             result: None,
             error: None,
             ended: None,
+            read_at: Arc::new(StdMutex::new(0)),
+            cancel: Arc::new(pa_agent::abort::AbortController::new()),
         });
         let mut inner = registry.inner.lock();
         let record = inner
