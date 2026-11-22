@@ -128,6 +128,9 @@ async fn drive(cfg: RunConfig, port: impl RuntimePort, shell: &mut StdShell) -> 
     // frozen. Check once a second and re-assert raw mode when it was lost.
     let mut raw_guard = tokio::time::interval(RAW_GUARD_TICK);
     raw_guard.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Pending `session_before_shutdown` gate of an operator quit; dropping it
+    // (second quit, signal, loop exit) aborts its signal.
+    let mut close: Option<crate::port::CloseGate> = None;
     loop {
         let now = Instant::now();
         // Keep the animation clock running only while something animates;
@@ -149,7 +152,9 @@ async fn drive(cfg: RunConfig, port: impl RuntimePort, shell: &mut StdShell) -> 
             () = signals.recv() => {
                 // SIGTERM/SIGHUP/SIGINT: leave through the normal teardown so
                 // the alt screen, mouse tracking and keyboard modes are
-                // restored (TS postmortem `terminal-restore`).
+                // restored (TS postmortem `terminal-restore`). Not
+                // cancellable: a pending close gate is aborted.
+                drop(close.take());
                 break;
             }
             maybe_key = keys.next() => {
@@ -167,7 +172,16 @@ async fn drive(cfg: RunConfig, port: impl RuntimePort, shell: &mut StdShell) -> 
                     }
                     _ => {
                         if !app.handle_terminal_event(&event, &port) {
-                            break; // Action::Quit
+                            // Action::Quit. A further quit while extensions
+                            // are asked skips the prompts and closes (TS
+                            // `shutdown()` aborting the pending attempt).
+                            if close.take().is_some() {
+                                break;
+                            }
+                            match port.confirm_close() {
+                                None => break,
+                                Some(gate) => close = Some(gate),
+                            }
                         }
                     }
                 }
@@ -183,6 +197,13 @@ async fn drive(cfg: RunConfig, port: impl RuntimePort, shell: &mut StdShell) -> 
                 if app.pump_events(Instant::now()) {
                     commit_retired(&mut app, shell).context("commit scrollback")?;
                 }
+            }
+            proceed = async { match close.as_mut() { Some(g) => g.decided().await, None => std::future::pending().await } } => {
+                close = None;
+                if proceed {
+                    break;
+                }
+                app.close_cancelled();
             }
             _ = raw_guard.tick() => {
                 if restore_raw_mode_if_lost() {

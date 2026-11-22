@@ -627,6 +627,39 @@ impl ExtHost {
         Ok(())
     }
 
+    /// Start an awaited [`emit`](Self::emit) whose handlers get an `event.signal` the core can
+    /// abort with [`abort_emit`](Self::abort_emit) (`abortId` rides the request, outside the event).
+    /// `Ok(None)` when no extension subscribes (nothing was sent).
+    ///
+    /// # Errors
+    /// Fails only when the request cannot be enqueued (host stdin closed).
+    pub(crate) fn emit_abortable(
+        &self,
+        event: &Value,
+        ctx: Option<Value>,
+    ) -> Result<Option<(u64, PendingReply)>> {
+        if self.skip_emit(event, ctx.is_some()) {
+            return Ok(None);
+        }
+        let abort_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut p = emit_payload(event, &[]);
+        p["abortId"] = json!(abort_id);
+        if let Some(ctx) =
+            self.provided_ctx(ctx, event.get("type").and_then(Value::as_str).unwrap_or(""))
+        {
+            p["ctx"] = ctx;
+        }
+        Ok(Some((abort_id, self.send_request("emit", p)?)))
+    }
+
+    /// Abort the host-side `event.signal` of an [`emit_abortable`](Self::emit_abortable) emit;
+    /// the core no longer waits for it. Best-effort: an unknown or finished id is not an error.
+    pub(crate) fn abort_emit(&self, abort_id: u64) {
+        if let Err(e) = self.send_request("abort_emit", json!({ "abortId": abort_id })) {
+            eprintln!("omt: extension abort_emit: {e:#}");
+        }
+    }
+
     /// # Errors
     /// Transport failure.
     pub async fn list_tools(&self) -> Result<Vec<ToolInfo>> {
@@ -1117,6 +1150,9 @@ fn route(msg: &Value, pending: &Pending, host: Option<Arc<ExtHost>>) {
 }
 
 /// `emit` request params: `{event, skipExtensions?}`.
+/// Response receiver of a request sent with `send_request`.
+pub(crate) type PendingReply = oneshot::Receiver<Result<Value, String>>;
+
 fn emit_payload(event: &Value, skip: &[String]) -> Value {
     let mut p = json!({ "event": event });
     if !skip.is_empty() {

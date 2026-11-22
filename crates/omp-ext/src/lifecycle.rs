@@ -302,6 +302,11 @@ pub enum LifecycleEvent {
         exclude_from_context: bool,
         cwd: String,
     },
+    /// An operator close the host can still refuse (cancellable). The `signal` the TS event
+    /// carries is made host-side and aborted through `abort_emit` (see
+    /// [`ExtHost::emit_session_before_shutdown`]).
+    #[serde(rename = "session_before_shutdown")]
+    SessionBeforeShutdown,
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -702,6 +707,41 @@ impl ExtHost {
         Ok(SessionStopOutcome::from_value(
             &self.emit_event(&event, ctx).await?.result,
         ))
+    }
+
+    /// `session_before_shutdown` gate (TS `AgentSession.confirmClose`): `Ok(true)` lets the
+    /// close proceed. Without subscribers nothing is emitted. When `aborted` resolves first the
+    /// close stops waiting: the host's `event.signal` is aborted, a late handler result is
+    /// dropped and the close proceeds; only a `cancel` delivered before that keeps the session.
+    ///
+    /// # Errors
+    /// Transport failure (callers proceed with the close, as TS does on errors).
+    pub async fn emit_session_before_shutdown(
+        &self,
+        aborted: impl Future<Output = ()> + Send,
+        ctx: Option<Value>,
+    ) -> Result<bool> {
+        let Some((abort_id, rx)) =
+            self.emit_abortable(&LifecycleEvent::SessionBeforeShutdown.to_value(), ctx)?
+        else {
+            return Ok(true);
+        };
+        tokio::select! {
+            biased;
+            reply = rx => {
+                let v = match reply {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(m)) => anyhow::bail!("emit: {m}"),
+                    Err(_) => anyhow::bail!("emit: extension host dropped the request"),
+                };
+                let r: EmitResult = serde_json::from_value(v)?;
+                Ok(!CancelOutcome::from_result(r).cancel)
+            }
+            () = aborted => {
+                self.abort_emit(abort_id);
+                Ok(true)
+            }
+        }
     }
 }
 

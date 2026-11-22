@@ -14,6 +14,7 @@ const RESULTS: Record<string, unknown> = {
   session_before_switch: { cancel: true },
   session_before_branch: { cancel: false },
   session_before_tree: { cancel: true },
+  session_before_shutdown: { cancel: true },
   session_stop: { continue: true, additionalContext: "keep going" },
   user_bash: { result: { output: "handled", exitCode: 0 } },
   user_python: { result: { output: "py", exitCode: 0 } },

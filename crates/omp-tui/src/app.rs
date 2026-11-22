@@ -1724,6 +1724,11 @@ impl App {
         self.messages.push_system(&text);
     }
 
+    /// An extension refused the quit (`session_before_shutdown` cancel).
+    pub fn close_cancelled(&mut self) {
+        self.push_system("Session close cancelled".into());
+    }
+
     /// Forward queued overlay intents (model picks, palette commands,
     /// session picks) to the port. The model browser stays open after an
     /// assignment (TS model hub); Esc closes it.

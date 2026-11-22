@@ -180,3 +180,34 @@ test("before_subagent_spawn: block short-circuits, otherwise last model wins", a
   expect(r.result.result).toEqual({ block: true, reason: "no" });
   expect(r.result.handlers).toHaveLength(1);
 });
+
+test("session_before_shutdown: handlers get a live signal and a cancel short-circuits", async () => {
+  const core = await hostWith(TWO(`(e) => ({ cancel: e.signal instanceof AbortSignal && !e.signal.aborted })`, `() => { throw new Error("must not run"); }`, "session_before_shutdown"));
+  const r = await core.call("emit", { event: { type: "session_before_shutdown" }, abortId: 1 });
+  expect(r.result.result).toEqual({ cancel: true });
+  expect(r.result.handlers).toHaveLength(1);
+});
+
+test("session_before_shutdown: abort_emit aborts the signal and drops the late cancel", async () => {
+  const core = await hostWith(`export default (pi) => pi.on("session_before_shutdown", async (e, ctx) => {
+    await ctx.ui.confirm("Quit?", "sure");
+    if (!e.signal.aborted) await new Promise((r) => e.signal.addEventListener("abort", r, { once: true }));
+    return { cancel: true };
+  });`);
+  // The core stops waiting while the handler's dialog is open.
+  core.answer.ui_confirm = () => {
+    core.send({ id: 9_998, method: "abort_emit", params: { abortId: 7 } });
+    return true;
+  };
+  const r = await core.call("emit", { event: { type: "session_before_shutdown" }, abortId: 7 });
+  expect(r.result.result).toBeNull();
+  expect(core.requests.filter((m) => m.method === "ui_confirm")).toHaveLength(1);
+});
+
+test("session_before_shutdown: an abort that arrives first skips every handler", async () => {
+  const core = await hostWith(`export default (pi) => pi.on("session_before_shutdown", () => ({ cancel: true }));`);
+  expect((await core.call("abort_emit", { abortId: 5 })).result).toBe(true);
+  const r = await core.call("emit", { event: { type: "session_before_shutdown" }, abortId: 5 });
+  expect(r.result.result).toBeNull();
+  expect(r.result.handlers).toEqual([]);
+});
