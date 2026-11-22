@@ -1,7 +1,7 @@
 //! Parity with the TypeScript agent: the session tree computed from a real (redacted) branched
 //! session file must match omp's `SessionManager.getTree()` exactly. The golden digest in
-//! `branched-session.expectation.json` was produced by running the TS sources under bun (see
-//! `reports/SessionTree.md`); the companion `buildSessionContext` check lives in omp-cli
+//! `branched-session.expectation.json` was produced by running the TS sources under bun over this
+//! fixture (`SessionManager.open(path).getTree()` flattened by `node_digest` below); the companion `buildSessionContext` check lives in omp-cli
 //! (which depends on omp-compact; a dev-dependency here would cycle).
 
 use serde_json::{json, Value};
@@ -65,4 +65,64 @@ fn tree_matches_ts_get_tree() {
         golden["tree"],
         "tree differs from TS getTree()"
     );
+}
+
+/// Writer-produced `label` / `session_info` lines use omp's key order, resolve onto the tree like
+/// the TS index, and survive a strict JSONL v3 reload.
+#[test]
+fn writer_label_and_session_info_round_trip_through_tree() {
+    let dir = std::env::temp_dir().join(format!("omp-tree-parity-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut w =
+        omp_session::SessionWriter::create(&dir, "/w", "sid", "2026-10-01T00:00:00.000Z").unwrap();
+    let root = w
+        .append_entry(
+            "custom",
+            json!({"customType": "x"}),
+            "2026-10-01T00:00:01.000Z",
+        )
+        .unwrap();
+    let label = w
+        .append_label(&root, Some("checkpoint"), "2026-10-01T00:00:02.000Z")
+        .unwrap();
+    w.append_session_info("  My session  ", "2026-10-01T00:00:03.000Z")
+        .unwrap();
+    assert!(w
+        .append_label("missing", Some("x"), "2026-10-01T00:00:04.000Z")
+        .is_err());
+
+    let raw = std::fs::read_to_string(w.path()).unwrap();
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|l| l.contains("\"type\":\"label\"") || l.contains("session_info"))
+        .collect();
+    assert_eq!(
+        lines[0],
+        format!("{{\"type\":\"label\",\"id\":\"{label}\",\"parentId\":\"{root}\",\"timestamp\":\"2026-10-01T00:00:02.000Z\",\"targetId\":\"{root}\",\"label\":\"checkpoint\"}}")
+    );
+    assert!(lines[1].ends_with("\"name\":\"My session\"}"));
+
+    let loaded = omp_session::load(w.path()).unwrap();
+    assert!(loaded.malformed.is_empty());
+    let values = omp_session::read_values(w.path()).unwrap();
+    let entries: Vec<_> = values
+        .into_iter()
+        .filter(|e| !matches!(e["type"].as_str(), Some("title" | "session")))
+        .collect();
+    let tree = omp_session::tree::build_tree(&entries);
+    assert_eq!(tree[0].label.as_deref(), Some("checkpoint"));
+    assert_eq!(
+        omp_session::tree::session_name(&entries).as_deref(),
+        Some("My session")
+    );
+
+    w.append_label(&root, None, "2026-10-01T00:00:05.000Z")
+        .unwrap();
+    let entries: Vec<_> = omp_session::read_values(w.path())
+        .unwrap()
+        .into_iter()
+        .filter(|e| !matches!(e["type"].as_str(), Some("title" | "session")))
+        .collect();
+    assert_eq!(omp_session::tree::build_tree(&entries)[0].label, None);
+    let _ = std::fs::remove_dir_all(&dir);
 }

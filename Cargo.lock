@@ -2795,6 +2795,7 @@ dependencies = [
  "pa-types",
  "regex",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

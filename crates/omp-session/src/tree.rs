@@ -70,6 +70,19 @@ pub fn labels_in_effect(entries: &[Value]) -> HashMap<String, String> {
     labels
 }
 
+/// `getSessionName`: the newest `session_info` entry's trimmed, non-empty `name`.
+#[must_use]
+pub fn session_name(entries: &[Value]) -> Option<String> {
+    entries
+        .iter()
+        .rev()
+        .find(|e| e.get("type").and_then(Value::as_str) == Some("session_info"))
+        .and_then(|e| e.get("name").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
 /// Port of `SessionEntryIndex.tree`: every entry becomes a node; an entry whose `parentId` is
 /// null, its own id, or unknown (orphaned by a broken parent chain) is a root, otherwise it
 /// hangs under its parent. Children are sorted by entry timestamp (stable, so equal timestamps
