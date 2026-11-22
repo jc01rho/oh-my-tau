@@ -91,7 +91,7 @@ tau-only names. `Handler` is the function that actually runs.
 | 10 | `/ratchet` | STUB | `notice` (`slash.rs:880`) | Needs the eval-harness + hill-climb runner. |
 | 11 | `/prewalk` | STUB | `notice` (`slash.rs:881`) | Startup-only feature in omt (`--prewalk*` flags); `/prewalk restart` unsupported. |
 | 12 | `/modelpreset` | PORTED | `modelpreset_command` | `list save switch delete`. |
-| 13 | `/advisor` | STUB | `dispatch_builtin_more` | Always "inactive"; `configure` is TUI-only, `dump` has nothing to copy. |
+| 13 | `/advisor` | PARTIAL | `features::advisor` | 8b-2: single-advisor core — a second `Agent` on the `advisor` role (upstream system prompt, `advise` tool, the session's read-only tools) reviews primary updates per `reviewMode`/`reviewInterval`; notes return as `<advisory>` blocks (steer while running with the `immuneTurns` cooldown, held for the next prompt, or a continuation at `continueSeverity`); `on/off/toggle/status/dump [raw]` drive that state with upstream's messages, `--advisor` enables it. Missing: `WATCHDOG.yml` multi-advisor rosters, advisor transcripts on disk and resumed spend, `syncBacklog` waits, tool-result eviction, watchdog/loop/emission guards, `configure` editor. |
 | 14 | `/export` | PORTED | `dispatch_builtin` | HTML export, `--themes`, `--copy`/`clipboard`. |
 | 15 | `/trace` | PORTED | `trace_command` (`slash.rs:2048`) | Prints the dashboard URL for this session. |
 | 16 | `/dump` | PORTED | `dispatch_builtin` / `_more` | `all` → zip: transcript + LLM request JSON + one file per subagent. |
@@ -188,7 +188,7 @@ All 11 are honest about the gap except the four flagged below.
 | `/remove-dir` | same notice | honest |
 | `/dirs` | same notice | honest |
 | `/memory` | ~~canned strings~~ — **ported** on the session's shared engine (§1 #35) | resolved (8b-2) |
-| `/advisor` | Always inactive | **reports state falsely** |
+| `/advisor` | ~~always inactive~~ — **partial**: a real advisor agent reviews and advises (§1 #13) | resolved (8b-2) |
 | `/force` | ~~pins nothing~~ — **ported**: the next model call is forced (§1 #45) | resolved (8b-2) |
 | `/reload-plugins` | ~~claimed a reload~~ — **partial**: WASM tools, prompt/skills and the slash catalog reload live; extensions/MCP need /restart (§1 #44) | resolved (8b-2) |
 
