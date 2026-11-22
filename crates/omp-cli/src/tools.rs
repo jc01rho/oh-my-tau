@@ -40,7 +40,9 @@ pub(crate) mod rlm_combinators;
 mod search;
 pub(crate) mod security_scan;
 pub mod shell_host;
+pub(crate) mod subagents;
 mod task;
+mod task_control;
 mod todo;
 pub(crate) mod tts;
 pub(crate) mod vibe;
@@ -409,6 +411,24 @@ pub fn builtin_tools_with_env_and_jobs(
             task::schema(),
             Arc::new(|env, args, _| Box::pin(task::task(env, args))),
         ),
+        mk(
+            "task_send",
+            task_control::SEND_DESCRIPTION.to_string(),
+            task_control::send_schema(),
+            Arc::new(|env, args, _| Box::pin(task_control::task_send(env, args))),
+        ),
+        mk(
+            "task_output",
+            task_control::OUTPUT_DESCRIPTION.to_string(),
+            task_control::output_schema(),
+            Arc::new(|env, args, _| Box::pin(task_control::task_output(env, args))),
+        ),
+        mk(
+            "task_cancel",
+            task_control::CANCEL_DESCRIPTION.to_string(),
+            task_control::cancel_schema(),
+            Arc::new(|env, args, _| Box::pin(task_control::task_cancel(env, args))),
+        ),
         wait::tool(env.clone()),
         mk(
             "bash_output",
@@ -555,7 +575,11 @@ pub fn enabled_by_settings(settings: &omp_settings::Settings, name: &str) -> boo
         }
         // `canSpawnAtDepth(task.maxRecursionDepth, taskDepth)`: a non-positive
         // ceiling disables spawning everywhere (the depth leg is session state).
-        "task" => settings.get_number("task.maxRecursionDepth").unwrap_or(2.0) > 0.0,
+        // The background-task controls ride the same gate: without spawning
+        // there is nothing to steer, read or cancel.
+        "task" | "task_send" | "task_output" | "task_cancel" => {
+            settings.get_number("task.maxRecursionDepth").unwrap_or(2.0) > 0.0
+        }
         _ => true,
     }
 }
@@ -890,10 +914,16 @@ mod tests {
         assert!(!no_wait.iter().any(|n| n == "wait"), "wait gate ignored");
         // `task.maxRecursionDepth: 0` disables spawning everywhere.
         let no_task = names("task:\n  maxRecursionDepth: 0\n");
-        assert!(
-            !no_task.iter().any(|n| n == "task"),
-            "task depth gate ignored"
-        );
+        for gated in ["task", "task_send", "task_output", "task_cancel"] {
+            assert!(
+                !no_task.iter().any(|n| n == gated),
+                "{gated}: task depth gate ignored"
+            );
+            assert!(
+                defaults.iter().any(|n| n == gated),
+                "{gated} off by default"
+            );
+        }
         // `ask.enabled: false` hides `ask`.
         let no_ask = names("ask:\n  enabled: false\n");
         assert!(!no_ask.iter().any(|n| n == "ask"), "ask gate ignored");
@@ -1002,6 +1032,9 @@ mod tests {
                 "write",
                 "find",
                 "task",
+                "task_send",
+                "task_output",
+                "task_cancel",
                 "wait",
                 "bash_output",
                 "kill_bash",
