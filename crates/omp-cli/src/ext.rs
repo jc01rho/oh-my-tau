@@ -5,7 +5,7 @@
 //! `send_message`, ui frames), and emits omp lifecycle events.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +22,9 @@ use serde_json::{json, Value};
 use omp_ext::hooks::ExtHooks;
 use omp_ext::lifecycle::{self, InputSource, LifecycleEvent, SwitchReason};
 use omp_ext::{ExtHost, HostConfig, HostMessage, ToolInfo};
+use omp_providers::auth::{
+    on_credential_disabled, CredentialDisabledEvent, CredentialDisabledSubscription,
+};
 
 use crate::events::{message_value, ExtUpdateEncoder};
 use crate::runtime::Runtime;
@@ -583,6 +586,51 @@ struct Live {
     needs_branch: std::sync::atomic::AtomicBool,
 }
 
+/// TS `MAX_PENDING_CREDENTIAL_DISABLED` (runner.ts): the backlog kept for the window between the
+/// auth store's automatic soft-disable and the session that emits it.
+const MAX_PENDING_CREDENTIAL_DISABLED: usize = 32;
+
+/// Bridge from the auth store's process-wide listener to the host (TS `runner.ts`'s
+/// `#pendingCredentialDisabled` + `emitCredentialDisabled`): the store tears a credential down
+/// before, or long after, a runtime is attached, so events queue here and one drainer task emits
+/// them in order from the moment the session is live.
+#[derive(Default)]
+struct CredentialDisabledFeed {
+    queue: Mutex<Vec<CredentialDisabledEvent>>,
+    /// Wakes the drainer. `notify_one` keeps a permit, so a push that lands between a drain and
+    /// its `await` cannot be lost.
+    wake: tokio::sync::Notify,
+    /// The drainer runs once per session.
+    draining: AtomicBool,
+    /// Held for the session's lifetime: dropping it unsubscribes from the store.
+    sub: Mutex<Option<CredentialDisabledSubscription>>,
+}
+
+impl CredentialDisabledFeed {
+    /// Buffer one event; the store's listener may run on any thread, so this stays synchronous.
+    fn push(&self, event: CredentialDisabledEvent) {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queue.len() >= MAX_PENDING_CREDENTIAL_DISABLED {
+            queue.remove(0);
+        }
+        queue.push(event);
+        drop(queue);
+        self.wake.notify_one();
+    }
+
+    fn take(&self) -> Vec<CredentialDisabledEvent> {
+        std::mem::take(
+            &mut *self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
 /// Live extension host and its agent-facing hooks.
 pub struct Extensions {
     pub host: Arc<ExtHost>,
@@ -613,6 +661,9 @@ pub struct Extensions {
     /// Print/json runs: TS reaches extensions with `agent_end` only after `session_shutdown`
     /// (its settle path emits it detached), so the messages wait here for [`Self::shutdown`].
     deferred_agent_end: Arc<Mutex<Option<Vec<Value>>>>,
+    /// Automatic credential soft-disables on their way to extensions (see
+    /// [`CredentialDisabledFeed`]).
+    credential_disabled: Arc<CredentialDisabledFeed>,
 }
 
 /// `session_before_compact` / `session_compact` emission around runtime compactions.
@@ -768,7 +819,18 @@ impl Extensions {
             rt: Mutex::new(None),
             blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_agent_end: Arc::new(Mutex::new(None)),
+            credential_disabled: Arc::new(CredentialDisabledFeed::default()),
         });
+        {
+            // The store keeps the events of a session that has not subscribed yet, and hands its
+            // backlog to the first subscriber: subscribing here covers both windows.
+            let feed = ext.credential_disabled.clone();
+            let sub = on_credential_disabled(move |event| feed.push(event.clone()));
+            *ext.credential_disabled
+                .sub
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sub);
+        }
         ext.live.needs_branch.store(
             sources_read_branch(ext.dir.as_deref(), &ext.extra),
             Ordering::Relaxed,
@@ -1202,6 +1264,7 @@ impl Extensions {
         })));
         self.push_session_ctx(&rt).await;
         self.session_start().await;
+        self.start_credential_disabled_feed();
     }
 
     /// Refresh the live ctx facts from the runtime. `with_branch` also re-reads the session
@@ -1320,6 +1383,43 @@ impl Extensions {
         if let Err(e) = self.host.shutdown().await {
             eprintln!("omt: extension host shutdown: {e:#}");
         }
+    }
+
+    /// Emit the credential soft-disables the auth store reported before this session attached, then
+    /// every later one as it arrives (TS `runner.ts`'s `emitCredentialDisabled`, whose pre-init
+    /// buffer is [`CredentialDisabledFeed`]). Runs once per session, after `session_start`.
+    fn start_credential_disabled_feed(self: &Arc<Self>) {
+        let feed = self.credential_disabled.clone();
+        if feed.draining.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let ext = self.clone();
+        tokio::spawn(async move {
+            loop {
+                flush_credential_disabled(&ext.host, &feed).await;
+                feed.wake.notified().await;
+            }
+        });
+    }
+}
+
+/// Emit every buffered credential soft-disable in order (TS `runner.ts`'s
+/// `emitCredentialDisabled`, which drains `#pendingCredentialDisabled` once initialized).
+async fn flush_credential_disabled(host: &ExtHost, feed: &CredentialDisabledFeed) {
+    for event in feed.take() {
+        emit_silent(
+            host.emit_credential_disabled(
+                event.provider,
+                event.disabled_cause,
+                event.credential_id,
+                event.email,
+                event.account_id,
+                event.org_id,
+                event.org_name,
+                None,
+            )
+            .await,
+        );
     }
 }
 
@@ -2159,6 +2259,60 @@ mod tests {
         // A bare string becomes a displayed default-type message; other shapes are dropped.
         assert!(injected_message(&json!("note")).is_some());
         assert!(injected_message(&json!(7)).is_none());
+    }
+
+    /// `credential_disabled`: events the auth store reported before the session was live wait in
+    /// the feed and reach the host, in the omp payload shape, on the next flush.
+    #[tokio::test]
+    async fn credential_disabled_feed_flushes_to_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("emits.log");
+        let host = sh_host(
+            dir.path(),
+            concat!(
+                "while IFS= read -r line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"method\":\"emit\"'*)\n",
+                "      printf '%s\\n' \"$line\" >> \"$LOG\"\n",
+                "      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":null,\"handlers\":[],\"errors\":[]}}\\n' \"$id\";;\n",
+                "  esac\n",
+                "done\n",
+            ),
+            vec![("LOG".into(), log.display().to_string())],
+        )
+        .await;
+        let feed = CredentialDisabledFeed::default();
+        feed.push(CredentialDisabledEvent {
+            provider: "anthropic".into(),
+            disabled_cause: "oauth refresh failed: invalid_grant".into(),
+            credential_id: Some(7),
+            email: Some("gone@example.com".into()),
+            account_id: Some("acct".into()),
+            org_id: None,
+            org_name: None,
+        });
+        flush_credential_disabled(&host, &feed).await;
+        assert!(feed.take().is_empty(), "the flush drains the queue");
+
+        let written = std::fs::read_to_string(&log).unwrap();
+        let request: Value = serde_json::from_str(written.lines().next().unwrap()).unwrap();
+        assert_eq!(request["method"], "emit");
+        let event = &request["params"]["event"];
+        assert_eq!(event["type"], "credential_disabled");
+        assert_eq!(event["provider"], "anthropic");
+        assert_eq!(
+            event["disabledCause"],
+            "oauth refresh failed: invalid_grant"
+        );
+        assert_eq!(event["credentialId"], 7);
+        assert_eq!(event["email"], "gone@example.com");
+        assert_eq!(event["accountId"], "acct");
+        assert!(
+            event.get("orgId").is_none(),
+            "absent identity fields are omitted"
+        );
+        host.shutdown().await.unwrap();
     }
 
     #[test]
