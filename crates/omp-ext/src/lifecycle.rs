@@ -135,6 +135,14 @@ pub enum CompactionAction {
     Snapcompact,
 }
 
+/// Why `resources_discover` fires (`ResourcesDiscoverEvent["reason"]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourcesDiscoverReason {
+    Startup,
+    Reload,
+}
+
 /// Tool approval mode (`tools/approval.ts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ApprovalMode {
@@ -144,6 +152,70 @@ pub enum ApprovalMode {
     Write,
     #[serde(rename = "yolo")]
     Yolo,
+}
+
+/// Status of one built-in session mode (`SessionModeState` in omp's `extensibility/extensions/types.ts`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModeStatus {
+    #[default]
+    Inactive,
+    Active,
+    Paused,
+}
+
+/// Plan mode: `planFilePath` is omitted when no plan file is known (TS optional field).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanModeState {
+    pub status: ModeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_file_path: Option<String>,
+}
+
+/// Vibe mode status.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeModeState {
+    pub status: ModeStatus,
+}
+
+/// Goal mode: `objective`/`tokenBudget` are omitted when no goal is tracked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalModeState {
+    pub status: ModeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+}
+
+/// Loop mode status.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopModeState {
+    pub status: ModeStatus,
+}
+
+/// Detached snapshot of the built-in session modes (TS `SessionModeState`). Field order follows
+/// the TS object literal so the serialized event matches byte for byte.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModeState {
+    pub plan: PlanModeState,
+    pub vibe: VibeModeState,
+    pub goal: GoalModeState,
+    #[serde(rename = "loop")]
+    pub r#loop: LoopModeState,
+}
+
+/// What spawned a subagent (`before_subagent_spawn.invocationKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentInvocationKind {
+    Task,
+    Eval,
 }
 
 /// An omp extension event. Message/entry payloads are opaque omp JSON (`AgentMessage`, `SessionEntry`, ...).
@@ -381,6 +453,95 @@ pub enum LifecycleEvent {
         continuation_probability: f64,
         action: CacheWarmingAction,
     },
+
+    /// The auth store automatically soft-disabled a credential (TS `CredentialDisabledEvent`):
+    /// a definitive OAuth refresh failure (`invalid_grant`, `revoked`, ...) or an auth-broker
+    /// disable. A user-initiated removal, a logout and the duplicate-credential purge stay
+    /// silent, like upstream. `disabled_cause` is the verbatim error kept for forensics.
+    #[serde(rename = "credential_disabled", rename_all = "camelCase")]
+    CredentialDisabled {
+        provider: String,
+        disabled_cause: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credential_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        org_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        org_name: Option<String>,
+    },
+
+    /// A built-in session mode changed, from any source: a slash command, a tool, RPC, or session
+    /// restore. `previous` is the last state reported through this event (all-inactive at first).
+    #[serde(rename = "mode_changed")]
+    ModeChanged {
+        previous: SessionModeState,
+        state: SessionModeState,
+    },
+
+    /// A subagent is about to spawn, before its model is resolved.
+    #[serde(rename = "before_subagent_spawn", rename_all = "camelCase")]
+    BeforeSubagentSpawn {
+        /// Agent definition name being spawned.
+        agent: String,
+        invocation_kind: SubagentInvocationKind,
+        /// Pre-expansion role alias; absent for an explicit selector.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_role: Option<String>,
+        /// Model patterns the spawn would use, in attempt order.
+        patterns: Vec<String>,
+        /// Stable per-spawn key, when the spawn has one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spawn_key: Option<String>,
+    },
+
+    /// A provider response arrived, before its stream body is read
+    /// (`types.ts` `AfterProviderResponseEvent extends ProviderResponseMetadata`). Observe-only:
+    /// the runner discards handler results. `metadata` is absent here for the same reason it is
+    /// absent upstream: no provider of this core supplies any.
+    #[serde(rename = "after_provider_response", rename_all = "camelCase")]
+    AfterProviderResponse {
+        status: u16,
+        headers: std::collections::BTreeMap<String, String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
+
+    /// Before compaction summarization: handlers may replace the summary prompt, add context
+    /// lines and stash `preserveData` on the entry (the last result wins).
+    #[serde(rename = "session.compacting", rename_all = "camelCase")]
+    SessionCompacting {
+        session_id: String,
+        messages: Vec<Value>,
+    },
+
+    /// Extensions may contribute skill/prompt/theme paths (`ResourcesDiscoverEvent`); emitted after
+    /// `session_start` at startup and on every extension reload.
+    #[serde(rename = "resources_discover", rename_all = "camelCase")]
+    ResourcesDiscover {
+        cwd: String,
+        reason: ResourcesDiscoverReason,
+    },
+
+    /// The live/model context was cleared in place: the session id, title and
+    /// transcript file survive (`/clear`, TS `SessionClearEvent`).
+    #[serde(rename = "session_clear")]
+    SessionClear,
+
+    /// A JSON-RPC notification received from a connected MCP server, after the
+    /// runtime's own handling of the frame (omp `McpNotificationEvent`).
+    #[serde(rename = "mcp_notification")]
+    McpNotification {
+        /// Server name exactly as declared in the MCP config (raw, unsanitized).
+        server: String,
+        /// JSON-RPC method (`notifications/tools/list_changed`, or server-custom).
+        method: String,
+        /// JSON-RPC params, opaque to the runtime.
+        params: Value,
+    },
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -420,6 +581,38 @@ pub struct CancelOutcome {
     pub result: Value,
 }
 
+/// Outcome of `session.compacting` (TS `SessionCompactingResult`): extra summary context, a
+/// summarization-prompt override, and data the committed `compaction` entry keeps.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactingOutcome {
+    /// Lines appended to the summary request (`<additional-context>`).
+    pub context: Vec<String>,
+    /// Replaces the default summarization prompt.
+    pub prompt: Option<String>,
+    /// Stored on the `compaction` entry as `preserveData`.
+    pub preserve_data: Option<Value>,
+}
+
+impl CompactingOutcome {
+    fn from_value(v: &Value) -> Self {
+        Self {
+            context: v
+                .get("context")
+                .and_then(Value::as_array)
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            prompt: str_of(v, "prompt"),
+            preserve_data: v.get("preserveData").filter(|d| d.is_object()).cloned(),
+        }
+    }
+}
+
 /// Outcome of `session_stop`: a handler may request one continuation turn.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionStopOutcome {
@@ -441,6 +634,25 @@ impl SessionStopOutcome {
 
 fn str_of(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// A `model` handler result: one selector or a list, comma-separated entries flattened and
+/// blanks dropped (TS `normalizeModelPatternList`). `None` when nothing is left, which leaves the
+/// spawn's own patterns in place.
+fn model_patterns(v: &Value) -> Option<Vec<String>> {
+    let raw: Vec<&str> = match v {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        _ => return None,
+    };
+    let patterns: Vec<String> = raw
+        .iter()
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!patterns.is_empty()).then_some(patterns)
 }
 
 impl BeforeAgentStartOutcome {
@@ -491,6 +703,27 @@ impl SessionStopOutcome {
     }
 }
 
+/// Outcome of `before_subagent_spawn`: `block` refuses the spawn, `model` replaces the pattern
+/// list, `note` labels the routing decision (surfaced as `resolvedModelRoute`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BeforeSubagentSpawnOutcome {
+    pub block: bool,
+    pub reason: Option<String>,
+    pub model: Option<Vec<String>>,
+    pub note: Option<String>,
+}
+
+impl BeforeSubagentSpawnOutcome {
+    fn from_value(v: &Value) -> Self {
+        Self {
+            block: v.get("block").and_then(Value::as_bool) == Some(true),
+            reason: str_of(v, "reason"),
+            model: v.get("model").and_then(model_patterns),
+            note: str_of(v, "note"),
+        }
+    }
+}
+
 /// Outcome of `assistant_message`: replacement `content` (text-only rewrites, chained) when a handler changed it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AssistantRewriteOutcome {
@@ -517,6 +750,53 @@ impl UserShellOutcome {
             result: v.get("result").cloned(),
         }
     }
+}
+
+/// One path a `resources_discover` handler contributed, tagged with the extension that returned it
+/// (the host's `{path, extensionPath}` entries).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveredPath {
+    /// Path as the handler spelled it (absolute, `~`-relative or cwd-relative).
+    pub path: String,
+    /// `ext.path` of the contributing extension.
+    pub extension_path: String,
+}
+
+/// Outcome of `resources_discover`: every handler's paths, in load order (`ExtensionRunner.emitResourcesDiscover`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourcesDiscoverOutcome {
+    pub skill_paths: Vec<DiscoveredPath>,
+    pub prompt_paths: Vec<DiscoveredPath>,
+    pub theme_paths: Vec<DiscoveredPath>,
+}
+
+impl ResourcesDiscoverOutcome {
+    fn from_value(v: &Value) -> Self {
+        Self {
+            skill_paths: discovered_paths(v, "skillPaths"),
+            prompt_paths: discovered_paths(v, "promptPaths"),
+            theme_paths: discovered_paths(v, "themePaths"),
+        }
+    }
+}
+
+/// `[{path, extensionPath}]` under `key`; entries without a string `path` are dropped (TS pushes
+/// only the paths it was handed, so a malformed entry has no usable path either).
+fn discovered_paths(v: &Value, key: &str) -> Vec<DiscoveredPath> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    Some(DiscoveredPath {
+                        path: e.get("path").and_then(Value::as_str)?.to_owned(),
+                        extension_path: str_of(e, "extensionPath").unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 macro_rules! notify_helpers {
@@ -601,6 +881,62 @@ impl ExtHost {
         emit_tool_approval_requested(session_id: String, tool_name: String, tool_call_id: String, reason: Option<String>, approval_mode: ApprovalMode) => LifecycleEvent::ToolApprovalRequested { session_id, tool_name, tool_call_id, reason, approval_mode };
         /// `tool_approval_resolved`.
         emit_tool_approval_resolved(session_id: String, tool_name: String, tool_call_id: String, approved: bool, reason: Option<String>) => LifecycleEvent::ToolApprovalResolved { session_id, tool_name, tool_call_id, approved, reason };
+        /// `credential_disabled`: the auth store tore down a credential on its own.
+        #[allow(clippy::too_many_arguments)] // one argument per omp payload field
+        emit_credential_disabled(provider: String, disabled_cause: String, credential_id: Option<i64>, email: Option<String>, account_id: Option<String>, org_id: Option<String>, org_name: Option<String>) => LifecycleEvent::CredentialDisabled { provider, disabled_cause, credential_id, email, account_id, org_id, org_name };
+        /// `mode_changed`: a built-in session mode changed.
+        emit_mode_changed(previous: SessionModeState, state: SessionModeState) => LifecycleEvent::ModeChanged { previous, state };
+        /// `after_provider_response`.
+        emit_after_provider_response(status: u16, headers: std::collections::BTreeMap<String, String>, request_id: Option<String>) => LifecycleEvent::AfterProviderResponse { status, headers, request_id };
+        /// `mcp_notification`: a server→client MCP notification, after the runtime handled it.
+        emit_mcp_notification(server: String, method: String, params: Value) => LifecycleEvent::McpNotification { server, method, params };
+        /// `session_clear`: the context was reset in place, the session kept.
+        emit_session_clear() => LifecycleEvent::SessionClear;
+    }
+
+    /// `before_subagent_spawn`: `block` refuses the spawn; `model` replaces the pattern list.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_before_subagent_spawn(
+        &self,
+        agent: String,
+        invocation_kind: SubagentInvocationKind,
+        model_role: Option<String>,
+        patterns: Vec<String>,
+        spawn_key: Option<String>,
+        ctx: Option<Value>,
+    ) -> Result<BeforeSubagentSpawnOutcome> {
+        let ev = LifecycleEvent::BeforeSubagentSpawn {
+            agent,
+            invocation_kind,
+            model_role,
+            patterns,
+            spawn_key,
+        };
+        Ok(BeforeSubagentSpawnOutcome::from_value(
+            &self.emit_event(&ev, ctx).await?.result,
+        ))
+    }
+
+    /// `session.compacting`: before summarization; the last handler result may override the
+    /// prompt, add context lines and set the entry's `preserveData`.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_session_compacting(
+        &self,
+        session_id: String,
+        messages: Vec<Value>,
+        ctx: Option<Value>,
+    ) -> Result<CompactingOutcome> {
+        let ev = LifecycleEvent::SessionCompacting {
+            session_id,
+            messages,
+        };
+        Ok(CompactingOutcome::from_value(
+            &self.emit_event(&ev, ctx).await?.result,
+        ))
     }
 
     /// `cache_warming_decision`: a handler may override the warmer's action (the last one wins).
@@ -721,6 +1057,22 @@ impl ExtHost {
             source,
         };
         Ok(InputOutcome::from_value(
+            &self.emit_event(&ev, ctx).await?.result,
+        ))
+    }
+
+    /// `resources_discover`: the skill/prompt/theme paths every handler contributed.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_resources_discover(
+        &self,
+        cwd: String,
+        reason: ResourcesDiscoverReason,
+        ctx: Option<Value>,
+    ) -> Result<ResourcesDiscoverOutcome> {
+        let ev = LifecycleEvent::ResourcesDiscover { cwd, reason };
+        Ok(ResourcesDiscoverOutcome::from_value(
             &self.emit_event(&ev, ctx).await?.result,
         ))
     }
@@ -1003,4 +1355,56 @@ pub fn serve(
         }
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `block` needs an explicit `true`; `reason`/`note` are plain strings.
+    #[test]
+    fn subagent_spawn_outcome_reads_block_and_reason() {
+        let blocked = BeforeSubagentSpawnOutcome::from_value(&json!({
+            "block": true,
+            "reason": "quota",
+            "note": "routed"
+        }));
+        assert!(blocked.block);
+        assert_eq!(blocked.reason.as_deref(), Some("quota"));
+        assert_eq!(blocked.note.as_deref(), Some("routed"));
+        assert_eq!(blocked.model, None);
+
+        let plain = BeforeSubagentSpawnOutcome::from_value(&json!({"block": false}));
+        assert!(!plain.block);
+        assert_eq!((plain.reason, plain.model, plain.note), (None, None, None));
+        assert!(!BeforeSubagentSpawnOutcome::from_value(&json!({"block": "yes"})).block);
+    }
+
+    /// `model` is a selector string or an array of them, comma-separated entries flatten, blanks
+    /// drop; an empty result means "no replacement".
+    #[test]
+    fn subagent_spawn_outcome_normalizes_model_patterns() {
+        let one = BeforeSubagentSpawnOutcome::from_value(&json!({"model": "a/b:high"}));
+        assert_eq!(one.model, Some(vec!["a/b:high".to_string()]));
+
+        let many = BeforeSubagentSpawnOutcome::from_value(&json!({
+            "model": ["a/b, c/d", " e/f ", ""]
+        }));
+        assert_eq!(
+            many.model,
+            Some(vec![
+                "a/b".to_string(),
+                "c/d".to_string(),
+                "e/f".to_string()
+            ])
+        );
+
+        for empty in [json!({"model": ""}), json!({"model": []}), json!({})] {
+            assert_eq!(
+                BeforeSubagentSpawnOutcome::from_value(&empty).model,
+                None,
+                "{empty}"
+            );
+        }
+    }
 }

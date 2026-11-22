@@ -5,7 +5,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use omp_ext::lifecycle::{ApprovalMode, CompactionAction, CompactionReason, LifecycleEvent};
+use omp_ext::lifecycle::{
+    ApprovalMode, CompactingOutcome, CompactionAction, CompactionReason, DiscoveredPath,
+    GoalModeState, LifecycleEvent, ModeStatus, PlanModeState, ResourcesDiscoverReason,
+    SessionModeState, SubagentInvocationKind,
+};
 use omp_ext::{ExtHost, HostConfig, HostMessage};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -226,15 +230,142 @@ async fn retry_compaction_goal_approval_and_user_shell_payloads() {
             r#"{"type":"user_python","code":"1+1","excludeFromContext":false,"cwd":"/tmp"}"#,
         ),
         (
+            LifecycleEvent::ResourcesDiscover {
+                cwd: s("/work"),
+                reason: ResourcesDiscoverReason::Startup,
+            },
+            r#"{"type":"resources_discover","cwd":"/work","reason":"startup"}"#,
+        ),
+        (
             LifecycleEvent::AssistantMessage {
                 message: json!({"role":"assistant","content":[{"type":"text","text":"a"}]}),
             },
             r#"{"type":"assistant_message","message":{"role":"assistant","content":[{"type":"text","text":"a"}]}}"#,
         ),
+        (
+            LifecycleEvent::ModeChanged {
+                previous: SessionModeState::default(),
+                state: SessionModeState::default(),
+            },
+            r#"{"type":"mode_changed","previous":{"plan":{"status":"inactive"},"vibe":{"status":"inactive"},"goal":{"status":"inactive"},"loop":{"status":"inactive"}},"state":{"plan":{"status":"inactive"},"vibe":{"status":"inactive"},"goal":{"status":"inactive"},"loop":{"status":"inactive"}}}"#,
+        ),
+        (
+            LifecycleEvent::ModeChanged {
+                previous: SessionModeState::default(),
+                state: SessionModeState {
+                    plan: PlanModeState {
+                        status: ModeStatus::Active,
+                        plan_file_path: Some(s("/tmp/plan.md")),
+                    },
+                    goal: GoalModeState {
+                        status: ModeStatus::Paused,
+                        objective: Some(s("ship it")),
+                        token_budget: Some(50_000),
+                    },
+                    ..SessionModeState::default()
+                },
+            },
+            r#"{"type":"mode_changed","previous":{"plan":{"status":"inactive"},"vibe":{"status":"inactive"},"goal":{"status":"inactive"},"loop":{"status":"inactive"}},"state":{"plan":{"status":"active","planFilePath":"/tmp/plan.md"},"vibe":{"status":"inactive"},"goal":{"status":"paused","objective":"ship it","tokenBudget":50000},"loop":{"status":"inactive"}}}"#,
+        ),
     ];
     for (ev, expected) in cases {
         assert_wire(&host, &mut rx, ev, expected).await;
     }
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn before_subagent_spawn_payload_and_result() {
+    if common::bun_missing("before_subagent_spawn_payload_and_result") {
+        return;
+    }
+    let host = loaded().await;
+    let mut rx = host.take_incoming().unwrap();
+    let s = String::from;
+    let cases: Vec<(LifecycleEvent, &str)> = vec![
+        (
+            LifecycleEvent::BeforeSubagentSpawn {
+                agent: s("task"),
+                invocation_kind: SubagentInvocationKind::Task,
+                model_role: Some(s("smol")),
+                patterns: vec![s("a/b:high"), s("c/d")],
+                spawn_key: Some(s("agent-1")),
+            },
+            r#"{"type":"before_subagent_spawn","agent":"task","invocationKind":"task","modelRole":"smol","patterns":["a/b:high","c/d"],"spawnKey":"agent-1"}"#,
+        ),
+        (
+            // An explicit selector has no role alias, and a spawn without a key omits it.
+            LifecycleEvent::BeforeSubagentSpawn {
+                agent: s("reviewer"),
+                invocation_kind: SubagentInvocationKind::Eval,
+                model_role: None,
+                patterns: Vec::new(),
+                spawn_key: None,
+            },
+            r#"{"type":"before_subagent_spawn","agent":"reviewer","invocationKind":"eval","patterns":[]}"#,
+        ),
+    ];
+    for (ev, expected) in cases {
+        assert_wire(&host, &mut rx, ev, expected).await;
+    }
+
+    // The host aggregates the handlers: the last `model` choice wins with its `note`.
+    let out = host
+        .emit_before_subagent_spawn(
+            s("task"),
+            SubagentInvocationKind::Task,
+            None,
+            vec![s("a/b")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!out.block);
+    assert_eq!(
+        out.model,
+        Some(vec![s("fx/one:high"), s("fx/two")]),
+        "the handler's model list replaces the spawn's patterns"
+    );
+    assert_eq!(out.note.as_deref(), Some("fixture route"));
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+
+async fn session_compacting_payload_and_result() {
+    if common::bun_missing("session_compacting_payload_and_result") {
+        return;
+    }
+    let host = loaded().await;
+    let mut rx = host.take_incoming().unwrap();
+    let messages = vec![json!({"role":"user","content":[{"type":"text","text":"hi"}]})];
+    // Upstream shape: `{type, sessionId, messages}` with the summarized window verbatim.
+    assert_wire(
+        &host,
+        &mut rx,
+        LifecycleEvent::SessionCompacting {
+            session_id: "s1".into(),
+            messages: messages.clone(),
+        },
+        r#"{"type":"session.compacting","sessionId":"s1","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#,
+    )
+    .await;
+
+    // The fixture answers `{context, prompt, preserveData}`; the host keeps the last result and
+    // the core parses it into the outcome it applies to the summary and the entry.
+    let out = host
+        .emit_session_compacting("s1".into(), messages, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        CompactingOutcome {
+            context: vec!["ctx line".into()],
+            prompt: Some("CUSTOM PROMPT".into()),
+            preserve_data: Some(json!({"keep": 1})),
+        }
+    );
     host.shutdown().await.unwrap();
 }
 
@@ -278,5 +409,68 @@ async fn assistant_message_rewrite_and_user_shell_results_aggregate() {
         .await
         .unwrap();
     assert_eq!(py.result, Some(json!({"output":"py","exitCode":0})));
+    host.shutdown().await.unwrap();
+}
+
+/// `resources_discover`: the handler's three path lists come back tagged with the extension that
+/// returned them (`ExtensionRunner.emitResourcesDiscover`), for both reasons.
+#[tokio::test]
+async fn resources_discover_collects_tagged_paths() {
+    if common::bun_missing("resources_discover_collects_tagged_paths") {
+        return;
+    }
+    // Both reasons serialize to the host's `{type, cwd, reason}` event.
+    for (reason, wire) in [
+        (
+            ResourcesDiscoverReason::Startup,
+            r#"{"type":"resources_discover","cwd":"/work","reason":"startup"}"#,
+        ),
+        (
+            ResourcesDiscoverReason::Reload,
+            r#"{"type":"resources_discover","cwd":"/work","reason":"reload"}"#,
+        ),
+    ] {
+        let ev = LifecycleEvent::ResourcesDiscover {
+            cwd: "/work".into(),
+            reason,
+        };
+        assert_eq!(serde_json::to_string(&ev).unwrap(), wire);
+    }
+
+    let host = loaded().await;
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lifecycle.ts");
+    let ext = fixture.to_string_lossy().into_owned();
+    for reason in [
+        ResourcesDiscoverReason::Startup,
+        ResourcesDiscoverReason::Reload,
+    ] {
+        let out = host
+            .emit_resources_discover("/work".into(), reason, None)
+            .await
+            .unwrap();
+        // A shared test host may hold the fixture twice; compare the distinct tagged paths.
+        let distinct = |paths: &[DiscoveredPath]| {
+            let mut v: Vec<(String, String)> = paths
+                .iter()
+                .map(|p| (p.path.clone(), p.extension_path.clone()))
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert_eq!(
+            distinct(&out.skill_paths),
+            vec![("skills/ext-a".to_string(), ext.clone())],
+            "{reason:?}"
+        );
+        assert_eq!(
+            distinct(&out.prompt_paths),
+            vec![("prompts/ext-b.md".to_string(), ext.clone())]
+        );
+        assert_eq!(
+            distinct(&out.theme_paths),
+            vec![("themes/ext-c.json".to_string(), ext.clone())]
+        );
+    }
     host.shutdown().await.unwrap();
 }

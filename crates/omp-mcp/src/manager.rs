@@ -9,18 +9,19 @@
 //! first use, and retries once after reconnect when the error looks like a
 //! stale/dead connection (omp `isRetriableConnectionError`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::cache::ToolCache;
-use crate::client::{call_tool, connect_to_server, list_tools, Connection};
+use crate::client::{call_tool, connect_to_server_with, list_tools, Connection};
 use crate::config::{load_configs, McpServerConfig};
 use crate::errors::McpError;
 use crate::names::create_tool_name;
+use crate::transport::NotificationCallback;
 use crate::{ToolCallResult, ToolDefinition};
 
 /// One tool discovered on a server, with its omp registry name pre-minted.
@@ -30,6 +31,53 @@ pub struct DiscoveredTool {
     /// Registry key: `mcp__<server>_<tool>`, minted by [`create_tool_name`].
     pub registry_name: String,
     pub definition: ToolDefinition,
+}
+
+/// One server→client JSON-RPC notification (`mcp_notification` payload): the
+/// server name exactly as declared in the MCP config (raw, unsanitized — not
+/// the `mcp__<sanitized>_<tool>` prefix), the method and its opaque params.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerNotification {
+    pub server: String,
+    pub method: String,
+    pub params: Value,
+}
+
+/// Sink for every server→client notification, called after the manager's own
+/// handling of the frame (omp `MCPManager.addNotificationListener`).
+pub type NotificationListener = Arc<dyn Fn(&ServerNotification) + Send + Sync>;
+
+/// Frames buffered before the first listener attaches (omp
+/// `MCPManager.NOTIFICATION_BUFFER_CAP`); drop-oldest under pressure.
+pub const NOTIFICATION_BUFFER_CAP: usize = 100;
+
+/// `notifications/tools/list_changed`: the manager re-lists that server's
+/// tools before the next tool snapshot (omp `#triggerNotificationRefresh`).
+const TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
+
+/// Listener registry plus the pre-attach buffer.
+#[derive(Default)]
+struct NotificationHub {
+    listeners: Vec<NotificationListener>,
+    /// Frames received while no listener was attached, drained into the first
+    /// listener that attaches (drop-oldest at [`NOTIFICATION_BUFFER_CAP`]).
+    pending: VecDeque<ServerNotification>,
+}
+
+impl NotificationHub {
+    /// Hand one frame to every listener, or buffer it when nobody listens yet.
+    fn publish(&mut self, frame: ServerNotification) {
+        if self.listeners.is_empty() {
+            if self.pending.len() >= NOTIFICATION_BUFFER_CAP {
+                self.pending.pop_front();
+            }
+            self.pending.push_back(frame);
+            return;
+        }
+        for listener in &self.listeners {
+            listener(&frame);
+        }
+    }
 }
 
 /// Per-server health, for diagnostics and UIs.
@@ -60,6 +108,11 @@ pub struct McpManager {
     cwd: Arc<PathBuf>,
     servers: Mutex<BTreeMap<String, ServerEntry>>,
     cache: Option<ToolCache>,
+    notifications: Arc<StdMutex<NotificationHub>>,
+    /// Servers whose `tools/list` is stale: a `notifications/tools/list_changed`
+    /// arrived, so the next [`McpManager::tools`] re-lists them before returning
+    /// (omp awaits `#triggerNotificationRefresh` ahead of the listener fanout).
+    stale_tools: Arc<StdMutex<BTreeSet<String>>>,
 }
 
 impl std::fmt::Debug for McpManager {
@@ -91,6 +144,8 @@ impl McpManager {
             cwd,
             servers: Mutex::new(servers),
             cache: None,
+            notifications: Arc::new(StdMutex::new(NotificationHub::default())),
+            stale_tools: Arc::new(StdMutex::new(BTreeSet::new())),
         }
     }
 
@@ -189,7 +244,13 @@ impl McpManager {
             return Ok(());
         };
         let result: Result<Connection, McpError> = async {
-            let mut connection = connect_to_server(name, &config, self.cwd.clone()).await?;
+            let mut connection = connect_to_server_with(
+                name,
+                &config,
+                self.cwd.clone(),
+                Some(self.notification_callback(name)),
+            )
+            .await?;
             list_tools(&mut connection).await?;
             Ok(connection)
         }
@@ -230,6 +291,7 @@ impl McpManager {
                 tracing::warn!("MCP server \"{name}\" unavailable: {error}");
             }
         }
+        self.refresh_stale_tools().await;
         let guard = self.servers.lock().await;
         let mut out = Vec::new();
         for (server, entry) in guard.iter() {
@@ -301,6 +363,110 @@ impl McpManager {
             Err(error) => Err(error),
         }
     }
+
+    /// Attach a listener for every server→client notification
+    /// (`mcp_notification`). Frames received before the first listener attached
+    /// were buffered (up to [`NOTIFICATION_BUFFER_CAP`], drop-oldest) and are
+    /// drained into it in arrival order; later frames go straight through.
+    pub fn add_notification_listener(&self, listener: NotificationListener) {
+        let mut hub = self
+            .notifications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = hub.listeners.is_empty();
+        hub.listeners.push(listener.clone());
+        let pending: Vec<ServerNotification> = if first {
+            hub.pending.drain(..).collect()
+        } else {
+            Vec::new()
+        };
+        drop(hub);
+        for frame in pending {
+            listener(&frame);
+        }
+    }
+
+    /// Re-list the tools of every server that announced
+    /// `notifications/tools/list_changed`, so the snapshot this call returns is
+    /// post-change (omp `refreshServerTools`). The frame is only recorded here;
+    /// a failed re-list is logged and the server keeps its previous list.
+    async fn refresh_stale_tools(&self) {
+        let stale: Vec<String> = {
+            let pending = self
+                .stale_tools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.iter().cloned().collect()
+        };
+        for server in stale {
+            let mut guard = self.servers.lock().await;
+            let Some(entry) = guard.get_mut(&server) else {
+                self.mark_tools_fresh(&server);
+                continue;
+            };
+            let ServerState::Connected(connection) = &mut entry.state else {
+                // Not connected (or connecting): nothing cached to invalidate.
+                self.mark_tools_fresh(&server);
+                continue;
+            };
+            connection.tools = None;
+            let config = entry.config.clone();
+            let result = list_tools(connection).await;
+            match result {
+                Ok(tools) => {
+                    if let Some(cache) = &self.cache {
+                        if let Err(error) = cache.put(&server, &config, &tools) {
+                            tracing::warn!("failed to write MCP tool cache: {error}");
+                        }
+                    }
+                    self.mark_tools_fresh(&server);
+                }
+                Err(error) => {
+                    tracing::warn!("MCP server \"{server}\" tool refresh failed: {error}");
+                    self.mark_tools_fresh(&server);
+                }
+            }
+        }
+    }
+
+    /// Drop `server` from the stale set (the re-list ran, or there is no cached
+    /// connection to invalidate).
+    fn mark_tools_fresh(&self, server: &str) {
+        self.stale_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(server);
+    }
+
+    /// Sink handed to a connection's transport: every frame the transport
+    /// delivers for `server` is published to the listeners (omp
+    /// `onNotification: (method, params) => this.#handleServerNotification(name, ...)`).
+    fn notification_callback(&self, server: &str) -> NotificationCallback {
+        let hub = self.notifications.clone();
+        let stale_tools = self.stale_tools.clone();
+        let server = server.to_string();
+        Arc::new(move |method: &str, params: Value| {
+            // The manager's own handling runs ahead of the emit: a
+            // `tools/list_changed` marks the server's tool list stale, so the next
+            // `tools()` re-lists before answering. The re-list itself is async and
+            // this sink is synchronous (the transport calls it from its read loop),
+            // so the refresh happens at the next snapshot instead of inline.
+            if method == TOOLS_LIST_CHANGED {
+                stale_tools
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(server.clone());
+            }
+            let frame = ServerNotification {
+                server: server.clone(),
+                method: method.to_string(),
+                params,
+            };
+            hub.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .publish(frame);
+        })
+    }
 }
 
 /// Port of `isRetriableConnectionError`: network-level and stale-session
@@ -334,6 +500,92 @@ mod tests {
     use super::*;
     use crate::test_http::{MockServer, Reply};
     use serde_json::json;
+
+    /// Server notifications reach a listener registered later: the manager buffers
+    /// frames received before the first listener (drop-oldest at the cap) and drains
+    /// them into it, tagged with the raw configured server name.
+    #[test]
+    fn notifications_buffer_until_first_listener_and_drain() {
+        let mut configs = BTreeMap::new();
+        configs.insert(
+            "raw-server".to_string(),
+            serde_json::from_value(json!({"type": "http", "url": "http://127.0.0.1:1/mcp"}))
+                .unwrap(),
+        );
+        let manager = McpManager::new(Arc::new(PathBuf::from(".")), configs);
+        let deliver = manager.notification_callback("raw-server");
+
+        deliver("notifications/tools/list_changed", json!({}));
+        deliver("custom/progress", json!({"pct": 42}));
+
+        let seen: Arc<StdMutex<Vec<ServerNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = seen.clone();
+        manager.add_notification_listener(Arc::new(move |frame: &ServerNotification| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(frame.clone());
+        }));
+
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            seen,
+            vec![
+                ServerNotification {
+                    server: "raw-server".into(),
+                    method: "notifications/tools/list_changed".into(),
+                    params: json!({}),
+                },
+                ServerNotification {
+                    server: "raw-server".into(),
+                    method: "custom/progress".into(),
+                    params: json!({"pct": 42}),
+                },
+            ],
+            "buffered frames drain in arrival order under the raw server name"
+        );
+
+        // After the first listener attached, later frames go straight through.
+        let later: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = later.clone();
+        manager.add_notification_listener(Arc::new(move |frame: &ServerNotification| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(frame.method.clone());
+        }));
+        deliver("custom/late", Value::Null);
+        assert_eq!(
+            *later.lock().unwrap(),
+            vec!["custom/late".to_string()],
+            "a second listener sees only new frames"
+        );
+    }
+
+    /// The pre-listener buffer is bounded: oldest frames are dropped at the cap.
+    #[test]
+    fn notifications_buffer_drops_oldest_at_cap() {
+        let manager = McpManager::new(Arc::new(PathBuf::from(".")), BTreeMap::new());
+        let deliver = manager.notification_callback("srv");
+        for i in 0..NOTIFICATION_BUFFER_CAP + 5 {
+            deliver("custom/tick", json!({"i": i}));
+        }
+        let seen: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = seen.clone();
+        manager.add_notification_listener(Arc::new(move |frame: &ServerNotification| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(frame.params.clone());
+        }));
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), NOTIFICATION_BUFFER_CAP);
+        assert_eq!(seen[0], json!({"i": 5}), "oldest five were dropped");
+        assert_eq!(
+            seen[seen.len() - 1],
+            json!({"i": NOTIFICATION_BUFFER_CAP + 4})
+        );
+    }
 
     fn mcp_server(tool_name: &'static str) -> impl Fn(&crate::test_http::Request) -> Reply {
         move |req| {

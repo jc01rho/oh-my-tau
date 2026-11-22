@@ -89,6 +89,173 @@ fn in_ms(delta: i64) -> i64 {
     now_ms() as i64 + delta
 }
 
+/// The automatic-disable registry is process-wide, so these tests take turns: one test's backlog
+/// must not be replayed into another's subscription.
+static DISABLED_EVENT_TESTS: Mutex<()> = Mutex::new(());
+
+fn disabled_event_tests() -> std::sync::MutexGuard<'static, ()> {
+    DISABLED_EVENT_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Drop whatever earlier tests left in the store's backlog, so the next subscriber sees only what
+/// this test triggers.
+fn clear_pending_disabled_events() {
+    drop(on_credential_disabled(|_| {}));
+}
+
+/// An OAuth row whose identity fields make its events identifiable across tests.
+fn oauth_row(email: &str, expires: i64) -> String {
+    serde_json::json!({
+        "access": "dead",
+        "refresh": "r",
+        "expires": expires,
+        "email": email,
+        "accountId": "acct-1",
+        "orgId": "org-1",
+        "orgName": "Acme",
+    })
+    .to_string()
+}
+
+/// A definitive refresh failure soft-disables the row with the failure as its cause and reports it
+/// once, with the omp payload (TS `refreshStored` + `credentialDisabledEvent`).
+#[test]
+fn definitive_refresh_failure_disables_the_row_and_reports_it() {
+    let _guard = disabled_event_tests();
+    let (url, _seen) = serve(|_| (400, r#"{"error":"invalid_grant"}"#.into()));
+    let hosts = Hosts { kimi: Some(url) };
+    let (t, _d) = agent_db(&[(
+        "kimi-code",
+        "oauth",
+        &oauth_row("disabled@example.com", in_ms(-30_000)),
+    )]);
+    let db = t.path().join("agent.db");
+    clear_pending_disabled_events();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let sub = on_credential_disabled(move |e| sink.lock().unwrap().push(e.clone()));
+
+    // A dead refresh token is not retried on every request: no credential for this one.
+    assert_eq!(
+        block_on(|| local_resolve(&db, "kimi-code", None, &hosts)).unwrap(),
+        None
+    );
+    drop(sub);
+
+    let events = seen.lock().unwrap().clone();
+    let ours: Vec<_> = events
+        .iter()
+        .filter(|e| e.email.as_deref() == Some("disabled@example.com"))
+        .collect();
+    assert_eq!(ours.len(), 1, "exactly one event: {events:?}");
+    let event = ours[0];
+    assert_eq!(event.provider, "kimi-code");
+    assert_eq!(event.credential_id, Some(1));
+    assert_eq!(event.account_id.as_deref(), Some("acct-1"));
+    assert_eq!(event.org_id.as_deref(), Some("org-1"));
+    assert_eq!(event.org_name.as_deref(), Some("Acme"));
+    assert!(
+        event
+            .disabled_cause
+            .starts_with("oauth refresh failed: kimi-code token refresh failed: 400"),
+        "{}",
+        event.disabled_cause
+    );
+    assert!(event.disabled_cause.contains("invalid_grant"));
+
+    // The cause is what the row keeps, and the row is out of the usable set.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let cause: String = conn
+        .query_row(
+            "SELECT disabled_cause FROM auth_credentials WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cause, event.disabled_cause);
+    assert!(read_rows(&db, "kimi-code").unwrap().is_empty());
+}
+
+/// A disable reported while nothing is subscribed waits in the store's backlog and reaches the
+/// first subscriber, once (TS `onDisabled`'s one-shot replay).
+#[test]
+fn credential_disabled_before_a_subscriber_is_replayed_once() {
+    let _guard = disabled_event_tests();
+    let (url, _seen) = serve(|_| (400, r#"{"error":"invalid_grant"}"#.into()));
+    let hosts = Hosts { kimi: Some(url) };
+    let (t, _d) = agent_db(&[(
+        "kimi-code",
+        "oauth",
+        &oauth_row("buffered@example.com", in_ms(-30_000)),
+    )]);
+    let db = t.path().join("agent.db");
+    clear_pending_disabled_events();
+
+    assert_eq!(
+        block_on(|| local_resolve(&db, "kimi-code", None, &hosts)).unwrap(),
+        None
+    );
+
+    let first = Arc::new(Mutex::new(Vec::new()));
+    let sink = first.clone();
+    let sub = on_credential_disabled(move |e| sink.lock().unwrap().push(e.clone()));
+    let replayed: Vec<_> = first
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.email.as_deref() == Some("buffered@example.com"))
+        .cloned()
+        .collect();
+    assert_eq!(replayed.len(), 1, "the backlog is replayed on subscribe");
+    assert_eq!(replayed[0].credential_id, Some(1));
+    drop(sub);
+
+    // One-shot: a second subscriber sees no replay.
+    let second = Arc::new(Mutex::new(Vec::new()));
+    let sink = second.clone();
+    let sub = on_credential_disabled(move |e| sink.lock().unwrap().push(e.clone()));
+    drop(sub);
+    assert!(
+        second
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| e.email.as_deref() != Some("buffered@example.com")),
+        "the replay must not repeat"
+    );
+}
+
+/// A user-initiated removal (`omp logout`, `/logout`, the credential picker) stays silent, like
+/// upstream: only the store's automatic teardown is reported.
+#[test]
+fn user_removal_is_not_reported_as_a_disable() {
+    let _guard = disabled_event_tests();
+    let (t, _d) = agent_db(&[(
+        "manual-removal",
+        "oauth",
+        &oauth_row("manual@example.com", in_ms(600_000)),
+    )]);
+    let db = t.path().join("agent.db");
+    clear_pending_disabled_events();
+    let store = crate::login::LocalStore::open(&db).unwrap();
+    assert!(store.disable(1, "deleted by user").unwrap());
+    drop(store);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let sub = on_credential_disabled(move |e| sink.lock().unwrap().push(e.clone()));
+    drop(sub);
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .all(|e| e.provider != "manual-removal"),
+        "user removal must not be reported"
+    );
+}
+
 #[test]
 fn broker_config_follows_env_config_then_token_file() {
     let t = tempfile::tempdir().unwrap();

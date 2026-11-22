@@ -14,6 +14,8 @@ class Core {
   /** Answers host -> core requests (method -> handler); unknown methods get an error. */
   answer: Record<string, (params: Json) => unknown> = {};
   requests: Json[] = [];
+  /** Host -> core notifications (no id): `log`, `append_entry`, … */
+  notifications: Json[] = [];
   constructor() {
     void this.read();
   }
@@ -28,6 +30,7 @@ class Core {
         buf = buf.slice(i + 1);
         if (msg.method !== undefined && msg.id !== undefined) void this.serve(msg);
         else if (msg.method === undefined) this.waiters.get(msg.id)?.(msg);
+        else this.notifications.push(msg);
       }
     }
   }
@@ -76,6 +79,18 @@ async function hostWith(source: string): Promise<Core> {
 
 const REPLY = { replyText: "side answer", assistantMessage: { role: "assistant", content: [{ type: "text", text: "side answer" }], stopReason: "stop" } };
 
+/** The host's side-turn id on the request it just sent (echoed back on `ephemeral_delta`). */
+const streamOf = (params: Json) => params.streamId as number;
+
+/** Stream `deltas` to a running side turn, in order, then settle it with `replyText`. */
+async function streamReply(core: Core, params: Json, deltas: string[], replyText: string): Promise<Json> {
+  for (const delta of deltas) {
+    const r = await core.call("ephemeral_delta", { streamId: streamOf(params), delta });
+    if (r.error) throw new Error(`ephemeral_delta failed: ${r.error.message}`);
+  }
+  return { replyText, assistantMessage: { ...REPLY.assistantMessage, content: [{ type: "text", text: replyText }] } };
+}
+
 test("runEphemeralTurn forwards options to the core and returns EphemeralTurnResult", async () => {
   const core = await hostWith(`export default (pi) => pi.registerCommand("side", { handler: async (_a, ctx) => {
     const deltas = []; const usage = [];
@@ -83,12 +98,51 @@ test("runEphemeralTurn forwards options to the core and returns EphemeralTurnRes
       onTextDelta: (d) => void deltas.push(d), onUsage: (m) => void usage.push(m.stopReason) });
     return { r, deltas, usage };
   } });`);
+  // The reply reaches the caller through the deltas the core streams; this core streams none.
   core.answer.run_ephemeral_turn = () => REPLY;
   const r = await core.call("call_command", { name: "side", args: "" });
-  expect(r.result).toEqual({ r: REPLY, deltas: ["side answer"], usage: ["stop"] });
+  expect(r.result).toEqual({ r: REPLY, deltas: [], usage: ["stop"] });
   const req = core.requests.find((m) => m.method === "run_ephemeral_turn")!;
-  // Callbacks and the signal never cross the wire.
-  expect(req.params).toEqual({ promptText: "why?", maxTokens: 32, tools: false, history: [] });
+  // Callbacks and the signal never cross the wire: only their announcement does.
+  const { streamId, ...rest } = req.params;
+  expect(rest).toEqual({ promptText: "why?", maxTokens: 32, tools: false, history: [], usageCallback: true });
+  expect(typeof streamId).toBe("number");
+});
+
+test("runEphemeralTurn streams onTextDelta deltas as the core produces them", async () => {
+  const core = await hostWith(`export default (pi) => pi.registerCommand("side", { handler: async (_a, ctx) => {
+    const deltas = [];
+    const r = await ctx.runEphemeralTurn({ promptText: "q", onTextDelta: async (d) => { await Promise.resolve(); deltas.push(d); } });
+    return { reply: r.replyText, deltas };
+  } });`);
+  core.answer.run_ephemeral_turn = (params) => streamReply(core, params, ["Hel", "lo, ", "world"], "Hello, world");
+  const r = await core.call("call_command", { name: "side", args: "" });
+  expect(r.result).toEqual({ reply: "Hello, world", deltas: ["Hel", "lo, ", "world"] });
+});
+
+test("runEphemeralTurn rejects the side turn when onTextDelta throws", async () => {
+  const core = await hostWith(`export default (pi) => pi.registerCommand("side", { handler: async (_a, ctx) => {
+    const deltas = [];
+    const outcome = await ctx.runEphemeralTurn({ promptText: "q", onTextDelta: (d) => {
+      deltas.push(d);
+      if (d === "boom") throw new Error("callback exploded");
+    } }).then(() => "resolved", (e) => e.message);
+    return { outcome, deltas };
+  } });`);
+  // The core sees the rejected delivery and must not report a settled reply.
+  core.answer.run_ephemeral_turn = async (params) => streamReply(core, params, ["ok", "boom"], "unused");
+  const r = await core.call("call_command", { name: "side", args: "" });
+  expect(r.result.deltas).toEqual(["ok", "boom"]);
+  expect(r.result.outcome).toContain("ephemeral_delta failed");
+});
+
+test("ephemeral_delta for a side turn that is not running is refused", async () => {
+  const core = await hostWith(`export default (pi) => pi.registerCommand("side", { handler: async (_a, ctx) =>
+    ctx.runEphemeralTurn({ promptText: "q" }) });`);
+  core.answer.run_ephemeral_turn = () => REPLY;
+  await core.call("call_command", { name: "side", args: "" });
+  const r = await core.call("ephemeral_delta", { streamId: 999, delta: "late" });
+  expect(r.error.message).toBe("ephemeral_delta: no running side turn 999");
 });
 
 test("runEphemeralTurn rejects with the core's error instead of a silent reply", async () => {
@@ -127,7 +181,7 @@ test("runEphemeralTurn cannot be started from inside a side turn's callbacks", a
     } });
     return nested;
   } });`);
-  core.answer.run_ephemeral_turn = () => REPLY;
+  core.answer.run_ephemeral_turn = (params) => streamReply(core, params, ["x"], "x");
   const r = await core.call("call_command", { name: "side", args: "" });
   expect(r.result).toBe("runEphemeralTurn cannot start inside a running side turn");
   expect(core.requests.filter((m) => m.method === "run_ephemeral_turn")).toHaveLength(1);
@@ -179,4 +233,98 @@ test("before_subagent_spawn: block short-circuits, otherwise last model wins", a
   const r = await block.call("emit", { event: { type: "before_subagent_spawn" } });
   expect(r.result.result).toEqual({ block: true, reason: "no" });
   expect(r.result.handlers).toHaveLength(1);
+});
+
+// ---------------------------------------------------------------- link_activate
+/** Load `sources` as extensions in one host; returns the core plus the load result. */
+async function hostWithSources(sources: string[]): Promise<{ core: Core; loaded: Json[]; errors: Json[] }> {
+  const dir = mkdtempSync(join(tmpdir(), "omt-ext-"));
+  const paths = sources.map((source, i) => {
+    const path = join(dir, `probe-${i}.ts`);
+    writeFileSync(path, source);
+    return path;
+  });
+  const core = new Core();
+  cores.push(core);
+  const r = await core.call("load", { paths, cwd: dir });
+  return { core, loaded: r.result.loaded, errors: r.result.errors };
+}
+
+/** An extension claiming `scheme`, recording every `link_activate` and serving it as `cmd`. */
+const LINKER = (scheme: string, cmd: string, body = "seen.push(e.scheme + '|' + e.url);") => `export default (pi) => {
+  pi.registerLinkScheme("${scheme}");
+  const seen: string[] = [];
+  pi.on("link_activate", (e) => { ${body} });
+  pi.registerCommand("${cmd}", { handler: () => seen });
+};`;
+
+test("registerLinkScheme validates the scheme and reports it on load", async () => {
+  const { core, loaded, errors } = await hostWithSources([
+    `export default (pi) => {
+      const rejected: string[] = [];
+      for (const bad of ["a", "cc stretch", "1cc", "http", "HTTPS", "memory", "omp", ""]) {
+        try { pi.registerLinkScheme(bad); rejected.push("accepted:" + bad); } catch (e) { rejected.push(String(e.message)); }
+      }
+      pi.registerLinkScheme("CC-Stretch");
+      pi.registerLinkScheme("cc-stretch");
+      pi.registerCommand("rejected", { handler: () => rejected });
+    };`,
+  ]);
+  expect(errors).toEqual([]);
+  expect(loaded[0].linkSchemes).toEqual(["cc-stretch"]);
+  const rejected = (await core.call("call_command", { name: "rejected", args: "" })).result;
+  expect(rejected.some((m: string) => m.startsWith("accepted:"))).toBe(false);
+  expect(rejected[0]).toContain("is not a URL scheme of two or more characters");
+  expect(rejected[3]).toBe('registerLinkScheme: "http" is reserved for standard or omp-internal links');
+  expect(rejected[5]).toBe('registerLinkScheme: "memory" is reserved for standard or omp-internal links');
+});
+
+test("link_activate reaches only the extension that claimed the scheme", async () => {
+  const { core } = await hostWithSources([LINKER("cc-stretch", "seen-a"), LINKER("other", "seen-b")]);
+  const r = await core.call("link_activate", { url: "cc-stretch:open/1792/0/2" });
+  expect(r.result).toEqual({ handled: true });
+  expect((await core.call("call_command", { name: "seen-a", args: "" })).result).toEqual([
+    "cc-stretch|cc-stretch:open/1792/0/2",
+  ]);
+  expect((await core.call("call_command", { name: "seen-b", args: "" })).result).toEqual([]);
+  // The scheme half of a URL is case-insensitive; the URL itself is passed through verbatim.
+  await core.call("link_activate", { url: "CC-Stretch:open/1" });
+  expect((await core.call("call_command", { name: "seen-a", args: "" })).result).toEqual([
+    "cc-stretch|cc-stretch:open/1792/0/2",
+    "cc-stretch|CC-Stretch:open/1",
+  ]);
+});
+
+test("link_activate reports an unowned link as handled=false and runs nobody", async () => {
+  const { core } = await hostWithSources([LINKER("cc-stretch", "seen-a")]);
+  expect((await core.call("link_activate", { url: "https://example.com" })).result).toEqual({ handled: false });
+  expect((await core.call("link_activate", { url: "cc-stretch" })).result).toEqual({ handled: false });
+  expect((await core.call("link_activate", { url: ":nothing" })).result).toEqual({ handled: false });
+  expect((await core.call("call_command", { name: "seen-a", args: "" })).result).toEqual([]);
+});
+
+test("link_activate is owned even without a handler, and a failing handler is reported not thrown", async () => {
+  const { core } = await hostWithSources([
+    `export default (pi) => { pi.registerLinkScheme("quiet"); };`,
+    `export default (pi) => {
+      pi.registerLinkScheme("loud");
+      pi.on("link_activate", () => { throw new Error("boom"); });
+    };`,
+  ]);
+  expect((await core.call("link_activate", { url: "quiet:op" })).result).toEqual({ handled: true });
+  expect((await core.call("link_activate", { url: "loud:op" })).result).toEqual({ handled: true });
+  // The failure is reported to the core (pi warns and emits an error), never thrown back.
+  const warned = core.notifications.filter((n) => n.method === "log" && String(n.params.message).includes("boom"));
+  expect(warned.length).toBe(1);
+  // The host keeps serving after the handler error.
+  expect((await core.call("link_activate", { url: "quiet:op" })).result).toEqual({ handled: true });
+});
+
+test("emit link_activate is owner-routed, never broadcast", async () => {
+  const { core } = await hostWithSources([LINKER("cc-stretch", "seen-a"), LINKER("other", "seen-b")]);
+  const r = await core.call("emit", { event: { type: "link_activate", url: "other:go" } });
+  expect(r.result.result).toEqual({ handled: true });
+  expect(r.result.handlers).toHaveLength(1);
+  expect((await core.call("call_command", { name: "seen-b", args: "" })).result).toEqual(["other|other:go"]);
+  expect((await core.call("call_command", { name: "seen-a", args: "" })).result).toEqual([]);
 });

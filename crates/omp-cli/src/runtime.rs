@@ -23,6 +23,7 @@ use crate::agent::Target;
 use crate::events::Framer;
 use crate::persist::Persistence;
 use crate::tools::edit_mode_for;
+use omp_ext::lifecycle::CompactingOutcome;
 use omp_tui::magic::Ultra;
 
 // Declared here (not in main.rs, which another agent owns); same file `src/recovery.rs`.
@@ -194,6 +195,8 @@ pub struct Runtime {
     ask_blocked: std::sync::atomic::AtomicU64,
     /// In-flight automatic title generation (`--mode print` awaits it before exiting).
     title_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Last built-in mode state reported through `mode_changed` (TS `#reportedModeState`).
+    reported_mode: Mutex<omp_ext::lifecycle::SessionModeState>,
 }
 
 /// The session journal as the experimental context tools see it
@@ -246,6 +249,13 @@ pub trait CompactionHooks: Send + Sync {
         branch_entries: Vec<Value>,
         custom_instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    /// Before summarizing, after `before`: `session.compacting` (TS `#prepareCompactionFromHooks`).
+    /// `None` when no extension subscribes.
+    fn compacting<'a>(
+        &'a self,
+        session_id: &'a str,
+        messages: Vec<Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CompactingOutcome>> + Send + 'a>>;
     /// After the `compaction` entry is committed.
     fn after<'a>(
         &'a self,
@@ -267,6 +277,15 @@ impl crate::compact::CompactHook for HookWithBranch<'_> {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         self.hooks
             .before(preparation, self.branch.clone(), custom_instructions)
+    }
+
+    fn compacting<'a>(
+        &'a self,
+        session_id: &'a str,
+        messages: Vec<Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CompactingOutcome>> + Send + 'a>>
+    {
+        self.hooks.compacting(session_id, messages)
     }
 }
 
@@ -538,6 +557,7 @@ impl Runtime {
             compaction_done: tokio::sync::Notify::new(),
             switch_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             summarizer: Mutex::new(None),
+            reported_mode: Mutex::new(omp_ext::lifecycle::SessionModeState::default()),
         });
         rt.publish_session_file();
         let host: Arc<dyn crate::tools::context_notes::ContextNotesHost> = rt.clone();
@@ -2399,6 +2419,59 @@ impl Runtime {
         Ok(())
     }
 
+    /// TS `resetSessionContext` (the `/clear` body): drop the live/model context in
+    /// place. The session id, title and transcript file all survive; a durable
+    /// `reset_boundary` marks the edge, so the next context rebuild (and any
+    /// resume) starts emission after it while the file keeps the pre-reset
+    /// history. Returns the number of dropped messages, or `None` when the reset is
+    /// refused because a response is streaming — a turn settling after the reset
+    /// would otherwise land its output back in the cleared context.
+    pub async fn reset_context(&self) -> Option<usize> {
+        if self.agent.is_streaming().await {
+            return None;
+        }
+        // An in-flight compaction must not swap its rebuilt context over the one
+        // this call drops (TS `handleResetContextCommand` aborts it first).
+        self.cancel_compaction_and_wait().await;
+        self.cancel_retry_and_wait().await;
+        let dropped = self.agent.message_count().await;
+        self.agent.abort();
+        self.agent.wait_for_idle().await;
+        // `reset()` keeps the model and the system prompt and drops messages, the
+        // queued steers/follow-ups, pending tool calls and the error state.
+        self.agent.reset().await;
+        // A failed turn still held back for the retry saga must not be journaled
+        // after the boundary and re-enter the cleared context.
+        self.persist.drop_deferred_error();
+        *lock(&self.pending_rewind_report) = None;
+        lock(&self.prompts).open.clear();
+        {
+            let mut st = lock(&self.settings);
+            st.last_queue = (Vec::new(), Vec::new());
+        }
+        // Todo state is rehydrated from the session entries: the pre-boundary ones
+        // no longer count, exactly as on a resume across the same boundary.
+        self.rehydrate_todo_tool(&[]).await;
+        self.bump_generation();
+        if let Err(e) = self.persist.append_reset_boundary() {
+            eprintln!("omt: reset boundary: {e:#}");
+        }
+        // Interactive TUI: drop the rendered transcript; the session chrome stays.
+        if self
+            .ui_context_frames
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.send(json!({"type": "session_reset"}));
+        }
+        // TS emits `session_clear` last, once the context is gone.
+        if let Some(host) = self.ext_host().filter(|h| h.has_handlers("session_clear")) {
+            if let Err(e) = host.emit_session_clear(None).await {
+                eprintln!("omt: extension session_clear: {e:#}");
+            }
+        }
+        Some(dropped)
+    }
+
     /// Resume `path` in place (TS `SessionManager.open`): the agent context is rebuilt from the
     /// journal and new entries are appended to the SAME file, chained to the active branch tip.
     /// `dir` is unused (the file keeps its own directory).
@@ -2755,6 +2828,19 @@ impl Runtime {
         });
         *lock(&self.ext_frames) = feed;
         *lock(&self.ext_host) = host;
+    }
+
+    /// Record `state` as the last one reported through `mode_changed`: returns the state reported
+    /// before it when the modes moved, `None` when nothing changed (TS `#reportedModeKey`).
+    pub fn commit_mode_state(
+        &self,
+        state: &omp_ext::lifecycle::SessionModeState,
+    ) -> Option<omp_ext::lifecycle::SessionModeState> {
+        let mut reported = lock(&self.reported_mode);
+        if *reported == *state {
+            return None;
+        }
+        Some(std::mem::replace(&mut *reported, state.clone()))
     }
 
     /// Install the `session_before_switch` gate.
@@ -3174,9 +3260,13 @@ impl Runtime {
         if let Some(f) = lock(&self.summarizer).clone() {
             return Ok(crate::compact::Summarizer::Injected(f));
         }
-        Ok(crate::compact::Summarizer::Live(Arc::new(
-            crate::compact::LiveCompleter::from_target(&self.target)?,
-        )))
+        Ok(crate::compact::Summarizer::Live(Arc::new({
+            let mut live = crate::compact::LiveCompleter::from_target(&self.target)?;
+            // The summary is a provider request like any other: extensions see it
+            // (upstream `onPayload` on the compaction path).
+            live.payload = self.ext_host().map(crate::ext::ai_payload_hook);
+            live
+        })))
     }
 
     /// The handoff oneshot context (`SessionHandoff.generateDocument`): the base
@@ -5790,6 +5880,99 @@ mod ultra_tests {
         assert_eq!(parse_ultra_name("code"), None);
         assert_eq!(parse_ultra_name("max"), None);
     }
+
+    /// Mode transitions run against the process-wide plan state, so the mode tests take turns.
+    static MODE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn bun_on_path() -> bool {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("bun").is_file()))
+    }
+
+    /// The real extension host with `tests/fixtures/mode_changed.ts` loaded: it records every
+    /// `mode_changed` it receives as a `seen:mode_changed` entry.
+    async fn mode_host() -> Option<(
+        Arc<omp_ext::ExtHost>,
+        UnboundedReceiver<omp_ext::HostMessage>,
+    )> {
+        if !bun_on_path() {
+            eprintln!("skipping mode_changed test: bun not found on PATH");
+            return None;
+        }
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut cfg = omp_ext::HostConfig::new(root.join("../../ext-host/host.ts"));
+        cfg.handler_timeout_ms = Some(5000);
+        let host = omp_ext::ExtHost::spawn(&cfg).await.expect("ext host");
+        let loaded = host
+            .load(
+                Some(&[root.join("tests/fixtures/mode_changed.ts")]),
+                None,
+                "/tmp",
+                Some(json!({"sessionId": "s1"})),
+            )
+            .await
+            .expect("load fixture");
+        assert!(loaded.errors.is_empty(), "{loaded:?}");
+        assert_eq!(loaded.loaded.len(), 1);
+        let rx = host.take_incoming().expect("incoming");
+        Some((host, rx))
+    }
+
+    async fn next_mode_changed(rx: &mut UnboundedReceiver<omp_ext::HostMessage>) -> Value {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                .await
+                .expect("mode_changed in time")
+                .expect("host closed");
+            if let omp_ext::HostMessage::Notification { method, params } = msg {
+                if method == "append_entry" && params["customType"] == "seen:mode_changed" {
+                    let raw = params["data"].as_str().expect("fixture records JSON");
+                    return serde_json::from_str(raw).expect("mode_changed JSON");
+                }
+            }
+        }
+    }
+
+    /// `/plan` reports entering and leaving plan mode through `mode_changed`, with the previously
+    /// reported state as `previous`; a transition that moves nothing reports nothing.
+    #[tokio::test]
+    async fn mode_changed_reports_plan_enter_and_exit() {
+        let _guard = MODE_LOCK.lock().await;
+        let Some((host, mut rx)) = mode_host().await else {
+            return;
+        };
+        let h = harness(&[], "", None).await;
+        h.rt.set_ext_host(Some(host));
+        let plan_status = || {
+            crate::features::modes::snapshot(&h.rt.session_id())
+                .plan
+                .status
+        };
+        assert_eq!(plan_status(), omp_ext::lifecycle::ModeStatus::Inactive);
+
+        crate::features::plan::command(&h.rt, "fix the tests").await;
+        let entered = next_mode_changed(&mut rx).await;
+        assert_eq!(entered["type"], "mode_changed");
+        assert_eq!(entered["previous"]["plan"]["status"], "inactive");
+        assert_eq!(entered["state"]["plan"]["status"], "active");
+        assert_eq!(entered["state"]["vibe"]["status"], "inactive");
+        assert_eq!(entered["state"]["goal"]["status"], "inactive");
+        assert_eq!(entered["state"]["loop"]["status"], "inactive");
+        assert_eq!(plan_status(), omp_ext::lifecycle::ModeStatus::Active);
+
+        crate::features::plan::command(&h.rt, "off").await;
+        let left = next_mode_changed(&mut rx).await;
+        assert_eq!(left["previous"]["plan"]["status"], "active");
+        assert_eq!(left["state"]["plan"]["status"], "inactive");
+
+        crate::features::plan::command(&h.rt, "off").await;
+        let state = crate::features::modes::snapshot(&h.rt.session_id());
+        assert_eq!(state, omp_ext::lifecycle::SessionModeState::default());
+        assert!(
+            h.rt.commit_mode_state(&state).is_none(),
+            "an unchanged mode state reports nothing"
+        );
+    }
 }
 
 /// Compaction concurrency guard (bug-hunt #2): a prompt, `/new` or Esc during
@@ -6265,5 +6448,276 @@ mod compaction_guard_tests {
             "the turn landed in the new session: {:?}",
             fresh.last().unwrap()
         );
+    }
+}
+
+/// `/clear` (TS `resetSessionContext`): the live/model context is dropped in
+/// place — session id, title and transcript file survive — a durable
+/// `reset_boundary` marks the edge a rebuild resumes from, and `session_clear`
+/// reaches the extension host.
+#[cfg(test)]
+mod clear_context_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use pa_agent::agent::{Agent, AgentInitialState, AgentOptions};
+    use pa_agent::scripted::ScriptedProvider;
+    use serde_json::{json, Value};
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    use super::*;
+    use crate::adapter::{json_round_trip, ProviderTarget};
+
+    fn model() -> pa_types::ai::Model {
+        serde_json::from_value(json!({
+            "id": "a", "name": "a", "api": "openai-completions", "provider": "p",
+            "baseUrl": "http://127.0.0.1:9", "reasoning": false, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 100_000, "maxTokens": 4096
+        }))
+        .expect("model json")
+    }
+
+    struct Harness {
+        rt: Arc<Runtime>,
+        rx: UnboundedReceiver<Value>,
+        _dir: tempfile::TempDir,
+        _provider: Arc<ScriptedProvider>,
+    }
+
+    async fn harness(script: impl FnOnce(&ScriptedProvider)) -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let model = model();
+        let provider = Arc::new(ScriptedProvider::new(
+            json_round_trip(&model).expect("agent model"),
+        ));
+        script(&provider);
+        let agent = Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                system_prompt: Some("test".into()),
+                model: json_round_trip(&model),
+                thinking_level: Some(pa_agent::types::ThinkingLevel::Off),
+                tools: Some(Vec::new()),
+                messages: None,
+            },
+            stream_fn: Some(provider.stream_fn()),
+            ..AgentOptions::default()
+        });
+        let persist = crate::persist::attach_in(
+            &agent,
+            dir.path(),
+            dir.path(),
+            None,
+            crate::persist::uuid_v7(),
+        )
+        .await
+        .expect("session");
+        let target = Arc::new(std::sync::RwLock::new(Some(ProviderTarget {
+            api_key: Some("k".into()),
+            model,
+            service_tier: None,
+            headers: None,
+            credential_id: None,
+        })));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = Runtime::start(
+            Arc::new(agent),
+            target,
+            dir.path().to_path_buf(),
+            persist,
+            tx,
+        )
+        .await;
+        Harness {
+            rt,
+            rx,
+            _dir: dir,
+            _provider: provider,
+        }
+    }
+
+    async fn until_settled(rx: &mut UnboundedReceiver<Value>) {
+        loop {
+            let f = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("frame in time")
+                .expect("open");
+            if f["type"] == "session_settled" {
+                return;
+            }
+        }
+    }
+
+    async fn prompt(h: &mut Harness, text: &str) {
+        h.rt.prompt(None, text, None, Vec::new())
+            .await
+            .expect("prompt");
+        until_settled(&mut h.rx).await;
+    }
+
+    fn journal(path: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// A host that records every `emit` request line and answers with the empty
+    /// `EmitResult` (no handlers). It writes before answering, so a test reading the
+    /// file after an awaited emit sees the event.
+    async fn recording_host(
+        dir: &std::path::Path,
+        events: &std::path::Path,
+    ) -> Arc<omp_ext::ExtHost> {
+        let script = dir.join("recording-host.sh");
+        std::fs::write(
+            &script,
+            concat!(
+                ": > \"$EVENTS\"\n",
+                "while IFS= read -r line; do\n",
+                "  case \"$line\" in\n",
+                "    *'\"method\":\"emit\"'*) printf '%s\\n' \"$line\" >> \"$EVENTS\";;\n",
+                "  esac\n",
+                "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+                "  if [ -n \"$id\" ]; then\n",
+                "    printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":null,\"handlers\":[],\"errors\":[]}}\\n' \"$id\"\n",
+                "  fi\n",
+                "done\n",
+            ),
+        )
+        .unwrap();
+        omp_ext::ExtHost::spawn(&omp_ext::HostConfig {
+            bun: "/bin/sh".into(),
+            host_script: script,
+            trace: None,
+            handler_timeout_ms: None,
+            env: vec![("EVENTS".into(), events.display().to_string())],
+            shared_socket: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// `/clear` keeps the session (id + file), empties the live context, records
+    /// the boundary and emits `session_clear` with the omp payload.
+    #[tokio::test]
+    async fn clear_drops_the_context_in_place_and_emits_session_clear() {
+        let mut h = harness(|p| {
+            p.push_text_turn("answer 0");
+            p.push_text_turn("answer 1");
+        })
+        .await;
+        prompt(&mut h, "first question").await;
+        let (session_id, file) = (h.rt.session_id(), h.rt.session_file());
+        assert_eq!(h.rt.messages().await.len(), 2, "user + assistant");
+
+        let host_dir = tempfile::tempdir().unwrap();
+        let events = host_dir.path().join("events.jsonl");
+        let host = recording_host(host_dir.path(), &events).await;
+        h.rt.set_ext_host(Some(host.clone()));
+
+        assert_eq!(h.rt.reset_context().await, Some(2), "two messages dropped");
+
+        assert_eq!(h.rt.session_id(), session_id, "the session id survives");
+        assert_eq!(h.rt.session_file(), file, "the transcript file survives");
+        assert!(h.rt.messages().await.is_empty(), "the context is empty");
+        assert_eq!(
+            h.rt.state().await["messageCount"],
+            json!(0),
+            "no message left in the live state"
+        );
+        let entries = journal(&file);
+        assert_eq!(
+            entries.last().unwrap()["type"],
+            "reset_boundary",
+            "the durable edge is the last entry: {entries:?}"
+        );
+        let emitted = std::fs::read_to_string(&events).unwrap();
+        let emits: Vec<Value> = emitted
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .collect();
+        assert_eq!(emits.len(), 1, "one emit: {emits:?}");
+        assert_eq!(
+            emits[0]["params"]["event"],
+            json!({"type": "session_clear"}),
+            "the omp payload"
+        );
+        host.shutdown().await.unwrap();
+    }
+
+    /// The pre-reset history stays out of the model context on resume: the
+    /// rebuild starts after the latest boundary while the file keeps the history.
+    #[tokio::test]
+    async fn resume_after_clear_restores_only_the_post_boundary_context() {
+        let mut h = harness(|p| {
+            p.push_text_turn("first answer");
+            p.push_text_turn("second answer");
+        })
+        .await;
+        prompt(&mut h, "first question").await;
+        let file = h.rt.session_file();
+        assert_eq!(h.rt.reset_context().await, Some(2));
+        prompt(&mut h, "second question").await;
+        assert_eq!(h.rt.session_file(), file, "still the same file");
+        assert_eq!(h.rt.messages().await.len(), 2, "only the post-reset turn");
+
+        let resumed = harness(|p| p.push_text_turn("unused")).await;
+        resumed.rt.load_session(&file, None).await.expect("resume");
+        let context = resumed
+            .rt
+            .messages()
+            .await
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            context.contains("second question"),
+            "the post-reset turn is restored: {context}"
+        );
+        assert!(
+            !context.contains("first question") && !context.contains("first answer"),
+            "the pre-reset history is not restored: {context}"
+        );
+        // The file still holds the pre-reset history: it is a log, not the context.
+        let entries = journal(&file);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.to_string().contains("first question")),
+            "the journal keeps the pre-reset turn"
+        );
+    }
+
+    /// A streaming response refuses the reset instead of landing its output in
+    /// the cleared context (TS `resetSessionContext` returns `undefined`).
+    #[tokio::test]
+    async fn clear_is_refused_while_a_response_streams() {
+        let h = harness(|p| p.push_stalled_turn("")).await;
+        h.rt.prompt(None, "streaming question", None, Vec::new())
+            .await
+            .expect("prompt");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !h.rt.agent.is_streaming().await {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("turn in flight");
+
+        assert_eq!(h.rt.reset_context().await, None, "refused while streaming");
+        assert!(
+            !h.rt.messages().await.is_empty(),
+            "the in-flight turn keeps its context"
+        );
+        assert!(
+            journal(&h.rt.session_file())
+                .iter()
+                .all(|e| e["type"] != "reset_boundary"),
+            "no boundary is recorded"
+        );
+        h.rt.abort().await;
     }
 }

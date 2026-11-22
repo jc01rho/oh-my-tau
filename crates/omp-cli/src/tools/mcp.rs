@@ -49,6 +49,11 @@ fn block_on_discover(cwd: &Path) -> Option<Vec<Arc<dyn AgentTool>>> {
     let cwd = cwd.to_path_buf();
     let discover = move || async move {
         let manager = Arc::new(McpManager::from_default_configs(&cwd));
+        // Every server notification reaches the extension sessions' `mcp_notification`
+        // handlers (omp `sdk.ts`: `mcpManager.addNotificationListener(...)` -> runner).
+        manager.add_notification_listener(Arc::new(|frame: &omp_mcp::ServerNotification| {
+            crate::ext::publish_mcp_notification(frame);
+        }));
         let discovered = manager.tools().await;
         let mut connected = Vec::new();
         for (name, status) in manager.statuses().await {
