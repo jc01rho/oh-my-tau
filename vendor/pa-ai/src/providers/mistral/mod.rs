@@ -275,6 +275,7 @@ mod tests {
             featured: None,
             headers: None,
             compat: None,
+            tokenizer: None,
         };
         assert!(uses_reasoning_effort(&model));
         assert_eq!(

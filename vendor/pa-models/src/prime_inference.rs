@@ -522,6 +522,7 @@ pub fn build_prime_inference_models(
             featured: template.and_then(|t| t.featured),
             headers: None,
             compat: Some(compat),
+            tokenizer: None,
         });
     }
     // Coverage gate: the float round-trip is the intended computation;
@@ -1020,6 +1021,7 @@ mod tests {
                     ..OpenAiCompletionsCompat::default()
                 }),
             ))),
+            tokenizer: None,
         }
     }
 

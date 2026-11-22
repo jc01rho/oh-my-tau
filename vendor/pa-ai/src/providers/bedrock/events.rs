@@ -444,6 +444,7 @@ mod tests {
             featured: None,
             headers: None,
             compat: None,
+            tokenizer: None,
         };
         let request_id = None;
         let mut output = crate::event_stream::initial_assistant_message(

@@ -160,6 +160,7 @@ fn parse_entry(candidate: &serde_json::Value) -> Result<Model, String> {
         featured: entry.featured,
         headers: None,
         compat: entry.compat.map(|raw| ModelCompat { raw }),
+        tokenizer: None,
     })
 }
 

@@ -52,6 +52,7 @@ fn glm_53_flash(base_url: &str) -> Model {
                 serde_json::from_value(compat_json).expect("compat parses"),
             )),
         )),
+        tokenizer: None,
     }
 }
 

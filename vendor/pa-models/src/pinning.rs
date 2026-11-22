@@ -135,6 +135,7 @@ mod tests {
                 featured: None,
                 headers,
                 compat: None,
+                tokenizer: None,
             }
         };
         PinnedTemplates::from_models(vec![

@@ -28,6 +28,7 @@ fn tier_model(provider: &str, api: &str, id: &str) -> Model {
         featured: None,
         headers: None,
         compat: None,
+        tokenizer: None,
     }
 }
 
@@ -188,4 +189,65 @@ fn user_content_text_helper() {
     )
     .unwrap();
     assert_eq!(content.text(), "a b c");
+}
+
+#[test]
+fn model_tokenizer_from_model_id() {
+    use ModelTokenizer as T;
+    let cases = [
+        ("claude-3-5-sonnet-20241022", Some(T::ClaudeV3)),
+        ("claude-sonnet-4-5", Some(T::ClaudeV3)),
+        ("anthropic/claude-opus-4.7", Some(T::ClaudeV47)),
+        ("claude-opus-4-7-20260101", Some(T::ClaudeV47)),
+        ("claude-opus-5", Some(T::ClaudeV5)),
+        ("claude-sonnet-5", Some(T::ClaudeV5Sonnet)),
+        ("Qwen/Qwen3-Coder-480B", Some(T::Qwen3)),
+        ("deepseek-chat", Some(T::DeepseekV3)),
+        ("deepseek/deepseek-v3.2", Some(T::DeepseekV3)),
+        ("moonshotai/kimi-k2-instruct", Some(T::KimiK2)),
+        ("z-ai/glm-5", Some(T::Glm5)),
+        ("gpt-4o-mini", Some(T::O200k)),
+        ("gpt-4.1", Some(T::O200k)),
+        ("gpt-5.1-codex", Some(T::O200k)),
+        ("o3-mini", Some(T::O200k)),
+        ("gpt-4-turbo", Some(T::Cl100k)),
+        ("gpt-3.5-turbo", Some(T::Cl100k)),
+        ("gemini-2.5-pro", None),
+        ("llama-4-maverick", None),
+    ];
+    for (id, want) in cases {
+        assert_eq!(ModelTokenizer::from_model_id(id), want, "{id}");
+    }
+}
+
+#[test]
+fn model_tokenizer_serde_and_resolution() {
+    for t in [
+        ModelTokenizer::ClaudeV3,
+        ModelTokenizer::ClaudeV47,
+        ModelTokenizer::ClaudeV5,
+        ModelTokenizer::ClaudeV5Sonnet,
+        ModelTokenizer::Qwen3,
+        ModelTokenizer::DeepseekV3,
+        ModelTokenizer::KimiK2,
+        ModelTokenizer::Glm5,
+        ModelTokenizer::Cl100k,
+        ModelTokenizer::O200k,
+    ] {
+        let wire = serde_json::to_value(t).unwrap();
+        assert_eq!(wire, serde_json::Value::String(t.as_str().to_owned()));
+        assert_eq!(serde_json::from_value::<ModelTokenizer>(wire).unwrap(), t);
+    }
+
+    let mut model = tier_model("openai", "openai-responses", "gpt-4o");
+    let json = serde_json::to_value(&model).unwrap();
+    assert!(json.get("tokenizer").is_none());
+    assert_eq!(model.resolved_tokenizer(), Some(ModelTokenizer::O200k));
+
+    model.tokenizer = Some(ModelTokenizer::Cl100k);
+    let json = serde_json::to_value(&model).unwrap();
+    assert_eq!(json["tokenizer"], "cl100k");
+    let back: Model = serde_json::from_value(json).unwrap();
+    assert_eq!(back.tokenizer, Some(ModelTokenizer::Cl100k));
+    assert_eq!(back.resolved_tokenizer(), Some(ModelTokenizer::Cl100k));
 }

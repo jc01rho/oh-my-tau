@@ -688,6 +688,109 @@ pub use routing::{
     DataCollection, NumOrString, OpenRouterMaxPrice, OpenRouterRouting, OpenRouterSort,
     OpenRouterThreshold, VercelGatewayRouting,
 };
+/// Native tokenizer family a model counts with (omp's catalog `tokenizer`). `None` on a
+/// [`Model`] means the family is unknown and callers fall back to a byte estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ModelTokenizer {
+    #[serde(rename = "claude-v3")]
+    ClaudeV3,
+    #[serde(rename = "claude-v47")]
+    ClaudeV47,
+    #[serde(rename = "claude-v5")]
+    ClaudeV5,
+    #[serde(rename = "claude-v5-sonnet")]
+    ClaudeV5Sonnet,
+    #[serde(rename = "qwen3")]
+    Qwen3,
+    #[serde(rename = "deepseek-v3")]
+    DeepseekV3,
+    #[serde(rename = "kimi-k2")]
+    KimiK2,
+    #[serde(rename = "glm5")]
+    Glm5,
+    #[serde(rename = "cl100k")]
+    Cl100k,
+    #[serde(rename = "o200k")]
+    O200k,
+}
+
+impl ModelTokenizer {
+    /// Wire name (the serde tag).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeV3 => "claude-v3",
+            Self::ClaudeV47 => "claude-v47",
+            Self::ClaudeV5 => "claude-v5",
+            Self::ClaudeV5Sonnet => "claude-v5-sonnet",
+            Self::Qwen3 => "qwen3",
+            Self::DeepseekV3 => "deepseek-v3",
+            Self::KimiK2 => "kimi-k2",
+            Self::Glm5 => "glm5",
+            Self::Cl100k => "cl100k",
+            Self::O200k => "o200k",
+        }
+    }
+
+    /// Infer the tokenizer family from a model id (provider prefixes such as `openrouter/` or
+    /// `anthropic.` and `.`/`_` version separators are tolerated). `None` when unknown.
+    #[must_use]
+    pub fn from_model_id(id: &str) -> Option<Self> {
+        let lower = id.to_ascii_lowercase();
+        let name = lower.rsplit('/').next().unwrap_or(&lower);
+        let norm: String = name
+            .chars()
+            .map(|c| if c == '.' || c == '_' { '-' } else { c })
+            .collect();
+        let parts: Vec<&str> = norm.split('-').filter(|p| !p.is_empty()).collect();
+        let has = |p: &str| parts.contains(&p);
+        if norm.contains("claude") {
+            // Version = first short numeric part (dates are 8 digits) plus the part after it.
+            let short_num = |p: &&str| p.len() <= 2 && p.bytes().all(|b| b.is_ascii_digit());
+            let major_at = parts.iter().position(short_num);
+            let major = major_at.map(|i| parts[i]);
+            let minor = major_at
+                .and_then(|i| parts.get(i + 1))
+                .filter(|p| short_num(p))
+                .copied();
+            return Some(match (major, minor) {
+                (Some("5"), _) if has("sonnet") => Self::ClaudeV5Sonnet,
+                (Some("5"), _) => Self::ClaudeV5,
+                (Some("4"), Some("7")) => Self::ClaudeV47,
+                _ => Self::ClaudeV3,
+            });
+        }
+        if norm.contains("qwen3") || norm.contains("qwen-3") {
+            return Some(Self::Qwen3);
+        }
+        if norm.contains("deepseek") {
+            return Some(Self::DeepseekV3);
+        }
+        if norm.contains("kimi-k2") {
+            return Some(Self::KimiK2);
+        }
+        if norm.contains("glm-5") || norm.contains("glm5") {
+            return Some(Self::Glm5);
+        }
+        let openai_o_series = parts
+            .first()
+            .is_some_and(|p| matches!(*p, "o1" | "o3" | "o4"));
+        if openai_o_series
+            || norm.contains("gpt-4o")
+            || norm.contains("gpt-4-1")
+            || norm.contains("gpt-5")
+            || norm.contains("gpt-oss")
+            || norm.contains("chatgpt-4o")
+        {
+            return Some(Self::O200k);
+        }
+        if norm.contains("gpt-4") || norm.contains("gpt-3-5") || norm.contains("text-embedding") {
+            return Some(Self::Cl100k);
+        }
+        None
+    }
+}
+
 /// `skip_serializing_if` predicate for [`Model::max_tokens_explicit`]: the
 /// wire/catalog JSON stays byte-identical for catalog models (the flag
 /// serializes only when set).
@@ -737,6 +840,18 @@ pub struct Model {
     /// Compatibility overrides; auto-detected from `baseUrl` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<ModelCompat>,
+    /// Native tokenizer family; see [`Model::resolved_tokenizer`] for the id-based fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer: Option<ModelTokenizer>,
+}
+
+impl Model {
+    /// The configured [`Model::tokenizer`], else the family inferred from the model id.
+    #[must_use]
+    pub fn resolved_tokenizer(&self) -> Option<ModelTokenizer> {
+        self.tokenizer
+            .or_else(|| ModelTokenizer::from_model_id(&self.id))
+    }
 }
 
 /// TS `supportsServiceTier` over the eligibility fields; the Model-typed [`supports_service_tier`]
