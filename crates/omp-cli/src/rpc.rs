@@ -1798,7 +1798,10 @@ pub async fn run_with(
             let follow_up: crate::tools::FollowUpSink = Arc::new(move |message: String| {
                 let rt = Arc::clone(&follow_up_rt);
                 tokio::spawn(async move {
-                    if let Err(e) = rt.prompt(None, &message, Some("followUp"), Vec::new()).await {
+                    if let Err(e) = rt
+                        .prompt(None, &message, Some("followUp"), Vec::new())
+                        .await
+                    {
                         eprintln!("omt: ask_user_question follow-up: {e:?}");
                     }
                 });

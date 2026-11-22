@@ -151,7 +151,9 @@ fn validate(args: &AskArgs) -> Option<String> {
         let at = |what: &str| format!("questions[{index}]: {what}");
         let header = question.header.trim();
         if header.is_empty() || header.chars().count() > MAX_HEADER_CHARS {
-            return Some(at(&format!("header must be 1 to {MAX_HEADER_CHARS} characters")));
+            return Some(at(&format!(
+                "header must be 1 to {MAX_HEADER_CHARS} characters"
+            )));
         }
         if questions[..index].iter().any(|q| q.header.trim() == header) {
             return Some(at(&format!("header {header:?} is used twice")));
@@ -202,13 +204,22 @@ fn gateway_dialog(questions: &[AskQuestion]) -> (String, Value) {
                 .map(|o| {
                     let mut option = Map::new();
                     option.insert("label".into(), json!(o.label.trim()));
-                    if let Some(d) = o.description.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                    if let Some(d) = o
+                        .description
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|d| !d.is_empty())
+                    {
                         option.insert("description".into(), json!(d));
                     }
                     Value::Object(option)
                 })
                 .collect();
-            let hint = if q.multi_select { MULTI_SELECT_HINT } else { "" };
+            let hint = if q.multi_select {
+                MULTI_SELECT_HINT
+            } else {
+                ""
+            };
             json!({
                 "id": question_id(index),
                 "header": q.header.trim(),
@@ -290,7 +301,12 @@ fn parse_response(questions: &[AskQuestion], response: Option<Value>) -> Outcome
     let strings = |value: Option<&Value>| -> Vec<String> {
         value
             .and_then(Value::as_array)
-            .map(|list| list.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let entry_of = |id: &str| -> Option<Value> {
@@ -303,7 +319,9 @@ fn parse_response(questions: &[AskQuestion], response: Option<Value>) -> Outcome
             _ => None,
         }
     };
-    let single_value = (questions.len() == 1).then(|| nonempty(frame.get("value"))).flatten();
+    let single_value = (questions.len() == 1)
+        .then(|| nonempty(frame.get("value")))
+        .flatten();
     let answers: Vec<Answer> = questions
         .iter()
         .enumerate()
@@ -323,7 +341,9 @@ fn parse_response(questions: &[AskQuestion], response: Option<Value>) -> Outcome
             }
         })
         .collect();
-    let empty = answers.iter().all(|a| a.selected.is_empty() && a.other.is_none());
+    let empty = answers
+        .iter()
+        .all(|a| a.selected.is_empty() && a.other.is_none());
     if empty && comment.is_none() {
         return Outcome::Cancelled;
     }
@@ -337,7 +357,12 @@ fn outcome_from_ask_details(questions: &[AskQuestion], details: &Value) -> Outco
         selected: entry
             .get("selectedOptions")
             .and_then(Value::as_array)
-            .map(|list| list.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default(),
         other: nonempty(entry.get("customInput")),
     };
@@ -460,7 +485,12 @@ fn render(id: &str, questions: &[AskQuestion], outcome: &Outcome) -> Rendered {
     }
 }
 
-fn finish(id: &str, required: bool, questions: &[AskQuestion], outcome: &Outcome) -> AgentToolResult {
+fn finish(
+    id: &str,
+    required: bool,
+    questions: &[AskQuestion],
+    outcome: &Outcome,
+) -> AgentToolResult {
     let rendered = render(id, questions, outcome);
     if required && *outcome == Outcome::Cancelled {
         let mut result = coded_error("question_cancelled", rendered.text);
@@ -548,9 +578,14 @@ impl AskUserQuestionTool {
             let message = match collect(ui, &args.questions, &AbortSignal::never()).await {
                 Ok(outcome) => {
                     let result = finish(&pending_id, args.required, &args.questions, &outcome);
-                    format!("[ask_user_question answer {pending_id}]\n{}", result_text(&result))
+                    format!(
+                        "[ask_user_question answer {pending_id}]\n{}",
+                        result_text(&result)
+                    )
                 }
-                Err(e) => format!("[ask_user_question answer {pending_id}]\nThe question failed: {e}"),
+                Err(e) => {
+                    format!("[ask_user_question answer {pending_id}]\nThe question failed: {e}")
+                }
             };
             sink(message);
         });
@@ -743,14 +778,21 @@ impl GoalCompatTool {
         match self.op {
             GoalOp::Get => goal_result(runtime.state_goal(), false),
             GoalOp::Create => {
-                let objective = params.get("objective").and_then(Value::as_str).unwrap_or("").trim();
+                let objective = params
+                    .get("objective")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
                 if objective.is_empty() || objective.chars().count() > MAX_OBJECTIVE_CHARS {
                     return coded_error(
                         "invalid_arguments",
                         format!("objective must be 1 to {MAX_OBJECTIVE_CHARS} characters"),
                     );
                 }
-                if runtime.state_goal().is_some_and(|g| g.wire_status() != "complete") {
+                if runtime
+                    .state_goal()
+                    .is_some_and(|g| g.wire_status() != "complete")
+                {
                     return coded_error(
                         "goal_exists",
                         "cannot create a new goal because this session already has an unfinished goal",
@@ -766,17 +808,25 @@ impl GoalCompatTool {
                 let reason = params.get("reason").and_then(Value::as_str);
                 let outcome = match (status, reason) {
                     (Some("complete"), Some(_)) => {
-                        return coded_error("invalid_arguments", "reason is only allowed when status is blocked")
+                        return coded_error(
+                            "invalid_arguments",
+                            "reason is only allowed when status is blocked",
+                        )
                     }
                     (Some("complete"), None) => runtime.complete_goal(),
                     (Some("blocked"), reason) => runtime.block_goal(reason.unwrap_or("")),
                     _ => {
-                        return coded_error("invalid_arguments", "status must be \"complete\" or \"blocked\"")
+                        return coded_error(
+                            "invalid_arguments",
+                            "status must be \"complete\" or \"blocked\"",
+                        )
                     }
                 };
                 match outcome {
                     Ok(goal) => goal_result(Some(&goal), status == Some("complete")),
-                    Err(e) if runtime.state_goal().is_none() => coded_error("goal_not_found", e.to_string()),
+                    Err(e) if runtime.state_goal().is_none() => {
+                        coded_error("goal_not_found", e.to_string())
+                    }
                     Err(e) => coded_error("invalid_arguments", e.to_string()),
                 }
             }
@@ -815,8 +865,8 @@ impl AgentTool for GoalCompatTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parking_lot::Mutex as PlMutex;
     use pa_agent::types::ToolResultContent;
+    use parking_lot::Mutex as PlMutex;
 
     /// Gateway-style host: records the `question` dialog, answers with a fixed response.
     struct GatewayUi {
@@ -934,7 +984,10 @@ mod tests {
         assert_eq!(item["properties"]["header"]["maxLength"], 12);
         assert_eq!(item["properties"]["options"]["minItems"], 2);
         assert_eq!(item["properties"]["options"]["maxItems"], 4);
-        assert_eq!(item["properties"]["options"]["items"]["required"], json!(["label"]));
+        assert_eq!(
+            item["properties"]["options"]["items"]["required"],
+            json!(["label"])
+        );
         for key in ["header", "question", "multiSelect", "options"] {
             assert!(item["properties"].get(key).is_some(), "question key {key}");
         }
@@ -947,7 +1000,10 @@ mod tests {
         assert_eq!(tools[0].parameters()["required"], json!(["objective"]));
         assert_eq!(tools[1].parameters()["properties"], json!({}));
         let update = tools[2].parameters();
-        assert_eq!(update["properties"]["status"]["enum"], json!(["complete", "blocked"]));
+        assert_eq!(
+            update["properties"]["status"]["enum"],
+            json!(["complete", "blocked"])
+        );
         assert_eq!(update["required"], json!(["status"]));
         assert_eq!(ask_user_question_tool().name(), "ask_user_question");
     }
@@ -974,13 +1030,21 @@ mod tests {
             json!({}),
             json!({"questions": vec![storage()["questions"][0].clone(); 5]}),
             one(json!({"header": "H", "question": "Q?", "options": [{"label": "A"}]})),
-            one(json!({"header": "H", "question": "Q?", "options": [{"label": "A"}, {"label": "B"}, {"label": "C"}, {"label": "D"}, {"label": "E"}]})),
+            one(
+                json!({"header": "H", "question": "Q?", "options": [{"label": "A"}, {"label": "B"}, {"label": "C"}, {"label": "D"}, {"label": "E"}]}),
+            ),
             one(json!({"header": "", "question": "Q?", "options": opts2})),
             one(json!({"header": "thirteen-chars", "question": "Q?", "options": opts2})),
             one(json!({"header": "H", "question": "  ", "options": opts2})),
-            one(json!({"header": "H", "question": "Q?", "options": [{"label": "A"}, {"label": "A"}]})),
-            one(json!({"header": "H", "question": "Q?", "options": [{"label": "A"}, {"label": "Other (type an answer)"}]})),
-            one(json!({"header": "H", "question": "Q?", "options": [{"label": "A"}, {"label": "Chat about this"}]})),
+            one(
+                json!({"header": "H", "question": "Q?", "options": [{"label": "A"}, {"label": "A"}]}),
+            ),
+            one(
+                json!({"header": "H", "question": "Q?", "options": [{"label": "A"}, {"label": "Other (type an answer)"}]}),
+            ),
+            one(
+                json!({"header": "H", "question": "Q?", "options": [{"label": "A"}, {"label": "Chat about this"}]}),
+            ),
             json!({"questions": [
                 {"header": "Same", "question": "Q1?", "options": opts2},
                 {"header": "Same", "question": "Q2?", "options": opts2}
@@ -991,7 +1055,10 @@ mod tests {
             assert_eq!(result.is_error, Some(true), "{case}");
             assert_eq!(result.details["errorCode"], "invalid_arguments", "{case}");
         }
-        assert!(ui.dialogs.lock().is_empty(), "an invalid call never opens a dialog");
+        assert!(
+            ui.dialogs.lock().is_empty(),
+            "an invalid call never opens a dialog"
+        );
     }
 
     #[tokio::test]
@@ -1012,7 +1079,9 @@ mod tests {
 
     #[tokio::test]
     async fn multi_select_and_several_questions_shape_the_dialog() {
-        let (ui, tool) = gateway(Some(json!({"answers": {}, "comment": "SQLite plus a cache"})));
+        let (ui, tool) = gateway(Some(
+            json!({"answers": {}, "comment": "SQLite plus a cache"}),
+        ));
         call(&tool, two_questions()).await.unwrap();
         let dialogs = ui.dialogs.lock();
         assert_eq!(dialogs[0].0, "Storage / Extras");
@@ -1033,14 +1102,21 @@ mod tests {
         assert_eq!(result.details["pending"], false);
         assert_eq!(result.details["answers"][0]["header"], "Storage");
         assert_eq!(result.details["answers"][0]["selected"], json!(["SQLite"]));
-        assert!(result.details["questionId"].as_str().is_some_and(|id| id.starts_with("askq-")));
+        assert!(result.details["questionId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("askq-")));
     }
 
     #[tokio::test]
     async fn free_text_and_unknown_labels_are_the_users_own_answer() {
-        let (_, tool) = gateway(Some(json!({"answers": {"q1": {"selected": [], "text": "DuckDB"}}})));
+        let (_, tool) = gateway(Some(
+            json!({"answers": {"q1": {"selected": [], "text": "DuckDB"}}}),
+        ));
         let result = call(&tool, storage()).await.unwrap();
-        assert_eq!(text_of(&result), "User answered:\n- Storage: own answer: \"DuckDB\"");
+        assert_eq!(
+            text_of(&result),
+            "User answered:\n- Storage: own answer: \"DuckDB\""
+        );
         assert_eq!(result.details["answers"][0]["selected"], json!([]));
         assert_eq!(result.details["answers"][0]["other"], "DuckDB");
 
@@ -1051,7 +1127,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_multi_question_dialog_answered_by_comment_alone_keeps_the_comment() {
-        let (_, tool) = gateway(Some(json!({"answers": {}, "comment": "SQLite plus a cache"})));
+        let (_, tool) = gateway(Some(
+            json!({"answers": {}, "comment": "SQLite plus a cache"}),
+        ));
         let result = call(&tool, two_questions()).await.unwrap();
         assert_eq!(
             text_of(&result),
@@ -1077,17 +1155,27 @@ mod tests {
     async fn a_degraded_select_value_answers_a_single_question() {
         let (_, tool) = gateway(Some(json!({"value": "Postgres"})));
         let result = call(&tool, storage()).await.unwrap();
-        assert_eq!(result.details["answers"][0]["selected"], json!(["Postgres"]));
+        assert_eq!(
+            result.details["answers"][0]["selected"],
+            json!(["Postgres"])
+        );
     }
 
     #[tokio::test]
     async fn a_dismissed_question_is_a_result_unless_required() {
-        for response in [Some(json!({"cancelled": true})), None, Some(json!({"answers": {}}))] {
+        for response in [
+            Some(json!({"cancelled": true})),
+            None,
+            Some(json!({"answers": {}})),
+        ] {
             let (_, tool) = gateway(response);
             let result = call(&tool, storage()).await.unwrap();
             assert_eq!(result.is_error, None);
             assert_eq!(result.details["cancelled"], true);
-            assert_eq!(text_of(&result), "The user dismissed the question without answering.");
+            assert_eq!(
+                text_of(&result),
+                "The user dismissed the question without answering."
+            );
         }
         let (_, tool) = gateway(Some(json!({"cancelled": true})));
         let mut params = storage();
@@ -1100,7 +1188,9 @@ mod tests {
     #[tokio::test]
     async fn hosts_without_the_gateway_dialog_ask_through_the_ask_tool() {
         let tool = tool_with(
-            Arc::new(TauUi(json!({"answers": [{"id": "q1", "selectedOptions": ["Postgres"]}]}))),
+            Arc::new(TauUi(
+                json!({"answers": [{"id": "q1", "selectedOptions": ["Postgres"]}]}),
+            )),
             None,
         );
         let result = call(&tool, storage()).await.unwrap();
@@ -1177,7 +1267,12 @@ mod tests {
             fn has_question_dialog(&self) -> bool {
                 true
             }
-            fn question(&self, _: String, _: Value, _: Option<u64>) -> BoxFut<'static, Result<Option<Value>>> {
+            fn question(
+                &self,
+                _: String,
+                _: Value,
+                _: Option<u64>,
+            ) -> BoxFut<'static, Result<Option<Value>>> {
                 Box::pin(std::future::pending())
             }
         }
@@ -1190,9 +1285,14 @@ mod tests {
 
     async fn goal_call(tools: &[Arc<dyn AgentTool>], name: &str, params: Value) -> AgentToolResult {
         let tool = tools.iter().find(|t| t.name() == name).unwrap().clone();
-        tool.execute("call".into(), params, AbortSignal::never(), Arc::new(|_| {}))
-            .await
-            .unwrap()
+        tool.execute(
+            "call".into(),
+            params,
+            AbortSignal::never(),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap()
     }
 
     fn fresh_goals() -> Vec<Arc<dyn AgentTool>> {
@@ -1259,10 +1359,19 @@ mod tests {
         let missing = goal_call(&tools, "update_goal", json!({"status": "complete"})).await;
         assert_eq!(missing.is_error, Some(true));
         assert_eq!(missing.details["errorCode"], "goal_not_found");
-        let missing = goal_call(&tools, "update_goal", json!({"status": "blocked", "reason": "x"})).await;
+        let missing = goal_call(
+            &tools,
+            "update_goal",
+            json!({"status": "blocked", "reason": "x"}),
+        )
+        .await;
         assert_eq!(missing.details["errorCode"], "goal_not_found");
 
-        for bad in [json!({}), json!({"objective": "   "}), json!({"objective": "x".repeat(4001)})] {
+        for bad in [
+            json!({}),
+            json!({"objective": "   "}),
+            json!({"objective": "x".repeat(4001)}),
+        ] {
             let result = goal_call(&tools, "create_goal", bad).await;
             assert_eq!(result.is_error, Some(true));
             assert_eq!(result.details["errorCode"], "invalid_arguments");
@@ -1294,7 +1403,12 @@ mod tests {
         let tools = fresh_goals();
         goal_call(&tools, "create_goal", json!({"objective": "x"})).await;
         goal_call(&tools, "update_goal", json!({"status": "complete"})).await;
-        let result = goal_call(&tools, "update_goal", json!({"status": "blocked", "reason": "late"})).await;
+        let result = goal_call(
+            &tools,
+            "update_goal",
+            json!({"status": "blocked", "reason": "late"}),
+        )
+        .await;
         assert_eq!(result.is_error, Some(true));
         assert_eq!(result.details["errorCode"], "invalid_arguments");
     }
@@ -1303,15 +1417,17 @@ mod tests {
     fn the_session_registry_lists_the_compat_tools() {
         let dir = tempfile::tempdir().unwrap();
         let settings = omp_settings::Settings::load(dir.path());
-        let names: Vec<_> = crate::tools::session_builtin_tools(
-            dir.path(),
-            pi_edit::EditMode::Replace,
-            &settings,
-        )
-        .iter()
-        .map(|t| t.name())
-        .collect();
-        for name in ["ask_user_question", "create_goal", "get_goal", "update_goal"] {
+        let names: Vec<_> =
+            crate::tools::session_builtin_tools(dir.path(), pi_edit::EditMode::Replace, &settings)
+                .iter()
+                .map(|t| t.name())
+                .collect();
+        for name in [
+            "ask_user_question",
+            "create_goal",
+            "get_goal",
+            "update_goal",
+        ] {
             assert!(names.contains(&name), "{name} is registered");
         }
         // tau's own tools stay.
