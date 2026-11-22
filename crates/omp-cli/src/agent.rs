@@ -288,7 +288,15 @@ pub fn build_agent(
             })
         }),
         stream_fn: Some(crate::methodology::wrap_stream(
-            switchable_stream_fn(target.clone()),
+            // The provider's HTTP response lands before its stream body is read: the extension
+            // host observes it (`after_provider_response`, TS `sdk.ts` `onResponse`).
+            match ext_hooks {
+                Some(ext) => crate::ext::with_response_hook(
+                    switchable_stream_fn(target.clone()),
+                    crate::ext::after_provider_response_hook(ext.host.clone()),
+                ),
+                None => switchable_stream_fn(target.clone()),
+            },
             core_profile,
             ext_hooks.map(crate::ext::Extensions::payload_hook),
         )),

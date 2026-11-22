@@ -2632,6 +2632,7 @@ mod tests {
             rt: Mutex::new(None),
             blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_agent_end: Arc::new(Mutex::new(None)),
+            credential_disabled: Arc::new(CredentialDisabledFeed::default()),
         })
     }
 

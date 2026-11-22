@@ -724,9 +724,11 @@ impl ExtHost {
         /// `credential_disabled`: the auth store tore down a credential on its own.
         #[allow(clippy::too_many_arguments)] // one argument per omp payload field
         emit_credential_disabled(provider: String, disabled_cause: String, credential_id: Option<i64>, email: Option<String>, account_id: Option<String>, org_id: Option<String>, org_name: Option<String>) => LifecycleEvent::CredentialDisabled { provider, disabled_cause, credential_id, email, account_id, org_id, org_name };
-    }
         /// `mode_changed`: a built-in session mode changed.
         emit_mode_changed(previous: SessionModeState, state: SessionModeState) => LifecycleEvent::ModeChanged { previous, state };
+        /// `after_provider_response`.
+        emit_after_provider_response(status: u16, headers: std::collections::BTreeMap<String, String>, request_id: Option<String>) => LifecycleEvent::AfterProviderResponse { status, headers, request_id };
+    }
 
     /// `before_subagent_spawn`: `block` refuses the spawn; `model` replaces the pattern list.
     ///
@@ -752,8 +754,6 @@ impl ExtHost {
             &self.emit_event(&ev, ctx).await?.result,
         ))
     }
-        /// `after_provider_response`.
-        emit_after_provider_response(status: u16, headers: std::collections::BTreeMap<String, String>, request_id: Option<String>) => LifecycleEvent::AfterProviderResponse { status, headers, request_id };
 
     /// `session.compacting`: before summarization; the last handler result may override the
     /// prompt, add context lines and set the entry's `preserveData`.

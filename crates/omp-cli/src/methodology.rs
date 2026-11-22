@@ -116,16 +116,6 @@ pub fn wrap_stream(
     core: bool,
     payload_hook: Option<pa_agent::stream::OnPayloadHook>,
 ) -> StreamFn {
-    // The provider's HTTP response lands before its stream body is read: the extension host
-    // observes it (`after_provider_response`, TS `sdk.ts` `onResponse`). The loop passes no
-    // request hooks of its own, so they are composed here, at the request seam.
-    let base = match &extensions {
-        Some(ext) => crate::ext::with_response_hook(
-            base,
-            crate::ext::after_provider_response_hook(ext.host.clone()),
-        ),
-        None => base,
-    };
     Arc::new(move |model: Model, mut context: LlmContext, mut options| {
         let base = base.clone();
         let payload_hook = payload_hook.clone();

@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use omp_ext::lifecycle::{ApprovalMode, CompactingOutcome, CompactionAction, CompactionReason, GoalModeState, LifecycleEvent, ModeStatus, PlanModeState, SessionModeState, SubagentInvocationKind};
+use omp_ext::lifecycle::{
+    ApprovalMode, CompactingOutcome, CompactionAction, CompactionReason, GoalModeState,
+    LifecycleEvent, ModeStatus, PlanModeState, SessionModeState, SubagentInvocationKind,
+};
 use omp_ext::{ExtHost, HostConfig, HostMessage};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedReceiver;
