@@ -20,7 +20,7 @@ use pa_agent::types::{
 use serde_json::{json, Value};
 
 use omp_ext::hooks::ExtHooks;
-use omp_ext::lifecycle::{self, InputSource, LifecycleEvent, SwitchReason};
+use omp_ext::lifecycle::{self, CompactingOutcome, InputSource, LifecycleEvent, SwitchReason};
 use omp_ext::{ExtHost, HostConfig, HostMessage, ToolInfo};
 use omp_providers::auth::{
     on_credential_disabled, CredentialDisabledEvent, CredentialDisabledSubscription,
@@ -666,7 +666,8 @@ pub struct Extensions {
     credential_disabled: Arc<CredentialDisabledFeed>,
 }
 
-/// `session_before_compact` / `session_compact` emission around runtime compactions.
+/// `session_before_compact` / `session.compacting` / `session_compact` emission around runtime
+/// compactions.
 struct CompactBridge {
     host: Arc<ExtHost>,
 }
@@ -696,6 +697,30 @@ impl crate::runtime::CompactionHooks for CompactBridge {
                 Err(e) => {
                     eprintln!("omt: extension session_before_compact: {e:#}");
                     false
+                }
+            }
+        })
+    }
+
+    fn compacting<'a>(
+        &'a self,
+        session_id: &'a str,
+        messages: Vec<Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CompactingOutcome>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if !self.host.has_handlers("session.compacting") {
+                return None;
+            }
+            match self
+                .host
+                .emit_session_compacting(session_id.to_owned(), messages, None)
+                .await
+            {
+                Ok(outcome) => Some(outcome),
+                Err(e) => {
+                    eprintln!("omt: extension session.compacting: {e:#}");
+                    None
                 }
             }
         })

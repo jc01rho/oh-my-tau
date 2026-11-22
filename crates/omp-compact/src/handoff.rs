@@ -95,6 +95,8 @@ pub struct HandoffCommit<'a> {
     pub tokens_before: u64,
     pub tokens_after: Option<u64>,
     pub file_ops: &'a FileOperations,
+    /// `preserveData` for the committed entry (the `session.compacting` handler's).
+    pub preserve_data: Option<&'a Value>,
 }
 
 /// `handoffSummaryFromDocument` + the `appendCompaction` payload for a handoff.
@@ -122,7 +124,7 @@ pub fn handoff_compaction_entry(
         provider_replay_through_entry_id: None,
         details: Some(details),
         from_extension: Some(false),
-        preserve_data: None,
+        preserve_data: commit.preserve_data.cloned(),
         warning: None,
         rest: Map::new(),
     }
@@ -149,6 +151,9 @@ pub fn append_handoff(
     payload.insert("method".into(), "handoff".into());
     payload.insert("details".into(), details);
     payload.insert("fromExtension".into(), false.into());
+    if let Some(preserve) = commit.preserve_data {
+        payload.insert("preserveData".into(), preserve.clone());
+    }
     writer.append_entry("compaction", Value::Object(payload), timestamp_iso)
 }
 

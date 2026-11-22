@@ -5,7 +5,7 @@ const OBSERVED = [
   "session_branch", "session_tree", "session_shutdown",
   "assistant_message", "auto_compaction_start", "auto_compaction_end", "auto_retry_start", "auto_retry_end",
   "retry_fallback_applied", "retry_fallback_succeeded", "ttsr_triggered", "todo_reminder", "goal_updated",
-  "tool_approval_requested", "tool_approval_resolved",
+  "tool_approval_requested", "tool_approval_resolved", "session.compacting",
 ];
 const RESULTS: Record<string, unknown> = {
   before_agent_start: { message: { customType: "fx", content: "hello", display: false }, systemPrompt: ["sys-a", "sys-b"] },
@@ -17,6 +17,7 @@ const RESULTS: Record<string, unknown> = {
   session_stop: { continue: true, additionalContext: "keep going" },
   user_bash: { result: { output: "handled", exitCode: 0 } },
   user_python: { result: { output: "py", exitCode: 0 } },
+  "session.compacting": { context: ["ctx line"], prompt: "CUSTOM PROMPT", preserveData: { keep: 1 } },
 };
 
 export default function lifecycle(pi: any): void {

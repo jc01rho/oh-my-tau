@@ -87,6 +87,7 @@ async fn handoff_document_commits_as_handoff_compaction_and_replays() {
         tokens_before: 500,
         tokens_after: Some(80),
         file_ops: &file_ops,
+        preserve_data: None,
     };
     let entry = handoff_compaction_entry(
         "h1",

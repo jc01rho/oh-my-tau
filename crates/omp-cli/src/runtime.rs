@@ -23,6 +23,7 @@ use crate::agent::Target;
 use crate::events::Framer;
 use crate::persist::Persistence;
 use crate::tools::edit_mode_for;
+use omp_ext::lifecycle::CompactingOutcome;
 use omp_tui::magic::Ultra;
 
 // Declared here (not in main.rs, which another agent owns); same file `src/recovery.rs`.
@@ -246,6 +247,13 @@ pub trait CompactionHooks: Send + Sync {
         branch_entries: Vec<Value>,
         custom_instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    /// Before summarizing, after `before`: `session.compacting` (TS `#prepareCompactionFromHooks`).
+    /// `None` when no extension subscribes.
+    fn compacting<'a>(
+        &'a self,
+        session_id: &'a str,
+        messages: Vec<Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CompactingOutcome>> + Send + 'a>>;
     /// After the `compaction` entry is committed.
     fn after<'a>(
         &'a self,
@@ -267,6 +275,15 @@ impl crate::compact::CompactHook for HookWithBranch<'_> {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         self.hooks
             .before(preparation, self.branch.clone(), custom_instructions)
+    }
+
+    fn compacting<'a>(
+        &'a self,
+        session_id: &'a str,
+        messages: Vec<Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CompactingOutcome>> + Send + 'a>>
+    {
+        self.hooks.compacting(session_id, messages)
     }
 }
 

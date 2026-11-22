@@ -321,6 +321,13 @@ pub enum LifecycleEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         org_name: Option<String>,
     },
+    /// Before compaction summarization: handlers may replace the summary prompt, add context
+    /// lines and stash `preserveData` on the entry (the last result wins).
+    #[serde(rename = "session.compacting", rename_all = "camelCase")]
+    SessionCompacting {
+        session_id: String,
+        messages: Vec<Value>,
+    },
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -358,6 +365,38 @@ pub struct InputOutcome {
 pub struct CancelOutcome {
     pub cancel: bool,
     pub result: Value,
+}
+
+/// Outcome of `session.compacting` (TS `SessionCompactingResult`): extra summary context, a
+/// summarization-prompt override, and data the committed `compaction` entry keeps.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactingOutcome {
+    /// Lines appended to the summary request (`<additional-context>`).
+    pub context: Vec<String>,
+    /// Replaces the default summarization prompt.
+    pub prompt: Option<String>,
+    /// Stored on the `compaction` entry as `preserveData`.
+    pub preserve_data: Option<Value>,
+}
+
+impl CompactingOutcome {
+    fn from_value(v: &Value) -> Self {
+        Self {
+            context: v
+                .get("context")
+                .and_then(Value::as_array)
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            prompt: str_of(v, "prompt"),
+            preserve_data: v.get("preserveData").filter(|d| d.is_object()).cloned(),
+        }
+    }
 }
 
 /// Outcome of `session_stop`: a handler may request one continuation turn.
@@ -544,6 +583,26 @@ impl ExtHost {
         /// `credential_disabled`: the auth store tore down a credential on its own.
         #[allow(clippy::too_many_arguments)] // one argument per omp payload field
         emit_credential_disabled(provider: String, disabled_cause: String, credential_id: Option<i64>, email: Option<String>, account_id: Option<String>, org_id: Option<String>, org_name: Option<String>) => LifecycleEvent::CredentialDisabled { provider, disabled_cause, credential_id, email, account_id, org_id, org_name };
+    }
+
+    /// `session.compacting`: before summarization; the last handler result may override the
+    /// prompt, add context lines and set the entry's `preserveData`.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_session_compacting(
+        &self,
+        session_id: String,
+        messages: Vec<Value>,
+        ctx: Option<Value>,
+    ) -> Result<CompactingOutcome> {
+        let ev = LifecycleEvent::SessionCompacting {
+            session_id,
+            messages,
+        };
+        Ok(CompactingOutcome::from_value(
+            &self.emit_event(&ev, ctx).await?.result,
+        ))
     }
 
     /// `assistant_message`: a handler may rewrite the text of the finalized message (text blocks only).
