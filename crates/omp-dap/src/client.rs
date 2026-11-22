@@ -65,10 +65,12 @@ struct PendingRequest {
     tx: oneshot::Sender<DapResult<Value>>,
 }
 
+type EventPredicate = Arc<dyn Fn(&Value) -> bool + Send + Sync>;
+
 /// A registered `wait_for_event` waiter.
 struct EventWaiter {
     event: String,
-    predicate: Option<Arc<dyn Fn(&Value) -> bool + Send + Sync>>,
+    predicate: Option<EventPredicate>,
     tx: Option<oneshot::Sender<Option<Value>>>,
 }
 
@@ -396,7 +398,7 @@ impl DapClient {
 
     fn assemble(
         adapter: &DapResolvedAdapter,
-        cwd: &PathBuf,
+        cwd: &Path,
         write: Box<dyn AsyncWrite + Unpin + Send>,
         read: Box<dyn AsyncRead + Unpin + Send>,
         stderr: Option<tokio::process::ChildStderr>,
@@ -421,7 +423,7 @@ impl DapClient {
         });
         let client = Arc::new(Self {
             adapter: adapter.clone(),
-            cwd: cwd.clone(),
+            cwd: cwd.to_path_buf(),
             inner: Arc::clone(&inner),
             child: Mutex::new(child),
             port,
@@ -598,7 +600,7 @@ impl DapClient {
     pub async fn wait_for_event(
         &self,
         event: &str,
-        predicate: Option<Arc<dyn Fn(&Value) -> bool + Send + Sync>>,
+        predicate: Option<EventPredicate>,
         cancel: Option<&dyn Cancel>,
         timeout: Option<Duration>,
     ) -> DapResult<Value> {
@@ -1127,6 +1129,7 @@ impl Framer {
     }
 
     /// Pop the next complete message body; `None` when more bytes are needed.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<String> {
         loop {
             let header_end = find_subslice(&self.buf, b"\r\n\r\n")?;

@@ -378,6 +378,7 @@ struct SessionInner {
     capabilities: DapCapabilities,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for DapSessionStatus {
     fn default() -> Self {
         Self::Launching
@@ -543,7 +544,7 @@ impl DapSessionState {
                     thread_id: parsed.thread_id,
                     reason: Some(parsed.reason.clone()),
                     description: parsed.description.clone(),
-                    text: parsed.text.clone(),
+                    text: parsed.text,
                     ..DapStopLocation::default()
                 };
                 if location.thread_id.is_none() {
@@ -1217,7 +1218,7 @@ impl DapSessionManager {
                 parent.remove_child(state.id());
             }
         }
-        self.forget(&state.id());
+        self.forget(state.id());
         Ok(snapshot)
     }
 
@@ -1937,6 +1938,7 @@ impl DapSessionManager {
     /// # Errors
     ///
     /// Returns [`DapError::Unsupported`] when the adapter lacks the capability.
+    #[allow(clippy::too_many_arguments)]
     pub async fn disassemble(
         &self,
         id: Option<&str>,

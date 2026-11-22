@@ -177,9 +177,7 @@ fn merge_adapter(base: Option<&DapAdapterConfig>, raw: &Value) -> Option<DapAdap
         return None;
     }
     let mut merged = serde_json::to_value(existing).ok()?;
-    let Some(merged_obj) = merged.as_object_mut() else {
-        return None;
-    };
+    let merged_obj = merged.as_object_mut()?;
     for key in ["launchDefaults", "attachDefaults"] {
         let base_defaults = merged_obj.get(key).cloned().unwrap_or(Value::Null);
         let raw_defaults = raw.get(key).cloned().unwrap_or(Value::Null);
@@ -191,9 +189,7 @@ fn merge_adapter(base: Option<&DapAdapterConfig>, raw: &Value) -> Option<DapAdap
             merged_obj.insert(key.to_string(), Value::Object(combined));
         }
     }
-    let Some(raw_obj) = raw.as_object() else {
-        return None;
-    };
+    let raw_obj = raw.as_object()?;
     for (k, v) in raw_obj {
         if k == "launchDefaults" || k == "attachDefaults" {
             continue;
@@ -269,11 +265,13 @@ pub fn load_adapter_configs(cwd: &Path) -> BTreeMap<String, DapAdapterConfig> {
     adapters
 }
 
+type AdapterConfigCache =
+    OnceLock<Mutex<BTreeMap<PathBuf, Arc<BTreeMap<String, DapAdapterConfig>>>>>;
+
 /// Adapter configs for `cwd`, cached per normalized path.
 #[must_use]
 pub fn get_adapter_configs(cwd: &Path) -> Arc<BTreeMap<String, DapAdapterConfig>> {
-    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, Arc<BTreeMap<String, DapAdapterConfig>>>>> =
-        OnceLock::new();
+    static CACHE: AdapterConfigCache = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
     let key = normalize_path(cwd);
     if let Ok(guard) = cache.lock() {
@@ -290,8 +288,7 @@ pub fn get_adapter_configs(cwd: &Path) -> Arc<BTreeMap<String, DapAdapterConfig>
 
 /// Drop the cached config for `cwd` (tests, and `reload` of adapter settings).
 pub fn invalidate_config(cwd: &Path) {
-    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, Arc<BTreeMap<String, DapAdapterConfig>>>>> =
-        OnceLock::new();
+    static CACHE: AdapterConfigCache = OnceLock::new();
     if let Some(cache) = CACHE.get() {
         if let Ok(mut guard) = cache.lock() {
             guard.remove(&normalize_path(cwd));
@@ -872,7 +869,7 @@ async fn process_image_name(pid: u32) -> Option<String> {
             .await
             .ok()?;
         let name = comm.trim();
-        return (!name.is_empty()).then(|| name.to_string());
+        (!name.is_empty()).then(|| name.to_string())
     }
     #[cfg(not(target_os = "linux"))]
     {

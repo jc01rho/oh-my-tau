@@ -941,6 +941,7 @@ impl DapResolvedAdapter {
 
 /// Result of automatic launch-adapter selection (omp `LaunchAdapterSelection`).
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum LaunchAdapterSelection {
     /// A runnable adapter.
     Adapter(DapResolvedAdapter),
