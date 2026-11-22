@@ -33,6 +33,43 @@ fn discover_once(cwd: &Path) -> Arc<Discovery> {
     registry
 }
 
+/// What `/reload-plugins` swaps: the tool names the previous registry
+/// contributed and the freshly discovered registry's tools and load errors.
+pub struct Rediscovered {
+    /// `<plugin>_<tool>` names of the registry being replaced.
+    pub old_names: Vec<String>,
+    /// Tools of the new registry.
+    pub tools: Vec<Arc<dyn AgentTool>>,
+    /// Plugins that loaded.
+    pub plugins: usize,
+    /// `path: error` for every plugin that failed to load.
+    pub failures: Vec<String>,
+}
+
+/// Drop the cached registry for `cwd` and discover again (TS
+/// `clearPluginRootsAndCaches` for the WASM plugin source).
+pub fn rediscover(cwd: &Path) -> Rediscovered {
+    let old_names: Vec<String> = wasm_tools(cwd)
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect();
+    *REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let tools = wasm_tools(cwd);
+    let registry = discover_once(cwd);
+    Rediscovered {
+        old_names,
+        tools,
+        plugins: registry.plugins.len(),
+        failures: registry
+            .failures
+            .iter()
+            .map(|(path, error)| format!("{}: {error}", path.display()))
+            .collect(),
+    }
+}
+
 /// Discover WASM plugins for `cwd` and wrap each manifest tool as an agent
 /// tool named `<plugin>_<tool>`.
 #[must_use]
@@ -254,5 +291,27 @@ impl AgentTool for WasmTool {
                 }),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rediscover_sees_plugins_added_after_the_first_discovery() {
+        let cwd = tempfile::tempdir().unwrap();
+        let plugins = cwd.path().join(".omp/plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        let before = wasm_tools(cwd.path());
+        std::fs::write(plugins.join("late.wasm"), b"not a wasm module").unwrap();
+        let fresh = rediscover(cwd.path());
+        assert_eq!(fresh.old_names.len(), before.len());
+        assert!(
+            fresh.failures.iter().any(|f| f.contains("late.wasm")),
+            "{:?}",
+            fresh.failures
+        );
+        assert!(plugins_list_text(cwd.path()).contains("late.wasm"));
     }
 }

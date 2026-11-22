@@ -3806,6 +3806,83 @@ impl Runtime {
         true
     }
 
+    /// `/reload-plugins` (TS `reloadTuiPluginState` / `runtime.reloadPlugins`):
+    /// re-discover what omp-rs loads from plugin sources and swap it into the
+    /// live session without a restart — WASM plugin tools (the old registry's
+    /// tools leave the tool list, the new one's join it, gated like the rest),
+    /// the base system prompt (skills and the tool surface re-read), and the
+    /// slash catalog (WASM plugin commands and `commands/*.md` files). Returns
+    /// the report lines; extension hosts and MCP connections are named as
+    /// needing `/restart` because they are not reloaded live.
+    pub async fn reload_plugins(self: &Arc<Self>) -> Vec<String> {
+        let settings = omp_settings::Settings::load(&self.cwd);
+        let wasm = crate::tools::wasm::rediscover(&self.cwd);
+        let mut tools: Vec<Arc<dyn pa_agent::types::AgentTool>> = self
+            .agent
+            .tools()
+            .await
+            .into_iter()
+            .filter(|tool| !wasm.old_names.iter().any(|name| name == tool.name()))
+            .collect();
+        tools.extend(match crate::approval::Gate::get() {
+            Some(gate) => gate.wrap_tools(wasm.tools.clone()),
+            None => wasm.tools.clone(),
+        });
+        if let Some(env) = crate::tools::session_env() {
+            env.set_dyn_tools(&tools);
+        }
+        crate::tools::eval_bridge::set_session_tools(tools.clone());
+        if let Some(opts) = crate::sysprompt::session_options() {
+            let model = self
+                .target
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|target| target.model.clone());
+            let hidden = crate::tools::hidden_tools(&settings, model.as_ref(), false, false);
+            let surface: Vec<_> = tools
+                .iter()
+                .filter(|tool| tool.name() != crate::context::TOOL_NAME)
+                .cloned()
+                .collect();
+            self.agent
+                .set_system_prompt(crate::agent::base_prompt(
+                    &self.cwd, &opts, &hidden, &surface,
+                ))
+                .await;
+        }
+        self.agent.set_tools(tools).await;
+        let catalog = crate::rpc::slash::dynamic_commands(self).await;
+        let file_commands = catalog
+            .iter()
+            .filter(|c| c.get("source").and_then(Value::as_str) == Some("file"))
+            .count();
+        self.set_available_commands(catalog);
+        let mut lines = vec![
+            "Plugins reloaded.".to_string(),
+            format!(
+                "WASM plugins: {} ({} tools)",
+                wasm.plugins,
+                wasm.tools.len()
+            ),
+            format!("File commands: {file_commands}"),
+            format!(
+                "Skills: {}",
+                crate::sysprompt::visible_skills(&self.cwd).len()
+            ),
+        ];
+        lines.extend(
+            wasm.failures
+                .iter()
+                .map(|failure| format!("WASM plugin load error: {failure}")),
+        );
+        lines.push(
+            "Extensions and MCP server connections are not reloaded live; run /restart to pick up changes there."
+                .to_string(),
+        );
+        lines
+    }
+
     /// `ModelControls.setThinkingLevel`: clamp to the live model; journal and announce only a change.
     /// Returns the effective level.
     async fn apply_thinking(&self, requested: ThinkingLevel) -> ThinkingLevel {
@@ -6049,6 +6126,30 @@ mod compaction_guard_tests {
         .await;
         std::mem::forget(provider);
         Harness { rt, rx, _dir: dir }
+    }
+
+    #[tokio::test]
+    async fn reload_plugins_picks_up_commands_added_after_start() {
+        let h = harness(0).await;
+        h.rt.set_available_commands(crate::rpc::slash::dynamic_commands(&h.rt).await);
+        let has = |rt: &Runtime, name: &str| {
+            rt.available_commands()
+                .iter()
+                .any(|c| c.get("name").and_then(Value::as_str) == Some(name))
+        };
+        assert!(!has(&h.rt, "p8b2-late"));
+        let commands = h.rt.cwd.join(".omp/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(commands.join("p8b2-late.md"), "Say late things\n").unwrap();
+        let tools_before = h.rt.agent.tools().await.len();
+        let report = h.rt.reload_plugins().await;
+        assert_eq!(report[0], "Plugins reloaded.");
+        assert!(report.iter().any(|l| l.starts_with("File commands: ")));
+        assert!(has(&h.rt, "p8b2-late"), "the reload refreshed the catalog");
+        assert_eq!(
+            h.rt.agent.tools().await.len(),
+            tools_before + crate::tools::wasm::wasm_tools(&h.rt.cwd).len()
+        );
     }
 
     async fn until_settled(rx: &mut UnboundedReceiver<Value>) {

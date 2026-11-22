@@ -888,6 +888,33 @@ pub fn set_skill_paths(paths: Vec<PathBuf>) {
     let _ = SKILL_EXTRA_ROOTS.set(paths);
 }
 
+/// The options the session's base prompt was assembled from (kept by agent
+/// construction so `/reload-plugins` can reassemble it with fresh skills).
+static SESSION_OPTIONS: std::sync::Mutex<Option<Options>> = std::sync::Mutex::new(None);
+
+/// Remember the session's prompt options.
+pub fn remember_session_options(opts: &Options) {
+    *SESSION_OPTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(opts.clone());
+}
+
+/// The session's prompt options, once the agent was built.
+pub fn session_options() -> Option<Options> {
+    SESSION_OPTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The skills the prompt for `cwd` lists now (`skills.enabled` honoured).
+pub fn visible_skills(cwd: &Path) -> Vec<Skill> {
+    let enabled = omp_settings::Settings::load(cwd)
+        .get_bool("skills.enabled")
+        .unwrap_or(true);
+    load_skills(&agent_dir(), cwd, enabled)
+}
+
 /// All visible skills for the prompt (TS: `loadSkills` from the agent dir's
 /// `skills/`, `hide: true` dropped from the render).
 pub fn load_skills(agent: &Path, cwd: &Path, enabled: bool) -> Vec<Skill> {
@@ -1445,7 +1472,7 @@ pub fn render(template: &str, data: &Value) -> String {
 // ---------------------------------------------------------------------------
 
 /// Inputs the CLI gathers for the system prompt.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Options {
     /// `--system-prompt <path|text>` (replaces the default prompt).
     pub system_prompt: Option<String>,

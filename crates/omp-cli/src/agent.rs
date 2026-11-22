@@ -126,6 +126,32 @@ pub fn deferred_tools_note(deferred: &[String]) -> String {
     )
 }
 
+/// The session's base system prompt: the assembled omp prompt plus, under the
+/// `tools.profile: core` profile, the deferred-tools note for every tool of
+/// `tools` outside the core set. Shared by agent construction and
+/// `/reload-plugins`.
+pub fn base_prompt(
+    cwd: &Path,
+    opts: &crate::sysprompt::Options,
+    hidden: &[Arc<dyn AgentTool>],
+    tools: &[Arc<dyn AgentTool>],
+) -> String {
+    let mut prompt = system_prompt(cwd, opts, hidden);
+    let core_profile = opts.tools_csv.is_none() && crate::methodology::core_profile_requested();
+    if core_profile {
+        let deferred: Vec<String> = tools
+            .iter()
+            .filter(|tool| !crate::methodology::is_core_tool(tool.name()))
+            .map(|tool| tool.name().to_string())
+            .collect();
+        if !deferred.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&deferred_tools_note(&deferred));
+        }
+    }
+    prompt
+}
+
 /// Build an agent for `cwd` using the selected model, plus the provider
 /// target slot a live `set_model` swaps. `extra_tools` (extension tools) are
 /// appended to the built-ins; `ext_hooks`, when present, wires the extension
@@ -194,22 +220,12 @@ pub fn build_agent(
         .collect();
     tools.retain(|tool| !replacement_names.contains(tool.name()));
     tools.extend(extra_tools);
-    let mut prompt = system_prompt(cwd, sysprompt_opts, &hidden);
     crate::tools::set_session_jobs(session_jobs);
-    tools.extend(hidden);
+    tools.extend(hidden.iter().cloned());
+    let prompt = base_prompt(cwd, sysprompt_opts, &hidden, &tools);
+    crate::sysprompt::remember_session_options(sysprompt_opts);
     let core_profile =
         sysprompt_opts.tools_csv.is_none() && crate::methodology::core_profile_requested();
-    if core_profile {
-        let deferred: Vec<String> = tools
-            .iter()
-            .filter(|tool| !crate::methodology::is_core_tool(tool.name()))
-            .map(|tool| tool.name().to_string())
-            .collect();
-        if !deferred.is_empty() {
-            prompt.push_str("\n\n");
-            prompt.push_str(&deferred_tools_note(&deferred));
-        }
-    }
     let ctx = (context_strategy != crate::context::Kind::Append).then(|| {
         let policy = crate::context_policy::Policy::resolve(&settings, &|k| std::env::var(k).ok())
             .unwrap_or_else(|e| {

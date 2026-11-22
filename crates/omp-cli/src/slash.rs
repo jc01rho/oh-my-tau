@@ -782,7 +782,7 @@ async fn dispatch_builtin_more(
             })
         }
         "reload-plugins" => {
-            output(rt, RELOAD_PLUGINS_UNSUPPORTED);
+            output(rt, &rt.reload_plugins().await.join("\n"));
             Some(Handled {
                 agent_invoked: false,
             })
@@ -3145,10 +3145,6 @@ fn unported_reserved_notice(name: &str) -> String {
     )
 }
 
-/// `/reload-plugins`: omp loads WASM plugins and extensions once per session
-/// and has no hot-reload path, so say that instead of claiming a reload.
-const RELOAD_PLUGINS_UNSUPPORTED: &str = "Plugin hot reload is not supported: plugins and extensions load when the session starts. Run /restart to pick up plugin changes.";
-
 /// Names (including aliases) reserved by text-mode builtins
 /// (TS `ACP_BUILTIN_RESERVED_NAMES`, from `builtin_commands.json`).
 fn is_reserved_builtin(name: &str) -> bool {
@@ -3345,11 +3341,6 @@ mod tests {
                 "/{name} is not an upstream-only name"
             );
         }
-    }
-
-    #[test]
-    fn stub_notices_do_not_claim_success() {
-        assert!(!RELOAD_PLUGINS_UNSUPPORTED.contains("reloaded"));
     }
 
     #[test]
