@@ -11,10 +11,10 @@
 //! * After a provider 401 [`recover`] force-refreshes the failing credential once
 //!   (`?reason=auth-recovery` through the broker) and hands back the new bearer, if it differs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -60,6 +60,168 @@ impl CredentialPool {
     pub fn has_alternates(&self) -> bool {
         !self.alternates.is_empty()
     }
+}
+
+/// One credential the store tore down on its own (TS `CredentialDisabledEvent`, `auth/types.ts`):
+/// the provider, the verbatim failure kept as the row's `disabled_cause`, and the account identity
+/// an OAuth row was signed in as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialDisabledEvent {
+    pub provider: String,
+    pub disabled_cause: String,
+    pub credential_id: Option<i64>,
+    pub email: Option<String>,
+    pub account_id: Option<String>,
+    pub org_id: Option<String>,
+    pub org_name: Option<String>,
+}
+
+impl CredentialDisabledEvent {
+    /// TS `credentialDisabledEvent` (`auth/pool.ts`): the identity fields come from an OAuth
+    /// credential only, and only when the row carries them.
+    fn from_parts(provider: &str, id: i64, oauth: bool, credential: &Value, cause: &str) -> Self {
+        let identity = |key: &str| {
+            oauth
+                .then(|| credential.get(key).and_then(Value::as_str))
+                .flatten()
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            provider: provider.to_string(),
+            disabled_cause: cause.to_string(),
+            credential_id: Some(id),
+            email: identity("email"),
+            account_id: identity("accountId"),
+            org_id: identity("orgId"),
+            org_name: identity("orgName"),
+        }
+    }
+}
+
+/// TS `MAX_PENDING_DISABLED_EVENTS` (`auth/pool.ts`): the backlog a store with no subscriber keeps.
+const MAX_PENDING_DISABLED_EVENTS: usize = 32;
+
+type DisabledListener = Arc<dyn Fn(&CredentialDisabledEvent) + Send + Sync>;
+
+#[derive(Default)]
+struct DisabledListeners {
+    listeners: Vec<(u64, DisabledListener)>,
+    pending: VecDeque<CredentialDisabledEvent>,
+    next_id: u64,
+}
+
+/// TS `CredentialPool`'s `#credentialDisabledListeners` + `#pendingDisabledEvents`, process-wide:
+/// the automatic soft-disable path holds no handle on the session that wants to hear about it.
+static DISABLED_LISTENERS: LazyLock<Mutex<DisabledListeners>> =
+    LazyLock::new(|| Mutex::new(DisabledListeners::default()));
+
+fn disabled_listeners() -> std::sync::MutexGuard<'static, DisabledListeners> {
+    DISABLED_LISTENERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Subscribe to automatic credential soft-disables (TS `CredentialPool.onDisabled`).
+///
+/// Events fired while nothing was subscribed are replayed in order to the subscriber that
+/// triggers the empty→non-empty transition; the replay is one-shot. Dropping the returned handle
+/// unsubscribes.
+pub fn on_credential_disabled(
+    listener: impl Fn(&CredentialDisabledEvent) + Send + Sync + 'static,
+) -> CredentialDisabledSubscription {
+    let listener: DisabledListener = Arc::new(listener);
+    let (id, replayed) = {
+        let mut state = disabled_listeners();
+        state.next_id += 1;
+        let id = state.next_id;
+        let was_empty = state.listeners.is_empty();
+        state.listeners.push((id, listener.clone()));
+        let replayed = if was_empty {
+            std::mem::take(&mut state.pending)
+        } else {
+            VecDeque::new()
+        };
+        (id, replayed)
+    };
+    for event in replayed {
+        listener(&event);
+    }
+    CredentialDisabledSubscription { id }
+}
+
+/// Handle from [`on_credential_disabled`]; dropping it (or [`Self::unsubscribe`]) stops delivery.
+#[derive(Debug)]
+pub struct CredentialDisabledSubscription {
+    id: u64,
+}
+
+impl CredentialDisabledSubscription {
+    /// Stop delivery now; calling it twice is a no-op (TS's idempotent unsubscribe).
+    pub fn unsubscribe(&self) {
+        disabled_listeners()
+            .listeners
+            .retain(|(id, _)| *id != self.id);
+    }
+}
+
+impl Drop for CredentialDisabledSubscription {
+    fn drop(&mut self) {
+        self.unsubscribe();
+    }
+}
+
+/// Tell every subscriber about an automatic soft-disable, or buffer it while nobody listens
+/// (TS `CredentialPool.emitDisabled`).
+fn emit_credential_disabled(event: CredentialDisabledEvent) {
+    // TS logs every automatic disable with or without subscribers: once a session has moved on to
+    // a sibling account the event alone leaves nothing behind.
+    tracing::warn!(
+        provider = %event.provider,
+        credential_id = ?event.credential_id,
+        "auth credential disabled: {}",
+        event.disabled_cause
+    );
+    let listeners = {
+        let mut state = disabled_listeners();
+        if state.listeners.is_empty() {
+            if state.pending.len() >= MAX_PENDING_DISABLED_EVENTS {
+                state.pending.pop_front();
+            }
+            state.pending.push_back(event);
+            return;
+        }
+        state
+            .listeners
+            .iter()
+            .map(|(_, listener)| listener.clone())
+            .collect::<Vec<_>>()
+    };
+    for listener in listeners {
+        listener(&event);
+    }
+}
+
+/// TS `isDefinitiveOAuthFailure` (`pi-ai/src/error/auth-classify.ts` → `isOAuthExpiry`): the grant
+/// is dead, so the row must be torn down, as opposed to a transient network or rate-limit failure.
+/// The auth-broker daemon applies the same rule before it disables a row.
+#[must_use]
+pub fn is_definitive_oauth_failure(message: &str) -> bool {
+    static DEFINITIVE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)invalid_grant|invalid_token|unauthorized_client|\brevoked\b|refresh[\s_]?token.*expired",
+        )
+        .expect("static regex")
+    });
+    static TRANSIENT: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)timeout|network|fetch failed|ECONN(?:REFUSED|RESET)|ETIMEDOUT|EAI_AGAIN|socket hang up|\b(?:408|425|429|5\d{2})\b|rate.?limit|too many requests|temporar|unavailable|forbidden|permission_denied|cloudflare|captcha",
+        )
+        .expect("static regex")
+    });
+    static HTTP_AUTH: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\b401\b").expect("static regex"));
+    DEFINITIVE.is_match(message) || (HTTP_AUTH.is_match(message) && !TRANSIENT.is_match(message))
 }
 
 /// Broker connection (TS `AuthBrokerClientConfig`).
@@ -399,6 +561,18 @@ async fn broker_entry_credential(
                             "auth broker refresh of credential {} failed: {e:#}",
                             entry.id
                         );
+                        // The broker tears a row down when it judges the failure definitive
+                        // (`refresh_entry`), so the same rule reports exactly those disables.
+                        let cause = format!("oauth refresh failed: {e:#}");
+                        if is_definitive_oauth_failure(&cause) {
+                            emit_credential_disabled(CredentialDisabledEvent::from_parts(
+                                &entry.provider,
+                                entry.id,
+                                true,
+                                &entry.credential,
+                                &cause,
+                            ));
+                        }
                         return Ok(None);
                     }
                 }
@@ -491,6 +665,36 @@ fn read_rows(db: &Path, provider: &str) -> Result<Vec<Row>> {
         .filter_map(std::result::Result::ok)
         .collect();
     Ok(rows)
+}
+
+/// Soft-disable `row` with `cause` while it still holds the data we failed to refresh (TS
+/// `tryDisableAuthCredentialIfMatches`), then notify the store's subscribers. A peer that rotated
+/// the row wins the compare-and-set: nothing is disabled and nothing is emitted.
+fn disable_definitively(db: &Path, provider: &str, row: &Row, cause: &str) {
+    let Ok(conn) = open_rw(db) else {
+        tracing::warn!(
+            "could not open {} to disable credential {}",
+            db.display(),
+            row.id
+        );
+        return;
+    };
+    let changed = conn.execute(
+        "UPDATE auth_credentials SET disabled_cause = ?1, updated_at = CAST(strftime('%s','now') AS INTEGER)
+         WHERE id = ?2 AND data = ?3 AND disabled_cause IS NULL",
+        rusqlite::params![cause, row.id, row.data],
+    );
+    if !matches!(changed, Ok(n) if n > 0) {
+        return;
+    }
+    let data: Value = serde_json::from_str(&row.data).unwrap_or(Value::Null);
+    emit_credential_disabled(CredentialDisabledEvent::from_parts(
+        provider,
+        row.id,
+        row.kind == "oauth",
+        &data,
+        cause,
+    ));
 }
 
 /// What a provider token endpoint handed back for a refresh grant.
@@ -1040,14 +1244,20 @@ async fn local_row_credential(
             }
             match refresh_local_row(db, provider, row, forced, hosts).await {
                 Ok(Some(c)) => Some((c, data)),
-                Ok(None) | Err(_) if forced => None,
                 Ok(None) => None,
                 Err(e) => {
                     tracing::warn!(
                         "OAuth refresh of {provider} credential {} failed: {e:#}",
                         row.id
                     );
-                    if expires_of(&data).is_none_or(|x| x > now) {
+                    // The grant itself is dead: soft-disable the row with the failure as its cause
+                    // and tell the store's subscribers, instead of retrying a dead refresh token on
+                    // every request (TS `refreshStored`'s CAS disable + emit).
+                    let cause = format!("oauth refresh failed: {e:#}");
+                    if is_definitive_oauth_failure(&cause) {
+                        disable_definitively(db, provider, row, &cause);
+                    }
+                    if !forced && expires_of(&data).is_none_or(|x| x > now) {
                         Some((
                             Credential {
                                 key: access.to_string(),

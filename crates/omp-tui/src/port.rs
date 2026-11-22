@@ -79,6 +79,11 @@ pub trait RuntimePort: Send + Sync + 'static {
     /// Answer an extension dialog (`extension_ui_response` frame).
     fn extension_ui_response(&self, id: String, value: Value);
 
+    /// Raise `link_activate` for `url` on the extension that claimed its
+    /// scheme (TS `emitLinkActivate`). Links no extension owns are dropped by
+    /// the port; a transport failure is surfaced as a system notice.
+    fn link_activate(&self, url: String);
+
     /// Resume a session journal (`Runtime::load_session`) or fork it
     /// (`tree::fork`) when `fork` is set.
     fn resume_session(&self, path: std::path::PathBuf, fork: bool);
@@ -148,6 +153,13 @@ pub trait RuntimePort: Send + Sync + 'static {
     /// the runtime answers with a `session_info` frame titled "Usage".
     fn request_usage(&self) {}
 
+    /// Ask extensions whether an operator close may proceed (TS
+    /// `AgentSession.confirmClose`, `session_before_shutdown`). `None` when
+    /// nobody subscribes: close at once.
+    fn confirm_close(&self) -> Option<CloseGate> {
+        None
+    }
+
     /// The session's `local://` files, newest first (TS `listLocalFiles`).
     ///
     /// # Errors
@@ -170,6 +182,45 @@ pub trait RuntimePort: Send + Sync + 'static {
     ) -> Result<(String, std::path::PathBuf), String> {
         let _ = (target, picked);
         Err("this host has no session local:// store".into())
+    }
+}
+
+/// A pending `session_before_shutdown` gate ([`RuntimePort::confirm_close`]).
+/// Dropping it before the answer arrives aborts the gate's `signal`: the
+/// close stopped waiting (another close request, a signal, the UI stopping).
+pub struct CloseGate {
+    decision: tokio::sync::oneshot::Receiver<bool>,
+    abort: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl CloseGate {
+    /// `decision` yields `true` to close; `abort` releases the pending gate.
+    #[must_use]
+    pub fn new(
+        decision: tokio::sync::oneshot::Receiver<bool>,
+        abort: Box<dyn FnOnce() + Send>,
+    ) -> Self {
+        Self {
+            decision,
+            abort: Some(abort),
+        }
+    }
+
+    /// Wait for the answer: `true` closes, `false` keeps the session (an
+    /// extension cancelled). A gate that vanished without answering closes,
+    /// as TS proceeds on errors. Cancel-safe.
+    pub async fn decided(&mut self) -> bool {
+        let close = (&mut self.decision).await.unwrap_or(true);
+        self.abort = None;
+        close
+    }
+}
+
+impl Drop for CloseGate {
+    fn drop(&mut self) {
+        if let Some(abort) = self.abort.take() {
+            abort();
+        }
     }
 }
 
@@ -223,6 +274,9 @@ impl RuntimePort for FakePort {
     }
     fn extension_ui_response(&self, id: String, value: Value) {
         self.record(format!("extension_ui_response({id}, {value})"));
+    }
+    fn link_activate(&self, url: String) {
+        self.record(format!("link_activate({url:?})"));
     }
     fn resume_session(&self, path: std::path::PathBuf, fork: bool) {
         self.record(format!("resume_session({path:?}, fork={fork})"));
@@ -312,5 +366,60 @@ impl RuntimePort for FakePort {
         } else {
             Err(format!("Local file not found: local://{name}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod close_gate_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::CloseGate;
+
+    fn new_gate() -> (
+        CloseGate,
+        tokio::sync::oneshot::Sender<bool>,
+        Arc<AtomicUsize>,
+    ) {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let counted = aborts.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let gate = CloseGate::new(
+            rx,
+            Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        (gate, tx, aborts)
+    }
+
+    #[tokio::test]
+    async fn cancel_keeps_the_session_without_aborting() {
+        let (mut gate, tx, aborts) = new_gate();
+        tx.send(false).unwrap();
+        assert!(!gate.decided().await);
+        drop(gate);
+        assert_eq!(aborts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn proceed_or_a_vanished_answer_closes() {
+        let (mut gate, tx, aborts) = new_gate();
+        tx.send(true).unwrap();
+        assert!(gate.decided().await);
+        drop(gate);
+        assert_eq!(aborts.load(Ordering::SeqCst), 0);
+        let (mut lost, tx, _) = new_gate();
+        drop(tx);
+        assert!(lost.decided().await);
+    }
+
+    /// A second quit, a signal or the loop ending drops a pending gate: its
+    /// signal is aborted exactly once.
+    #[test]
+    fn dropping_a_pending_gate_aborts_its_signal_once() {
+        let (gate, _tx, aborts) = new_gate();
+        drop(gate);
+        assert_eq!(aborts.load(Ordering::SeqCst), 1);
     }
 }

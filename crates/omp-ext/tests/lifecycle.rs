@@ -151,7 +151,30 @@ async fn observed_events_reach_extensions_with_omp_payloads() {
             LifecycleEvent::SessionTree { new_leaf_id: Some("n".into()), old_leaf_id: None, summary_entry: None, from_extension: Some(false) },
             r#"{"type":"session_tree","newLeafId":"n","oldLeafId":null,"fromExtension":false}"#.into(),
         ),
+        (
+            LifecycleEvent::SessionBeforeShutdown,
+            r#"{"type":"session_before_shutdown"}"#.into(),
+        ),
+        (LifecycleEvent::SessionClear, r#"{"type":"session_clear"}"#.into()),
         (LifecycleEvent::SessionShutdown, r#"{"type":"session_shutdown"}"#.into()),
+        (
+            LifecycleEvent::AfterProviderResponse {
+                status: 429,
+                headers: [("request-id".to_string(), "req_abc".to_string())]
+                    .into_iter()
+                    .collect(),
+                request_id: Some("req_abc".into()),
+            },
+            r#"{"type":"after_provider_response","status":429,"headers":{"request-id":"req_abc"},"requestId":"req_abc"}"#.into(),
+        ),
+        (
+            LifecycleEvent::AfterProviderResponse {
+                status: 200,
+                headers: std::collections::BTreeMap::default(),
+                request_id: None,
+            },
+            r#"{"type":"after_provider_response","status":200,"headers":{}}"#.into(),
+        ),
     ];
     for (ev, expected) in cases {
         assert_wire(&host, &mut rx, ev, &expected).await;

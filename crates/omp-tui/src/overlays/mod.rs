@@ -23,6 +23,7 @@ pub mod command_palette;
 pub mod diff;
 pub mod help;
 pub mod large_paste;
+pub mod links;
 pub mod local_files;
 pub mod models;
 pub mod session_info;
@@ -82,6 +83,8 @@ pub enum OpenOverlay {
     Thinking,
     /// Large-paste chooser (`paste.largeMenuThreshold` gate).
     LargePaste,
+    /// Extension link picker (`app.links.hint`, TS `startLinkHints`).
+    LinkHints,
     /// `local://` file picker (`/local`, `app.local.open`).
     LocalFiles,
 }
@@ -128,6 +131,7 @@ pub struct Overlays {
     session_info: session_info::SessionInfoOverlay,
     thinking: thinking::ThinkingSelector,
     large_paste: large_paste::LargePasteMenu,
+    links: links::LinkHints,
     local_files: local_files::LocalFilePicker,
     stack: Vec<OpenOverlay>,
 }
@@ -242,6 +246,14 @@ impl Overlays {
         self.stack.push(OpenOverlay::LargePaste);
     }
 
+    /// Open the extension link picker over `urls` (transcript links whose
+    /// scheme an extension claimed), replacing any open picker.
+    pub fn open_link_hints(&mut self, urls: Vec<String>) {
+        self.links.open(urls);
+        self.close(OpenOverlay::LinkHints);
+        self.stack.push(OpenOverlay::LinkHints);
+    }
+
     /// Open the `local://` file picker over `files` (newest first).
     pub fn open_local_files(&mut self, files: Vec<crate::port::LocalFile>) {
         self.local_files.open(files);
@@ -302,6 +314,7 @@ impl Overlays {
             OpenOverlay::SessionInfo => &self.session_info,
             OpenOverlay::Thinking => &self.thinking,
             OpenOverlay::LargePaste => &self.large_paste,
+            OpenOverlay::LinkHints => &self.links,
             OpenOverlay::LocalFiles => &self.local_files,
         }
     }
@@ -318,6 +331,7 @@ impl Overlays {
             OpenOverlay::SessionInfo => &mut self.session_info,
             OpenOverlay::Thinking => &mut self.thinking,
             OpenOverlay::LargePaste => &mut self.large_paste,
+            OpenOverlay::LinkHints => &mut self.links,
             OpenOverlay::LocalFiles => &mut self.local_files,
         }
     }
@@ -405,6 +419,12 @@ impl Overlays {
         }
         for (id, value) in self.settings.take_changes() {
             out.push(Action::SettingChanged { id, value });
+        }
+        // A link pick activates the link on its owning extension and closes
+        // the picker (TS `typeLinkHint` → `emitLinkActivate`).
+        if let Some(url) = self.links.take_pick() {
+            out.push(Action::LinkActivate { url });
+            self.close(OpenOverlay::LinkHints);
         }
         out
     }

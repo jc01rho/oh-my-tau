@@ -304,12 +304,26 @@ fn zai_effort_hook(
     ))
 }
 
-fn chain_payload_hooks(
+pub(crate) fn chain_payload_hooks(
     first: Option<pa_ai::types::OnPayloadHook>,
     second: Option<pa_ai::types::OnPayloadHook>,
 ) -> Option<pa_ai::types::OnPayloadHook> {
     match (first, second) {
         (Some(a), Some(b)) => Some(Arc::new(move |p: serde_json::Value, m: &Model| {
+            b(a(p, m)?, m)
+        })),
+        (a, b) => a.or(b),
+    }
+}
+
+/// [`chain_payload_hooks`] on the loop side of the boundary: the second hook sees
+/// what the first one returned.
+pub(crate) fn chain_agent_payload_hooks(
+    first: Option<pa_agent::stream::OnPayloadHook>,
+    second: Option<pa_agent::stream::OnPayloadHook>,
+) -> Option<pa_agent::stream::OnPayloadHook> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(Arc::new(move |p: serde_json::Value, m: &AgentModel| {
             b(a(p, m)?, m)
         })),
         (a, b) => a.or(b),
