@@ -88,6 +88,19 @@ impl McpServerConfig {
     pub fn timeout_ms(&self) -> u64 {
         resolve_timeout_ms(self.timeout)
     }
+
+    /// The entry's `oauth` block; `None` when absent or malformed.
+    #[must_use]
+    pub fn oauth(&self) -> Option<crate::oauth::OAuthConfig> {
+        let value = self.extra.get("oauth")?;
+        match serde_json::from_value(value.clone()) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                tracing::warn!("ignoring malformed MCP oauth config: {error}");
+                None
+            }
+        }
+    }
 }
 
 /// Standard user config path: `~/.omp/agent/mcp.json`.
