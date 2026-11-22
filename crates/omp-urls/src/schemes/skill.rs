@@ -16,11 +16,16 @@ use super::{
 
 static EXTRA_SKILL_PATHS: std::sync::RwLock<Vec<PathBuf>> = std::sync::RwLock::new(Vec::new());
 
+fn absolutize_skill_path(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
+}
+
 /// Install `--skill` roots shared between the prompt catalog and `skill://` resolution.
 pub fn set_extra_skill_paths(paths: Vec<PathBuf>) {
+    let resolved = paths.into_iter().map(absolutize_skill_path).collect();
     *EXTRA_SKILL_PATHS
         .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = paths;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = resolved;
 }
 
 /// The installed `--skill` roots.
@@ -51,24 +56,37 @@ pub fn discover_skills_with(
     extra_roots: &[PathBuf],
 ) -> Vec<SkillEntry> {
     let mut skills = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for dir in cwd.ancestors() {
-        load_skills_dir(&dir.join(".omp/skills"), &mut skills);
+        load_skills_dir(&dir.join(".omp/skills"), &mut seen, &mut skills);
     }
-    load_skills_dir(&agent_dir.join("skills"), &mut skills);
-    for root in extra_roots {
+    load_skills_dir(&agent_dir.join("skills"), &mut seen, &mut skills);
+    for raw_root in extra_roots {
+        let root_buf;
+        let root: &Path = if raw_root.is_absolute() {
+            raw_root
+        } else {
+            root_buf = absolutize_skill_path(raw_root.clone());
+            &root_buf
+        };
         if root.is_file() {
             let base_dir = root.parent().unwrap_or(root);
-            load_skill_file(root, base_dir, &mut skills);
+            load_skill_file(root, base_dir, &mut seen, &mut skills);
         } else if root.is_dir() && root.join("SKILL.md").is_file() {
-            load_skill_file(&root.join("SKILL.md"), root, &mut skills);
+            load_skill_file(&root.join("SKILL.md"), root, &mut seen, &mut skills);
         } else if root.is_dir() {
-            load_skills_dir(root, &mut skills);
+            load_skills_dir(root, &mut seen, &mut skills);
         }
     }
     skills
 }
 
-fn load_skill_file(file: &Path, base_dir: &Path, skills: &mut Vec<SkillEntry>) {
+fn load_skill_file(
+    file: &Path,
+    base_dir: &Path,
+    seen: &mut std::collections::HashSet<String>,
+    skills: &mut Vec<SkillEntry>,
+) {
     let Ok(content) = std::fs::read_to_string(file) else {
         return;
     };
@@ -79,6 +97,9 @@ fn load_skill_file(file: &Path, base_dir: &Path, skills: &mut Vec<SkillEntry>) {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let name = get("name").unwrap_or(fallback_name);
+    if !seen.insert(name.clone()) {
+        return;
+    }
     let description = get("description").unwrap_or_default();
     let hide = get("hide").is_some_and(|v| v == "true");
     if hide {
@@ -95,7 +116,11 @@ fn load_skill_file(file: &Path, base_dir: &Path, skills: &mut Vec<SkillEntry>) {
     });
 }
 
-fn load_skills_dir(dir: &Path, skills: &mut Vec<SkillEntry>) {
+fn load_skills_dir(
+    dir: &Path,
+    seen: &mut std::collections::HashSet<String>,
+    skills: &mut Vec<SkillEntry>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -104,7 +129,7 @@ fn load_skills_dir(dir: &Path, skills: &mut Vec<SkillEntry>) {
         if !path.is_dir() {
             continue;
         }
-        load_skill_file(&path.join("SKILL.md"), &path, skills);
+        load_skill_file(&path.join("SKILL.md"), &path, seen, &mut *skills);
     }
 }
 
@@ -432,8 +457,14 @@ mod tests {
         );
     }
 
+    /// Shared guard across every test in this module that reads or mutates `EXTRA_SKILL_PATHS`.
+    static EXTRA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resource_reads_file() {
+        let _guard = EXTRA_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!("ompurls-skill-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".omp/skills/demo")).unwrap();
         std::fs::write(
@@ -516,8 +547,9 @@ mod tests {
         assert_eq!(by_col[0].name, "col-skill");
 
         // 5) Shared extra roots resolve through SkillProvider::read (`skill://...`).
-        static EXTRA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = EXTRA_LOCK.lock().unwrap();
+        let _guard = EXTRA_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = extra_skill_paths();
         set_extra_skill_paths(vec![extra.join("picked/SKILL.md")]);
         let ctx = UrlCtx {

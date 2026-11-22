@@ -577,8 +577,8 @@ struct Live {
     snap: Mutex<serde_json::Map<String, Value>>,
     /// Branch entries (root -> leaf) not yet sent to the host.
     branch: Mutex<Option<Value>>,
-    /// Session file len the cached branch was computed at.
-    branch_len: Mutex<Option<(PathBuf, u64)>>,
+    /// `(session file, file len, nav leaf divergence)` the cached branch was computed at.
+    branch_len: Mutex<Option<(PathBuf, u64, Option<Option<String>>)>>,
     /// Some loaded extension reads the branch (`getBranch`/`getEntry`/`getLeafId`/`getEntries`).
     needs_branch: std::sync::atomic::AtomicBool,
 }
@@ -794,6 +794,15 @@ impl Extensions {
 
     #[cfg(test)]
     pub(crate) fn for_test(host: Arc<ExtHost>, cwd: &Path) -> Arc<Self> {
+        Self::for_test_with_extra(host, cwd, Vec::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_extra(
+        host: Arc<ExtHost>,
+        cwd: &Path,
+        extra: Vec<PathBuf>,
+    ) -> Arc<Self> {
         let hooks = ExtHooks::new(host.clone());
         let ext = Arc::new(Self {
             host,
@@ -802,7 +811,7 @@ impl Extensions {
             turn: Arc::new(AtomicU64::new(0)),
             stop: Arc::new(Mutex::new(StopState::default())),
             cwd: cwd.to_path_buf(),
-            extra: Vec::new(),
+            extra,
             dir: None,
             ctx: Mutex::new(SessionCtx::default()),
             mode: Mutex::new(ExtMode::Rpc),
@@ -813,6 +822,10 @@ impl Extensions {
             blocked_calls: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_agent_end: Arc::new(Mutex::new(None)),
         });
+        ext.live.needs_branch.store(
+            sources_read_branch(ext.dir.as_deref(), &ext.extra),
+            Ordering::Relaxed,
+        );
         let live = ext.live.clone();
         ext.host
             .set_ctx_provider(Some(Arc::new(move |_ty: &str| live.provide())));
@@ -888,6 +901,7 @@ impl Extensions {
 
     async fn reconcile_tools(&self, rt: &Arc<Runtime>) -> Result<()> {
         let latest = self.host.list_tools().await?;
+        let _tool_guard = rt.lock_tool_list().await;
         let prev = self
             .installed_tools
             .lock()
@@ -1215,6 +1229,12 @@ impl Extensions {
             eprintln!("omt: extension failed to load: {}: {}", err.path, err.error);
         }
         self.send_ctx().await?;
+        if !self.extra.is_empty() || self.dir.is_some() {
+            self.live.needs_branch.store(
+                sources_read_branch(self.dir.as_deref(), &self.extra),
+                Ordering::Relaxed,
+            );
+        }
         *self
             .live
             .branch_len
@@ -1323,26 +1343,22 @@ impl Extensions {
     fn refresh_branch(&self, rt: &Runtime) {
         let path = rt.session_file();
         let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+        let divergence = rt.leaf_divergence();
         {
             let mut seen = self
                 .live
                 .branch_len
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if seen.as_ref().is_some_and(|(p, l)| *p == path && *l == len) {
+            if seen
+                .as_ref()
+                .is_some_and(|(p, l, d)| *p == path && *l == len && *d == divergence)
+            {
                 return;
             }
-            *seen = Some((path, len));
+            *seen = Some((path, len, divergence));
         }
-        let Ok(entries) = rt.entries() else { return };
-        let branch = omp_session::tree::leaf_id(&entries)
-            .map(|leaf| {
-                omp_session::tree::branch_path(&entries, leaf)
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<Value>>()
-            })
-            .unwrap_or_default();
+        let branch = rt.branch_entries();
         *self
             .live
             .branch
@@ -2357,18 +2373,34 @@ mod tests {
             ],
         )
         .await;
-        let ext = Extensions::for_test(host, dir.path());
-        ext.live.needs_branch.store(true, Ordering::Relaxed);
+        let ext_file = dir.path().join("ext.ts");
+        // Start without branch reads (`needs_branch == false` initially).
+        std::fs::write(&ext_file, "export default function() {}\n").unwrap();
+        let ext = Extensions::for_test_with_extra(host, dir.path(), vec![ext_file.clone()]);
+        assert!(!ext.live.needs_branch.load(Ordering::Relaxed));
         let initial_tools = ext.tools().await.unwrap();
         let rt = test_runtime(dir.path(), initial_tools).await;
         rt.append_entry("custom", json!({"customType": "note", "v": 1}))
             .unwrap();
+        let first_leaf = rt
+            .entries()
+            .unwrap()
+            .last()
+            .and_then(|e| e["id"].as_str())
+            .unwrap()
+            .to_string();
+        rt.append_entry("custom", json!({"customType": "note", "v": 2}))
+            .unwrap();
+        // Navigate `/tree` back to the first entry; reload must report the selected leaf, not the journal tail.
+        rt.branch_to(Some(first_leaf.clone())).unwrap();
         ext.attach(rt.clone());
-        // Simulate an earlier emit having consumed `Live.branch` before idle reload.
         *ext.live.branch.lock().unwrap() = None;
 
+        // Edit the extension to read `getBranch()` before reload: `recover` must recompute `needs_branch`.
+        std::fs::write(&ext_file, "export default (pi) => pi.getBranch();\n").unwrap();
         std::fs::write(&phase, "2").unwrap();
         ext.reload().await.unwrap();
+        assert!(ext.live.needs_branch.load(Ordering::Relaxed));
 
         let tools = rt.agent.tools().await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -2389,8 +2421,9 @@ mod tests {
             .as_array()
             .expect("branch array in session_start ctx");
         assert!(!branch.is_empty(), "{start_val}");
-        assert!(
-            start_val["params"]["ctx"]["leafId"].is_string(),
+        assert_eq!(
+            start_val["params"]["ctx"]["leafId"],
+            json!(first_leaf),
             "{start_val}"
         );
 

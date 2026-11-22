@@ -76,24 +76,28 @@ pub fn extensions() -> Option<&'static Arc<Ext>> {
     EXTENSIONS.get()
 }
 
-pub(crate) async fn extension_commands_for(ext: Option<&Arc<Ext>>) -> Vec<serde_json::Value> {
+pub(crate) async fn try_extension_commands_for(
+    ext: Option<&Arc<Ext>>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
     let Some(ext) = ext else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    match ext.host.list_commands().await {
-        Ok(cmds) => cmds
-            .into_iter()
-            .map(|c| {
-                json!({
-                    "name": c.name,
-                    "description": c.description.unwrap_or_else(|| "(extension command)".into()),
-                    "input": {"hint": "arguments"},
-                    "source": "extension",
-                })
+    let cmds = ext.host.list_commands().await?;
+    Ok(cmds
+        .into_iter()
+        .map(|c| {
+            json!({
+                "name": c.name,
+                "description": c.description.unwrap_or_else(|| "(extension command)".into()),
+                "input": {"hint": "arguments"},
+                "source": "extension",
             })
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+        })
+        .collect())
+}
+
+pub(crate) async fn extension_commands_for(ext: Option<&Arc<Ext>>) -> Vec<serde_json::Value> {
+    try_extension_commands_for(ext).await.unwrap_or_default()
 }
 
 /// Execute an extension command (`#tryExecuteExtensionCommand`). The handler's
@@ -3167,8 +3171,20 @@ pub(crate) async fn dynamic_commands_for(
     rt: &std::sync::Arc<Runtime>,
     ext: Option<&Arc<Ext>>,
 ) -> Vec<Value> {
+    let ext_cmds = extension_commands_for(ext).await;
+    finish_dynamic_commands(rt, ext_cmds)
+}
+
+pub(crate) async fn try_dynamic_commands_for(
+    rt: &std::sync::Arc<Runtime>,
+    ext: Option<&Arc<Ext>>,
+) -> anyhow::Result<Vec<Value>> {
+    let ext_cmds = try_extension_commands_for(ext).await?;
+    Ok(finish_dynamic_commands(rt, ext_cmds))
+}
+
+fn finish_dynamic_commands(rt: &Runtime, mut out: Vec<Value>) -> Vec<Value> {
     refresh_file_commands(&rt.cwd);
-    let mut out = extension_commands_for(ext).await;
     out.extend(crate::tools::wasm::command_catalog(&rt.cwd));
     for cmd in FILE_COMMANDS
         .lock()

@@ -2457,10 +2457,21 @@ mod tests {
         assert_eq!(close_code_fence("```\nx\n```\n"), "```\nx\n```\n");
     }
 
+    /// Shared guard across every test in this module that reads or mutates the
+    /// process-global `--skill` roots (`set_skill_paths` / `load_skills` / `build_with`).
+    static SKILL_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_skill_paths() -> std::sync::MutexGuard<'static, ()> {
+        SKILL_PATH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Skills: `enabled: false` in config.yml suppresses the listing; hide:
     /// true entries are dropped from the render.
     #[test]
     fn skills_respect_config_and_hide() {
+        let _guard = lock_skill_paths();
         let root = tempdir("skills");
         let agent = root.join("agent");
         let sk = agent.join("skills/demo");
@@ -2484,8 +2495,7 @@ mod tests {
     fn set_skill_paths_shares_roots_with_skill_url_provider() {
         use omp_urls::{parse_internal_url, schemes::skill::SkillProvider, UrlCtx, UrlProvider};
 
-        static SKILL_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = SKILL_PATH_LOCK.lock().unwrap();
+        let _guard = lock_skill_paths();
         let prev = omp_urls::schemes::skill::extra_skill_paths();
 
         let root = tempdir("shared-skills");
@@ -2528,6 +2538,7 @@ mod tests {
     /// `--tools <csv>` keeps only registered names, in the given order.
     #[test]
     fn tools_csv_restricts_surface() {
+        let _guard = lock_skill_paths();
         let root = tempdir("tools");
         let agent = root.join("agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -2548,6 +2559,7 @@ mod tests {
     /// bundled prompt is used.
     #[test]
     fn compact_prompt_selection() {
+        let _guard = lock_skill_paths();
         let root = tempdir("compact");
         let agent = root.join("agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -2570,6 +2582,7 @@ mod tests {
     /// template without the flag.
     #[test]
     fn compact_prompt_setting() {
+        let _guard = lock_skill_paths();
         let root = tempdir("compact-setting");
         let agent = root.join("agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -2583,6 +2596,7 @@ mod tests {
     /// and `--append-system-prompt` lands at the end of the project block.
     #[test]
     fn flags_replace_and_append() {
+        let _guard = lock_skill_paths();
         let root = tempdir("flags");
         let agent = root.join("agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -2672,6 +2686,7 @@ mod tests {
     /// `<domain-rules>`, and the scheme docs in the Internal URLs block.
     #[test]
     fn rules_and_internal_urls_render() {
+        let _guard = lock_skill_paths();
         let root = tempdir("rulesrender");
         let repo = root.join("repo");
         let agent = root.join("agent");
@@ -2709,6 +2724,7 @@ mod tests {
     /// and subagent sessions drop AGENTS.md only.
     #[test]
     fn context_files_render_and_subagents_drop_agents_md() {
+        let _guard = lock_skill_paths();
         let root = tempdir("ctxrender");
         let repo = root.join("repo");
         let cwd = repo.join("pkg");
@@ -2815,6 +2831,7 @@ mod tests {
 
     #[test]
     fn ultrawork_bootstrap_injected_into_sysprompt_and_idempotent() {
+        let _guard = lock_skill_paths();
         let root = tempdir("ulw-hook");
         let agent = root.join("agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -2870,6 +2887,7 @@ mod tests {
 
     #[test]
     fn skills_dedupe_by_priority_and_respect_disabled_list() {
+        let _guard = lock_skill_paths();
         let root = tempdir("skills-disabled");
         let agent = root.join("agent");
         let proj_sk = root.join(".omp/skills/ultrawork");

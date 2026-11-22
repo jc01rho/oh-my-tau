@@ -167,6 +167,12 @@ pub struct Runtime {
     /// Monotonically incremented whenever `pause_for_stop` starts so a prompt admitted before
     /// `abort()` cannot start a turn after a concurrent stop takes the hold.
     stop_epoch: std::sync::atomic::AtomicU64,
+    /// Orders final stop check + `prompt_until_accepted` against `pause_for_stop` so a prompt
+    /// cannot register an active run in the gap after `pause_for_stop`'s `abort()` ran.
+    prompt_admission: tokio::sync::Mutex<()>,
+    /// Serializes read-modify-write updates to `agent.tools()` across `set_host_tools` and
+    /// extension `reconcile_tools`.
+    tool_list_lock: tokio::sync::Mutex<()>,
     /// Set while a manual compaction aborts the live turn (TS
     /// `disconnectFromAgent` around that abort): the empty aborted stub is
     /// neither rendered nor journaled — the turn resumes after the summary.
@@ -536,6 +542,8 @@ impl Runtime {
             pause: Mutex::new(crate::pause::PauseState::default()),
             stop_pending: std::sync::atomic::AtomicUsize::new(0),
             stop_epoch: std::sync::atomic::AtomicU64::new(0),
+            prompt_admission: tokio::sync::Mutex::new(()),
+            tool_list_lock: tokio::sync::Mutex::new(()),
             compaction_abort: std::sync::atomic::AtomicBool::new(false),
             compaction_stub_start: std::sync::atomic::AtomicBool::new(false),
             ui_context_frames: std::sync::atomic::AtomicBool::new(false),
@@ -1940,24 +1948,25 @@ impl Runtime {
             }
         }
         let notices = self.prompt_notices(message, true).await;
-        // Re-check stop/hold right before `prompt_until_accepted`: if `pause_for_stop` ran while
-        // `before_start` or `prompt_notices` awaited (with no active run for `abort()` to cancel),
-        // refuse to start a turn under the newly installed hold.
-        if self.interrupted_by_stop(stop_epoch) {
-            lock(&self.prompts)
-                .open
-                .retain(|t| !(t.starts_at_begin == starts && t.id == id && !t.waiting));
-            return Err(CmdError::coded(
-                "Prompt interrupted by stop before execution",
-                "session_paused",
-            ));
-        }
         let input = prompt_input(message, images, notices, injected);
-        let pua = self.agent.prompt_until_accepted(input).await;
+        // Hold `prompt_admission` across the final stop check and `prompt_until_accepted` (which
+        // resolves as soon as the run slot is registered): either `pause_for_stop` ran first and
+        // `interrupted_by_stop` rejects here, or `pause_for_stop` waits on `prompt_admission` and
+        // its `abort()` cancels the newly registered run.
+        let pua = {
+            let _admission = self.prompt_admission.lock().await;
+            if self.interrupted_by_stop(stop_epoch) {
+                drop(_admission);
+                self.reject_unstarted_ticket(starts, &id);
+                return Err(CmdError::coded(
+                    "Prompt interrupted by stop before execution",
+                    "session_paused",
+                ));
+            }
+            self.agent.prompt_until_accepted(input).await
+        };
         if let Err(e) = pua {
-            lock(&self.prompts)
-                .open
-                .retain(|t| !(t.starts_at_begin == starts && t.id == id && !t.waiting));
+            self.reject_unstarted_ticket(starts, &id);
             return Err(CmdError::new(format!("{e:#}")));
         }
         Ok(())
@@ -2083,6 +2092,34 @@ impl Runtime {
         crate::pause::set_client_info(&mut pause, cmd).map_err(CmdError::coded_params)
     }
 
+    fn reject_unstarted_ticket(&self, starts: u64, id: &Option<Value>) {
+        let drained = self.queued_count() == 0;
+        let mut p = lock(&self.prompts);
+        p.open
+            .retain(|t| !(t.starts_at_begin == starts && t.id == *id && !t.waiting));
+        // If an earlier run's delayed reporter saw this unstarted ticket in `p.open`, it deferred
+        // settling and left `p.active` true; finalize activity when no newer run has started.
+        let settle = p.active && p.agent_starts == starts && drained && p.open.is_empty();
+        if settle {
+            p.active = false;
+            self.send(json!({"type": "session_settled"}));
+            self.send(json!({"type": "agent_settled"}));
+        }
+        drop(p);
+        if settle {
+            self.settled.notify_waiters();
+        }
+    }
+
+    pub async fn lock_tool_list(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.tool_list_lock.lock().await
+    }
+
+    #[must_use]
+    pub fn leaf_divergence(&self) -> Option<Option<String>> {
+        self.persist.leaf_divergence()
+    }
+
     fn interrupted_by_stop(&self, stop_epoch: u64) -> bool {
         self.stop_epoch.load(std::sync::atomic::Ordering::SeqCst) != stop_epoch
             || self.stop_pending.load(std::sync::atomic::Ordering::SeqCst) > 0
@@ -2109,6 +2146,9 @@ impl Runtime {
         self.stop_pending
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _guard = StopPendingGuard(&self.stop_pending);
+        // Drain any in-flight `prompt_until_accepted` admission so either it saw the bumped
+        // `stop_epoch` and refused, or its run is registered before `abort()` runs below.
+        drop(self.prompt_admission.lock().await);
         self.abort().await;
         self.set(|s| s.abort_bash());
         let at = crate::persist::now_iso();
@@ -2710,6 +2750,17 @@ impl Runtime {
             self.record_model_state().await;
             if compacted {
                 crate::compact::seed_branch(&self.persist, &index, path)?;
+                // `seed_branch` copies raw `custom` entries from the source branch; if the source
+                // ended in a `hold`, record a `release` in the new fork so reopening it later does
+                // not inherit the source session's hold.
+                if let Some((seq, Some(_))) = latest_session_hold(&index, path, &branch)? {
+                    let _ = self.journal_hold(
+                        "release",
+                        seq + 1,
+                        Some("fork"),
+                        &crate::persist::now_iso(),
+                    );
+                }
             } else {
                 for (m, raw) in messages.iter().zip(&raw_messages) {
                     seed_resumed_message(&self.persist, m, raw.as_ref());
@@ -6953,5 +7004,63 @@ mod pr18_review_regressions {
         assert_eq!(env.rt.state().await["paused"], json!(true));
         assert_eq!(env.rt.state().await["pauseSeq"], json!(1));
         let _ = &env.dir;
+    }
+
+    #[tokio::test]
+    async fn rejecting_last_ticket_during_stop_settles_deferred_activity() {
+        let mut env = make_env(None, None).await;
+        env.rt
+            .set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let entered2 = entered.clone();
+        let proceed2 = proceed.clone();
+        env.rt.set_before_start_hook(Some(Arc::new(move |_, _| {
+            let entered = entered2.clone();
+            let proceed = proceed2.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                proceed.notified().await;
+                Vec::new()
+            })
+        })));
+
+        // Simulate a previous completed run whose delayed `report_prompts_now` had not settled yet.
+        let starts = {
+            let mut p = lock(&env.rt.prompts);
+            p.agent_starts = 1;
+            p.active = true;
+            p.agent_starts
+        };
+
+        let rt2 = env.rt.clone();
+        let prompt_task = tokio::spawn(async move {
+            rt2.prompt(Some(json!("p-deferred")), "next", None, Vec::new())
+                .await
+        });
+        entered.notified().await;
+
+        // Previous run's reporter runs while `p-deferred` is in `p.open`: it leaves `p.active = true`.
+        let outcome = RunOutcome {
+            status: "completed",
+            error: None,
+        };
+        env.rt.report_prompts_now(&outcome, Vec::new(), starts);
+        assert!(lock(&env.rt.prompts).active);
+
+        // Now `pause_for_stop` rejects `p-deferred`: rejecting the last ticket must finalize activity
+        // so `wait_settled()` resolves and settle frames are emitted.
+        env.rt.pause_for_stop().await.unwrap();
+        proceed.notify_one();
+        let err = prompt_task.await.unwrap().expect_err("rejected by stop");
+        assert_eq!(err.code, Some("session_paused"));
+
+        tokio::time::timeout(Duration::from_secs(2), env.rt.wait_settled())
+            .await
+            .expect("wait_settled must not hang after rejecting last ticket");
+        let _ = next_frame_matching(&mut env.rx, |f| f["type"] == "session_settled").await;
+        let _ = next_frame_matching(&mut env.rx, |f| f["type"] == "agent_settled").await;
     }
 }

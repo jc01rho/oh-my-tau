@@ -580,6 +580,7 @@ async fn set_host_tools(rt: &Arc<Runtime>, cmd: &Value) -> CmdResult {
             rt.send(frame);
         }
     });
+    let _tool_guard = rt.lock_tool_list().await;
     let mut tools = rt.agent.tools().await;
     {
         let mut installed = lock(&HOST_TOOL_NAMES);
@@ -1449,11 +1450,14 @@ async fn reload_with_ext(
     ext: Option<&Arc<crate::ext::Extensions>>,
 ) -> CmdResult {
     // Extensions reload; the session and any hold survive (the gateway reloads while holding a
-    // lane). Failures propagate to the client via `CmdError` without dropping session or hold.
+    // lane). Failures propagate to the client via `CmdError` without dropping session, hold or
+    // the previously published command catalog.
     if let Some(ext) = ext {
         ext.reload().await.map_err(CmdError::from)?;
     }
-    let commands = slash::dynamic_commands_for(rt, ext).await;
+    let commands = slash::try_dynamic_commands_for(rt, ext)
+        .await
+        .map_err(CmdError::from)?;
     rt.set_available_commands(commands);
     if !rt.commands_announced() {
         rt.announce_commands();
@@ -2352,6 +2356,8 @@ mod tests {
                 "    *'\"method\":\"list_commands\"'*)\n",
                 "      if [ \"$p\" = \"1\" ]; then\n",
                 "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[{\"name\":\"old_cmd\",\"description\":\"old\",\"extension\":\"ext\"}]}\\n' \"$id\"\n",
+                "      elif [ \"$p\" = \"fail_list\" ]; then\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":-32001,\"message\":\"boom list_commands\"}}\\n' \"$id\"\n",
                 "      else\n",
                 "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[{\"name\":\"new_cmd\",\"description\":\"new\",\"extension\":\"ext\"}]}\\n' \"$id\"\n",
                 "      fi;;\n",
@@ -2434,6 +2440,28 @@ mod tests {
         assert!(
             !announced_names.contains(&"old_cmd".to_string()),
             "{announced_names:?}"
+        );
+
+        // If `load` succeeds but `list_commands` fails, return CmdError and keep the existing catalog.
+        std::fs::write(&phase_file, "fail_list").unwrap();
+        let list_err = response(
+            Some(&json!("r3")),
+            "reload",
+            reload_with_ext(&rt, Some(&ext)).await,
+        );
+        assert_eq!(list_err["success"], json!(false));
+        assert!(list_err["error"]
+            .as_str()
+            .unwrap()
+            .contains("boom list_commands"));
+        let kept_names: Vec<String> = rt
+            .available_commands()
+            .iter()
+            .filter_map(|c| c["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            kept_names.contains(&"new_cmd".to_string()),
+            "{kept_names:?}"
         );
 
         ext.host.shutdown().await.unwrap();
