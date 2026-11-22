@@ -5,10 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use omp_ext::lifecycle::{
-    ApprovalMode, CompactionAction, CompactionReason, GoalModeState, LifecycleEvent, ModeStatus,
-    PlanModeState, SessionModeState,
-};
+use omp_ext::lifecycle::{ApprovalMode, CompactionAction, CompactionReason, GoalModeState, LifecycleEvent, ModeStatus, PlanModeState, SessionModeState, SubagentInvocationKind};
 use omp_ext::{ExtHost, HostConfig, HostMessage};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -263,6 +260,63 @@ async fn retry_compaction_goal_approval_and_user_shell_payloads() {
     for (ev, expected) in cases {
         assert_wire(&host, &mut rx, ev, expected).await;
     }
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn before_subagent_spawn_payload_and_result() {
+    if common::bun_missing("before_subagent_spawn_payload_and_result") {
+        return;
+    }
+    let host = loaded().await;
+    let mut rx = host.take_incoming().unwrap();
+    let s = String::from;
+    let cases: Vec<(LifecycleEvent, &str)> = vec![
+        (
+            LifecycleEvent::BeforeSubagentSpawn {
+                agent: s("task"),
+                invocation_kind: SubagentInvocationKind::Task,
+                model_role: Some(s("smol")),
+                patterns: vec![s("a/b:high"), s("c/d")],
+                spawn_key: Some(s("agent-1")),
+            },
+            r#"{"type":"before_subagent_spawn","agent":"task","invocationKind":"task","modelRole":"smol","patterns":["a/b:high","c/d"],"spawnKey":"agent-1"}"#,
+        ),
+        (
+            // An explicit selector has no role alias, and a spawn without a key omits it.
+            LifecycleEvent::BeforeSubagentSpawn {
+                agent: s("reviewer"),
+                invocation_kind: SubagentInvocationKind::Eval,
+                model_role: None,
+                patterns: Vec::new(),
+                spawn_key: None,
+            },
+            r#"{"type":"before_subagent_spawn","agent":"reviewer","invocationKind":"eval","patterns":[]}"#,
+        ),
+    ];
+    for (ev, expected) in cases {
+        assert_wire(&host, &mut rx, ev, expected).await;
+    }
+
+    // The host aggregates the handlers: the last `model` choice wins with its `note`.
+    let out = host
+        .emit_before_subagent_spawn(
+            s("task"),
+            SubagentInvocationKind::Task,
+            None,
+            vec![s("a/b")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!out.block);
+    assert_eq!(
+        out.model,
+        Some(vec![s("fx/one:high"), s("fx/two")]),
+        "the handler's model list replaces the spawn's patterns"
+    );
+    assert_eq!(out.note.as_deref(), Some("fixture route"));
     host.shutdown().await.unwrap();
 }
 

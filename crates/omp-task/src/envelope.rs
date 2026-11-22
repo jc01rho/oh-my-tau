@@ -30,6 +30,10 @@ pub struct TaskResultEnvelope {
     pub truncated: bool,
     /// Failure detail (stderr summary, schema violation, abort reason).
     pub error: Option<String>,
+    /// `before_subagent_spawn` routing note for the model a handler chose
+    /// (TS `resolvedModelRoute`); absent when no handler routed this run.
+    #[serde(rename = "resolvedModelRoute", skip_serializing_if = "Option::is_none")]
+    pub resolved_model_route: Option<String>,
 }
 
 /// Render the `<task-result>` envelope for a settled run
@@ -70,6 +74,7 @@ pub fn format_task_result(result: &RunOutput) -> TaskResultEnvelope {
         agent_url: format!("agent://{}", result.id),
         preview,
         error,
+        resolved_model_route: result.resolved_model_route.clone(),
     }
 }
 
@@ -105,6 +110,7 @@ mod tests {
             schema: SchemaValidation::NoSchema,
             duration: Duration::from_millis(42),
             truncated: false,
+            resolved_model_route: None,
         }
     }
 
