@@ -182,7 +182,48 @@ const orUndefined = (v: unknown) => (typeof v === "string" ? v : undefined);
 const unsupportedNow = (what: string): never => {
   throw new Error(`${what} is not available in the Rust extension host`);
 };
-const unsupported = (what: string) => async () => unsupportedNow(what);
+// `ctx.runEphemeralTurn` (TS EphemeralTurnOptions -> EphemeralTurnResult): the core runs the
+// /btw side turn (`run_ephemeral_turn` request); nothing enters the session history and tool
+// calls are never executed. Callbacks cannot cross the wire, so `onTextDelta` receives the
+// settled reply as one delta and `onUsage` the settled message. Callbacks run marked as inside
+// the side turn, so they cannot start another one (bounded recursion, as in TS).
+const inEphemeral = new AsyncLocalStorage<true>();
+async function runEphemeralTurn(options: Json): Promise<{ replyText: string; assistantMessage: Json }> {
+  if (inEphemeral.getStore()) throw new Error("runEphemeralTurn cannot start inside a running side turn");
+  if (!options || typeof options !== "object") throw new Error("runEphemeralTurn: options must be an object");
+  const { signal, onTextDelta, onUsage, ...wire } = options as Json & {
+    signal?: AbortSignal;
+    onTextDelta?: (delta: string) => unknown;
+    onUsage?: (message: Json) => unknown;
+  };
+  signal?.throwIfAborted();
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal?.reason ?? new Error("runEphemeralTurn aborted"));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    const reply = (await Promise.race([request("run_ephemeral_turn", wire), aborted])) as Json | null;
+    if (!reply || typeof reply.replyText !== "string" || !reply.assistantMessage || typeof reply.assistantMessage !== "object") {
+      throw new Error("runEphemeralTurn: the core returned a malformed result");
+    }
+    const result = { replyText: reply.replyText, assistantMessage: reply.assistantMessage as Json };
+    await inEphemeral.run(true, async () => {
+      if (onUsage) {
+        try {
+          await onUsage(result.assistantMessage);
+        } catch (e) {
+          log("warn", `runEphemeralTurn onUsage failed: ${e instanceof Error ? e.message : e}`);
+        }
+      }
+      // A delivery failure rejects the side turn (TS: awaited in order).
+      if (onTextDelta && result.replyText) await onTextDelta(result.replyText);
+    });
+    return result;
+  } finally {
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
+}
 function makeCtx() {
   const noop = () => {};
   return {
@@ -253,7 +294,7 @@ function makeCtx() {
     shutdown: () => notify("shutdown_requested", {}),
     isProjectTrusted: () => true,
     getSystemPrompt: () => (state.systemPrompt as string[]) ?? [],
-    runEphemeralTurn: unsupported("runEphemeralTurn"),
+    runEphemeralTurn: (options: Json) => runEphemeralTurn(options),
     setInterval: (cb: (...a: unknown[]) => void, ms?: number, ...a: unknown[]) => {
       const t = setInterval(() => safe(cb, a), ms);
       t.unref?.();
@@ -878,6 +919,51 @@ async function emit(p: Json) {
         for (const [i, b] of rep.entries()) if (b.type === "text") texts[i] = b.text;
       }
     if (original.some((_b, i) => rewritten(i))) result = { content: current() };
+  } else if (type === "resources_discover") {
+    // Every handler contributes; each path is tagged with its extension (ExtensionRunner.emitResourcesDiscover).
+    const found = { skillPaths: [] as Json[], promptPaths: [] as Json[], themePaths: [] as Json[] };
+    for (const e of exts)
+      for (const h of handlersFor(e)) {
+        const hr = (await runHandler(e, h, { type, cwd: event.cwd, reason: event.reason }, timeoutMs, rec)).value as Json | undefined;
+        for (const k of ["skillPaths", "promptPaths", "themePaths"] as const) {
+          const paths = hr?.[k];
+          if (Array.isArray(paths)) found[k].push(...paths.map((path) => ({ path, extensionPath: e.path })));
+        }
+      }
+    result = found;
+  } else if (type === "before_provider_request") {
+    // Chained payload replacement: each handler sees the previous handler's payload.
+    let payload = event.payload;
+    let modified = false;
+    for (const e of exts)
+      for (const h of handlersFor(e)) {
+        const hr = (await runHandler(e, h, { type, payload }, timeoutMs, rec)).value;
+        if (hr !== undefined) ((payload = hr), (modified = true));
+      }
+    result = modified ? { payload } : undefined;
+  } else if (type === "cache_warming_decision") {
+    // Last handler returning an action wins, starting from the core's proposal.
+    let action = event.action;
+    for (const e of exts)
+      for (const h of handlersFor(e)) {
+        const hr = (await runHandler(e, h, event, timeoutMs, rec)).value as Json | undefined;
+        if (hr?.action !== undefined) action = hr.action;
+      }
+    result = { action };
+  } else if (type === "before_subagent_spawn") {
+    // `block` short-circuits; otherwise the last model choice wins (with its note).
+    let chosen: Json | undefined;
+    outer4: for (const e of exts)
+      for (const h of handlersFor(e)) {
+        const hr = (await runHandler(e, h, event, timeoutMs, rec)).value as Json | undefined;
+        if (!hr) continue;
+        if (hr.block) {
+          chosen = hr;
+          break outer4;
+        }
+        if (hr.model !== undefined) chosen = { model: hr.model, note: hr.note };
+      }
+    result = chosen;
   } else if (type === "user_bash" || type === "user_python") {
     // First handler returning a result wins.
     outer3: for (const e of exts)
