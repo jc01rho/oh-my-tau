@@ -45,24 +45,21 @@ Mechanism is faithfully ported, not just the table:
 - `key_id_from_event` ↔ `parseKey` + `canonicalKeyId` fused, including the
   explicit-SHIFT-flag carry (CSI-u / modifyOtherKeys).
 
-### The 11 ids present upstream but absent here
+### The 11 upstream ids: declared, wiring status (Phase 8b)
 
-Verified absent from the whole crate, not merely from the table — `grep -rn`
-over `crates/**/*.rs` for each id outside `keybindings.rs` returns nothing:
+All 11 ids are declared in `keybindings.rs` with upstream defaults. Wiring:
 
-| Missing id | Needed by |
-|---|---|
-| `app.approval.approve` | tool-approval dialog (the dialog exists; approve is hard-wired) |
-| `app.ask.hide` | ask-dialog overlay |
-| `app.ask.note` | ask-dialog overlay |
-| `app.btw.inject` | btw-inject / btw-panel overlays |
-| `app.links.hint` | link-browser overlay |
-| `app.local.open` | local file/URL open |
-| `app.session.pin` | session-selector overlay |
-| `app.session.unpin` | session-selector overlay |
-| `app.stt.pushToTalk` | STT gesture (hold-Space); `app.stt.toggle` exists with `&[]` and no gesture |
-| `app.tree.nextBranch` | tree overlay branch navigation |
-| `app.tree.previousBranch` | tree overlay branch navigation |
+| Id | Status | Action |
+|---|---|---|
+| `app.approval.approve` | WIRED | `ExtensionUi::approve_active`: answers a pending confirm with `true`, or a select with its first Approve/Allow/Yes/Accept option; any other dialog gets a notice instead of an answer. |
+| `app.ask.hide` | WIRED | `ExtensionUi::toggle_hidden`: the dialog stays pending but stops rendering and owning keys until the key is pressed again; the next dialog always starts visible. |
+| `app.stt.pushToTalk` | WIRED (notice) | With `stt.enabled` on and an empty editor, Space prints `speech-to-text is not available ...`; omp has no STT backend. With `stt.enabled` off Space types normally, as upstream. |
+| `app.ask.note` | NOT WIRED | Needs per-option notes in the ask dialog (`AskAnswer` has no note field). |
+| `app.btw.inject` | NOT WIRED | No btw panel overlay in the TUI to inject from. |
+| `app.links.hint` | NOT WIRED | No link-hint overlay. |
+| `app.local.open` | NOT WIRED | omp has no session `local://` store (see `app.rs` image-attach note). |
+| `app.session.pin` / `app.session.unpin` | NOT WIRED | The sessions overlay has a `pinned` field but no host pin-store hook. |
+| `app.tree.nextBranch` / `app.tree.previousBranch` | NOT WIRED | The tree overlay lists one branch path and has no branch-point navigation. |
 
 ### Two ids present here but absent upstream
 
@@ -77,9 +74,7 @@ without translating these two ids. Decide which side is canonical before the
 tree-overlay port; the cheap answer is to keep both pairs one release and
 retire the Rust-only pair once `nextBranch`/`previousBranch` land.
 
-Any one of these is a table entry, not a subsystem: adding the 11 ids is a
-single small patch. Only `app.stt.pushToTalk` carries behavioural weight (it
-needs the hold-Space gesture, which does not exist in `crates/omp-tui`).
+The NOT WIRED rows each need a missing UI component, not just a table entry.
 
 ---
 

@@ -68,6 +68,18 @@ use crate::theme::Theme;
 const MESSAGE_UPDATE_COALESCE: Duration = Duration::from_millis(33);
 /// Double-Esc / double-Ctrl+C window (input-controller L585, L1527).
 const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
+
+/// Notice for `app.stt.pushToTalk` while `stt.enabled` is on: omp ships no
+/// speech-to-text backend.
+pub const STT_UNAVAILABLE: &str =
+    "speech-to-text is not available: omp has no speech-to-text backend (stt.enabled is on)";
+
+/// `stt.enabled` as the runtime resolves it.
+fn stt_enabled(port: &impl RuntimePort) -> bool {
+    port.settings_get(&["stt.enabled".to_string()])
+        .into_iter()
+        .any(|(_, v)| v.as_bool() == Some(true))
+}
 /// Spinner frames for the "Working…" loader (TS loading animation set).
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// Loader spinner glyph step (TS `SPINNER_ADVANCE_MS`).
@@ -1350,6 +1362,27 @@ impl App {
         }
         self.last_ctrl_c = None;
 
+        // `app.ask.hide` hides/shows a pending dialog without answering it;
+        // `app.approval.approve` answers an approval prompt affirmatively
+        // (upstream app-keybindings.ts).
+        if self.keys.matches_event(&key, "app.ask.hide") {
+            if let Some(hidden) = self.extension_ui.toggle_hidden() {
+                if hidden {
+                    self.push_system(
+                        "Dialog hidden; press the app.ask.hide key again to answer it.".into(),
+                    );
+                }
+                return Some(true);
+            }
+        }
+        if self.extension_ui.wants_focus() && self.keys.matches_event(&key, "app.approval.approve")
+        {
+            if !self.extension_ui.approve_active(port) {
+                self.push_system("The open dialog is not a tool approval prompt.".into());
+            }
+            return Some(true);
+        }
+
         // Pending extension dialogs own keys before the editor (ExtUi
         // contract): they render modally above the live region.
         if self.extension_ui.handle_key(key, port) {
@@ -1417,6 +1450,18 @@ impl App {
 
         if self.keys.matches_event(&key, "app.interrupt") {
             return Some(self.esc_ladder(now, port));
+        }
+
+        // Push-to-talk (`app.stt.pushToTalk`, default Space on an empty
+        // editor) only claims the key when `stt.enabled` is on, like
+        // upstream. omp has no speech-to-text backend, so say so instead of
+        // swallowing the key silently.
+        if self.editor.is_empty()
+            && self.keys.matches_event(&key, "app.stt.pushToTalk")
+            && stt_enabled(port)
+        {
+            self.push_system(STT_UNAVAILABLE.into());
+            return Some(true);
         }
 
         // Tab accepts the ghost word completion plus a space; the popup branch
