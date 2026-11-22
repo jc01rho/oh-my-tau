@@ -918,6 +918,15 @@ pub(crate) fn extension_registry_lock() -> &'static tokio::sync::Mutex<()> {
     &LOCK
 }
 
+/// Extra skill roots from `--skill <path>` (repeatable). Set once at startup; each entry is
+/// a skill directory or a single `SKILL.md`-bearing directory, as mhc accepts both.
+static SKILL_EXTRA_ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+
+/// Record the `--skill` roots for [`load_skills`]. Later calls are ignored (one process, one argv).
+pub fn set_skill_paths(paths: Vec<PathBuf>) {
+    let _ = SKILL_EXTRA_ROOTS.set(paths);
+}
+
 /// All visible skills for the prompt (TS: `loadSkills` from the agent dir's
 /// `skills/`, `hide: true` dropped from the render).
 pub fn load_skills(agent: &Path, cwd: &Path, enabled: bool) -> Vec<Skill> {
@@ -948,6 +957,17 @@ pub fn load_skills_with(
             }
         } else {
             load_skills_dir(path, &mut skills);
+        }
+    }
+    // `--skill` roots come last so a gateway-provided root cannot shadow project skills.
+    if let Some(extra) = SKILL_EXTRA_ROOTS.get() {
+        for root in extra {
+            if root.is_dir() && !root.join("SKILL.md").is_file() {
+                load_skills_dir(root, &mut skills);
+            } else if let Some(parent) = root.parent() {
+                // A `--skill <dir>/SKILL.md` path: load its containing skill dir.
+                load_skills_dir(parent, &mut skills);
+            }
         }
     }
     skills.retain(|s| !s.hide);

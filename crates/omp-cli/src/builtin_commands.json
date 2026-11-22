@@ -951,5 +951,120 @@
   "input": {
    "hint": "<status|on|off|net on|net off>"
   }
+ },
+ {
+  "name": "settings",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "setup",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "plan-review",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "vibe",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "guided-goal",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "git",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "local",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "hub",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "tree",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "resume",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "delete",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "exit",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "commit",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "live",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "record",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "pause",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "forget-approvals",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "join",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "leave",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "open",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "tan",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "omfg",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
+ },
+ {
+  "name": "cleanse",
+  "description": "Reserved upstream command (not implemented in this build)",
+  "source": "builtin"
  }
 ]

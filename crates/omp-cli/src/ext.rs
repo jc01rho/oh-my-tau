@@ -1575,6 +1575,15 @@ impl Extensions {
         }
     }
 
+    /// Reload extensions into the live host (`reload`): same `load` + ctx re-send as a
+    /// reconnect recovery, but callable on demand. The session and any hold survive.
+    ///
+    /// # Errors
+    /// Transport failure on reload or ctx re-send.
+    pub async fn reload(self: &Arc<Self>) -> Result<()> {
+        self.recover().await
+    }
+
     /// Re-establish session state on a transparently reconnected host.
     ///
     /// # Errors

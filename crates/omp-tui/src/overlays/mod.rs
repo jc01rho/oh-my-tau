@@ -181,14 +181,15 @@ impl Overlays {
         }
     }
 
-    /// Open the tree navigator in `mode`, seeded with raw journal entries
-    /// (`/tree` full view, double-Esc rewind column).
-    pub fn open_tree(&mut self, entries: &[serde_json::Value], mode: tree::TreeMode) {
-        self.tree.set_entries(entries, mode);
-        self.tree.title = match mode {
-            tree::TreeMode::Rewind => "rewind".to_owned(),
-            tree::TreeMode::Tree => "tree".to_owned(),
-        };
+    /// Open the tree navigator in `mode` over the session `journal` (`/tree`
+    /// full view, double-Esc rewind column).
+    pub fn open_tree(
+        &mut self,
+        journal: &crate::port::SessionJournal,
+        mode: tree::TreeMode,
+        options: tree::TreeOptions,
+    ) {
+        self.tree.open(journal, mode, options);
         if !self.stack.contains(&OpenOverlay::Tree) {
             self.stack.push(OpenOverlay::Tree);
         }
@@ -279,6 +280,12 @@ impl Overlays {
         &mut self.tree
     }
 
+    /// Mutable access to the keyboard sheet (rebuilt from the effective
+    /// bindings when it opens).
+    pub fn help_mut(&mut self) -> &mut help::Help {
+        &mut self.help
+    }
+
     fn component(&self, which: OpenOverlay) -> &dyn Component {
         match which {
             OpenOverlay::Help => &self.help,
@@ -328,10 +335,11 @@ impl Overlays {
     /// dispatch (TS: the interactive controller polls each overlay after
     /// key handling). Covers: model picker's SetModel/SetThinkingLevel,
     /// palette confirmations (`/cmd` → [`Action::Slash`]), session picker
-    /// resolutions ([`Action::ResumeSession`]), tree selections
-    /// ([`Action::Rewind`]). Resolved overlays (palette, sessions, tree) are
-    /// popped automatically; Models stays open. The session picker is popped
-    /// from the stack whenever its pick resolves (either variant).
+    /// resolutions ([`Action::ResumeSession`]), tree decisions
+    /// ([`Action::Rewind`] / [`Action::NavigateTree`] / label edits).
+    /// Resolved overlays (palette, sessions, tree) are popped automatically;
+    /// Models stays open, and so does the tree after a label edit. The
+    /// session picker is popped whenever its pick resolves (either variant).
     pub fn take_actions(&mut self) -> Vec<crate::action::Action> {
         use crate::action::Action;
         let mut out = self.models.take_actions();
@@ -348,11 +356,29 @@ impl Overlays {
             }
             self.palette_close();
         }
-        if let Some(sel) = self.tree.take_selection() {
-            out.push(Action::Rewind {
-                entry_id: sel.entry_id,
-            });
-            self.close(OpenOverlay::Tree);
+        match self.tree.take_outcome() {
+            Some(tree::TreeOutcome::Navigate {
+                entry_id,
+                summarize,
+            }) => {
+                out.push(match self.tree.mode {
+                    tree::TreeMode::Rewind => Action::Rewind { entry_id },
+                    tree::TreeMode::Tree => Action::NavigateTree {
+                        entry_id,
+                        summarize,
+                    },
+                });
+                self.close(OpenOverlay::Tree);
+            }
+            Some(tree::TreeOutcome::AlreadyHere) => {
+                out.push(Action::Status("Already at this point".into()));
+                self.close(OpenOverlay::Tree);
+            }
+            Some(tree::TreeOutcome::Label { entry_id, label }) => {
+                out.push(Action::SetEntryLabel { entry_id, label });
+            }
+            Some(tree::TreeOutcome::Cancel) => self.close(OpenOverlay::Tree),
+            None => {}
         }
         if let Some(pick) = self.sessions.take_pick() {
             if let sessions::SessionPick::Resume(path) = pick {

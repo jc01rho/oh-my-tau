@@ -52,6 +52,12 @@ impl CmdError {
             code: Some(code),
         }
     }
+
+    /// A malformed-parameter failure (`invalid_params`).
+    #[must_use]
+    pub fn coded_params(message: impl Into<String>) -> Self {
+        Self::coded(message, "invalid_params")
+    }
 }
 
 impl From<anyhow::Error> for CmdError {
@@ -154,6 +160,9 @@ pub struct Runtime {
     /// Set by `abort()` (TS `#advisors.autoResumeSuppressed`): a follow-up-only
     /// queued-message drain stays suppressed until the next explicit user prompt.
     user_interrupt: std::sync::atomic::AtomicBool,
+    /// Lane hold state behind `interrupt intent:stop`, `get_state`'s pause fields and
+    /// `resume_session` (`pieces/01`, `pieces/03`).
+    pause: Mutex<crate::pause::PauseState>,
     /// Set while a manual compaction aborts the live turn (TS
     /// `disconnectFromAgent` around that abort): the empty aborted stub is
     /// neither rendered nor journaled — the turn resumes after the summary.
@@ -480,7 +489,10 @@ impl Runtime {
                 Ok(mut r) => {
                     apply_launch_fallbacks(&mut r);
                     agent.set_credential_id(r.credential_id);
-                    RecoveryConfig::from_resolved(&r)
+                    let mut cfg = RecoveryConfig::from_resolved(&r);
+                    cfg.model_fallback_disabled =
+                        MODEL_FALLBACK_DISABLED.load(std::sync::atomic::Ordering::Relaxed);
+                    cfg
                 }
                 Err(_) => RecoveryConfig::default(),
             },
@@ -535,6 +547,7 @@ impl Runtime {
             retry_task: Mutex::new(None),
             post_turn_task: Mutex::new(None),
             user_interrupt: std::sync::atomic::AtomicBool::new(false),
+            pause: Mutex::new(crate::pause::PauseState::default()),
             compaction_abort: std::sync::atomic::AtomicBool::new(false),
             compaction_stub_start: std::sync::atomic::AtomicBool::new(false),
             ui_context_frames: std::sync::atomic::AtomicBool::new(false),
@@ -1808,7 +1821,10 @@ impl Runtime {
             self.send(frame);
         }
         if settle {
+            // `session_settled` is omp's frame; `agent_settled` is the gateway's settle signal
+            // (it reads it as the "run is fully idle" marker before it releases a lane).
             self.send(json!({"type": "session_settled"}));
+            self.send(json!({"type": "agent_settled"}));
         }
         self.settled.notify_waiters();
     }
@@ -1829,6 +1845,7 @@ impl Runtime {
             self.emit_notice("warning", &msg, Some("budget"));
             return Err(CmdError::new(msg));
         }
+        self.release_pause("input");
         // A prompt during in-flight compaction cancels it and waits for the
         // pass to settle first (TS prompt-side `abortCompaction` +
         // `waitForManualMaintenanceCleanup`): the turn must start on the
@@ -2020,6 +2037,55 @@ impl Runtime {
         self.agent.wait_for_idle().await;
     }
 
+    /// Apply `set_client_info` and answer its role/capability errors.
+    ///
+    /// # Errors
+    /// A missing `width`, or a role change after it was fixed.
+    pub fn set_client_info(&self, cmd: &Value) -> Result<(), CmdError> {
+        let mut pause = lock(&self.pause);
+        crate::pause::set_client_info(&mut pause, cmd).map_err(CmdError::coded_params)
+    }
+
+    /// `interrupt intent:"stop"`: abort the turn, stop the shell, then hold the lane.
+    ///
+    /// # Errors
+    /// The peer never declared `interactive_user`.
+    pub async fn pause_for_stop(&self) -> Result<(), CmdError> {
+        if let Err(message) = crate::pause::require_interactive(&lock(&self.pause)) {
+            return Err(CmdError::coded(message, "stop_requires_interactive_client"));
+        }
+        self.abort().await;
+        self.set(|s| s.abort_bash());
+        let at = crate::persist::now_iso();
+        let seq = crate::pause::hold(&mut lock(&self.pause), &at);
+        self.journal_hold("hold", seq, None, &at);
+        self.send(crate::pause::paused_frame(seq, &at));
+        Ok(())
+    }
+
+    /// Drop every hold and announce the resume.
+    pub fn release_pause(&self, cause: &str) {
+        let at = crate::persist::now_iso();
+        let seq = {
+            let mut pause = lock(&self.pause);
+            if !pause.paused() {
+                return;
+            }
+            crate::pause::release(&mut pause)
+        };
+        self.journal_hold("release", seq, Some(cause), &at);
+        self.send(crate::pause::resumed_frame(seq, cause, &at));
+    }
+
+    fn journal_hold(&self, op: &str, seq: u64, cause: Option<&str>, at: &str) {
+        if let Err(e) = self
+            .persist
+            .append_entry("custom", crate::pause::journal(op, seq, cause, at))
+        {
+            eprintln!("omt: session-hold journal: {e:#}");
+        }
+    }
+
     pub fn steer(&self, message: &str) {
         self.agent.steer(user_message(message));
         self.emit_queue_update();
@@ -2151,6 +2217,12 @@ impl Runtime {
                 })).collect::<Vec<_>>(),
                 "goal": null,
             });
+            let pause = crate::pause::view(&lock(&self.pause));
+            if let Some(obj) = pause.as_object() {
+                v.as_object_mut()
+                    .expect("state is an object")
+                    .extend(obj.clone());
+            }
             if let Some(name) = &st.session_name {
                 v["sessionName"] = json!(name);
             }
@@ -3227,18 +3299,24 @@ impl Runtime {
         let Ok(entries) = self.entries() else {
             return Vec::new();
         };
-        let leaf = match self.persist.leaf_divergence() {
-            Some(Some(id)) => Some(id),
-            Some(None) => None,
-            None => omp_session::tree::leaf_id(&entries).map(str::to_owned),
-        };
-        leaf.map(|leaf| {
-            omp_session::tree::branch_path(&entries, &leaf)
-                .into_iter()
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
+        self.live_leaf(&entries)
+            .map(|leaf| {
+                omp_session::tree::branch_path(&entries, &leaf)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The live leaf of `entries` (TS `getLeafId()`): the writer's append
+    /// point after a `/tree` move, else the last journaled entry.
+    #[must_use]
+    pub fn live_leaf(&self, entries: &[Value]) -> Option<String> {
+        match self.persist.leaf_divergence() {
+            Some(leaf) => leaf,
+            None => omp_session::tree::leaf_id(entries).map(str::to_owned),
+        }
     }
 
     // ---------------------------------------------------------- compaction
@@ -3254,6 +3332,20 @@ impl Runtime {
     #[allow(dead_code)]
     pub fn set_summarizer(&self, f: Option<crate::compact::SummarizeFn>) {
         *lock(&self.summarizer) = f;
+    }
+
+    /// The compaction summarizer as a plain function (`/tree` branch summaries
+    /// run on the compaction lane, like TS `navigateTree`).
+    ///
+    /// # Errors
+    /// The live model target cannot build a completer (no model / credentials).
+    pub fn summarize_fn(&self) -> Result<crate::compact::SummarizeFn> {
+        use omp_compact::summary::Completer as _;
+        let summarizer = self.summarizer()?;
+        Ok(Arc::new(move |request| {
+            let summarizer = summarizer.clone();
+            Box::pin(async move { summarizer.complete(request).await })
+        }))
     }
 
     fn summarizer(&self) -> Result<crate::compact::Summarizer> {
@@ -4507,6 +4599,11 @@ struct MessageEnvelope {
 /// (TS `hasExplicitModel`); cleared by the first `load_session`.
 pub static MODEL_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static THINKING_PINNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by `main` for `--no-model-fallback`: recovery keeps backoff retries but never walks the
+/// fallback chain, so the gateway's pinned provider/id survives a retryable failure.
+pub static MODEL_FALLBACK_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Set by `main` for `-p` runs that persist no session: automatic titling

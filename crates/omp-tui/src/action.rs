@@ -74,6 +74,24 @@ pub enum Action {
         /// Target journal entry id.
         entry_id: String,
     },
+    /// `/tree` navigation to any entry (TS `AgentSession.navigateTree`),
+    /// optionally summarizing the abandoned branch first.
+    NavigateTree {
+        /// Target journal entry id.
+        entry_id: String,
+        /// Record a branch summary of the path being left.
+        summarize: bool,
+    },
+    /// Set (`Some`) or clear (`None`) a journal entry's label (`/tree`
+    /// Shift+L, TS `appendLabelChange`); the tree reloads afterwards.
+    SetEntryLabel {
+        /// Labeled entry id.
+        entry_id: String,
+        /// New label; `None` clears it.
+        label: Option<String>,
+    },
+    /// A one-line status for the transcript (TS `showStatus`).
+    Status(String),
     /// A `/settings` overlay edit (TS `cfg://` set): persist via the port
     /// and apply live where the TUI can (theme, thinking level).
     SettingChanged {
