@@ -1296,6 +1296,7 @@ fn base64url_payload(value: &Value) -> String {
 
 #[tokio::test]
 async fn gitlab_duo_login_completes_through_the_loopback_callback() {
+    let _port = FIXED_PORT_LOGINS.lock().await;
     let (_dir, target) = temp_target();
     let (services, http) = services(|request| {
         assert_eq!(request.url, "https://gitlab.com/oauth/token");
@@ -1407,6 +1408,7 @@ async fn gitlab_duo_login_completes_through_the_loopback_callback() {
 
 #[tokio::test]
 async fn gitlab_duo_login_cancelled_and_exchange_failure() {
+    let _port = FIXED_PORT_LOGINS.lock().await;
     let (_dir, target) = temp_target();
     let (services, _) = services(|_| (200, "{}".into()));
     assert_eq!(
@@ -1465,6 +1467,7 @@ impl OAuthLoginUi for ManualPasteUi {
 
 #[tokio::test]
 async fn gitlab_duo_agent_login_exchanges_the_pasted_vscode_redirect() {
+    let _port = FIXED_PORT_LOGINS.lock().await;
     let (_dir, target) = temp_target();
     let (services, http) = services(|request| {
         assert_eq!(request.url, "https://gitlab.com/oauth/token");
@@ -1512,6 +1515,7 @@ async fn gitlab_duo_agent_login_exchanges_the_pasted_vscode_redirect() {
 
 #[tokio::test]
 async fn gitlab_duo_agent_login_cancelled() {
+    let _port = FIXED_PORT_LOGINS.lock().await;
     let (_dir, target) = temp_target();
     let (services, _) = services(|_| (200, "{}".into()));
     assert_eq!(
@@ -1593,6 +1597,10 @@ fn queue(replies: Vec<(u16, String)>) -> Replies {
 fn routes(table: Vec<(&'static str, Replies)>) -> Arc<Mutex<Vec<(&'static str, Replies)>>> {
     Arc::new(Mutex::new(table))
 }
+
+/// These providers bind a fixed loopback callback port (8080, 8085, 51121, 59653, 54547) as the
+/// real CLIs do, so their tests take turns: two at once would race for the same port.
+static FIXED_PORT_LOGINS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The browser leg: waits for the authorize URL, then fires one real HTTP
 /// request at the running callback server with the state and code.
@@ -2037,6 +2045,7 @@ async fn perplexity_csrf_failure_is_a_login_error() {
 
 #[tokio::test]
 async fn gemini_cli_loopback_login_exchanges_and_discovers_the_project() {
+    let _port = FIXED_PORT_LOGINS.lock().await;
     let access = jwt(&json!({ "email": "g@x.com" }));
     let (services, http) = routed(routes(vec![
         (
@@ -2124,6 +2133,7 @@ async fn gemini_cli_loopback_login_exchanges_and_discovers_the_project() {
 
 #[tokio::test]
 async fn gemini_cli_project_discovery_failure_is_a_login_error() {
+    let _port = FIXED_PORT_LOGINS.lock().await;
     let access = jwt(&json!({}));
     let (services, _) = routed(routes(vec![
         (
@@ -2157,6 +2167,7 @@ async fn gemini_cli_project_discovery_failure_is_a_login_error() {
 
 #[tokio::test]
 async fn antigravity_loopback_login_onboards_the_free_tier_then_stores_the_project() {
+    let _port = FIXED_PORT_LOGINS.lock().await;
     let access = jwt(&json!({}));
     let (services, http) = routed(routes(vec![
         (
@@ -2219,6 +2230,7 @@ async fn antigravity_loopback_login_onboards_the_free_tier_then_stores_the_proje
 
 #[tokio::test]
 async fn devin_loopback_login_exchanges_json_and_stores_the_endpoints() {
+    let _port = FIXED_PORT_LOGINS.lock().await;
     let access = jwt(&json!({ "exp": 1_900_000_000i64 }));
     let (services, http) = routed(routes(vec![(
         "api.devin.ai/auth/cli/token",
@@ -2280,6 +2292,7 @@ async fn devin_loopback_login_exchanges_json_and_stores_the_endpoints() {
 
 #[tokio::test]
 async fn stencil_loopback_login_exchanges_and_profiles_the_account() {
+    let _port = FIXED_PORT_LOGINS.lock().await;
     let (services, http) = routed(routes(vec![
         (
             "auth.stencil.so/oauth/token",
@@ -2342,6 +2355,7 @@ async fn stencil_loopback_login_exchanges_and_profiles_the_account() {
 
 #[tokio::test]
 async fn stencil_manual_paste_completes_the_login_without_the_browser() {
+    let _port = FIXED_PORT_LOGINS.lock().await;
     let (services, _) = routed(routes(vec![
         (
             "auth.stencil.so/oauth/token",
