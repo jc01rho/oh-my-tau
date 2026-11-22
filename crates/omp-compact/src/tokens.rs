@@ -4,8 +4,10 @@
 //! `ceil(bytes / 4)` estimate otherwise (and always in tests). The estimate is the default here;
 //! inject a [`Tokenizer`] for exact counts.
 
+use pa_types::ai::ModelTokenizer;
 use serde_json::Value;
 
+use crate::image_tokens::{image_size_base64, ImageBilling};
 use crate::json::{message_role, str_field};
 
 /// Counts tokens in one text fragment. Fragments of a message are counted independently and
@@ -13,9 +15,18 @@ use crate::json::{message_role, str_field};
 pub trait Tokenizer: Sync {
     fn count_text(&self, text: &str) -> u64;
 
-    /// Estimated tokens for one image block. omp decodes the image header for its pixel size; the
-    /// default charges the unknown-size patch budget (never undercounts).
+    /// Pixel billing scheme for image blocks; `None` keeps the unknown-size budgets.
+    fn image_billing(&self) -> Option<ImageBilling> {
+        None
+    }
+
+    /// Estimated tokens for one image block: the decoded header size billed with
+    /// [`Tokenizer::image_billing`] when both are known, else the unknown-size patch budget (never
+    /// undercounts).
     fn count_image(&self, block: &Value) -> u64 {
+        if let Some(tokens) = billed_image_tokens(self.image_billing(), block) {
+            return tokens;
+        }
         match str_field(block, "detail") {
             Some("low") => 308,
             Some("high") => 3000,
@@ -34,8 +45,48 @@ impl Tokenizer for ByteEstimate {
     }
 }
 
+/// Byte estimate for text plus a pixel [`ImageBilling`] scheme for image blocks and frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchEstimate {
+    pub billing: ImageBilling,
+}
+
+impl PatchEstimate {
+    /// Estimator for a tokenizer family with a modelled pixel scheme.
+    #[must_use]
+    pub const fn for_tokenizer(tokenizer: ModelTokenizer) -> Option<Self> {
+        match ImageBilling::for_tokenizer(tokenizer) {
+            Some(billing) => Some(Self { billing }),
+            None => None,
+        }
+    }
+}
+
+impl Tokenizer for PatchEstimate {
+    fn count_text(&self, text: &str) -> u64 {
+        ByteEstimate.count_text(text)
+    }
+
+    fn image_billing(&self) -> Option<ImageBilling> {
+        Some(self.billing)
+    }
+}
+
+fn billed_image_tokens(billing: Option<ImageBilling>, block: &Value) -> Option<u64> {
+    let billing = billing?;
+    let size = image_size_base64(str_field(block, "data")?)?;
+    Some(billing.tokens(size))
+}
+
 /// Token cost of one snapcompact frame (`snapcompact.FRAME_TOKEN_ESTIMATE`).
 const FRAME_TOKEN_ESTIMATE: u64 = 5024;
+
+/// Tokens for one snapcompact frame image: its header size billed with the tokenizer's
+/// [`ImageBilling`] when known, else [`FRAME_TOKEN_ESTIMATE`].
+#[must_use]
+pub fn frame_tokens(t: &dyn Tokenizer, frame: &Value) -> u64 {
+    billed_image_tokens(t.image_billing(), frame).unwrap_or(FRAME_TOKEN_ESTIMATE)
+}
 
 /// Options for [`count_message`] (`MessageCountOptions`).
 #[derive(Debug, Clone, Copy, Default)]
@@ -146,11 +197,14 @@ pub fn count_message(t: &dyn Tokenizer, message: &Value, options: CountOptions) 
                         if str_field(block, "type") == Some("text") {
                             total += t.count_text(str_field(block, "text").unwrap_or(""));
                         } else {
-                            extra += FRAME_TOKEN_ESTIMATE;
+                            extra += frame_tokens(t, block);
                         }
                     }
                 } else if let Some(images) = message.get("images").and_then(Value::as_array) {
-                    extra += images.len() as u64 * FRAME_TOKEN_ESTIMATE;
+                    extra += images
+                        .iter()
+                        .map(|image| frame_tokens(t, image))
+                        .sum::<u64>();
                 }
             }
         }
@@ -163,4 +217,86 @@ pub fn count_message(t: &dyn Tokenizer, message: &Value, options: CountOptions) 
 #[must_use]
 pub fn count_messages(t: &dyn Tokenizer, messages: &[Value], options: CountOptions) -> u64 {
     messages.iter().map(|m| count_message(t, m, options)).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::image_tokens::tests::{b64, png};
+
+    fn image(width: u32, height: u32) -> Value {
+        json!({"type": "image", "data": b64(&png(width, height)), "mimeType": "image/png"})
+    }
+
+    #[test]
+    fn count_image_bills_decoded_size_when_scheme_known() {
+        let openai = PatchEstimate::for_tokenizer(ModelTokenizer::O200k).unwrap();
+        let deepseek = PatchEstimate::for_tokenizer(ModelTokenizer::DeepseekV3).unwrap();
+        assert!(PatchEstimate::for_tokenizer(ModelTokenizer::ClaudeV47).is_none());
+
+        let block = image(1024, 1024);
+        assert_eq!(openai.count_image(&block), 1024);
+        assert_eq!(deepseek.count_image(&block), 211 + 14 * 3 * (14 * 3 + 1));
+        assert_eq!(ByteEstimate.count_image(&block), 12_000);
+
+        let undecodable = json!({"type": "image", "data": "!!", "detail": "low"});
+        assert_eq!(openai.count_image(&undecodable), 308);
+    }
+
+    #[test]
+    fn count_message_sums_text_and_billed_images() {
+        let message = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "abcdefgh"}, image(64, 64)],
+        });
+        let openai = PatchEstimate {
+            billing: ImageBilling::OpenAiPatch,
+        };
+        assert_eq!(
+            count_message(&openai, &message, CountOptions::default()),
+            2 + 4
+        );
+        assert_eq!(
+            count_message(&ByteEstimate, &message, CountOptions::default()),
+            2 + 12_000
+        );
+    }
+
+    #[test]
+    fn frame_tokens_bill_frames_or_fall_back_to_estimate() {
+        let openai = PatchEstimate {
+            billing: ImageBilling::OpenAiPatch,
+        };
+        let frame = image(320, 64);
+        assert_eq!(frame_tokens(&openai, &frame), 10 * 2);
+        assert_eq!(frame_tokens(&ByteEstimate, &frame), FRAME_TOKEN_ESTIMATE);
+        assert_eq!(
+            frame_tokens(&openai, &json!({"type": "image"})),
+            FRAME_TOKEN_ESTIMATE
+        );
+
+        let summary = json!({
+            "role": "compactionSummary",
+            "summary": "abcd",
+            "blocks": [{"type": "text", "text": "abcd"}, frame.clone()],
+        });
+        let options = CountOptions::default();
+        assert_eq!(count_message(&openai, &summary, options), 1 + 1 + 20);
+        assert_eq!(
+            count_message(&ByteEstimate, &summary, options),
+            1 + 1 + FRAME_TOKEN_ESTIMATE
+        );
+
+        let legacy = json!({
+            "role": "compactionSummary",
+            "summary": "",
+            "images": [frame, {"data": "", "mimeType": "image/png"}],
+        });
+        assert_eq!(
+            count_message(&openai, &legacy, options),
+            20 + FRAME_TOKEN_ESTIMATE
+        );
+    }
 }

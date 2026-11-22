@@ -607,6 +607,7 @@ mod subscription_identity_tests {
             featured: None,
             headers: None,
             compat: None,
+            tokenizer: None,
         }
     }
 

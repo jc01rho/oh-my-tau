@@ -4436,6 +4436,7 @@ fn model_from_raw(raw: &RawModel) -> Model {
         compat: (raw.provider == "prime-inference")
             .then(|| raw.compat.as_ref().map(compat_from_raw))
             .flatten(),
+        tokenizer: None,
     }
 }
 

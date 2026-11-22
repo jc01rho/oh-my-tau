@@ -32,6 +32,7 @@ pub mod cut;
 pub mod dialect;
 pub mod files;
 pub mod handoff;
+pub mod image_tokens;
 pub mod json;
 pub mod messages;
 pub mod native;
@@ -58,6 +59,7 @@ pub use handoff::{
     append_handoff, generate_handoff_from_context, handoff_compaction_entry,
     handoff_summary_from_document, render_handoff_prompt, HandoffCommit,
 };
+pub use image_tokens::{image_size, image_size_base64, ImageBilling, ImageSize};
 pub use json::parse_iso_ms;
 pub use native::{
     anthropic_compaction_payload, archive_source_text, get_preserved_archive, history_blocks,
@@ -68,4 +70,4 @@ pub use summary::{
     build_short_summary_request, build_summary_request, build_turn_prefix_request, compact,
     generate_summary, CompactionResult, Completer, SummaryKind, SummaryParams, SummaryRequest,
 };
-pub use tokens::{ByteEstimate, Tokenizer};
+pub use tokens::{frame_tokens, ByteEstimate, PatchEstimate, Tokenizer};

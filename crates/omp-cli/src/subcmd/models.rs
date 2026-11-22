@@ -398,6 +398,7 @@ fn lenient_model(entry: &Value, provider: &str) -> Option<Model> {
         featured: None,
         headers: None,
         compat: None,
+        tokenizer: None,
     })
 }
 
@@ -635,6 +636,7 @@ fn custom_model(provider: &str, entry: &Value) -> Option<Model> {
         featured: None,
         headers: None,
         compat: None,
+        tokenizer: None,
     })
 }
 
