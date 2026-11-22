@@ -1846,11 +1846,17 @@ mod tests {
         let frame = response(
             Some(&json!("e1")),
             "interrupt",
-            Err(CmdError::coded("no interactive client", "stop_requires_interactive_client")),
+            Err(CmdError::coded(
+                "no interactive client",
+                "stop_requires_interactive_client",
+            )),
         );
         assert_eq!(frame["success"], json!(false));
         assert_eq!(frame["code"], json!("stop_requires_interactive_client"));
-        assert_eq!(frame["errorCode"], json!("stop_requires_interactive_client"));
+        assert_eq!(
+            frame["errorCode"],
+            json!("stop_requires_interactive_client")
+        );
         assert!(frame.get("data").is_none());
     }
 
