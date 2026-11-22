@@ -769,7 +769,7 @@ async fn dispatch_builtin_more(
             })
         }
         "reload-plugins" => {
-            output(rt, "Plugins reloaded.");
+            output(rt, RELOAD_PLUGINS_UNSUPPORTED);
             Some(Handled {
                 agent_invoked: false,
             })
@@ -782,7 +782,7 @@ async fn dispatch_builtin_more(
             if tool.is_empty() {
                 return Some(usage(rt, "Usage: /force:<tool-name> [prompt]"));
             }
-            output(rt, &format!("Next turn forced to use {tool}."));
+            output(rt, &force_unsupported(tool, !prompt.is_empty()));
             if prompt.is_empty() {
                 Some(Handled {
                     agent_invoked: false,
@@ -790,6 +790,12 @@ async fn dispatch_builtin_more(
             } else {
                 Some(Prompt(prompt.to_string()))
             }
+        }
+        name if UNPORTED_RESERVED.contains(&name) => {
+            output(rt, &unported_reserved_notice(name));
+            Some(Handled {
+                agent_invoked: false,
+            })
         }
         "dump" => {
             let messages = rt.messages().await;
@@ -3084,6 +3090,58 @@ fn context_report(_state: &Value, usage: &Value) -> String {
     }
 }
 
+/// Upstream builtin names reserved in `builtin_commands.json` so extensions and
+/// `commands/*.md` cannot claim them, whose behaviour omp has not ported yet.
+/// Each one answers with an explicit not-ported notice.
+const UNPORTED_RESERVED: &[&str] = &[
+    "settings",
+    "setup",
+    "plan-review",
+    "vibe",
+    "guided-goal",
+    "git",
+    "local",
+    "hub",
+    "tree",
+    "resume",
+    "delete",
+    "exit",
+    "commit",
+    "live",
+    "record",
+    "pause",
+    "forget-approvals",
+    "join",
+    "leave",
+    "open",
+    "tan",
+    "omfg",
+    "cleanse",
+];
+
+fn unported_reserved_notice(name: &str) -> String {
+    format!(
+        "/{name} is reserved for parity with upstream omp but is not implemented in this build."
+    )
+}
+
+/// `/reload-plugins`: omp loads WASM plugins and extensions once per session
+/// and has no hot-reload path, so say that instead of claiming a reload.
+const RELOAD_PLUGINS_UNSUPPORTED: &str = "Plugin hot reload is not supported: plugins and extensions load when the session starts. Run /restart to pick up plugin changes.";
+
+/// `/force:<tool>`: the agent loop sends no forced `tool_choice`, so the tool
+/// cannot be pinned; the prompt (if any) still runs as a normal turn.
+fn force_unsupported(tool: &str, has_prompt: bool) -> String {
+    let tail = if has_prompt {
+        " Sending the prompt as a normal turn."
+    } else {
+        ""
+    };
+    format!(
+        "Cannot force {tool}: forcing a tool choice for the next turn is not supported yet.{tail}"
+    )
+}
+
 /// Names (including aliases) reserved by text-mode builtins
 /// (TS `ACP_BUILTIN_RESERVED_NAMES`, from `builtin_commands.json`).
 fn is_reserved_builtin(name: &str) -> bool {
@@ -3240,6 +3298,25 @@ mod tests {
     }
 
     #[test]
+    fn every_upstream_builtin_name_is_reserved() {
+        for name in UNPORTED_RESERVED
+            .iter()
+            .copied()
+            .chain(["clear", "unpin", "hotkeys"])
+        {
+            assert!(is_reserved_builtin(name), "/{name} must be reserved");
+        }
+        assert_eq!(UNPORTED_RESERVED.len() + 3, 26);
+    }
+
+    #[test]
+    fn stub_notices_do_not_claim_success() {
+        assert!(!RELOAD_PLUGINS_UNSUPPORTED.contains("reloaded"));
+        assert!(force_unsupported("bash", true).starts_with("Cannot force bash"));
+        assert!(!force_unsupported("bash", false).contains("forced to use"));
+    }
+
+    #[test]
     fn reserved_names_match_catalog() {
         assert!(is_reserved_builtin("model"));
         assert!(is_reserved_builtin("models"));
@@ -3280,6 +3357,11 @@ mod tests {
                 // `:`-suffixed aliases (`force:`) are split off by
                 // `parse_slash_command` and dispatched under the base name.
                 let name = name.strip_suffix(':').unwrap_or(name);
+                // Reserved-but-unported names share one guard arm
+                // (`name if UNPORTED_RESERVED.contains(&name)`), not a literal one.
+                if UNPORTED_RESERVED.contains(&name) {
+                    continue;
+                }
                 let arm = regex::Regex::new(&format!(
                     r#"(?m)(^\s*"{}"\s*(=>|\|)|\|\s*"{}"\s*(=>|\|))"#,
                     regex::escape(name),

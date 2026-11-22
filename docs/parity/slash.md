@@ -113,7 +113,7 @@ tau-only names. `Handler` is the function that actually runs.
 | 32 | `/handoff` | STUB | `handoff_command` | Real `isStreaming` guard, then a notice: document generation + compact-in-place not wired. |
 | 33 | `/pin` | PORTED | `pin_command` | Pin session in the resume list. |
 | 34 | `/retry` | PORTED | `dispatch_builtin` | Re-runs the last failed turn. |
-| 35 | `/memory` | STUB | `dispatch_builtin_more` | Canned strings per verb, no backend — and it *asserts success* (`"Memory cleared."`). |
+| 35 | `/memory` | PARTIAL | `features::memory::handle_memory_command` | Backed by `omp_memory::MemoryRuntime` (`view stats diagnose clear reset enqueue rebuild queue sync mm`); opens its own runtime per call rather than the session-registered one or `tools/memory_backend.rs` `StoreBackend`. |
 | 36 | `/rename` | PORTED | `dispatch_builtin` | Rename, or generate a title. |
 | 37 | `/move` | PARTIAL | `move_command` | Validates the path and streaming state for real, then reports the relocation gap instead of re-scoping the session. |
 | 38 | `/wt` (`/worktree`) | PORTED | `features::worktree::command` | Move session into a new worktree, changes included. |
@@ -122,8 +122,8 @@ tau-only names. `Handler` is the function that actually runs.
 | 41 | `/dirs` | STUB | `notice` (same arm) | Cannot even list roots. |
 | 42 | `/marketplace` | PORTED | `features::skills::marketplace_command` | 10 subcommands. |
 | 43 | `/plugins` (`/plugin`) | PORTED | `plugins_command` | `list enable disable`. |
-| 44 | `/reload-plugins` | STUB | `dispatch_builtin_more` | Prints `"Plugins reloaded."` without reloading — asserts success falsely. |
-| 45 | `/force` (`/force:`) | STUB | `dispatch_builtin_more` | Prints `"Next turn forced to use <tool>."`, forwards the prompt, pins nothing. |
+| 44 | `/reload-plugins` | STUB | `dispatch_builtin_more` | Phase 8b: says hot reload is unsupported and points at `/restart` (`RELOAD_PLUGINS_UNSUPPORTED`); no longer claims a reload. |
+| 45 | `/force` (`/force:`) | STUB | `dispatch_builtin_more` | Phase 8b: says a forced tool choice is unsupported (`force_unsupported`) and sends the prompt as a normal turn; the agent loop still sends `tool_choice: None`. |
 | 46 | `/budget` | PORTED | `features::budget::command` | `status`, `$amount`, `<n>k`, `off`. Top-level only in tau; upstream nests it. |
 | 47 | `/sandbox` | UNIQUE | `features::sandbox::command` | Landlock + seccomp; `status/on/off/net on/net off`. |
 | 48 | `/rlm` | UNIQUE | `rlm_command` (`slash_extra.rs:69`) | `[--max-calls=N] <question> @file \| -- <text>`; loads the file as `context` in the eval kernel, delegates chunks via `llm_query`. |
@@ -199,6 +199,12 @@ mutations cannot rely on `/reload-plugins` to refresh state.
 ---
 
 ## 4. (c) MISSING — 26 upstream names with no reserved name
+
+**Phase 8b:** all 26 are now reserved. `clear`, `unpin` and `hotkeys` were
+already in `builtin_commands.json`; the other 23 were added there and answer
+with an explicit not-implemented notice (`UNPORTED_RESERVED` in `slash.rs`,
+test `every_upstream_builtin_name_is_reserved`). The table below is kept as the
+list of behaviour still to port.
 
 Exhaustive complement of §1: the full set difference between the 89 upstream
 top-level names and the 74 reserved strings on the target.

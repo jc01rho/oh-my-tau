@@ -453,6 +453,9 @@ pub struct ExtensionUi {
     widgets_below: Vec<HookWidget>,
     /// Most recent `ui_notify` toast, consumed once by the embedding loop.
     notification: Option<(String, String)>,
+    /// `app.ask.hide`: the active dialog stays pending but neither renders
+    /// nor owns keys until shown again.
+    hidden: bool,
 }
 
 impl ExtensionUi {
@@ -507,7 +510,45 @@ impl ExtensionUi {
     /// Whether a dialog currently owns the screen and keyboard.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.active.is_some()
+        self.active.is_some() && !self.hidden
+    }
+
+    /// `app.ask.hide`: hide or show the active dialog without answering it.
+    /// Returns the new hidden state, or `None` when no dialog is pending.
+    pub fn toggle_hidden(&mut self) -> Option<bool> {
+        self.active.as_ref()?;
+        self.hidden = !self.hidden;
+        Some(self.hidden)
+    }
+
+    /// Whether a pending dialog is currently hidden by `app.ask.hide`.
+    #[must_use]
+    pub fn is_hidden(&self) -> bool {
+        self.active.is_some() && self.hidden
+    }
+
+    /// `app.approval.approve`: answer the active dialog affirmatively when it
+    /// is an approval prompt — a yes/no confirm, or a select whose options
+    /// include an approve/allow/yes choice. Returns `false` (nothing sent)
+    /// when no such dialog is pending.
+    pub fn approve_active(&mut self, port: &impl RuntimePort) -> bool {
+        let Some(dialog) = self.active.as_ref() else {
+            return false;
+        };
+        let value = match &dialog.kind {
+            DialogKind::Confirm { .. } => serde_json::json!({"value": true}),
+            DialogKind::Select { options, .. } => {
+                let Some(option) = options.iter().find(|o| is_approve_label(&o.label)) else {
+                    return false;
+                };
+                serde_json::json!({"value": option.label.clone()})
+            }
+            _ => return false,
+        };
+        let id = dialog.id.clone();
+        port.extension_ui_response(id.clone(), value);
+        self.complete(&id);
+        true
     }
 
     /// Whether the active dialog is a full-screen picker (frame `fullscreen: true`): the shell
@@ -588,6 +629,7 @@ impl ExtensionUi {
 
     /// Promote the oldest queued request to the active dialog.
     fn activate_next(&mut self) {
+        self.hidden = false;
         self.active_req = self.queue.pop_front();
         self.active = self.active_req.as_ref().map(ActiveDialog::new);
     }
@@ -675,6 +717,17 @@ impl ExtensionUi {
 /// envelope keys (`RpcAskUi` puts `questions`/`timeout` at the top level).
 const ENVELOPE_KEYS: [&str; 4] = ["type", "id", "method", "extension"];
 
+/// Approval prompts label their affirmative choice "Approve", "Allow",
+/// "Allow once", "Yes", ...; match on the leading word.
+fn is_approve_label(label: &str) -> bool {
+    let first = label
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(first.as_str(), "approve" | "allow" | "yes" | "accept")
+}
+
 fn payload_of(frame: &Value) -> Value {
     if let Some(params) = frame.get("params").filter(|p| p.is_object()) {
         return params.clone();
@@ -701,7 +754,7 @@ impl ExtensionUi {
     /// editor (TS `#dialogActive` gates editor input).
     #[must_use]
     pub fn wants_focus(&self) -> bool {
-        self.active.is_some()
+        self.active.is_some() && !self.hidden
     }
 
     /// Handle a key event while a dialog is active. Answers are sent through
@@ -983,6 +1036,9 @@ impl ExtensionUi {
         let Some(dialog) = &self.active else {
             return;
         };
+        if self.hidden {
+            return;
+        }
         let fullscreen = self.wants_fullscreen();
         let popup = if fullscreen {
             area
@@ -1311,6 +1367,61 @@ mod tests {
         assert!(log[0].starts_with("extension_ui_response(sel-2, "));
         assert!(log[0].contains(r#""cancelled":true"#));
         assert!(!log[0].contains(r#""timedOut":true"#));
+    }
+
+    #[test]
+    fn approve_answers_confirm_and_approval_select_but_not_other_selects() {
+        let mut ui = ExtensionUi::new();
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"c","method":"confirm",
+            "title":"Run bash?","message":"rm -rf build"}),
+        );
+        let port = FakePort::default();
+        assert!(ui.approve_active(&port));
+        assert!(port.log.lock()[0].contains(r#""value":true"#));
+        assert!(!ui.is_active());
+
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"s","method":"select",
+            "title":"Tool approval","options":["Deny","Allow once","Allow always"]}),
+        );
+        let port = FakePort::default();
+        assert!(ui.approve_active(&port));
+        assert!(port.log.lock()[0].contains(r#""value":"Allow once""#));
+
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"p","method":"select",
+            "title":"Pick","options":["Basic","Pro"]}),
+        );
+        let port = FakePort::default();
+        assert!(!ui.approve_active(&port));
+        assert!(port.log.lock().is_empty());
+        assert!(ui.is_active());
+    }
+
+    #[test]
+    fn hide_keeps_the_dialog_pending_and_releases_focus() {
+        let mut ui = ExtensionUi::new();
+        assert_eq!(ui.toggle_hidden(), None);
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"c","method":"confirm",
+            "title":"Switch?","message":"m"}),
+        );
+        assert_eq!(ui.toggle_hidden(), Some(true));
+        assert!(!ui.wants_focus());
+        assert!(ui.is_hidden());
+        assert_eq!(ui.pending_len(), 1);
+        assert_eq!(ui.toggle_hidden(), Some(false));
+        assert!(ui.wants_focus());
+        // Answering resets the hidden flag for the next dialog.
+        ui.toggle_hidden();
+        let port = FakePort::default();
+        assert!(ui.approve_active(&port));
+        ui.push(
+            &json!({"type":"extension_ui_request","id":"d","method":"confirm",
+            "title":"Again?","message":"m"}),
+        );
+        assert!(ui.wants_focus());
     }
 
     #[test]
