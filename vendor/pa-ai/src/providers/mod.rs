@@ -11,6 +11,7 @@ pub mod google_stream;
 pub mod google_vertex;
 pub mod kimi;
 pub mod mistral;
+pub mod model_family;
 pub mod openai_codex_responses;
 pub mod openai_completions;
 pub mod openai_responses;

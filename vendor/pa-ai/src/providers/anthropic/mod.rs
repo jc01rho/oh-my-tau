@@ -112,19 +112,7 @@ pub struct AnthropicOptions {
 
 /// Check if a model supports adaptive thinking (Opus 4.6+, Sonnet 4.6+).
 pub(crate) fn supports_adaptive_thinking(model_id: &str) -> bool {
-    model_id.contains("opus-4-6")
-        || model_id.contains("opus-4.6")
-        || model_id.contains("opus-5")
-        || model_id.contains("opus-4-7")
-        || model_id.contains("opus-4.7")
-        || model_id.contains("opus-4-8")
-        || model_id.contains("opus-4.8")
-        || model_id.contains("sonnet-4-6")
-        || model_id.contains("sonnet-4.6")
-        || model_id.contains("sonnet-5")
-        || model_id.contains("fable-5")
-        || model_id.contains("mythos-5")
-        || model_id.contains("mythos-preview")
+    crate::providers::model_family::classify(model_id).supports_adaptive_thinking()
 }
 
 pub(crate) fn is_oauth_token(api_key: &str) -> bool {

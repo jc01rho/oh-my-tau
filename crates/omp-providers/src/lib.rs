@@ -11,6 +11,7 @@
 //!   per lookup, and request paths re-resolve per request and retry once after a 401).
 
 pub mod auth;
+pub mod catalog;
 mod command;
 mod fallback;
 mod judge;

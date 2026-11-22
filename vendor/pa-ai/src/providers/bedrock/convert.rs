@@ -34,17 +34,7 @@ fn get_model_match_candidates(model_id: &str, model_name: Option<&str>) -> Vec<S
 pub fn supports_adaptive_thinking(model_id: &str, model_name: Option<&str>) -> bool {
     get_model_match_candidates(model_id, model_name)
         .iter()
-        .any(|s| {
-            s.contains("opus-4-6")
-                || s.contains("opus-4-7")
-                || s.contains("opus-4-8")
-                || s.contains("opus-5")
-                || s.contains("sonnet-4-6")
-                || s.contains("sonnet-5")
-                || s.contains("fable-5")
-                || s.contains("mythos-5")
-                || s.contains("mythos-preview")
-        })
+        .any(|s| crate::providers::model_family::classify(s).supports_adaptive_thinking())
 }
 
 /// Fable/Mythos models — and Claude Opus 5.5 — think every turn and reject sampling params with a
@@ -52,13 +42,7 @@ pub fn supports_adaptive_thinking(model_id: &str, model_name: Option<&str>) -> b
 pub fn supports_always_on_adaptive_thinking(model_id: &str, model_name: Option<&str>) -> bool {
     get_model_match_candidates(model_id, model_name)
         .iter()
-        .any(|s| {
-            s.contains("fable-5")
-                || s.contains("mythos-5")
-                || s.contains("mythos-preview")
-                || s.contains("opus-5-5")
-                || s.contains("opus-5.5")
-        })
+        .any(|s| crate::providers::model_family::classify(s).supports_always_on_adaptive_thinking())
 }
 
 pub fn is_anthropic_claude_model(model: &Model) -> bool {

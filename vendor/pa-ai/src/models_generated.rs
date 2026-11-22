@@ -1,7 +1,10 @@
 //! Compiled fallback catalog ported from the TS `packages/ai/src/models.generated.ts`.
 //!
 //! The full catalog is fetched at runtime (no-cold-start chain: validated disk cache ->
-//! packaged bundled snapshot -> this compiled fallback). Hand-maintained; there is no generator.
+//! packaged bundled snapshot -> this compiled fallback). Catalog-owned fields (name, reasoning,
+//! input, cost, context/max tokens) are refreshed from `crates/omp-cli/assets/tui-model-catalog.json`
+//! by `cargo run -p omp-providers --example gen_models -- --write`; transport fields, thinking
+//! levels, headers and compat stay hand-authored.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -12,6 +15,10 @@ use crate::types::{
 };
 
 type ProviderCatalog = HashMap<String, HashMap<String, Model>>;
+
+/// The `rules-<version>-<hash>` fingerprint of `data/compat/rules.json` this table was last
+/// generated against (checked by `omp-providers` `catalog` tests).
+pub const CATALOG_RULES_FINGERPRINT: &str = "rules-1-unset";
 
 /// The compat fields the fallback table carries: the
 /// [`OpenAiCompletionsCompat`] subset the TS fallback file uses. Absent

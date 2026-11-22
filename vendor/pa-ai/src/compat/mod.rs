@@ -2,7 +2,7 @@
 //! resolver that turns a model spec `(provider, id, api, baseUrl, …)` plus sparse overrides into
 //! the complete resolved compat record, thinking metadata and request policy every request
 //! builder reads. Rule data (`data/compat/rules.json`, `axes.json`) is generated from the TS tree
-//! by `runs/omp-rust/compat-oracle/gen-data.ts`; behaviour is checked against TS by the oracle
+//! by `scripts/compat-oracle/gen-data.ts`; behaviour is checked against TS by the oracle
 //! test (`oracle.rs`).
 
 pub mod cascade;
