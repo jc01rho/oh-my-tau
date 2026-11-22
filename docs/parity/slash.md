@@ -87,7 +87,7 @@ tau-only names. `Handler` is the function that actually runs.
 | 6 | `/skillful` | PARTIAL | `setting_status_toggle` | Flips the setting + prints status; prompt-side skill listing effect unverified. |
 | 7 | `/extended-context` | PARTIAL | `setting_status_toggle` | Same shape as `/skillful`, on `extendedContext`. |
 | 8 | `/computer` | PORTED | `features::browser::computer_command` | `on`/`off`/`status`. |
-| 9 | `/security` | STUB | `notice` (`slash.rs:882`) | One notice behind it; **Phase 1** dropped the 11 subcommands the catalog used to advertise, leaving a bare entry described as not ported. |
+| 9 | `/security` | PARTIAL | `features::security::command` | Rust verbs over the SQLite store and coordinator: `status plans plan preflight start cancel findings validate sarif cloud help`. The catalog lists upstream's 11 verbs, but `scan scans show import export compare disposition` have no handler yet (8b-2 ledger). |
 | 10 | `/ratchet` | STUB | `notice` (`slash.rs:880`) | Needs the eval-harness + hill-climb runner. |
 | 11 | `/prewalk` | STUB | `notice` (`slash.rs:881`) | Startup-only feature in omt (`--prewalk*` flags); `/prewalk restart` unsupported. |
 | 12 | `/modelpreset` | PORTED | `modelpreset_command` | `list save switch delete`. |
@@ -98,7 +98,7 @@ tau-only names. `Handler` is the function that actually runs.
 | 17 | `/share` | PORTED | `features::share::command` | Encrypted link or secret gist. |
 | 18 | `/browser` | PORTED | `features::browser::command` | `headless` / `visible`. |
 | 19 | `/todo` | PARTIAL | `todo_command` (`slash.rs:1425`) | All 11 verbs ported (`phasesToMarkdown`, `findPhaseFuzzy`, `findTaskFuzzy`, `normalize_in_progress`, `commitTodos`); `edit` is TUI-only outside the TUI. |
-| 20 | `/session` | PORTED | `dispatch_builtin` | `info` / `delete` / `pin [account]`. |
+| 20 | `/session` | PARTIAL | `dispatch_builtin` | `info` only; the usage line names `delete` / `pin`, which live in `/delete` and `/pin`. |
 | 21 | `/jobs` | PORTED | `slash_extra::interactive::jobs_command` | `full` for untruncated command lines. |
 | 22 | `/usage` | PARTIAL | `usage_command` (`slash.rs:1663`) | `show`/`reset`; anthropic OAuth limits + reset credits. `reset` cannot select `provider/credential-id`. |
 | 23 | `/stats` | PORTED | `stats_command` (`slash.rs:2029`) | In-process dashboard, `--port`/`--host`. |
@@ -110,10 +110,10 @@ tau-only names. `Handler` is the function that actually runs.
 | 29 | `/fresh` | PORTED | `dispatch_builtin` | Resets provider stream state; transcript untouched. |
 | 30 | `/compact` | PORTED | `dispatch_builtin` | `soft`, `remote`, `snapcompact`, focus text. |
 | 31 | `/shake` | PORTED | `features::shake::command` | `elide` (default), `images`, `thinking`. |
-| 32 | `/handoff` | STUB | `handoff_command` | Real `isStreaming` guard, then a notice: document generation + compact-in-place not wired. |
+| 32 | `/handoff` | PORTED | `handoff_command` → `rt.compact(focus, "handoff")` | Handoff document oneshot (`omp_compact::handoff`) then compact in place, with the streaming guard. Runs in the foreground (TS backgrounds it). |
 | 33 | `/pin` | PORTED | `pin_command` | Pin session in the resume list. |
 | 34 | `/retry` | PORTED | `dispatch_builtin` | Re-runs the last failed turn. |
-| 35 | `/memory` | PARTIAL | `features::memory::handle_memory_command` | Backed by `omp_memory::MemoryRuntime` (`view stats diagnose clear reset enqueue rebuild queue sync mm`); opens its own runtime per call rather than the session-registered one or `tools/memory_backend.rs` `StoreBackend`. |
+| 35 | `/memory` | PORTED | `features::memory::handle_memory_command` | 8b-2: every verb runs on the session's shared engine (`tools::memory_backend::shared_runtime`, the one the memory tools retain through, configured `mnemopi.*` settings); `clear`/`reset` republish the `memory://` book. `mm` answers the ACP notice like TS's `handle`. |
 | 36 | `/rename` | PORTED | `dispatch_builtin` | Rename, or generate a title. |
 | 37 | `/move` | PARTIAL | `move_command` | Validates the path and streaming state for real, then reports the relocation gap instead of re-scoping the session. |
 | 38 | `/wt` (`/worktree`) | PORTED | `features::worktree::command` | Move session into a new worktree, changes included. |
@@ -122,8 +122,8 @@ tau-only names. `Handler` is the function that actually runs.
 | 41 | `/dirs` | STUB | `notice` (same arm) | Cannot even list roots. |
 | 42 | `/marketplace` | PORTED | `features::skills::marketplace_command` | 10 subcommands. |
 | 43 | `/plugins` (`/plugin`) | PORTED | `plugins_command` | `list enable disable`. |
-| 44 | `/reload-plugins` | STUB | `dispatch_builtin_more` | Phase 8b: says hot reload is unsupported and points at `/restart` (`RELOAD_PLUGINS_UNSUPPORTED`); no longer claims a reload. |
-| 45 | `/force` (`/force:`) | STUB | `dispatch_builtin_more` | Phase 8b: says a forced tool choice is unsupported (`force_unsupported`) and sends the prompt as a normal turn; the agent loop still sends `tool_choice: None`. |
+| 44 | `/reload-plugins` | PARTIAL | `Runtime::reload_plugins` | 8b-2: WASM plugin registry re-discovered and its tools swapped into the live tool list, base system prompt reassembled (skills re-read), slash catalog (WASM commands, `commands/*.md`) refreshed and re-announced; reports counts and load errors. Extension hosts and MCP connections are not reloaded live (the report says to /restart); `/plugins enable|disable` and marketplace installs do not trigger it. |
+| 45 | `/force` (`/force:`) | PORTED | `tool_choice::force` + `tool_choice::wrap_stream` | 8b-2: TS `setForcedToolChoice`: active-tool and model checks (TS `buildNamedToolChoice`), `[forced, none]` queued and carried by the main agent's next model calls as `SimpleToolChoice`; failed/aborted calls requeue, an inactive tool drops the sequence, `/new` clears it. |
 | 46 | `/budget` | PORTED | `features::budget::command` | `status`, `$amount`, `<n>k`, `off`. Top-level only in tau; upstream nests it. |
 | 47 | `/sandbox` | UNIQUE | `features::sandbox::command` | Landlock + seccomp; `status/on/off/net on/net off`. |
 | 48 | `/rlm` | UNIQUE | `rlm_command` (`slash_extra.rs:69`) | `[--max-calls=N] <question> @file \| -- <text>`; loads the file as `context` in the eval kernel, delegates chunks via `llm_query`. |
@@ -134,7 +134,7 @@ tau-only names. `Handler` is the function that actually runs.
 | 53 | `/fork` | PORTED | `slash_extra` | Fork from a previous message. |
 | 54 | `/branch` (`/rewind`) | PORTED | `interactive::branch_command` | Rewind keeping the old path as a branch. |
 | 55 | `/plan` | PORTED | `features::plan::command` | Toggle plan mode. |
-| 56 | `/goal` | PORTED | `slash_extra` | Persistent session objective. |
+| 56 | `/goal` | STUB | `slash_extra` | Answers that goal mode is not enabled: omp-rs registers the hidden `goal` tool without a goal runtime (`tools/goal.rs` `tool()` → every op fails), so goal mode itself is unported. Blocks `/guided-goal`. |
 | 57 | `/loop` | PORTED | `features::loop_mode::command` | |
 | 58 | `/queue` | PORTED | `slash_extra` | |
 | 59 | `/skills` | PORTED | `features::skills::command` | `search install installed update`. |
@@ -182,15 +182,15 @@ All 11 are honest about the gap except the four flagged below.
 |---|---|---|
 | `/security` | `"/security needs the security-scan mode controller (plan/run/compare), which is not ported to omt."` | honest. **Phase 1:** `builtin_commands.json` now holds a single bare `security` entry, `"description": "Not ported: security scans need the security-scan mode controller"`, with **no subcommand list** — the 11 phantom subcommands (`plan\|scan\|status\|cancel\|scans\|show\|import\|export\|validate\|compare\|disposition`) are gone. The `security_scan` tool is still absent (`tools.md` §1 #18); porting still means both together (§6 #6). |
 | `/ratchet` | `"/ratchet needs the ratchet eval-harness subsystem (eval preludes + hill-climb runner), which is not ported to omt."` | honest |
-| `/handoff` | `"/handoff (handoff document generation + compact-in-place) is not wired into the omt runtime; only the /compact summary path is available."` | honest |
+| `/handoff` | ~~not wired~~ — **ported** (handoff document + compact in place, §1 #32) | resolved |
 | `/prewalk` | `"Prewalk is a startup-time feature in omt (the --prewalk/--no-prewalk/--prewalk-into flags); arming or restarting it mid-session is not supported."` | honest |
 | `/add-dir` | `"Multi-root workspace directories are not tracked per-session in omt; …"` | honest |
 | `/remove-dir` | same notice | honest |
 | `/dirs` | same notice | honest |
-| `/memory` | Canned per-verb strings from `dispatch_builtin_more` | **reports success** |
+| `/memory` | ~~canned strings~~ — **ported** on the session's shared engine (§1 #35) | resolved (8b-2) |
 | `/advisor` | Always inactive | **reports state falsely** |
-| `/force` | Acknowledges, pins nothing | **reports success** |
-| `/reload-plugins` | `"Plugins reloaded."` | **reports success** |
+| `/force` | ~~pins nothing~~ — **ported**: the next model call is forced (§1 #45) | resolved (8b-2) |
+| `/reload-plugins` | ~~claimed a reload~~ — **partial**: WASM tools, prompt/skills and the slash catalog reload live; extensions/MCP need /restart (§1 #44) | resolved (8b-2) |
 
 The four bold rows are worse than the explicit gap stubs: `/memory`, `/force` and
 `/reload-plugins` claim the operation happened, and `/marketplace` / `/plugins`
@@ -214,20 +214,20 @@ or a `commands/*.md` file can claim any of these today.
 
 | Command | Upstream provider | Note |
 |---|---|---|
-| `/settings` | modes | Settings editor. |
+| `/settings` | modes | **TUI-only like TS**: omp-tui opens `overlays/settings.rs`; text-mode dispatch says it needs the TUI (8b-2). |
 | `/setup` | modes | First-run wizard. |
 | `/plan-review` | modes | Review gate on plan mode; tau has `/plan` only. |
 | `/vibe` | modes | |
-| `/guided-goal` | modes | Distinct from `/goal`, which tau has. |
+| `/guided-goal` | modes | **Not ported (8b-2)**: it interviews the user and finishes with `goal create`, but omp-rs goal mode is unported (the hidden `goal` tool has no runtime, §1 #56), so the kickoff could not complete. |
 | `/hotkeys` | session | Keybinding help overlay; blocked on the 9 missing binding ids (`tui.md` §1). |
 | `/git` | session | In tau, `/branch` and `/fork` are *conversation* forks — port `/git` subcommand-form only. |
 | `/local` | session | **Ported (8b-2), TUI-only like TS `handleTui`**: picker over the session's `local://` files or `/local <name>`, opened in `$VISUAL`/`$EDITOR` with the TUI stopped (`app.local.open` runs the same flow); text-mode dispatch says it needs the TUI. |
 | `/hub` | session | `/git hub`. |
-| `/tree` | session | `/git tree`; no collision with tau's `/branch`. |
-| `/resume` | lifecycle | Session picker; tau has `/new` and `/pin`. |
+| `/tree` | session | **TUI-only like TS**: `overlays/tree.rs` (8c); text-mode dispatch says it needs the TUI (8b-2). |
+| `/resume` | lifecycle | **TUI-only like TS**: `overlays/sessions.rs` with pins (8b-2); text-mode dispatch says it needs the TUI. |
 | `/unpin` | lifecycle | `/pin` exists, unpin-by-id does not. |
-| `/delete` | lifecycle | Deletes the current session; overlaps `/session delete`. |
-| `/exit` | lifecycle | tau uses `/quit` (`/q`). Divergence, not a bug. |
+| `/delete` | lifecycle | **Ported (8b-2)**: `Runtime::delete_session` starts a new session, then deletes the old session file and its artifacts dir (TS `newSession({ drop: true })`); "Nothing to delete (in-memory session)". |
+| `/exit` | lifecycle | **TUI-only like TS**: the TUI quits; text-mode dispatch says it needs the TUI (8b-2). |
 | `/clear` | lifecycle | **Dispatches in tau** but is unadvertised/unreserved — see §5. |
 | `/commit` | commit | Dedicated commit flow. |
 | `/live` | control | |
