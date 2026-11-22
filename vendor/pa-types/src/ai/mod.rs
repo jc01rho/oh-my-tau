@@ -746,7 +746,7 @@ impl ModelTokenizer {
         if norm.contains("claude") {
             // Version = first short numeric part (dates are 8 digits) plus the part after it.
             let short_num = |p: &&str| p.len() <= 2 && p.bytes().all(|b| b.is_ascii_digit());
-            let major_at = parts.iter().position(|p| short_num(&p));
+            let major_at = parts.iter().position(short_num);
             let major = major_at.map(|i| parts[i]);
             let minor = major_at
                 .and_then(|i| parts.get(i + 1))

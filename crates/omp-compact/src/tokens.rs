@@ -280,7 +280,7 @@ mod tests {
         let summary = json!({
             "role": "compactionSummary",
             "summary": "abcd",
-            "blocks": [{"type": "text", "text": "abcd"}, frame.clone()],
+            "blocks": [{"type": "text", "text": "abcd"}, frame],
         });
         let options = CountOptions::default();
         assert_eq!(count_message(&openai, &summary, options), 1 + 1 + 20);
