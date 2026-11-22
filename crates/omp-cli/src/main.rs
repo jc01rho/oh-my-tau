@@ -532,8 +532,12 @@ async fn async_main() -> Result<()> {
 
     // Session-source flags: --resume/--session/--continue/--fork load a
     // previous transcript; --session-dir relocates the session store.
-    let resume_target = if args.mode.as_deref() == Some("rpc") {
-        None // the rpc runtime owns session lifecycle
+    // rpc binds only an explicit `--session`/`--resume <id|path>`; every other combination
+    // (no flag, bare `--resume`, `--continue`, `--fork`) leaves the rpc runtime to own the
+    // session lifecycle and starts fresh.
+    let is_rpc = args.mode.as_deref() == Some("rpc");
+    let resume_target = if is_rpc && !matches!(args.resume, Some(Resume::Id(_))) {
+        None
     } else {
         let dir = sessions_dir(&cwd, args.session_dir.as_deref())?;
         std::fs::create_dir_all(&dir).ok();
@@ -542,10 +546,15 @@ async fn async_main() -> Result<()> {
         } else {
             persist::ts_sessions_dir(&cwd)
         };
+        let (continue_prev, fork) = if is_rpc {
+            (false, None)
+        } else {
+            (args.continue_prev, args.fork.as_deref())
+        };
         let target = resolve_resume_target(
             args.resume.as_ref(),
-            args.continue_prev,
-            args.fork.as_deref(),
+            continue_prev,
+            fork,
             &dir,
             ts_dir.as_deref(),
             &cwd,
@@ -577,8 +586,18 @@ async fn async_main() -> Result<()> {
             crate::slash_extra::mark_interactive_ui();
         }
         let result = match extensions.as_ref() {
-            Some(e) => rpc::run_with(agent, target, cwd, persistence, Some(e.rpc_on_start())).await,
-            None => rpc::run(agent, target, cwd, persistence).await,
+            Some(e) => {
+                rpc::run_with(
+                    agent,
+                    target,
+                    cwd,
+                    persistence,
+                    resume_target,
+                    Some(e.rpc_on_start()),
+                )
+                .await
+            }
+            None => rpc::run(agent, target, cwd, persistence, resume_target).await,
         };
         if let Some(e) = &extensions {
             e.shutdown().await;
