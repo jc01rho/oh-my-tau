@@ -12,11 +12,20 @@
 //! Unknown keys are preserved verbatim in the merged raw map and reported via
 //! [`Settings::unknown_keys`] — TS never drops config.yml keys it does not know.
 
+pub mod omo;
 mod schema;
 mod settings;
 
+pub use omo::{
+    active_profile_from_env, find_omo_config, load_omo_file, parse_jsonc, parse_omo_str,
+    resolve_profile_name, translate_omo_block, OmoLayer, OMO_CONFIG_FILENAMES, OMO_CONTROL_KEYS,
+    OMO_KNOWN_NAMESPACES,
+};
 pub use schema::{SettingDef, SETTINGS};
-pub use settings::{write_global, ModelPreset, ModelTagDef, Provenance, ServiceTier, Settings};
+pub use settings::{
+    resolve_agent_dir, resolve_agent_dir_with_home, write_global, ModelPreset, ModelTagDef,
+    Provenance, ServiceTier, Settings,
+};
 
 /// Value type of a setting, mirroring the TS registry `type:` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

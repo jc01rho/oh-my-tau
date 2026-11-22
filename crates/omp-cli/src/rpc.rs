@@ -1736,26 +1736,38 @@ pub type OnStart = Box<
 ///
 /// # Errors
 /// Fails on stdin read errors.
-pub async fn run(agent: Agent, target: Target, cwd: PathBuf, persist: Persistence) -> Result<()> {
-    run_with(agent, target, cwd, persist, None).await
+pub async fn run(
+    agent: Agent,
+    target: Target,
+    cwd: PathBuf,
+    persist: Persistence,
+    resume: Option<PathBuf>,
+) -> Result<()> {
+    run_with(agent, target, cwd, persist, resume, None).await
 }
 
 /// [`run`] with a start-up hook (see [`OnStart`]).
 ///
+/// `resume` (from `--session`/`--resume`) is bound before the hook and the `ready` frame.
+///
 /// # Errors
-/// Fails on stdin read errors.
+/// Fails on stdin read errors or when the `resume` session cannot be loaded.
 #[allow(clippy::too_many_lines)] // the RPC dispatch loop; one branch per wire frame type, mirrors omp's handler table
 pub async fn run_with(
     agent: Agent,
     target: Target,
     cwd: PathBuf,
     persist: Persistence,
+    resume: Option<PathBuf>,
     on_start: Option<OnStart>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     let agent = Arc::new(agent);
     RUNTIME_TX.with(|slot| *slot.borrow_mut() = Some(tx.clone()));
     let rt = Runtime::start(agent.clone(), target, cwd, persist, tx.clone()).await;
+    if let Some(path) = resume {
+        rt.load_session(&path, None).await?;
+    }
     if let Some(gate) = crate::approval::Gate::get() {
         gate.bind(&rt, true);
     }

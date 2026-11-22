@@ -46,7 +46,9 @@ const READ_ONLY_TOOLS: &[&str] = &[
 /// (`TaskRunner::default_max_concurrency`; the schema default `0` = auto).
 fn effective_max_concurrency(cwd: &std::path::Path) -> usize {
     let settings = omp_settings::Settings::load(cwd);
-    TaskRunner::resolve_max_concurrency(settings.get_number("task.maxConcurrency"))
+    settings
+        .effective_task_concurrency()
+        .unwrap_or_else(TaskRunner::default_max_concurrency)
 }
 
 /// Static header of the tool description (the `task.md` template rendered

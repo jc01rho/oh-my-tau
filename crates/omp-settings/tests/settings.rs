@@ -27,11 +27,17 @@ fn schema_covers_ts_registry() {
     // settings only the TS panel (`createSettingsHost`) lists, plus the omp-rs
     // gates `magicKeywords.ultracode`, `systemPrompt.compact` and
     // `sandbox.enabled`, plus upstream's later `btw.inject`.
-    assert_eq!(SETTINGS.len(), 554);
+    assert_eq!(SETTINGS.len(), 559);
+    assert!(SETTINGS.windows(2).all(|w| w[0].id < w[1].id));
     assert!(lookup("btw.inject").is_some());
     assert!(lookup("magicKeywords.ultracode").is_some());
     assert!(lookup("sandbox.enabled").is_some());
+    assert!(lookup("skills.disabled").is_some());
     assert!(lookup("systemPrompt.compact").is_some());
+    assert!(lookup("task.globalConcurrency").is_some());
+    assert!(lookup("task.wait.defaultMs").is_some());
+    assert!(lookup("task.wait.maxMs").is_some());
+    assert!(lookup("task.wait.minMs").is_some());
     assert!(lookup("modelRoles").is_some());
     assert!(lookup("cycleOrder").is_some());
     assert!(lookup("workspace.additionalDirectories").is_some());
@@ -454,4 +460,279 @@ fn real_user_config_loads_without_unknown_key_warnings() {
     // A few known values from the real file (structure only).
     assert!(settings.get("modelRoles").is_object());
     assert!(settings.model_roles().contains_key("default"));
+}
+
+#[test]
+fn jsonc_parser_handles_comments_trailing_commas_and_strings() {
+    let raw = r#"{
+        // single-line comment
+        "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-openagent/dev/assets/omo.schema.json",
+        /* multi-line
+           block comment */
+        "urlWithCommentTokens": "http://example.com/*not-a-comment*/,//still-string",
+        "escapedQuote": "a \" // b */ , } c",
+        "list": [
+            1,
+            2, // trailing comma in array
+        ],
+        "nested": {
+            "ok": true, /* trailing comma in object */
+        },
+    }"#;
+    let parsed = omp_settings::parse_jsonc(raw).expect("valid JSONC");
+    assert_eq!(
+        parsed["$schema"],
+        "https://raw.githubusercontent.com/code-yeongyu/oh-my-openagent/dev/assets/omo.schema.json"
+    );
+    assert_eq!(
+        parsed["urlWithCommentTokens"],
+        "http://example.com/*not-a-comment*/,//still-string"
+    );
+    assert_eq!(parsed["list"], serde_json::json!([1, 2]));
+    assert_eq!(parsed["nested"]["ok"], serde_json::json!(true));
+
+    assert!(omp_settings::parse_jsonc(r#"{"a": /* unclosed}"#).is_err());
+    assert!(omp_settings::parse_jsonc(r#"{"a": [1, 2}"#).is_err());
+}
+
+fn sample_fleet_jsonc() -> &'static str {
+    r#"{
+      "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-openagent/dev/assets/omo.schema.json",
+      "profiles": {
+        "fleet-small": {
+          "task": {
+            "default_concurrency": 2,
+            "global_concurrency": 2,
+          },
+        },
+        "fleet-medium": {
+          "task": {
+            "default_concurrency": 4,
+            "global_concurrency": 6,
+          },
+        },
+      },
+      "model_profile": "capable",
+      "models": {
+        "primary": { "model": "cliproxyapi/claude-sonnet-5-5", "reasoning": "high" }
+      },
+      "categories": {
+        "quick": {
+          "models": [
+            { "model": "cliproxyapi/ollama-deepseek-v4.1-flash" }
+          ]
+        }
+      },
+      "agents": {
+        "planner": {
+          "models": [
+            { "model": "cliproxyapi/claude-sonnet-5-5", "reasoning": "high" }
+          ]
+        }
+      },
+      "task": {
+        "default_execution_mode": "in-process",
+        "default_concurrency": 20,
+        "global_concurrency": 24,
+        "max_depth": 3,
+        "ttl_ms": 86400000,
+        "wait": {
+          "min_ms": 5000,
+          "default_ms": 60000,
+          "max_ms": 600000,
+        },
+      },
+      "[native]": {
+        "agents": {
+          "implementation-worker": {
+            "models": [
+              { "model": "cliproxyapi/claude-opus-5-5", "reasoning": "high" }
+            ]
+          }
+        }
+      },
+      "memory": { "enabled": true },
+      "telemetry": { "enabled": false },
+      "provenance": { "workspaces": [] },
+    }"#
+}
+
+#[test]
+fn omo_profile_selection_and_fleet_structure() {
+    let _guard = lock_env();
+    let root = tempdir("omo-profile");
+    let home = root.join("home");
+    let omo_dir = home.join(".omo");
+    let project = root.join("proj");
+    fs::create_dir_all(&omo_dir).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::write(omo_dir.join("omo.jsonc"), sample_fleet_jsonc()).unwrap();
+
+    std::env::remove_var("OMO_PROFILE");
+    std::env::remove_var("OMP_PROFILE");
+
+    let base_settings = Settings::load_with_home(&project, &home, None);
+    assert_eq!(base_settings.get_number("task.maxConcurrency"), Some(20.0));
+    assert_eq!(
+        base_settings.get_number("task.globalConcurrency"),
+        Some(24.0)
+    );
+    assert_eq!(
+        base_settings.get_number("task.maxRecursionDepth"),
+        Some(3.0)
+    );
+    assert_eq!(base_settings.get_number("task.wait.minMs"), Some(5_000.0));
+    assert_eq!(
+        base_settings.get_number("task.wait.defaultMs"),
+        Some(60_000.0)
+    );
+    assert_eq!(base_settings.get_number("task.wait.maxMs"), Some(600_000.0));
+    assert_eq!(base_settings.active_profile(), None);
+    assert!(
+        base_settings.unknown_keys().is_empty(),
+        "unexpected unknown keys: {:?}",
+        base_settings.unknown_keys()
+    );
+    let overrides = base_settings.get_record("task.agentModelOverrides");
+    assert_eq!(
+        overrides.get("quick").and_then(|v| v.as_str()),
+        Some("cliproxyapi/ollama-deepseek-v4.1-flash")
+    );
+    assert_eq!(
+        overrides
+            .get("implementation-worker")
+            .and_then(|v| v.as_str()),
+        Some("cliproxyapi/claude-opus-5-5")
+    );
+
+    std::env::set_var("OMO_PROFILE", "fleet-medium");
+    let medium_settings = Settings::load_with_home(&project, &home, None);
+    assert_eq!(medium_settings.active_profile(), Some("fleet-medium"));
+    assert_eq!(medium_settings.get_number("task.maxConcurrency"), Some(4.0));
+    assert_eq!(
+        medium_settings.get_number("task.globalConcurrency"),
+        Some(6.0)
+    );
+    assert_eq!(
+        medium_settings.provenance("task.maxConcurrency"),
+        Some(Provenance::Global)
+    );
+
+    let small_settings = Settings::load_with_home(&project, &home, Some("fleet-small"));
+    assert_eq!(small_settings.active_profile(), Some("fleet-small"));
+    assert_eq!(small_settings.get_number("task.maxConcurrency"), Some(2.0));
+    assert_eq!(
+        small_settings.get_number("task.globalConcurrency"),
+        Some(2.0)
+    );
+
+    let missing_profile = Settings::load_with_home(&project, &home, Some("fleet-nonexistent"));
+    assert_eq!(missing_profile.active_profile(), None);
+    assert_eq!(
+        missing_profile.get_number("task.maxConcurrency"),
+        Some(20.0)
+    );
+    assert!(missing_profile
+        .omo_diagnostics()
+        .iter()
+        .any(|d| d.contains("profiles.fleet-nonexistent")));
+
+    std::env::remove_var("OMO_PROFILE");
+}
+
+#[test]
+fn omp_and_omo_overlap_precedence_and_native_overlay() {
+    let _guard = lock_env();
+    let root = tempdir("omp-omo-precedence");
+    let home = root.join("home");
+    let omo_dir = home.join(".omo");
+    let omp_agent = home.join(".omp").join("agent");
+    let project = root.join("proj");
+    fs::create_dir_all(&omo_dir).unwrap();
+    fs::create_dir_all(&omp_agent).unwrap();
+    fs::create_dir_all(project.join(".omo")).unwrap();
+    fs::create_dir_all(project.join(".omp")).unwrap();
+
+    fs::write(
+        omo_dir.join("omo.jsonc"),
+        r#"{
+          "profiles": {
+            "fleet-medium": {
+              "task": {
+                "default_concurrency": 4,
+                "global_concurrency": 6
+              }
+            }
+          },
+          "task": {
+            "default_concurrency": 20,
+            "global_concurrency": 24,
+            "max_depth": 4
+          },
+          "[native]": {
+            "task": {
+              "max_depth": 5
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+
+    fs::write(
+        omp_agent.join("config.yml"),
+        "colorBlindMode: true\ntask:\n  maxConcurrency: 10\n",
+    )
+    .unwrap();
+
+    let s = Settings::load_with_home(&project, &home, Some("fleet-medium"));
+    assert_eq!(s.get_bool("colorBlindMode"), Some(true));
+    assert_eq!(s.get_number("task.maxConcurrency"), Some(10.0));
+    assert_eq!(s.get_number("task.globalConcurrency"), Some(6.0));
+    assert_eq!(s.effective_task_concurrency(), Some(6));
+    assert_eq!(s.get_number("task.maxRecursionDepth"), Some(5.0));
+
+    fs::write(
+        project.join(".omo").join("omo.jsonc"),
+        r#"{ "task": { "default_concurrency": 12, "global_concurrency": 14 } }"#,
+    )
+    .unwrap();
+    let with_project_fallback = Settings::load_with_home(&project, &home, Some("fleet-medium"));
+    assert_eq!(
+        with_project_fallback.get_number("task.maxConcurrency"),
+        Some(12.0)
+    );
+    assert_eq!(
+        with_project_fallback.get_number("task.globalConcurrency"),
+        Some(14.0)
+    );
+    assert_eq!(
+        with_project_fallback.provenance("task.maxConcurrency"),
+        Some(Provenance::Project)
+    );
+
+    fs::write(
+        project.join(".omp").join("config.yml"),
+        "task:\n  maxConcurrency: 16\n",
+    )
+    .unwrap();
+    let with_project_primary = Settings::load_with_home(&project, &home, Some("fleet-medium"));
+    assert_eq!(
+        with_project_primary.get_number("task.maxConcurrency"),
+        Some(16.0)
+    );
+    assert_eq!(
+        with_project_primary.get_number("task.globalConcurrency"),
+        Some(14.0)
+    );
+
+    let only_omo_home = root.join("only-omo-home");
+    fs::create_dir_all(only_omo_home.join(".omo").join("agent")).unwrap();
+    assert_eq!(
+        omp_settings::resolve_agent_dir_with_home(&only_omo_home, None),
+        only_omo_home.join(".omo").join("agent")
+    );
+    assert_eq!(
+        omp_settings::resolve_agent_dir_with_home(&home, None),
+        home.join(".omp").join("agent")
+    );
 }
