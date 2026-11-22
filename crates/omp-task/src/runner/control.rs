@@ -68,6 +68,28 @@ const RPC_FINISHING_DEADLINE: Duration = Duration::from_secs(15);
 /// Bound on a resumed run's `switch_session` answer.
 const RPC_REOPEN_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Bound on writing the prompt frame: a child that stops reading stdin makes
+/// `write_all` wait on pipe backpressure forever (no error arrives), which
+/// would hold the run's slot and its held steer receipts.
+const RPC_PROMPT_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Test knob for [`RPC_PROMPT_WRITE_DEADLINE`]
+/// (`OMP_TASK_TEST_PROMPT_WRITE_DEADLINE_MS`); unset in production.
+fn rpc_prompt_write_deadline() -> Duration {
+    std::env::var("OMP_TASK_TEST_PROMPT_WRITE_DEADLINE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(RPC_PROMPT_WRITE_DEADLINE)
+}
+
+/// The prompt write's own bound, tightened to a resumed run's reopen
+/// deadline while that one is still armed.
+fn prompt_write_deadline(reopen: Option<Instant>) -> Instant {
+    let own = Instant::now() + rpc_prompt_write_deadline();
+    reopen.map_or(own, |at| at.min(own))
+}
+
 /// Test knob for [`RPC_REOPEN_DEADLINE`] (`OMP_TASK_TEST_REOPEN_DEADLINE_MS`);
 /// unset in production.
 fn rpc_reopen_deadline() -> Duration {
@@ -862,18 +884,19 @@ async fn drive_rpc(
     let mut killed = false;
     let mut finishing_at: Option<Instant> = None;
     // The prompt counts as delivered only once its frame was written; a run
-    // whose prompt write fails ends right there (it never ran anything).
+    // whose prompt write fails or stalls ends right there (it never ran
+    // anything). The write itself happens at the top of the loop, raced
+    // against its deadline and a cancel.
     let mut delivered = false;
     let mut prompt_failed = false;
+    let mut prompt_timeout = false;
+    let mut pending_prompt: Option<Value> = None;
     for frame in rpc.open(&spec.prompt, opts) {
-        let written = send(&mut stdin, &frame).await;
         if is_prompt_frame(&frame) {
-            delivered = written;
-            prompt_failed = !written;
+            pending_prompt = Some(frame);
+        } else {
+            send(&mut stdin, &frame).await;
         }
-    }
-    if delivered {
-        shared.prompt_sent.store(true, Ordering::SeqCst);
     }
     publish_session(shared, &rpc);
     // A resumed run waits for its `switch_session` answer only so long.
@@ -892,13 +915,44 @@ async fn drive_rpc(
         }
     }
     loop {
+        if let Some(frame) = pending_prompt.take() {
+            // Raced only against its own deadline: dropping a half-done write
+            // to serve a control would leave a torn frame on the child's
+            // stdin. Controls wait in the channel meanwhile (a cancel still
+            // wins the run's killable transition at once).
+            let bound = prompt_write_deadline(reopen_deadline);
+            tokio::select! {
+                written = send(&mut stdin, &frame) => {
+                    delivered = written;
+                    prompt_failed = !written;
+                }
+                _ = sleep_until_opt(Some(bound)) => {
+                    prompt_failed = true;
+                    prompt_timeout = true;
+                }
+            }
+            if delivered {
+                shared.prompt_sent.store(true, Ordering::SeqCst);
+                for (message, ack) in held.drain(..) {
+                    steer_child(&mut stdin, &message, ack).await;
+                }
+            }
+            continue;
+        }
         if prompt_failed {
             // The prompt frame never reached the child: kill it and settle
             // failed, so the caller knows nothing ran.
             kill_tree(&mut child);
             let _ = child.wait().await;
             let stderr = join_text(stderr, true).await;
-            let error = "could not write the prompt to the child".to_string();
+            let error = if prompt_timeout {
+                format!(
+                    "timed out writing the prompt to the child after {:?}",
+                    rpc_prompt_write_deadline()
+                )
+            } else {
+                "could not write the prompt to the child".to_string()
+            };
             let stderr = if stderr.trim().is_empty() {
                 error
             } else {
@@ -914,21 +968,15 @@ async fn drive_rpc(
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
                     for frame in rpc.on_line(&line) {
-                        let written = send(&mut stdin, &frame).await;
                         if is_prompt_frame(&frame) {
-                            delivered = written;
-                            prompt_failed = !written;
+                            // Written at the top of the loop, raced against
+                            // its deadline and a cancel.
+                            pending_prompt = Some(frame);
+                        } else {
+                            send(&mut stdin, &frame).await;
                         }
                     }
                     publish_session(shared, &rpc);
-                    if delivered {
-                        shared.prompt_sent.store(true, Ordering::SeqCst);
-                        if !rpc.finishing {
-                            for (message, ack) in held.drain(..) {
-                                steer_child(&mut stdin, &message, ack).await;
-                            }
-                        }
-                    }
                     if rpc.finishing {
                         shared.set_phase(RunPhase::Finishing);
                         finishing_at.get_or_insert_with(Instant::now);
