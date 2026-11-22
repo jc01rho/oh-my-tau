@@ -2429,6 +2429,32 @@ impl Runtime {
     }
 
     /// Clear the conversation and start a fresh session file.
+    /// TS `/delete` (`handleDeleteCommand` → `newSession({ drop: true })`):
+    /// start a new session, then delete the previous session file with its
+    /// artifacts directory. An in-memory session has nothing to delete.
+    ///
+    /// # Errors
+    /// No session file, or the new session could not start (the old file is
+    /// then kept).
+    pub async fn delete_session(&self) -> Result<()> {
+        let Some(previous) = self.persist.file() else {
+            anyhow::bail!("Nothing to delete (in-memory session)");
+        };
+        self.new_session(None)
+            .await
+            .context("Failed to start a new session")?;
+        if let Some(artifacts) = omp_urls::artifacts_directory_for(&previous) {
+            let _ = std::fs::remove_dir_all(artifacts);
+        }
+        match std::fs::remove_file(&previous) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+                "Failed to delete {}: {e}",
+                previous.display()
+            )),
+            _ => Ok(()),
+        }
+    }
+
     pub async fn new_session(&self, dir: Option<&Path>) -> Result<()> {
         self.check_switch("new", None).await?;
         let previous = self.persist.file();
@@ -6126,6 +6152,24 @@ mod compaction_guard_tests {
         .await;
         std::mem::forget(provider);
         Harness { rt, rx, _dir: dir }
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_the_file_and_artifacts_and_starts_fresh() {
+        let mut h = harness(1).await;
+        h.rt.prompt(None, "hello", None, Vec::new()).await.unwrap();
+        until_settled(&mut h.rx).await;
+        let old = h.rt.persist.file().expect("session file");
+        let old_id = h.rt.session_id();
+        let artifacts = omp_urls::artifacts_directory_for(&old).unwrap();
+        std::fs::create_dir_all(artifacts.join("local")).unwrap();
+        std::fs::write(artifacts.join("local/note.md"), "x").unwrap();
+        assert!(old.exists());
+        h.rt.delete_session().await.unwrap();
+        assert!(!old.exists(), "session file deleted");
+        assert!(!artifacts.exists(), "artifacts deleted");
+        assert_ne!(h.rt.session_id(), old_id, "continues in a new session");
+        assert!(h.rt.messages().await.is_empty());
     }
 
     #[tokio::test]

@@ -1004,7 +1004,7 @@
  },
  {
   "name": "delete",
-  "description": "Reserved upstream command (not implemented in this build)",
+  "description": "Delete the current session and start a new one",
   "source": "builtin"
  },
  {

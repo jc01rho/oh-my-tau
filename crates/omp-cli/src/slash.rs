@@ -897,6 +897,7 @@ async fn dispatch_ported(rt: &std::sync::Arc<Runtime>, name: &str, args: &str) -
         "hotkeys" => Some(hotkeys_command(rt, args)),
         // Upstream runs these only in the interactive TUI (`handleTui`), which
         // handles them locally; text-mode dispatch says so.
+        "delete" => Some(delete_command(rt).await),
         "local" | "open" | "settings" | "tree" | "resume" | "exit" => Some(notice(
             rt,
             &format!("/{name} is only available in the interactive TUI."),
@@ -3071,6 +3072,25 @@ async fn plugins_command(rt: &Runtime, args: &str) -> Outcome {
     }
 }
 
+/// `/delete` (TS `handleDeleteCommand`): delete the current session's file
+/// and artifacts and continue in a new session.
+async fn delete_command(rt: &Arc<Runtime>) -> Outcome {
+    if rt.state().await.get("isStreaming").and_then(Value::as_bool) == Some(true) {
+        return usage(
+            rt,
+            "Wait for the current response to finish or abort it before deleting the session.",
+        );
+    }
+    match rt.delete_session().await {
+        Ok(()) => output(rt, "Session deleted"),
+        Err(e) if crate::runtime::is_switch_cancelled(&e) => {}
+        Err(e) => output(rt, &format!("{e:#}")),
+    }
+    Handled {
+        agent_invoked: false,
+    }
+}
+
 /// `/handoff [focus]` — TS `handoff` (alias for `/compact handoff`): generate a
 /// handoff document over the live context and compact in place with it.
 async fn handoff_command(rt: &Arc<Runtime>, args: &str) -> Outcome {
@@ -3122,7 +3142,6 @@ const UNPORTED_RESERVED: &[&str] = &[
     "guided-goal",
     "git",
     "hub",
-    "delete",
     "commit",
     "live",
     "record",
