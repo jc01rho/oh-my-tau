@@ -13,9 +13,11 @@ mod events;
 mod ext;
 mod features;
 mod herdr;
+mod host;
 mod images;
 mod methodology;
 mod model;
+mod move_cmd;
 mod notices;
 mod paging;
 mod pause;
@@ -23,6 +25,7 @@ mod persist;
 mod rpc;
 mod rules;
 mod runtime;
+mod scope;
 mod slash_extra;
 pub mod subcmd;
 mod sysprompt;
@@ -63,6 +66,12 @@ modes need a session id prefix or path):
   -c, --continue       continue the newest previous session
   -r, --resume [ID]    resume a session (also --session)
   --fork ID            fork a session into a fresh file
+
+Several RPC sessions in one process (the OmOMeow gateway's session-move host):
+  --mode rpc --multi-session [--session-runtime in-process]
+                       the host answers open_session, close_session, list_sessions,
+                       release_session and move_session; every other command and
+                       frame carries the session's sessionId
 
 Flags parsed for TS parity whose subsystems are not in omt (no-op or
 reported, see GapInventory): --config, --add-dir, --smol/--slow/--plan,
@@ -335,10 +344,12 @@ async fn async_main() -> Result<()> {
         bail!("omt: --mode {mode} is not supported (no {mode} subsystem)");
     }
     if args.multi_session {
-        // PR-G11 lands the in-process `SessionRegistry`; until then the flag is accepted at the
-        // parser (the gateway argv must parse) but hosting several sessions is refused loudly
-        // rather than silently serving only the first one.
-        bail!("omt: --multi-session is not supported yet (no multi-session host); run one process per session");
+        if args.mode.as_deref() != Some("rpc") {
+            return Err(usage_err("--multi-session requires --mode rpc"));
+        }
+        // Every hosted session is opened by the client (`open_session`); the host owns the
+        // session set-up a single-session process does below.
+        return host::run(args).await;
     }
     if let Some(runtime) = args.session_runtime.as_deref() {
         if !args.multi_session {

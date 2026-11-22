@@ -69,11 +69,18 @@ type Arc<T> = std::sync::Arc<T>;
 /// Register the process-wide extension host for command listing/dispatch.
 /// Called once at startup (rpc and -p modes).
 pub fn set_extensions(ext: Arc<Ext>) {
+    if let Some(scope) = crate::scope::current() {
+        *crate::scope::write(&scope.extensions) = Some(ext);
+        return;
+    }
     let _ = EXTENSIONS.set(ext);
 }
 
-pub fn extensions() -> Option<&'static Arc<Ext>> {
-    EXTENSIONS.get()
+pub fn extensions() -> Option<Arc<Ext>> {
+    if let Some(scope) = crate::scope::current() {
+        return crate::scope::read(&scope.extensions).clone();
+    }
+    EXTENSIONS.get().cloned()
 }
 
 pub(crate) async fn try_extension_commands_for(
@@ -3257,7 +3264,7 @@ use self::Outcome::{Handled, Prompt};
 /// Extension + file commands in TS `buildAvailableSlashCommands` order.
 /// Appended after the builtin catalog by `Runtime::available_commands`.
 pub async fn dynamic_commands(rt: &std::sync::Arc<Runtime>) -> Vec<Value> {
-    dynamic_commands_for(rt, extensions()).await
+    dynamic_commands_for(rt, extensions().as_ref()).await
 }
 
 pub(crate) async fn dynamic_commands_for(

@@ -962,6 +962,10 @@ impl Gate {
 
     /// Bind the live runtime and whether the session has a UI (TS `hasUI()`).
     pub fn bind(&self, rt: &Arc<Runtime>, has_ui: bool) {
+        if let Some(scope) = crate::scope::current() {
+            *crate::scope::lock(&scope.approval) = (Some(Arc::downgrade(rt)), has_ui);
+            return;
+        }
         let mut b = self
             .binding
             .lock()
@@ -1009,12 +1013,18 @@ impl Gate {
         if resolved.policy != Policy::Prompt {
             return Ok(());
         }
-        let (rt, has_ui) = {
-            let b = self
-                .binding
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (b.rt.as_ref().and_then(Weak::upgrade), b.has_ui)
+        let (rt, has_ui) = match crate::scope::current() {
+            Some(scope) => {
+                let b = crate::scope::lock(&scope.approval);
+                (b.0.as_ref().and_then(Weak::upgrade), b.1)
+            }
+            None => {
+                let b = self
+                    .binding
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (b.rt.as_ref().and_then(Weak::upgrade), b.has_ui)
+            }
         };
         let session_id = rt.as_ref().map(|r| r.session_id()).unwrap_or_default();
         let observed = self.ext.as_ref().filter(|e| {

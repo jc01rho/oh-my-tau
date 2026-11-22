@@ -24,6 +24,10 @@ static HOST: RwLock<Option<Weak<dyn ContextNotesHost>>> = RwLock::new(None);
 /// Publish `host` as the session's context host (weakly; the caller keeps the
 /// owning `Arc`). Replaces any previously bound host.
 pub fn bind(host: &Arc<dyn ContextNotesHost>) {
+    if let Some(scope) = crate::scope::current() {
+        *crate::scope::write(&scope.context_host) = Some(Arc::downgrade(host));
+        return;
+    }
     *HOST.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::downgrade(host));
 }
 
@@ -34,6 +38,11 @@ pub fn unbind() {
 }
 
 fn bound() -> Option<Arc<dyn ContextNotesHost>> {
+    if let Some(scope) = crate::scope::current() {
+        return crate::scope::read(&scope.context_host)
+            .as_ref()
+            .and_then(Weak::upgrade);
+    }
     HOST.read()
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()

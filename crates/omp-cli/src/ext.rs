@@ -1766,6 +1766,7 @@ impl Extensions {
                 };
                 let previous = previous.map(|p| p.to_string_lossy().into_owned());
                 emit_silent(ext.host.emit_session_switch(reason, previous, None).await);
+                ext.restore_moved_state(&rt).await;
             });
         })));
         let host = self.host.clone();
@@ -1794,6 +1795,87 @@ impl Extensions {
         crate::features::modes::notify(&rt);
         self.session_start().await;
         self.start_credential_disabled_feed();
+        self.restore_moved_state(&rt).await;
+    }
+
+    /// `session_move_export` while the session's runtime is still live: every handler writes what
+    /// must follow the session into `dir`. A transport failure or any handler error refuses the
+    /// move.
+    ///
+    /// # Errors
+    /// The emit failed, or a handler threw or timed out.
+    pub async fn export_moved_state(&self, move_id: &str, dir: &Path) -> Result<(), String> {
+        let r = self
+            .host
+            .emit_session_move_export(move_id.to_owned(), dir.to_string_lossy().into_owned(), None)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        if r.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(r
+                .errors
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("; "))
+        }
+    }
+
+    /// Hand a moved session's extension state to the extensions once (`session_move_import`),
+    /// after `session_start` / `session_switch`. A delivery that fails is offered again on the next
+    /// open (`redelivered`).
+    async fn restore_moved_state(&self, rt: &Runtime) {
+        use omp_session::move_bundle;
+        let Some(file) = rt.live_session_file() else {
+            return;
+        };
+        let delivery = match tokio::task::spawn_blocking(move || {
+            move_bundle::begin_moved_state_delivery(&file)
+        })
+        .await
+        {
+            Ok(Ok(Some(delivery))) => delivery,
+            Ok(Ok(None)) => return,
+            Ok(Err(e)) => return eprintln!("omt: moved extension state: {e}"),
+            Err(e) => return eprintln!("omt: moved extension state: {e}"),
+        };
+        let emitted = self
+            .host
+            .emit_session_move_import(
+                delivery.move_id.clone(),
+                delivery.dir.to_string_lossy().into_owned(),
+                delivery.redelivered,
+                None,
+            )
+            .await;
+        // No handler ran (the extension is missing or failed to load): nothing consumed the state,
+        // so it stays pending for an open that can restore it.
+        let mut delivered = match emitted {
+            Ok(r) if r.errors.is_empty() && !r.handlers.is_empty() => true,
+            Ok(r) if r.errors.is_empty() => false,
+            Ok(r) => {
+                for err in r.errors {
+                    eprintln!("omt: extension session_move_import: {err}");
+                }
+                false
+            }
+            Err(e) => {
+                eprintln!("omt: extension session_move_import: {e:#}");
+                false
+            }
+        };
+        if delivered {
+            let mark = json!({"customType": move_bundle::MOVED_STATE_RESTORED,
+                "data": {"move_id": delivery.move_id, "restored_at": crate::persist::now_iso()}});
+            if let Err(e) = rt.append_entry("custom", mark) {
+                eprintln!("omt: moved extension state: {e:#}");
+                delivered = false;
+            }
+        }
+        if let Err(e) = delivery.finish(delivered) {
+            eprintln!("omt: moved extension state: {e}");
+        }
     }
 
     /// Refresh the live ctx facts from the runtime. `with_branch` also re-reads the session

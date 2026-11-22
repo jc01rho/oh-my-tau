@@ -7,6 +7,7 @@
 
 pub mod entries;
 pub mod index;
+pub mod move_bundle;
 pub mod pins;
 pub mod scan;
 pub mod tree;
@@ -305,6 +306,15 @@ impl SessionWriter {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Flush everything appended so far to disk.
+    ///
+    /// # Errors
+    /// I/O failure.
+    pub fn sync(&self) -> Result<()> {
+        self.file.sync_all()?;
+        Ok(())
     }
 
     /// Append a `message` entry; returns the new entry id.
@@ -991,7 +1001,7 @@ fn unescape(s: &str) -> String {
     out
 }
 
-fn rand_u32() -> u32 {
+pub(crate) fn rand_u32() -> u32 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     let mut h = RandomState::new().build_hasher();

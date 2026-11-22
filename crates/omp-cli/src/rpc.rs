@@ -54,7 +54,7 @@ use crate::tools::{AskUi, SelectOption};
 #[path = "slash.rs"]
 pub mod slash;
 
-const MAX_FRAME_BYTES: u64 = 1_048_576;
+pub(crate) const MAX_FRAME_BYTES: u64 = 1_048_576;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -64,8 +64,15 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// when no waiter is registered. Also called from the interactive TUI's
 /// bridge (`tui.rs`), which never runs the RPC command loop.
 pub fn resolve_pending_ui_request(id: &str, frame: Value) {
-    let tx = lock(&PENDING_UI_REQUESTS).remove(id);
-    if let Some(tx) = tx {
+    let tx = {
+        let mut pending = lock(&PENDING_UI_REQUESTS);
+        match pending.get(id) {
+            Some((owner, _)) if !answers_session(owner.as_ref(), &frame) => None,
+            Some(_) => pending.remove(id),
+            None => None,
+        }
+    };
+    if let Some((_, tx)) = tx {
         let _ = tx.send(frame);
     }
 }
@@ -74,7 +81,7 @@ pub fn resolve_pending_ui_request(id: &str, frame: Value) {
 /// `/login` and `/logout` dialogs; resolved by [`resolve_pending_ui_request`]).
 pub fn register_pending_ui_request(id: &str) -> tokio::sync::oneshot::Receiver<Value> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    lock(&PENDING_UI_REQUESTS).insert(id.to_string(), tx);
+    lock(&PENDING_UI_REQUESTS).insert(id.to_string(), (caller_session(), tx));
     rx
 }
 
@@ -83,9 +90,28 @@ pub fn forget_pending_ui_request(id: &str) {
     lock(&PENDING_UI_REQUESTS).remove(id);
 }
 
-/// Pending RPC ask-UI dialogs (`extension_ui_request` id → waiter).
-static PENDING_UI_REQUESTS: LazyLock<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Value>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// A pending callback: the session that is owed the answer, and where it goes.
+type Pending<T> = (Option<String>, T);
+
+/// Pending RPC ask-UI dialogs (`extension_ui_request` id → waiter and the session that asked).
+static PENDING_UI_REQUESTS: LazyLock<
+    Mutex<HashMap<String, Pending<tokio::sync::oneshot::Sender<Value>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The routing id of the hosted session the caller runs in (none outside a multi-session host).
+pub(crate) fn caller_session() -> Option<String> {
+    crate::scope::current().and_then(|scope| crate::scope::read(&scope.routing_id).clone())
+}
+
+/// Whether a callback frame names the session that is owed the answer: a host stamps
+/// `sessionId` on every frame it routes back, so a callback for another session never
+/// resolves this one's pending request.
+fn answers_session(pending: Option<&String>, frame: &Value) -> bool {
+    match (pending, frame.get("sessionId").and_then(Value::as_str)) {
+        (Some(owner), Some(named)) => owner == named,
+        _ => true,
+    }
+}
 
 /// Mirrors the `set_ask_dialog` RPC command (TS `askDialogEnabled`).
 static ASK_DIALOG_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -97,7 +123,7 @@ static UI_REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
 static UI_REQUESTS_CLOSED: AtomicBool = AtomicBool::new(false);
 
 /// Fail every in-flight and future dialog (stdin closed).
-fn close_ui_requests() {
+pub(crate) fn close_ui_requests() {
     UI_REQUESTS_CLOSED.store(true, Ordering::SeqCst);
     lock(&PENDING_UI_REQUESTS).clear();
 }
@@ -133,7 +159,7 @@ impl RpcAskUi {
         frame.insert("type".into(), json!("extension_ui_request"));
         frame.insert("method".into(), json!(method));
         let _pending = PendingUiGuard(id.clone());
-        lock(&PENDING_UI_REQUESTS).insert(id.clone(), tx);
+        lock(&PENDING_UI_REQUESTS).insert(id.clone(), (caller_session(), tx));
         if UI_REQUESTS_CLOSED.load(Ordering::SeqCst) {
             anyhow::bail!("RPC client disconnected before the dialog was answered");
         }
@@ -253,7 +279,7 @@ impl AskUi for RpcAskUi {
     }
 }
 
-const MAX_REASSEMBLED_BYTES: u64 = 67_108_864;
+pub(crate) const MAX_REASSEMBLED_BYTES: u64 = 67_108_864;
 const CACHE_WARMING_MODES: [&str; 3] = ["off", "streaming", "idle"];
 
 /// RPC protocol version advertised by `get_protocol_info` (the transport `negotiate_protocol`
@@ -339,7 +365,7 @@ pub const RPC_COMMANDS: &[&str] = &[
 /// A failure carries the error code twice, as `code` (omp's spelling) and `errorCode` (the
 /// OmOMeow gateway's `MoveHost`/`lane-hold` parsers read `errorCode`). An error without a code
 /// falls back to `rpc_failed` so every failure frame is machine-classifiable.
-fn response(id: Option<&Value>, command: &str, result: CmdResult) -> Value {
+pub(crate) fn response(id: Option<&Value>, command: &str, result: CmdResult) -> Value {
     let mut m = Map::new();
     if let Some(id) = id {
         m.insert("id".into(), id.clone());
@@ -471,10 +497,12 @@ fn host_tool_definitions(cmd: &Value) -> Result<Vec<HostToolDef>, CmdError> {
     Ok(defs)
 }
 
-/// Host tool calls awaiting `host_tool_update` / `host_tool_result` frames (call id -> sink).
-static PENDING_HOST_TOOLS: LazyLock<Mutex<HashMap<String, mpsc::UnboundedSender<Value>>>> =
+/// Host tool calls awaiting `host_tool_update` / `host_tool_result` frames (call id -> sink and
+/// the session that asked).
+static PENDING_HOST_TOOLS: LazyLock<Mutex<HashMap<String, Pending<mpsc::UnboundedSender<Value>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// Names installed by the last `set_host_tools` (replaced wholesale by the next one).
+/// Names installed by the last `set_host_tools` outside a host (replaced wholesale by the next
+/// one); a hosted session keeps its own list in its scope.
 static HOST_TOOL_NAMES: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 /// Set once the client disconnected: active and later host tool calls fail (TS `close`).
 static HOST_TOOLS_CLOSED: AtomicBool = AtomicBool::new(false);
@@ -495,7 +523,7 @@ fn host_frame_id(prefix: &str) -> String {
 
 /// Route an inbound `host_tool_result` / `host_tool_update` frame to its pending call.
 /// `false` for unknown ids or frames whose result lacks a `content` array (TS type guards).
-fn route_host_tool_frame(frame: Value) -> bool {
+pub(crate) fn route_host_tool_frame(frame: Value) -> bool {
     let is_result = frame.get("type") == Some(&json!("host_tool_result"));
     let key = if is_result { "result" } else { "partialResult" };
     if !frame
@@ -510,17 +538,17 @@ fn route_host_tool_frame(frame: Value) -> bool {
     };
     let tx = {
         let mut pending = lock(&PENDING_HOST_TOOLS);
-        if is_result {
-            pending.remove(&id)
-        } else {
-            pending.get(&id).cloned()
+        match pending.get(&id) {
+            Some((owner, _)) if !answers_session(owner.as_ref(), &frame) => None,
+            Some(_) if is_result => pending.remove(&id),
+            other => other.cloned(),
         }
     };
-    tx.is_some_and(|tx| tx.send(frame).is_ok())
+    tx.is_some_and(|(_, tx)| tx.send(frame).is_ok())
 }
 
 /// Fail every in-flight and future host tool call (stdin closed).
-fn close_host_tools() {
+pub(crate) fn close_host_tools() {
     HOST_TOOLS_CLOSED.store(true, Ordering::SeqCst);
     lock(&PENDING_HOST_TOOLS).clear();
 }
@@ -548,7 +576,7 @@ impl HostTool {
         }
         let id = host_frame_id("host-tool");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        lock(&PENDING_HOST_TOOLS).insert(id.clone(), tx);
+        lock(&PENDING_HOST_TOOLS).insert(id.clone(), (caller_session(), tx));
         (self.sink)(
             json!({"type": "host_tool_call", "id": id, "toolCallId": tool_call_id,
                            "toolName": name, "arguments": arguments}),
@@ -632,10 +660,17 @@ async fn set_host_tools(rt: &Arc<Runtime>, cmd: &Value) -> CmdResult {
     });
     let _tool_guard = rt.lock_tool_list().await;
     let mut tools = rt.agent.tools().await;
-    {
-        let mut installed = lock(&HOST_TOOL_NAMES);
-        tools.retain(|t| !installed.iter().chain(&names).any(|n| n == t.name()));
-        installed.clone_from(&names);
+    match crate::scope::current() {
+        Some(scope) => {
+            let mut installed = crate::scope::write(&scope.host_tools);
+            tools.retain(|t| !installed.iter().chain(&names).any(|n| n == t.name()));
+            installed.clone_from(&names);
+        }
+        None => {
+            let mut installed = lock(&HOST_TOOL_NAMES);
+            tools.retain(|t| !installed.iter().chain(&names).any(|n| n == t.name()));
+            installed.clone_from(&names);
+        }
     }
     tools.extend(defs.into_iter().map(|def| {
         Arc::new(HostTool {
@@ -1062,7 +1097,7 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
                 }
             }
         }
-        "reload" => reload_with_ext(rt, crate::rpc::slash::extensions()).await,
+        "reload" => reload_with_ext(rt, crate::rpc::slash::extensions().as_ref()).await,
         "resume_session" => {
             rt.release_pause("resume_session");
             none()
@@ -1631,6 +1666,10 @@ fn overflow_frame(frame: &Value) -> Value {
                 "error".into(),
                 json!("RPC response exceeded the transport limit"),
             );
+            // A hosted client routes the failure by session; a classic frame stays untagged.
+            if let Some(session) = frame.get("sessionId").and_then(Value::as_str) {
+                m.insert("sessionId".into(), json!(session));
+            }
             Value::Object(m)
         }
         Some("agent_end") => json!({
@@ -1658,17 +1697,26 @@ fn overflow_frame(frame: &Value) -> Value {
 
 /// Port of omp's `RpcFrameEncoder`: keeps every physical line within `MAX_FRAME_BYTES`
 /// (protocol v1: shrink / compact / replace; v2: `rpc_chunk` sequences).
+/// A multi-session host writes every hosted session's frames through one encoder: the messages a
+/// client already received are tracked per `sessionId` (none on a single-session connection).
 struct FrameEncoder {
     version: u8,
-    streamed: Vec<Value>,
+    streamed: HashMap<Option<String>, Vec<Value>>,
     chunks: u64,
+}
+
+fn stream_of(frame: &Value) -> Option<String> {
+    frame
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 impl FrameEncoder {
     fn new() -> Self {
         Self {
             version: 1,
-            streamed: Vec::new(),
+            streamed: HashMap::new(),
             chunks: 0,
         }
     }
@@ -1686,10 +1734,12 @@ impl FrameEncoder {
         else {
             return frame.clone();
         };
+        let sent = self
+            .streamed
+            .get(&stream_of(frame))
+            .map_or(&[][..], Vec::as_slice);
         let mut streamed = 0;
-        while streamed < self.streamed.len().min(messages.len())
-            && self.streamed[streamed] == messages[streamed]
-        {
+        while streamed < sent.len().min(messages.len()) && sent[streamed] == messages[streamed] {
             streamed += 1;
         }
         let mut out = frame.clone();
@@ -1730,7 +1780,7 @@ impl FrameEncoder {
             );
         }
         if kind == Some("agent_start") {
-            self.streamed.clear();
+            self.streamed.remove(&stream_of(frame));
         }
         let json = frame.to_string();
         if trace {
@@ -1768,11 +1818,14 @@ impl FrameEncoder {
         match kind {
             Some("message_end") => {
                 if let Some(m) = frame.get("message") {
-                    self.streamed.push(m.clone());
+                    self.streamed
+                        .entry(stream_of(frame))
+                        .or_default()
+                        .push(m.clone());
                 }
             }
             Some("agent_end") if frame.get("willContinue") != Some(&json!(true)) => {
-                self.streamed.clear();
+                self.streamed.remove(&stream_of(frame));
             }
             _ => {}
         }
@@ -1806,31 +1859,99 @@ pub async fn run(
     run_with(agent, target, cwd, persist, resume, None).await
 }
 
-/// [`run`] with a start-up hook (see [`OnStart`]).
-///
-/// `resume` (from `--session`/`--resume`) is bound before the hook and the `ready` frame.
-///
-/// # Errors
-/// Fails on stdin read errors or when the `resume` session cannot be loaded.
-#[allow(clippy::too_many_lines)] // the RPC dispatch loop; one branch per wire frame type, mirrors omp's handler table
-pub async fn run_with(
-    agent: Agent,
+/// The stdout writer of one RPC connection: encodes every frame sent on `rx` until the
+/// [`FLUSH_MARKER`] (or a closed stdout).
+pub(crate) fn spawn_writer(mut rx: mpsc::UnboundedReceiver<Value>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut out = tokio::io::stdout();
+        let mut encoder = FrameEncoder::new();
+        while let Some(v) = rx.recv().await {
+            if v.get(FLUSH_MARKER).is_some() {
+                break;
+            }
+            let mut buf = String::new();
+            for line in encoder.encode(&v) {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+            if out.write_all(buf.as_bytes()).await.is_err() || out.flush().await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// Flush every frame queued on `tx` so far (FIFO before the marker) and stop the writer; the
+/// timeout only bounds a stalled stdout.
+pub(crate) async fn finish_writer(
+    tx: &mpsc::UnboundedSender<Value>,
+    mut writer: tokio::task::JoinHandle<()>,
+) {
+    let _ = tx.send(json!({ FLUSH_MARKER: true }));
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+    }
+}
+
+/// A parsed stdin line, or the `parse` failure frame it earns.
+pub(crate) fn parse_command(line: &str) -> Result<Value, Value> {
+    match serde_json::from_str::<Value>(line) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err(response(
+            None,
+            "parse",
+            Err(CmdError::new(
+                "Failed to parse command: expected a JSON object",
+            )),
+        )),
+        Err(e) => Err(response(
+            None,
+            "parse",
+            Err(CmdError::new(format!("Failed to parse command: {e}"))),
+        )),
+    }
+}
+
+/// How [`start_session`] brings a session up.
+pub(crate) struct StartOptions {
+    /// A session file (a new one at that path when missing) bound before the hook and ready.
+    pub resume: Option<PathBuf>,
+    /// Runs once the runtime exists (extension host start-up).
+    pub on_start: Option<OnStart>,
+    /// The client answers dialogs (TS `hasUI`).
+    pub has_ui: bool,
+    /// Announce the connection with a `ready` frame (a single-session process).
+    pub ready: bool,
+}
+
+/// Start one RPC session's runtime on the frame channel `frames`: approval binding, the `ask`
+/// dialog transport, the start-up hook, then the `ready` frame and the command catalog.
+pub(crate) async fn start_session(
+    agent: Arc<Agent>,
     target: Target,
     cwd: PathBuf,
     persist: Persistence,
-    resume: Option<PathBuf>,
-    on_start: Option<OnStart>,
-) -> Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    let agent = Arc::new(agent);
-    RUNTIME_TX.with(|slot| *slot.borrow_mut() = Some(tx.clone()));
-    UI_REQUESTS_CLOSED.store(false, Ordering::SeqCst);
-    let rt = Runtime::start(agent.clone(), target, cwd, persist, tx.clone()).await;
+    frames: mpsc::UnboundedSender<Value>,
+    options: StartOptions,
+) -> Result<Arc<Runtime>> {
+    let StartOptions {
+        resume,
+        on_start,
+        has_ui,
+        ready,
+    } = options;
+    RUNTIME_TX.with(|slot| *slot.borrow_mut() = Some(frames.clone()));
+    let rt = Runtime::start(agent, target, cwd, persist, frames).await;
     if let Some(path) = resume {
-        rt.load_session(&path, None).await?;
+        rt.load_session(&path, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to load session: {e:#}"))?;
     }
     if let Some(gate) = crate::approval::Gate::get() {
-        gate.bind(&rt, true);
+        gate.bind(&rt, has_ui);
     }
     // Background tasks report to this session (completions, lifecycle).
     crate::tools::subagents::attach_runtime(&rt);
@@ -1878,84 +1999,50 @@ pub async fn run_with(
         crate::tools::republish_dyn_tools(&tools);
         rt.agent.set_tools(tools).await;
     }
-    let writer = tokio::spawn(async move {
-        let mut out = tokio::io::stdout();
-        let mut encoder = FrameEncoder::new();
-        while let Some(v) = rx.recv().await {
-            if v.get(FLUSH_MARKER).is_some() {
-                break;
-            }
-            let mut buf = String::new();
-            for line in encoder.encode(&v) {
-                buf.push_str(&line);
-                buf.push('\n');
-            }
-            if out.write_all(buf.as_bytes()).await.is_err() || out.flush().await.is_err() {
-                break;
-            }
-        }
-    });
-
     if let Some(hook) = on_start {
         hook(rt.clone()).await;
     }
-    rt.send(json!({
-        "type": "ready",
-        "protocolVersion": 1,
-        "supportedProtocolVersions": [1, 2],
-        "maxFrameBytes": MAX_FRAME_BYTES,
-        "maxReassembledFrameBytes": MAX_REASSEMBLED_BYTES,
-    }));
+    if ready {
+        rt.send(json!({
+            "type": "ready",
+            "protocolVersion": 1,
+            "supportedProtocolVersions": [1, 2],
+            "maxFrameBytes": MAX_FRAME_BYTES,
+            "maxReassembledFrameBytes": MAX_REASSEMBLED_BYTES,
+        }));
+    }
     rt.announce_commands();
     let dynamic = slash::dynamic_commands(&rt).await;
     if !dynamic.is_empty() {
         rt.set_available_commands(dynamic);
         rt.announce_commands();
     }
+    Ok(rt)
+}
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+/// Serve one session's commands, in arrival order, until `commands` closes; then let the accepted
+/// work finish. `inflight` counts the commands accepted and not yet answered.
+pub(crate) async fn serve_session(
+    rt: Arc<Runtime>,
+    mut commands: mpsc::UnboundedReceiver<Value>,
+    inflight: Arc<tokio::sync::watch::Sender<usize>>,
+) {
     let mut background = tokio::task::JoinSet::new();
-    // Commands run one at a time, in arrival order, on a worker task, so the read loop keeps
+    // Commands run one at a time, in arrival order, on a worker task, so this loop keeps
     // routing `extension_ui_response` (and `abort`) while a command awaits a dialog answer
     // (interactive slash commands, extension `ui.select`): handling inline deadlocked.
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Value>();
-    let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker = {
-        let (rt, busy) = (rt.clone(), busy.clone());
+        let (rt, inflight) = (rt.clone(), inflight.clone());
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
-                busy.store(true, std::sync::atomic::Ordering::SeqCst);
                 let reply = handle(&rt, &cmd).await;
                 rt.send(reply);
-                busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                inflight.send_modify(|n| *n = n.saturating_sub(1));
             }
         })
     };
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let cmd = match serde_json::from_str::<Value>(&line) {
-            Ok(v) if v.is_object() => v,
-            Ok(_) => {
-                rt.send(response(
-                    None,
-                    "parse",
-                    Err(CmdError::new(
-                        "Failed to parse command: expected a JSON object",
-                    )),
-                ));
-                continue;
-            }
-            Err(e) => {
-                rt.send(response(
-                    None,
-                    "parse",
-                    Err(CmdError::new(format!("Failed to parse command: {e}"))),
-                ));
-                continue;
-            }
-        };
+    while let Some(cmd) = commands.recv().await {
         let kind = cmd.get("type").and_then(Value::as_str).unwrap_or("");
         if kind == "extension_ui_response" {
             // Resolve a pending ask-UI dialog (see `RpcAskUi`).
@@ -1972,47 +2059,94 @@ pub async fn run_with(
             continue; // this server never opens `host_uri_request`s (no host URI bridge)
         }
         if kind == "bash" {
-            let rt = rt.clone();
+            let (rt, inflight) = (rt.clone(), inflight.clone());
             background.spawn(async move {
                 let result = match str_field(&cmd, "command") {
                     Ok(c) => run_bash(&rt, c).await,
                     Err(e) => Err(e),
                 };
                 rt.send(response(cmd.get("id"), "bash", result));
+                inflight.send_modify(|n| *n = n.saturating_sub(1));
             });
             continue;
         }
-        if matches!(kind, "abort" | "interrupt") && busy.load(std::sync::atomic::Ordering::SeqCst) {
+        // The router counted this command before handing it over; one in flight is this one.
+        if matches!(kind, "abort" | "interrupt") && *inflight.borrow() > 1 {
             // A command is in flight (possibly waiting on a dialog): abort or hold the run now
-            // instead of queueing behind it — `interrupt` awaits `wait_for_idle`.
+            // instead of queueing behind it — `interrupt` awaits `wait_for_idle`. This one is
+            // answered here, so it is released here too.
             let reply = handle(&rt, &cmd).await;
             rt.send(reply);
+            inflight.send_modify(|n| *n = n.saturating_sub(1));
             continue;
         }
         let _ = cmd_tx.send(cmd);
     }
+    drop(cmd_tx);
+    let _ = worker.await;
+    while background.join_next().await.is_some() {}
+    rt.agent.wait_for_idle().await;
+    // `prompt_result` / `session_settled` land a tick after the final `agent_end`.
+    rt.wait_settled().await;
+}
+
+/// [`run`] with a start-up hook (see [`OnStart`]).
+///
+/// # Errors
+/// Fails on stdin read errors.
+pub async fn run_with(
+    agent: Agent,
+    target: Target,
+    cwd: PathBuf,
+    persist: Persistence,
+    resume: Option<PathBuf>,
+    on_start: Option<OnStart>,
+) -> Result<()> {
+    let (tx, rx) = mpsc::unbounded_channel::<Value>();
+    let writer = spawn_writer(rx);
+    UI_REQUESTS_CLOSED.store(false, Ordering::SeqCst);
+    let rt = start_session(
+        Arc::new(agent),
+        target,
+        cwd,
+        persist,
+        tx.clone(),
+        StartOptions {
+            resume,
+            on_start,
+            has_ui: true,
+            ready: true,
+        },
+    )
+    .await?;
+    let (commands, queued) = mpsc::unbounded_channel::<Value>();
+    let inflight = Arc::new(tokio::sync::watch::channel(0usize).0);
+    let serving = tokio::spawn(serve_session(rt.clone(), queued, inflight));
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let read = async {
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match parse_command(&line) {
+                Ok(cmd) => {
+                    let _ = commands.send(cmd);
+                }
+                Err(frame) => rt.send(frame),
+            }
+        }
+        anyhow::Ok(())
+    };
+    let read = read.await;
     // stdin closed: let accepted work finish and flush its frames. Host tool calls can no
     // longer be answered, so fail them instead of waiting on the agent forever.
     close_host_tools();
     close_ui_requests();
-    drop(cmd_tx);
-    let _ = worker.await;
-    while background.join_next().await.is_some() {}
-    agent.wait_for_idle().await;
-    // `prompt_result` / `session_settled` land a tick after the final `agent_end`.
-    rt.wait_settled().await;
+    drop(commands);
+    let _ = serving.await;
     drop(rt);
-    // Every frame queued so far precedes the marker (FIFO), so the writer
-    // exits right after flushing them; the timeout only bounds a stalled stdout.
-    let _ = tx.send(json!({ FLUSH_MARKER: true }));
-    let mut writer = writer;
-    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut writer)
-        .await
-        .is_err()
-    {
-        writer.abort();
-    }
-    Ok(())
+    finish_writer(&tx, writer).await;
+    read
 }
 
 #[cfg(test)]
@@ -2769,7 +2903,7 @@ mod ask_ui_tests {
         let response = json!({"type": "extension_ui_response", "id": id,
             "answers": [{"id": "q1", "value": "ok"}]});
         let tx = lock(&PENDING_UI_REQUESTS).remove(&id).expect("waiter");
-        let _ = tx.send(response);
+        let _ = tx.1.send(response);
         let result = ui_task.await.unwrap().unwrap().unwrap();
         assert_eq!(result["answers"][0]["value"], json!("ok"));
         // A client that opted into tau's ask dialog does not get gateway `question` frames.

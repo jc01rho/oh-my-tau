@@ -74,8 +74,13 @@ pub trait ReviewSink: Send + Sync {
     );
 }
 
-fn sink() -> Option<&'static dyn ReviewSink> {
-    crate::rpc::slash::extensions().map(|e| e.as_ref() as &dyn ReviewSink)
+/// The session's extension host (per session in a multi-session host).
+fn sink() -> Option<std::sync::Arc<crate::ext::Extensions>> {
+    crate::rpc::slash::extensions()
+}
+
+fn as_sink(ext: Option<&std::sync::Arc<crate::ext::Extensions>>) -> Option<&dyn ReviewSink> {
+    ext.map(|e| e.as_ref() as &dyn ReviewSink)
 }
 
 /// The choices tau's plan review offers, in TS order. `execute` (`/plan approve`) and
@@ -523,7 +528,7 @@ async fn plan_turn(
     if !plan.trim().is_empty() {
         let request = review_request(&session_id, &plan);
         write_plan_file(rt, &request);
-        open_review(sink(), request);
+        open_review(as_sink(sink().as_ref()), request);
     }
     Ok(())
 }
@@ -546,7 +551,7 @@ async fn approve(rt: &Arc<Runtime>) -> Outcome {
     set_session(&session_id, false, &task);
     crate::features::modes::notify(rt);
     close_review(
-        sink(),
+        as_sink(sink().as_ref()),
         &session_id,
         Some(PlanReviewChoice::Execute),
         PlanReviewBy::Local,
@@ -573,7 +578,12 @@ fn leave(rt: &Arc<Runtime>) -> Outcome {
         was
     };
     crate::features::modes::notify(rt);
-    close_review(sink(), &session_id, None, PlanReviewBy::Local);
+    close_review(
+        as_sink(sink().as_ref()),
+        &session_id,
+        None,
+        PlanReviewBy::Local,
+    );
     output(
         rt,
         if was_active {

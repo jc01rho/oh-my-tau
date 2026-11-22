@@ -57,6 +57,10 @@ static SESSION_TOOLS: OnceLock<RwLock<Vec<Arc<dyn AgentTool>>>> = OnceLock::new(
 /// Install the process-global session tool list (TS `ToolSession` the py
 /// bridge's `entry.toolSession` resolves against).
 pub fn set_session_tools(tools: Vec<Arc<dyn AgentTool>>) {
+    if let Some(scope) = crate::scope::current() {
+        *crate::scope::write(&scope.eval_tools) = tools;
+        return;
+    }
     let slot = SESSION_TOOLS.get_or_init(|| RwLock::new(Vec::new()));
     *slot.write().expect("session tools lock") = tools;
 }
@@ -70,7 +74,12 @@ pub fn refresh_session_tools(tools: &[Arc<dyn AgentTool>]) {
 }
 
 fn session_tools(env: &Env) -> Vec<Arc<dyn AgentTool>> {
-    if let Some(slot) = SESSION_TOOLS.get() {
+    if let Some(scope) = crate::scope::current() {
+        let tools = crate::scope::read(&scope.eval_tools).clone();
+        if !tools.is_empty() {
+            return tools;
+        }
+    } else if let Some(slot) = SESSION_TOOLS.get() {
         let tools = slot.read().expect("session tools lock").clone();
         if !tools.is_empty() {
             return tools;
@@ -88,7 +97,18 @@ static SESSION_HOOKS: RwLock<SessionHooks> = RwLock::new((None, None));
 
 /// Install the process-global tool-call hooks the bridge applies.
 pub fn set_session_hooks(before: Option<BeforeToolCallFn>, after: Option<AfterToolCallFn>) {
+    if let Some(scope) = crate::scope::current() {
+        *crate::scope::write(&scope.eval_hooks) = (before, after);
+        return;
+    }
     *SESSION_HOOKS.write().expect("session hooks lock") = (before, after);
+}
+
+fn session_hooks() -> SessionHooks {
+    match crate::scope::current() {
+        Some(scope) => crate::scope::read(&scope.eval_hooks).clone(),
+        None => SESSION_HOOKS.read().expect("session hooks lock").clone(),
+    }
 }
 
 /// Tools a cell may never call through the bridge. `checkpoint`/`rewind`
@@ -121,7 +141,7 @@ impl BridgePolicy {
     /// The process session's policy (see [`set_session_tools`] /
     /// [`set_session_hooks`]).
     fn session(env: &Env) -> Self {
-        let (before, after) = SESSION_HOOKS.read().expect("session hooks lock").clone();
+        let (before, after) = session_hooks();
         Self {
             tools: session_tools(env),
             before,
@@ -830,7 +850,7 @@ pub(crate) async fn call_with_session_hooks(
     signal: &AbortSignal,
     on_update: AgentToolUpdateCallback,
 ) -> Result<AgentToolResult, String> {
-    let (before, after) = SESSION_HOOKS.read().expect("session hooks lock").clone();
+    let (before, after) = session_hooks();
     execute_with_hooks(
         tools,
         before.as_ref(),

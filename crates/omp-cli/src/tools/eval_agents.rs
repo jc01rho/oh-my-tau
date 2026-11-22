@@ -91,6 +91,10 @@ static HOOKS: OnceLock<RwLock<Option<EvalRuntimeHooks>>> = OnceLock::new();
 /// Install the process-global eval runtime hooks. Call once at session
 /// startup, right after [`crate::agent::build_agent`] returns its target.
 pub fn set_runtime_hooks(target: crate::agent::Target) {
+    if let Some(scope) = crate::scope::current() {
+        *crate::scope::write(&scope.eval_target) = Some(target);
+        return;
+    }
     let slot = HOOKS.get_or_init(|| RwLock::new(None));
     *slot.write().expect("eval runtime hooks lock") = Some(EvalRuntimeHooks { target });
 }
@@ -104,6 +108,14 @@ fn hooks() -> Result<std::sync::RwLockReadGuard<'static, Option<EvalRuntimeHooks
 
 /// The live provider target (TS `session.getActiveModel`-backed `default` tier).
 fn provider_target() -> Result<crate::adapter::ProviderTarget, String> {
+    if let Some(scope) = crate::scope::current() {
+        let slot = crate::scope::read(&scope.eval_target);
+        let target = slot.as_ref().ok_or_else(|| {
+            "eval runtime is not initialized (set_runtime_hooks not called)".to_string()
+        })?;
+        let target = target.read().expect("provider target lock").clone();
+        return target.ok_or_else(|| "completion() has no provider target set.".to_string());
+    }
     let guard = hooks()?;
     let hooks = guard.as_ref().ok_or_else(|| {
         "eval runtime is not initialized (set_runtime_hooks not called)".to_string()

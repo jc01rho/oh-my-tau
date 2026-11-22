@@ -1149,6 +1149,16 @@ async function emit(p: Json) {
         if (hr.model !== undefined) chosen = { model: hr.model, note: hr.note };
       }
     result = chosen;
+  } else if (type === "session_move_export" || type === "session_move_import") {
+    // senpi `SessionMove*Event.signal`: every handler gets its own AbortSignal, aborted once the
+    // handler failed or ran out of budget, so one still writing into `dir` stops instead of racing
+    // the move. Failures are reported per handler (the core refuses the move on any).
+    for (const e of exts)
+      for (const h of handlersFor(e)) {
+        const ac = new AbortController();
+        const r = await runHandler(e, h, { ...event, signal: ac.signal }, timeoutMs, rec);
+        if (r.failed) ac.abort(new Error(r.message ?? r.failed));
+      }
   } else if (type === "user_bash" || type === "user_python") {
     // First handler returning a result wins.
     outer3: for (const e of exts)

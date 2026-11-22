@@ -924,12 +924,19 @@ static ENTRY_SINK: LazyLock<parking_lot::RwLock<Option<EntrySink>>> =
 
 /// Install (or clear) the sink that records sub-call accounting in the session.
 pub fn set_entry_sink(sink: Option<EntrySink>) {
+    if let Some(scope) = crate::scope::current() {
+        *crate::scope::write(&scope.entry_sink) = sink;
+        return;
+    }
     *ENTRY_SINK.write() = sink;
 }
 
 /// Record one call as a `model_usage` session entry (no-op without a sink).
 fn append_session_entry(record: &CallRecord, usage: &Usage) {
-    let sink = ENTRY_SINK.read().clone();
+    let sink = match crate::scope::current() {
+        Some(scope) => crate::scope::read(&scope.entry_sink).clone(),
+        None => ENTRY_SINK.read().clone(),
+    };
     let Some(sink) = sink else {
         return;
     };

@@ -421,7 +421,7 @@ pub async fn eval(env: Arc<Env>, args: Value, ctx: CallCtx) -> Result<AgentToolR
             let k = Arc::clone(&kernel);
             let bridge = make_bridge();
             let cell_cancel = cancel.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = crate::scope::spawn_blocking(move || {
                 k.execute_with(&code_c, run_opts(&bridge, timeout, cell_cancel))
             })
             .await
@@ -451,7 +451,7 @@ pub async fn eval(env: Arc<Env>, args: Value, ctx: CallCtx) -> Result<AgentToolR
             let k = Arc::clone(&kernel);
             let bridge = make_bridge();
             let cell_cancel = cancel.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = crate::scope::spawn_blocking(move || {
                 k.execute_with(&code_c, run_opts(&bridge, timeout, cell_cancel))
             })
             .await
