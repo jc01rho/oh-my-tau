@@ -490,6 +490,22 @@ impl Messages {
         &self.entries
     }
 
+    /// Links in the transcript whose scheme an extension claimed, in
+    /// transcript order and without duplicates (TS `startLinkHints` collects
+    /// them from the rendered transcript the same way).
+    #[must_use]
+    pub fn link_urls(&self, schemes: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for entry in &self.entries {
+            for url in crate::links::link_urls(&entry.text, schemes) {
+                if !out.contains(&url) {
+                    out.push(url);
+                }
+            }
+        }
+        out
+    }
+
     /// True while a `message_update` stream is open.
     #[must_use]
     pub fn is_streaming(&self) -> bool {

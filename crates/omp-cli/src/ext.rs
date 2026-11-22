@@ -1799,6 +1799,23 @@ async fn flush_credential_disabled(host: &ExtHost, feed: &CredentialDisabledFeed
     }
 }
 
+
+    /// Link schemes the loaded extensions claimed with `pi.registerLinkScheme()`, in load order
+    /// (first claimer first). The TUI offers exactly these links for `link_activate`.
+    #[must_use]
+    pub fn link_schemes(&self) -> Vec<String> {
+        self.host.link_schemes()
+    }
+
+    /// Deliver a click on `url` as `link_activate` to the extension that claimed its scheme.
+    /// `false` when no extension owns the link.
+    ///
+    /// # Errors
+    /// Transport failure to the extension host.
+    pub async fn activate_link(&self, url: &str) -> Result<bool> {
+        self.host.link_activate(url).await
+    }
+
 fn emit_silent(r: Result<omp_ext::EmitResult>) {
     match r {
         Ok(r) => {

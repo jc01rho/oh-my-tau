@@ -14,6 +14,8 @@ class Core {
   /** Answers host -> core requests (method -> handler); unknown methods get an error. */
   answer: Record<string, (params: Json) => unknown> = {};
   requests: Json[] = [];
+  /** Host -> core notifications (no id): `log`, `append_entry`, … */
+  notifications: Json[] = [];
   constructor() {
     void this.read();
   }
@@ -28,6 +30,7 @@ class Core {
         buf = buf.slice(i + 1);
         if (msg.method !== undefined && msg.id !== undefined) void this.serve(msg);
         else if (msg.method === undefined) this.waiters.get(msg.id)?.(msg);
+        else this.notifications.push(msg);
       }
     }
   }
@@ -230,4 +233,98 @@ test("before_subagent_spawn: block short-circuits, otherwise last model wins", a
   const r = await block.call("emit", { event: { type: "before_subagent_spawn" } });
   expect(r.result.result).toEqual({ block: true, reason: "no" });
   expect(r.result.handlers).toHaveLength(1);
+});
+
+// ---------------------------------------------------------------- link_activate
+/** Load `sources` as extensions in one host; returns the core plus the load result. */
+async function hostWithSources(sources: string[]): Promise<{ core: Core; loaded: Json[]; errors: Json[] }> {
+  const dir = mkdtempSync(join(tmpdir(), "omt-ext-"));
+  const paths = sources.map((source, i) => {
+    const path = join(dir, `probe-${i}.ts`);
+    writeFileSync(path, source);
+    return path;
+  });
+  const core = new Core();
+  cores.push(core);
+  const r = await core.call("load", { paths, cwd: dir });
+  return { core, loaded: r.result.loaded, errors: r.result.errors };
+}
+
+/** An extension claiming `scheme`, recording every `link_activate` and serving it as `cmd`. */
+const LINKER = (scheme: string, cmd: string, body = "seen.push(e.scheme + '|' + e.url);") => `export default (pi) => {
+  pi.registerLinkScheme("${scheme}");
+  const seen: string[] = [];
+  pi.on("link_activate", (e) => { ${body} });
+  pi.registerCommand("${cmd}", { handler: () => seen });
+};`;
+
+test("registerLinkScheme validates the scheme and reports it on load", async () => {
+  const { core, loaded, errors } = await hostWithSources([
+    `export default (pi) => {
+      const rejected: string[] = [];
+      for (const bad of ["a", "cc stretch", "1cc", "http", "HTTPS", "memory", "omp", ""]) {
+        try { pi.registerLinkScheme(bad); rejected.push("accepted:" + bad); } catch (e) { rejected.push(String(e.message)); }
+      }
+      pi.registerLinkScheme("CC-Stretch");
+      pi.registerLinkScheme("cc-stretch");
+      pi.registerCommand("rejected", { handler: () => rejected });
+    };`,
+  ]);
+  expect(errors).toEqual([]);
+  expect(loaded[0].linkSchemes).toEqual(["cc-stretch"]);
+  const rejected = (await core.call("call_command", { name: "rejected", args: "" })).result;
+  expect(rejected.some((m: string) => m.startsWith("accepted:"))).toBe(false);
+  expect(rejected[0]).toContain("is not a URL scheme of two or more characters");
+  expect(rejected[3]).toBe('registerLinkScheme: "http" is reserved for standard or omp-internal links');
+  expect(rejected[5]).toBe('registerLinkScheme: "memory" is reserved for standard or omp-internal links');
+});
+
+test("link_activate reaches only the extension that claimed the scheme", async () => {
+  const { core } = await hostWithSources([LINKER("cc-stretch", "seen-a"), LINKER("other", "seen-b")]);
+  const r = await core.call("link_activate", { url: "cc-stretch:open/1792/0/2" });
+  expect(r.result).toEqual({ handled: true });
+  expect((await core.call("call_command", { name: "seen-a", args: "" })).result).toEqual([
+    "cc-stretch|cc-stretch:open/1792/0/2",
+  ]);
+  expect((await core.call("call_command", { name: "seen-b", args: "" })).result).toEqual([]);
+  // The scheme half of a URL is case-insensitive; the URL itself is passed through verbatim.
+  await core.call("link_activate", { url: "CC-Stretch:open/1" });
+  expect((await core.call("call_command", { name: "seen-a", args: "" })).result).toEqual([
+    "cc-stretch|cc-stretch:open/1792/0/2",
+    "cc-stretch|CC-Stretch:open/1",
+  ]);
+});
+
+test("link_activate reports an unowned link as handled=false and runs nobody", async () => {
+  const { core } = await hostWithSources([LINKER("cc-stretch", "seen-a")]);
+  expect((await core.call("link_activate", { url: "https://example.com" })).result).toEqual({ handled: false });
+  expect((await core.call("link_activate", { url: "cc-stretch" })).result).toEqual({ handled: false });
+  expect((await core.call("link_activate", { url: ":nothing" })).result).toEqual({ handled: false });
+  expect((await core.call("call_command", { name: "seen-a", args: "" })).result).toEqual([]);
+});
+
+test("link_activate is owned even without a handler, and a failing handler is reported not thrown", async () => {
+  const { core } = await hostWithSources([
+    `export default (pi) => { pi.registerLinkScheme("quiet"); };`,
+    `export default (pi) => {
+      pi.registerLinkScheme("loud");
+      pi.on("link_activate", () => { throw new Error("boom"); });
+    };`,
+  ]);
+  expect((await core.call("link_activate", { url: "quiet:op" })).result).toEqual({ handled: true });
+  expect((await core.call("link_activate", { url: "loud:op" })).result).toEqual({ handled: true });
+  // The failure is reported to the core (pi warns and emits an error), never thrown back.
+  const warned = core.notifications.filter((n) => n.method === "log" && String(n.params.message).includes("boom"));
+  expect(warned.length).toBe(1);
+  // The host keeps serving after the handler error.
+  expect((await core.call("link_activate", { url: "quiet:op" })).result).toEqual({ handled: true });
+});
+
+test("emit link_activate is owner-routed, never broadcast", async () => {
+  const { core } = await hostWithSources([LINKER("cc-stretch", "seen-a"), LINKER("other", "seen-b")]);
+  const r = await core.call("emit", { event: { type: "link_activate", url: "other:go" } });
+  expect(r.result.result).toEqual({ handled: true });
+  expect(r.result.handlers).toHaveLength(1);
+  expect((await core.call("call_command", { name: "seen-b", args: "" })).result).toEqual(["other|other:go"]);
+  expect((await core.call("call_command", { name: "seen-a", args: "" })).result).toEqual([]);
 });

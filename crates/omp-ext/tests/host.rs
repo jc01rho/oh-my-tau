@@ -1257,3 +1257,52 @@ async fn failed_load_restores_provider_it_only_unregistered() {
     );
     host.shutdown().await.unwrap();
 }
+
+/// `registerLinkScheme` claims a scheme; `link_activate` reaches only that
+/// extension and reports whether anyone owned the link (TS `emitLinkActivate`).
+#[tokio::test]
+async fn link_activate_routes_to_the_claiming_extension() {
+    if common::bun_missing("link_activate_routes_to_the_claiming_extension") {
+        return;
+    }
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let mut rx = host.take_incoming().unwrap();
+    let r = host
+        .load(Some(&[fixture("link.ts")]), None, "/tmp", None)
+        .await
+        .unwrap();
+    assert_eq!(r.errors.len(), 0, "{r:?}");
+    assert_eq!(r.loaded[0].link_schemes, ["cc-stretch"]);
+    assert_eq!(host.link_schemes(), ["cc-stretch"]);
+
+    assert!(
+        host.link_activate("cc-stretch:open/1792/0/2")
+            .await
+            .unwrap(),
+        "the claiming extension owns the link"
+    );
+    let mut seen = None;
+    while let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+        if let HostMessage::Notification { method, params } = m {
+            if method == "append_entry" {
+                seen = Some(params);
+                break;
+            }
+        }
+    }
+    let p = seen.expect("link_activate reached the extension");
+    assert_eq!(p["customType"], "link-activated");
+    assert_eq!(p["data"]["url"], "cc-stretch:open/1792/0/2");
+    assert_eq!(p["data"]["scheme"], "cc-stretch");
+    assert_eq!(p["data"]["type"], "link_activate");
+
+    assert!(
+        !host.link_activate("https://example.com").await.unwrap(),
+        "a standard scheme belongs to nobody"
+    );
+    assert!(
+        !host.link_activate("no-scheme").await.unwrap(),
+        "a URL without a scheme is not a link"
+    );
+    host.shutdown().await.unwrap();
+}

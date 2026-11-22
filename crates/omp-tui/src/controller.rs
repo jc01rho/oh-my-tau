@@ -113,6 +113,7 @@ async fn drive(cfg: RunConfig, port: impl RuntimePort, shell: &mut StdShell) -> 
         tracing::warn!("{warning}");
     }
     app.configure(cfg.models, cfg.session_sources);
+    app.set_link_schemes(cfg.link_schemes);
     app.set_model_name(cfg.model_name);
     app.set_welcome(&cfg.version);
     app.start_word_completion();

@@ -105,6 +105,9 @@ pub async fn run(
     rt.enable_context_usage_frames();
     crate::slash_extra::mark_interactive_ui();
     rt.publish_context_usage();
+    let link_schemes = extensions
+        .as_ref()
+        .map_or_else(Vec::new, |e| e.link_schemes());
     let port = Port {
         rt,
         ext: extensions,
@@ -119,6 +122,7 @@ pub async fn run(
             models,
             session_sources,
             osc11_bg,
+            link_schemes,
         },
         port,
     )
@@ -714,6 +718,29 @@ impl omp_tui::RuntimePort for Port {
                     rt.send(models_changed_frame());
                 }
                 Err(e) => rt.send(prompt_failed(format!("model refresh failed: {e:#}"))),
+            }
+        });
+    }
+
+    fn link_activate(&self, url: String) {
+        let Some(ext) = self.ext.clone() else {
+            return;
+        };
+        let rt = self.rt.clone();
+        tokio::spawn(async move {
+            match ext.activate_link(&url).await {
+                Ok(true) => {}
+                // The picker only offers links whose scheme an extension
+                // claimed, so this is a scheme list that went stale (a reload
+                // dropped the extension): say so instead of dropping the click.
+                Ok(false) => rt.send(serde_json::json!({
+                    "type": "command_output",
+                    "text": format!("link: no extension handles {url}"),
+                })),
+                Err(e) => rt.send(serde_json::json!({
+                    "type": "command_output",
+                    "text": format!("link failed: {e:#}"),
+                })),
             }
         });
     }
