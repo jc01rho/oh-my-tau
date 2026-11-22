@@ -222,7 +222,6 @@ impl Drop for CloseGate {
             abort();
         }
     }
-
 }
 
 /// A recording fake for tests. Every call appends to [`Self::log`].
