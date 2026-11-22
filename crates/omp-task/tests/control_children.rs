@@ -226,7 +226,9 @@ async fn a_prompt_that_never_reached_the_child_is_not_reported_sent() {
         r#"read -r switch
 exec 0<&-
 echo '{"type":"response","command":"switch_session","success":true,"data":{"cancelled":false}}'
-sleep 1"#,
+sleep 0.3
+echo '{"type":"message_end","message":{"role":"assistant","content":[]}}'
+sleep 30"#,
     );
     let runner = TaskRunner::new(&bin, 1);
     let opts = omp_task::StartOptions {
@@ -234,12 +236,23 @@ sleep 1"#,
         ..omp_task::StartOptions::default()
     };
     let (control, join) = runner.start_with(spec("again", dir.path()), ChildMode::Rpc, opts);
-    let out = tokio::time::timeout(Duration::from_secs(30), join)
+    let started = Instant::now();
+    let out = tokio::time::timeout(Duration::from_secs(20), join)
         .await
-        .expect("run settles");
+        .expect("a failed prompt write ends the run instead of holding its slot");
     std::env::remove_var("OMP_TASK_TEST_REOPEN_DEADLINE_MS");
     assert_eq!(out.status, RunStatus::Failed, "{out:?}");
+    assert!(
+        out.stderr.contains("could not write the prompt"),
+        "stderr: {}",
+        out.stderr
+    );
     assert!(!control.prompt_sent(), "the prompt never went out");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "no wait for the child's sleep"
+    );
+    assert_eq!(runner.available_permits(), 1, "permit released");
 }
 
 /// Finding 4 (steer receipt): a steer sent while the prompt is still running

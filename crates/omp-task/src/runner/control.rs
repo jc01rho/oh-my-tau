@@ -791,6 +791,10 @@ fn prompt_frame(message: &str) -> Value {
     json!({"id": PROMPT_ID, "type": "prompt", "message": message})
 }
 
+fn is_prompt_frame(frame: &Value) -> bool {
+    frame.get("id").and_then(Value::as_str) == Some(PROMPT_ID)
+}
+
 /// Fail steers still held back for a prompt that never went out.
 fn fail_held(held: &mut Vec<(String, SteerAck)>) {
     for (_, ack) in held.drain(..) {
@@ -850,11 +854,18 @@ async fn drive_rpc(
     let mut rpc = RpcRun::default();
     let mut killed = false;
     let mut finishing_at: Option<Instant> = None;
-    let mut prompt_written = true;
+    // The prompt counts as delivered only once its frame was written; a run
+    // whose prompt write fails ends right there (it never ran anything).
+    let mut delivered = false;
+    let mut prompt_failed = false;
     for frame in rpc.open(&spec.prompt, opts) {
-        prompt_written &= send(&mut stdin, &frame).await;
+        let written = send(&mut stdin, &frame).await;
+        if is_prompt_frame(&frame) {
+            delivered = written;
+            prompt_failed = !written;
+        }
     }
-    if rpc.prompt_sent && prompt_written {
+    if delivered {
         shared.prompt_sent.store(true, Ordering::SeqCst);
     }
     publish_session(shared, &rpc);
@@ -867,24 +878,43 @@ async fn drive_rpc(
     // session first) wait for it and are acknowledged once written.
     let mut held: Vec<(String, SteerAck)> = Vec::new();
     for (message, ack) in steers {
-        if rpc.prompt_sent {
+        if delivered {
             steer_child(&mut stdin, &message, ack).await;
         } else {
             held.push((message, ack));
         }
     }
     loop {
+        if prompt_failed {
+            // The prompt frame never reached the child: kill it and settle
+            // failed, so the caller knows nothing ran.
+            kill_tree(&mut child);
+            let _ = child.wait().await;
+            let stderr = join_text(stderr, true).await;
+            let error = "could not write the prompt to the child".to_string();
+            let stderr = if stderr.trim().is_empty() {
+                error
+            } else {
+                format!("{error}\n{stderr}")
+            };
+            fail_held(&mut held);
+            drain_controls(rx);
+            return collect_output(id, spec, false, None, String::new(), stderr, start);
+        }
         let finishing_deadline = finishing_at.map(|at| at + rpc_finishing_deadline());
-        let reopening = reopen_deadline.filter(|_| !rpc.prompt_sent && !rpc.finishing);
+        let reopening = reopen_deadline.filter(|_| !delivered && !rpc.finishing);
         tokio::select! {
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
-                    let mut wrote_all = true;
                     for frame in rpc.on_line(&line) {
-                        wrote_all &= send(&mut stdin, &frame).await;
+                        let written = send(&mut stdin, &frame).await;
+                        if is_prompt_frame(&frame) {
+                            delivered = written;
+                            prompt_failed = !written;
+                        }
                     }
                     publish_session(shared, &rpc);
-                    if rpc.prompt_sent && wrote_all {
+                    if delivered {
                         shared.prompt_sent.store(true, Ordering::SeqCst);
                         if !rpc.finishing {
                             for (message, ack) in held.drain(..) {
@@ -951,7 +981,7 @@ async fn drive_rpc(
                         // The prompt settled before the steer went out: fail
                         // the delivery explicitly instead of acknowledging it.
                         let _ = ack.send(Err(SteerError::NotRunning));
-                    } else if !rpc.prompt_sent {
+                    } else if !delivered {
                         held.push((message, ack));
                     } else {
                         steer_child(&mut stdin, &message, ack).await;
