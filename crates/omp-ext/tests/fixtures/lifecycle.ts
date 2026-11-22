@@ -5,7 +5,7 @@ const OBSERVED = [
   "session_branch", "session_tree", "session_shutdown",
   "assistant_message", "auto_compaction_start", "auto_compaction_end", "auto_retry_start", "auto_retry_end",
   "retry_fallback_applied", "retry_fallback_succeeded", "ttsr_triggered", "todo_reminder", "goal_updated",
-  "tool_approval_requested", "tool_approval_resolved",
+  "tool_approval_requested", "tool_approval_resolved", "after_provider_response",
 ];
 const RESULTS: Record<string, unknown> = {
   before_agent_start: { message: { customType: "fx", content: "hello", display: false }, systemPrompt: ["sys-a", "sys-b"] },

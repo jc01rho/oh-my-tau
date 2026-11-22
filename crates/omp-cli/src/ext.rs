@@ -1622,6 +1622,57 @@ fn notify(host: &ExtHost, ty: &str, build: impl FnOnce() -> LifecycleEvent) {
     }
 }
 
+/// The session stream's provider-response observation hook: TS `sdk.ts` wires
+/// `SimpleStreamOptions.onResponse` to `emitAfterProviderResponse`, so an extension sees every
+/// provider response once the HTTP response has landed and before its stream body is read.
+/// Observe-only (the runner discards handler results), so the emit rides [`notify`] instead of
+/// blocking the provider hook, which is sync by contract.
+#[must_use]
+pub fn after_provider_response_hook(host: Arc<ExtHost>) -> pa_agent::stream::OnResponseHook {
+    Arc::new(
+        move |response: pa_agent::stream::ProviderResponse, _model: &pa_agent::types::Model| {
+            // TS `normalizeProviderResponse` is handed the provider's request id
+            // (`request-id` for Anthropic, `x-request-id` elsewhere); this core's
+            // `ProviderResponse` carries headers only, so it is read back from them exactly as
+            // the providers do.
+            let request_id = response
+                .headers
+                .get("request-id")
+                .or_else(|| response.headers.get("x-request-id"))
+                .cloned();
+            notify(&host, "after_provider_response", || {
+                LifecycleEvent::AfterProviderResponse {
+                    status: response.status,
+                    headers: response.headers,
+                    request_id,
+                }
+            });
+        },
+    )
+}
+
+/// Compose [`after_provider_response_hook`] onto `base`: a response hook the request already
+/// carried runs first, then the extension observation (TS `agent-loop.ts` wraps the user's
+/// `onResponse` the same way).
+#[must_use]
+pub fn with_response_hook(
+    base: pa_agent::stream::StreamFn,
+    hook: pa_agent::stream::OnResponseHook,
+) -> pa_agent::stream::StreamFn {
+    Arc::new(move |model, context, mut options| {
+        let hook = hook.clone();
+        let composed: pa_agent::stream::OnResponseHook = match options.on_response.take() {
+            Some(existing) => Arc::new(move |response, model| {
+                existing(response.clone(), model);
+                hook(response, model);
+            }),
+            None => hook,
+        };
+        options.on_response = Some(composed);
+        base(model, context, options)
+    })
+}
+
 /// Queue one `message_update` as a delta frame against the message the host
 /// rebuilt from the previous frame (`ExtUpdateEncoder`; `ext-host/host.ts`
 /// `rebuildMessageUpdate` restores the full event before any handler runs).
@@ -1889,6 +1940,165 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// A fake host that appends every request line to `$LOG` and answers each request: `load`
+    /// with no extensions loaded, everything else with an empty emit outcome. Reading the log
+    /// after an awaited request is deterministic: the host runs queued emits in wire order.
+    const LOG_HOST: &str = concat!(
+        "while IFS= read -r line; do\n",
+        "  printf '%s\\n' \"$line\" >> \"$LOG\"\n",
+        "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+        "  case \"$line\" in\n",
+        "    *'\"method\":\"load\"'*) result='{\"loaded\":[],\"errors\":[]}';;\n",
+        "    *) result='{\"result\":null,\"handlers\":[],\"errors\":[]}';;\n",
+        "  esac\n",
+        "  if [ -n \"$id\" ]; then\n",
+        "    printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}\\n' \"$id\" \"$result\"\n",
+        "  fi\n",
+        "done\n",
+    );
+
+    /// The observation hook the session stream installs (`sdk.ts` `onResponse` →
+    /// `emitAfterProviderResponse`) hands the provider's status, headers and request id to the
+    /// host once the response lands.
+    #[tokio::test]
+    async fn after_provider_response_reaches_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = sh_host(
+            dir.path(),
+            LOG_HOST,
+            vec![("LOG".into(), log.display().to_string())],
+        )
+        .await;
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("request-id".to_string(), "req_abc".to_string());
+        headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        let hook = after_provider_response_hook(host.clone());
+        hook(
+            pa_agent::stream::ProviderResponse {
+                status: 429,
+                headers,
+            },
+            &pa_agent::types::Model::unknown(),
+        );
+        // Barrier: the host answers requests in order, so its reply to this awaited emit proves
+        // the queued observation above already reached it.
+        host.emit(json!({"type": "session_shutdown"}), None)
+            .await
+            .unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        let line = logged
+            .lines()
+            .find(|line| line.contains("after_provider_response"))
+            .expect("after_provider_response reached the host");
+        let value: Value = serde_json::from_str(line).unwrap();
+        let event = &value["params"]["event"];
+        assert_eq!(event["type"], json!("after_provider_response"));
+        assert_eq!(event["status"], json!(429));
+        assert_eq!(event["headers"]["content-type"], json!("text/event-stream"));
+        assert_eq!(event["headers"]["request-id"], json!("req_abc"));
+        assert_eq!(event["requestId"], json!("req_abc"));
+        host.shutdown().await.unwrap();
+    }
+
+    /// With no `after_provider_response` subscriber the hook stays silent (`hasHandlers` gate).
+    #[tokio::test]
+    async fn after_provider_response_skipped_without_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = sh_host(
+            dir.path(),
+            LOG_HOST,
+            vec![("LOG".into(), log.display().to_string())],
+        )
+        .await;
+        // `load` with no extensions: nothing subscribes, so the gate is closed.
+        host.load(None, None, "/tmp", None).await.unwrap();
+        assert!(!host.has_handlers("after_provider_response"));
+        let hook = after_provider_response_hook(host.clone());
+        hook(
+            pa_agent::stream::ProviderResponse {
+                status: 200,
+                headers: std::collections::BTreeMap::default(),
+            },
+            &pa_agent::types::Model::unknown(),
+        );
+        host.emit(json!({"type": "session_shutdown"}), None)
+            .await
+            .unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(!logged.contains("after_provider_response"), "{logged}");
+        host.shutdown().await.unwrap();
+    }
+
+    /// The session stream composes the observation onto the response hook a request already
+    /// carried, and both run (TS `agent-loop.ts` wraps the caller's `onResponse` the same way).
+    #[tokio::test]
+    async fn session_stream_composes_provider_response_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let host = sh_host(
+            dir.path(),
+            LOG_HOST,
+            vec![("LOG".into(), log.display().to_string())],
+        )
+        .await;
+        let caller_hook_calls = Arc::new(AtomicU64::new(0));
+        let seen = caller_hook_calls.clone();
+        // Stands in for the provider: fires the request's response hook exactly where `pa-ai`
+        // does, right after the HTTP response and before the body is read.
+        let base: pa_agent::stream::StreamFn = Arc::new(move |_model, _context, options| {
+            Box::pin(async move {
+                if let Some(hook) = &options.on_response {
+                    let mut headers = std::collections::BTreeMap::new();
+                    headers.insert("x-request-id".to_string(), "req_xyz".to_string());
+                    hook(
+                        pa_agent::stream::ProviderResponse {
+                            status: 503,
+                            headers,
+                        },
+                        &pa_agent::types::Model::unknown(),
+                    );
+                }
+                let no_body: anyhow::Result<Box<dyn pa_agent::stream::ModelStream>> = Err(
+                    anyhow::anyhow!("no body: the hook is what this test observes"),
+                );
+                no_body
+            })
+        });
+        let stream = with_response_hook(base, after_provider_response_hook(host.clone()));
+        let options = pa_agent::stream::StreamRequestOptions {
+            on_response: Some(Arc::new(move |_response, _model| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })),
+            ..pa_agent::stream::StreamRequestOptions::default()
+        };
+        let _ = stream(
+            pa_agent::types::Model::unknown(),
+            pa_agent::stream::LlmContext::default(),
+            options,
+        )
+        .await;
+        assert_eq!(
+            caller_hook_calls.load(Ordering::SeqCst),
+            1,
+            "the caller's response hook still runs"
+        );
+        host.emit(json!({"type": "session_shutdown"}), None)
+            .await
+            .unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        let line = logged
+            .lines()
+            .find(|line| line.contains("after_provider_response"))
+            .expect("observation reached the host");
+        let value: Value = serde_json::from_str(line).unwrap();
+        let event = &value["params"]["event"];
+        assert_eq!(event["status"], json!(503));
+        assert_eq!(event["requestId"], json!("req_xyz"));
+        host.shutdown().await.unwrap();
     }
 
     /// Answers every request with a `session_stop` outcome of

@@ -302,6 +302,17 @@ pub enum LifecycleEvent {
         exclude_from_context: bool,
         cwd: String,
     },
+    /// A provider response arrived, before its stream body is read
+    /// (`types.ts` `AfterProviderResponseEvent extends ProviderResponseMetadata`). Observe-only:
+    /// the runner discards handler results. `metadata` is absent here for the same reason it is
+    /// absent upstream: no provider of this core supplies any.
+    #[serde(rename = "after_provider_response", rename_all = "camelCase")]
+    AfterProviderResponse {
+        status: u16,
+        headers: std::collections::BTreeMap<String, String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -522,6 +533,8 @@ impl ExtHost {
         emit_tool_approval_requested(session_id: String, tool_name: String, tool_call_id: String, reason: Option<String>, approval_mode: ApprovalMode) => LifecycleEvent::ToolApprovalRequested { session_id, tool_name, tool_call_id, reason, approval_mode };
         /// `tool_approval_resolved`.
         emit_tool_approval_resolved(session_id: String, tool_name: String, tool_call_id: String, approved: bool, reason: Option<String>) => LifecycleEvent::ToolApprovalResolved { session_id, tool_name, tool_call_id, approved, reason };
+        /// `after_provider_response`.
+        emit_after_provider_response(status: u16, headers: std::collections::BTreeMap<String, String>, request_id: Option<String>) => LifecycleEvent::AfterProviderResponse { status, headers, request_id };
     }
 
     /// `assistant_message`: a handler may rewrite the text of the finalized message (text blocks only).
