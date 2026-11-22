@@ -1639,6 +1639,30 @@ mod tests {
     }
 
     #[test]
+    fn approval_hint_keeps_approve_deny_and_scroll_when_narrow() {
+        let dialog = approval::ApprovalDialog::new(
+            &json!({"title": "Allow tool: bash\nCommand: ls"}),
+            vec!["Approve".into(), "Deny".into()],
+            Instant::now(),
+        );
+        let keys = KeybindingsManager::defaults();
+        let theme = Theme::default();
+        let wide = dialog.hint(&keys, &theme, true, 200);
+        assert!(
+            wide.contains("choose") && wide.contains("details"),
+            "{wide}"
+        );
+        let narrow = dialog.hint(&keys, &theme, true, 50);
+        for kept in ["approve", "deny", "scroll"] {
+            assert!(narrow.contains(kept), "{kept} in {narrow}");
+        }
+        assert!(
+            !narrow.contains("choose") && !narrow.contains("select"),
+            "{narrow}"
+        );
+    }
+
+    #[test]
     fn approval_expand_swaps_in_the_full_prompt() {
         let mut ui = ExtensionUi::new();
         let mut frame = approval_frame("Allow tool: bash\nCommand: echo head[…12ch elided…]");

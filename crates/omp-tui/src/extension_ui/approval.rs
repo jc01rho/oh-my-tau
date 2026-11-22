@@ -280,9 +280,10 @@ impl ApprovalDialog {
         (lines, overflows)
     }
 
-    /// Footer hint (TS `#footerHint`) fitted to `width`: the choose/select
-    /// keys, which the highlighted list already implies, go first when the
-    /// row is too narrow for every key.
+    /// Footer hint (TS `#footerHint`) fitted to `width`: when the row is too
+    /// narrow for every key, the choose/select keys (the highlighted list
+    /// already implies them) go first, then the details key; approve, deny and
+    /// scroll stay.
     pub(super) fn hint(
         &self,
         keys: &KeybindingsManager,
@@ -293,34 +294,41 @@ impl ApprovalDialog {
         let k = |key: &str| format_key_hint(key, theme);
         let approve = format_key_hints(&keys.get_keys("app.approval.approve"), theme);
         let expand = format_key_hints(&keys.get_keys("app.tools.expand"), theme);
+        // (droppable, text) in display order.
         let mut segments = vec![
-            format!("{}/{} choose", k("up"), k("down")),
-            format!("{} select", k("enter")),
+            (true, format!("{}/{} choose", k("up"), k("down"))),
+            (true, format!("{} select", k("enter"))),
         ];
         if !approve.is_empty() {
-            segments.push(format!("{approve} approve"));
+            segments.push((false, format!("{approve} approve")));
         }
-        segments.push(format!("{} deny", k("escape")));
+        segments.push((false, format!("{} deny", k("escape"))));
         if !expand.is_empty() {
-            segments.push(format!(
-                "{expand} {}",
-                if self.expanded { "less" } else { "details" }
-            ));
+            let label = if self.expanded { "less" } else { "details" };
+            segments.push((true, format!("{expand} {label}")));
         }
         if overflows {
-            segments.push(format!("{}/{} scroll", k("pageUp"), k("pageDown")));
+            segments.push((false, format!("{}/{} scroll", k("pageUp"), k("pageDown"))));
         }
-        let fits = |s: &[String]| {
-            s.join(" · ")
+        let join = |s: &[(bool, String)]| {
+            s.iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        let fits = |s: &[(bool, String)]| {
+            join(s)
                 .chars()
                 .map(|c| c.width().unwrap_or(0))
                 .sum::<usize>()
                 <= width
         };
-        let mut drop = 0;
-        while drop < 2 && !fits(&segments[drop..]) {
-            drop += 1;
+        while !fits(&segments) {
+            let Some(drop) = segments.iter().position(|(droppable, _)| *droppable) else {
+                break;
+            };
+            segments.remove(drop);
         }
-        segments[drop..].join(" · ")
+        join(&segments)
     }
 }
