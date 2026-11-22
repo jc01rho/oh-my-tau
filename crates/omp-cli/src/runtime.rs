@@ -3406,12 +3406,18 @@ impl Runtime {
         })
     }
 
-    fn live_window(&self) -> u64 {
+    /// Window and tokenizer family (`Model::resolved_tokenizer`, `None` when unknown) of the
+    /// live model, read from one target snapshot so a concurrent model switch cannot pair one
+    /// model's window with another's tokenizer.
+    fn live_window_and_tokenizer(&self) -> (u64, Option<pa_types::ai::ModelTokenizer>) {
         self.target
             .read()
             .ok()
-            .and_then(|t| t.as_ref().map(|t| t.model.context_window))
-            .unwrap_or(0)
+            .and_then(|t| {
+                t.as_ref()
+                    .map(|t| (t.model.context_window, t.model.resolved_tokenizer()))
+            })
+            .unwrap_or((0, None))
     }
 
     /// rpc `compact`: summarize the older history into a `compaction` entry and swap the agent's
@@ -3546,6 +3552,14 @@ impl Runtime {
         let trace = std::env::var_os("OMP_RS_TURN_TRACE").is_some();
         turn_trace!("[turn-trace] compact-begin rss={}kB", rss_kb());
         let summarizer = self.summarizer()?;
+        // The summary budget counts for the model the request goes to: the live
+        // summarizer's pinned snapshot, not a re-read the model switch could race.
+        let (window, tokenizer) = match &summarizer {
+            crate::compact::Summarizer::Live(live) => {
+                (live.model.context_window, live.model.resolved_tokenizer())
+            }
+            crate::compact::Summarizer::Injected(_) => self.live_window_and_tokenizer(),
+        };
         // Only the prompt overhead and the model id are needed from the state:
         // release the snapshot (a full copy of the live context) before the
         // summarization, which is the compaction's memory peak.
@@ -3594,7 +3608,8 @@ impl Runtime {
         let params = crate::compact::CompactParams {
             settings: &settings,
             model_id: &model_id,
-            context_window: Some(self.live_window()).filter(|w| *w > 0),
+            context_window: Some(window).filter(|w| *w > 0),
+            tokenizer,
             custom_instructions,
             method: mode,
             handoff: handoff_context.as_ref(),
@@ -3663,10 +3678,11 @@ impl Runtime {
     async fn auto_compaction_due(&self) -> bool {
         let mut settings = lock(&self.compaction).clone();
         settings.enabled = true;
-        let window = self.live_window();
+        let (window, tokenizer) = self.live_window_and_tokenizer();
         if !settings.enabled || window == 0 {
             return false;
         }
+        let tokenizer = omp_compact::FamilyTokenizer::new(tokenizer);
         // Read the live context in place (no snapshot copy of the messages).
         let mut usage = None;
         let mut stored = 0;
@@ -3680,7 +3696,7 @@ impl Runtime {
                     }
                     _ => None,
                 });
-                stored = crate::compact::estimate_context_tokens(messages);
+                stored = crate::compact::estimate_context_tokens(messages, &tokenizer);
             })
             .await;
         crate::compact::auto_check(usage, stored, window, &settings)

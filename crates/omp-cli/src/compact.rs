@@ -18,11 +18,11 @@ use omp_compact::settings::{calculate_context_tokens, compaction_context_tokens}
 use omp_compact::tokens::CountOptions;
 use omp_compact::{
     build_session_context_path, plan_boundary, plan_region, project_tokens_after, should_compact,
-    synthetic_compaction_entry, ApplyOptions, BoundaryEntry, ByteEstimate, CompactionResult,
-    CompactionSettings, Completer, Leaf, SummaryParams, SummaryRequest,
+    synthetic_compaction_entry, ApplyOptions, BoundaryEntry, CompactionResult, CompactionSettings,
+    Completer, FamilyTokenizer, Leaf, SummaryParams, SummaryRequest, Tokenizer,
 };
 use pa_agent::types::AgentMessage;
-use pa_types::ai::{AssistantMessage, Model};
+use pa_types::ai::{AssistantMessage, Model, ModelTokenizer};
 use serde_json::{json, Value};
 
 use crate::persist::{iso_from_ms, Persistence};
@@ -299,6 +299,10 @@ pub struct CompactParams<'a> {
     /// Summarizer model id (`preferredDialect`) and window.
     pub model_id: &'a str,
     pub context_window: Option<u64>,
+    /// Tokenizer family of the active model ([`Model::resolved_tokenizer`]): the region plan,
+    /// the summary budget and the `tokensAfter` projection count with its native encoder (the
+    /// byte estimate when `None`).
+    pub tokenizer: Option<ModelTokenizer>,
     /// `/compact <instructions>` (soft path) — also the handoff focus text, already
     /// folded into [`Self::handoff`]'s prompt by the caller.
     pub custom_instructions: Option<&'a str>,
@@ -658,7 +662,7 @@ pub async fn compact_now(
     if let (Some(prev), b) = (&previous, &mut boundary) {
         b.previous_preserve_data = prev.get("preserveData").filter(|d| !d.is_null()).cloned();
     }
-    let tokenizer = ByteEstimate;
+    let tokenizer = FamilyTokenizer::new(params.tokenizer);
     let (prep, kept_entries) = plan_region(
         region,
         &boundary,
@@ -720,6 +724,7 @@ pub async fn compact_now(
     summary_params.custom_instructions = params.custom_instructions;
     summary_params.extra_context = &hook_context;
     summary_params.prompt_override = hook_prompt.as_deref();
+    summary_params.tokenizer = &tokenizer;
     let method = params.method.unwrap_or("soft");
     // Handoff (`/handoff`, `/compact handoff`): a handoff-document oneshot over the
     // caller-built context instead of the history summary; the document is the
@@ -908,13 +913,14 @@ fn load_one(path: &Path, index: &omp_session::index::SessionIndex, at: u32) -> R
 /// check's stored-conversation floor without touching the journal.
 ///
 /// An assistant turn that predates the latest compaction carries stale usage;
-/// the caller passes the newest usable usage separately.
-pub fn estimate_context_tokens(messages: &[AgentMessage]) -> u64 {
+/// the caller passes the newest usable usage separately. `tokenizer` is the
+/// active model's counter ([`FamilyTokenizer`] over [`Model::resolved_tokenizer`]).
+pub fn estimate_context_tokens(messages: &[AgentMessage], tokenizer: &dyn Tokenizer) -> u64 {
     messages
         .iter()
         .map(|m| {
             serde_json::to_value(m).map_or(0, |v| {
-                omp_compact::tokens::count_message(&ByteEstimate, &v, CountOptions::default())
+                omp_compact::tokens::count_message(tokenizer, &v, CountOptions::default())
             })
         })
         .sum()
@@ -1069,7 +1075,10 @@ mod tests {
 
     /// `dir = Some(..)`: a real (non-ephemeral) session file inside `dir`.
     async fn harness_in(turns: usize, dir: Option<&std::path::Path>) -> Harness {
-        let model = pa_model();
+        harness_model(turns, dir, pa_model()).await
+    }
+
+    async fn harness_model(turns: usize, dir: Option<&std::path::Path>, model: Model) -> Harness {
         let provider = Arc::new(ScriptedProvider::new(
             json_round_trip(&model).expect("agent model"),
         ));
@@ -1964,6 +1973,67 @@ mod tests {
         assert!(h.rt.messages().await[0]
             .to_string()
             .contains("AUTO SUMMARY"));
+    }
+
+    #[test]
+    fn estimate_context_tokens_counts_with_the_model_family() {
+        let message: AgentMessage = serde_json::from_value(json!({
+            "role": "user",
+            "content": "The quick brown fox jumps over the lazy dog. 1234567890 12 345 6789",
+            "timestamp": 1
+        }))
+        .expect("user message");
+        let messages = [message];
+        let o200k = FamilyTokenizer::new(Some(ModelTokenizer::O200k));
+        let unknown = FamilyTokenizer::new(None);
+        assert_eq!(estimate_context_tokens(&messages, &o200k), 22);
+        assert_eq!(estimate_context_tokens(&messages, &unknown), (67 + 3) >> 2);
+    }
+
+    /// The post-turn threshold floor counts the live context with the active
+    /// model's tokenizer family: a threshold between the o200k count and the
+    /// byte estimate of the same conversation fires only for the family-less model.
+    #[tokio::test]
+    async fn auto_threshold_counts_with_the_active_model_tokenizer() {
+        async fn compacted(model: Model, threshold: u64) -> bool {
+            let mut h = harness_model(4, None, model).await;
+            let (fake, _) = fake_summarizer("AUTO SUMMARY");
+            h.rt.set_summarizer(Some(fake));
+            h.rt.set_compaction_settings(CompactionSettings {
+                threshold_tokens: Some(threshold as f64),
+                ..small_keep()
+            });
+            talk(&mut h, 4).await;
+            h.rt.entries()
+                .unwrap()
+                .iter()
+                .any(|e| e["type"] == "compaction")
+        }
+
+        let texts: Vec<String> = (0..4)
+            .flat_map(|i| {
+                [
+                    format!("question {i} {}", "x".repeat(400)),
+                    format!("answer {i} {}", "y".repeat(400)),
+                ]
+            })
+            .collect();
+        let total = |t: &dyn Tokenizer| texts.iter().map(|s| t.count_text(s)).sum::<u64>();
+        let native = total(&FamilyTokenizer::new(Some(ModelTokenizer::O200k)));
+        let bytes = total(&FamilyTokenizer::new(None));
+        assert!(native < bytes, "o200k {native} vs bytes {bytes}");
+        let threshold = (native + bytes) / 2;
+
+        let mut o200k = pa_model();
+        o200k.tokenizer = Some(ModelTokenizer::O200k);
+        assert!(
+            !compacted(o200k, threshold).await,
+            "o200k context stays under {threshold}"
+        );
+        assert!(
+            compacted(pa_model(), threshold).await,
+            "byte estimate crosses {threshold}"
+        );
     }
 
     // ------------------------------------------------------- bug-hunt #4

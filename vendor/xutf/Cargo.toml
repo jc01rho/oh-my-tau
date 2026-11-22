@@ -8,6 +8,9 @@ description = "Pure stable-Rust stand-in for the xutf APIs the vendored omp2 she
 
 [dependencies]
 unicode-normalization = "0.1"
+# UCD 16.0.0 tables, pinned: see src/ucd.rs.
+unicode-properties = { version = "=0.1.3", default-features = false, features = ["general-category"] }
+unicode-script = "=0.5.7"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 

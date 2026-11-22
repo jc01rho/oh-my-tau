@@ -20,9 +20,22 @@ Copyright (c) 2026 Stencil Labs, Inc.).
 | `pa-agent`, `pa-ai`, `pa-models`, `pa-types` | [PrimeIntellect-ai/prime-agent](https://github.com/PrimeIntellect-ai/prime-agent) — **modified** in this repo | MIT, see [`vendor/LICENSE-prime-agent`](vendor/LICENSE-prime-agent) |
 | `pi-ast`, `pi-diff`, `pi-edit`, `pi-predict`, `pi-vfs`, `omp-xfs` | oh-my-pi (`can1357/oh-my-pi`) ref `main` @ `b636e19d10b664950d600505d194337bbeef42f0` (`19.0.1`), adapted per `vendor-src.lock` (`pi-walker` retired into `omp-xfs`) | MIT, see [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi) and per-crate `LICENSE` (`omp-xfs`, `pi-ast`) |
 | `omp-core`, `omp-macros`, `omp-vocab`, `omp-walker`, `omp-shell`, `omp-shell-builtins` | **adapted from** oh-my-pi (can1357/oh-my-pi) ref `omp2` @ `2f92f3b5aa2035d21c9f016f9ff6350795e5685a`: vendored from that commit with manifests pinned to build outside the upstream workspace, but **adapted, not unmodified verbatim** — several crates carry further upstream lineage with retained notices (`omp-shell`: brush-core/brush-parser; `omp-shell-builtins`: uutils coreutils/findutils/sed and `pi-builtins`/`pi-shell`; `omp-walker`: `pi-walker`; `omp-core`: `serde_json`). See each crate's `LICENSE`/`NOTICE`, listed below | MIT, see [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi); per-crate files listed below |
+| `omp-utok` | oh-my-pi (`can1357/oh-my-pi`) ref `main` @ `efcbef6dd0a190b82ea8811db3526a97101fbbb3`, `crates/natives` `utok` module extracted into a crate per `vendor-src.lock`; embeds the tokenizer vocabularies listed below | MIT, see [`vendor/LICENSE-oh-my-pi`](vendor/LICENSE-oh-my-pi) and [`vendor/omp-utok/data/LICENSE.ctok`](vendor/omp-utok/data/LICENSE.ctok) |
 | `omp-tool`, `omp-proto`, `xutf` | **local shims**, not upstream code — see the note below the table | MIT (this project) |
 | `crossterm` | fork of [crossterm](https://github.com/crossterm-rs/crossterm) 0.28 | MIT, see [`vendor/crossterm/LICENSE`](vendor/crossterm/LICENSE) |
 | `laya-ort` | part of this project (ONNX Runtime inference for the Laya judge) | MIT, plus the `ort` / ONNX Runtime terms below |
+
+`omp-utok` embeds zstd-compressed rank tables derived from public tokenizer
+files: OpenAI tiktoken `o200k_base` / `cl100k_base` (MIT, openai/tiktoken), the
+Qwen3.8 `tokenizer.json` (Apache-2.0, Alibaba Cloud; license text in
+`vendor/omp-utok/data/LICENSE-Qwen.Apache-2.0`), DeepSeek V3/V4 `tokenizer.json`
+(MIT, deepseek-ai), Kimi K2 `tiktoken.model` (Modified MIT, moonshotai) and the
+GLM-5 `tokenizer.json` (MIT, zai-org), plus the measured Claude vocabularies of
+[sanderland/ctok](https://github.com/sanderland/ctok) v1.0.0 (MIT, see
+`vendor/omp-utok/data/LICENSE.ctok`). Packing formats and sources:
+[`vendor/omp-utok/data/README.md`](vendor/omp-utok/data/README.md) and
+`families.json` next to it. Release builds ship these license texts next to the
+binaries as `THIRD-PARTY-NOTICES.txt`.
 
 Per-crate notices:
 
