@@ -121,6 +121,9 @@ pub struct LoadedExtension {
     pub tools: Vec<String>,
     #[serde(default)]
     pub commands: Vec<String>,
+    /// Link schemes claimed with `registerLinkScheme`, lowercase, in claim order.
+    #[serde(default, rename = "linkSchemes")]
+    pub link_schemes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -204,6 +207,10 @@ pub struct ExtHost {
     /// learned from `load` (mirrors the TS runner's `hasHandlers` gate).
     /// `None` = not loaded yet / unknown: send everything.
     subscribed: Mutex<Option<HashSet<String>>>,
+    /// Link schemes the loaded extensions claimed with `registerLinkScheme`, in load order with
+    /// the first claimer of a scheme kept (the host routes a click to that extension). Learned
+    /// from `load`, so a reconnect's re-load refreshes it.
+    link_schemes: Mutex<Vec<String>>,
     /// Live session state merged into the host ctx of every emit/tool call that carries no
     /// explicit `ctx` (branch, leafId, contextUsage, idle, pending, ...).
     ctx_provider: Mutex<Option<CtxProvider>>,
@@ -362,6 +369,7 @@ impl ExtHost {
         let (generation, _) = watch::channel(0usize);
         let host = Arc::new(Self {
             subscribed: Mutex::new(None),
+            link_schemes: Mutex::new(Vec::new()),
             ctx_provider: Mutex::new(None),
             conn: Mutex::new(conn),
             child: tokio::sync::Mutex::new(Some(child)),
@@ -511,7 +519,43 @@ impl ExtHost {
             .subscribed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(subscribed);
+        let mut seen = HashSet::new();
+        *self
+            .link_schemes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = result
+            .loaded
+            .iter()
+            .flat_map(|e| e.link_schemes.iter().cloned())
+            .filter(|scheme| seen.insert(scheme.clone()))
+            .collect();
         Ok(result)
+    }
+
+    /// Link schemes loaded extensions claimed with `registerLinkScheme`, in load order (the first
+    /// claimer of a scheme wins); empty until a `load` reported one.
+    #[must_use]
+    pub fn link_schemes(&self) -> Vec<String> {
+        self.link_schemes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Deliver a click on `url` as `link_activate` to the extension that claimed its scheme.
+    ///
+    /// Returns whether an extension owns the link (`false` for a URL with no scheme, or one no
+    /// extension claimed). A handler failure is reported by the host (as a `log` warning), never
+    /// thrown here: like a command or a shortcut, a click is the user's own action.
+    ///
+    /// # Errors
+    /// Transport failure, or a host that answered without `handled`.
+    pub async fn link_activate(&self, url: &str) -> Result<bool> {
+        let reply = self.request("link_activate", json!({ "url": url })).await?;
+        reply
+            .get("handled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow!("link_activate: the extension host answered without `handled`"))
     }
 
     /// Install the live-ctx provider: its value rides every emit / tool call that has no explicit
@@ -743,6 +787,7 @@ impl ExtHost {
         let (generation, _) = watch::channel(0usize);
         let host = Arc::new(Self {
             subscribed: Mutex::new(None),
+            link_schemes: Mutex::new(Vec::new()),
             ctx_provider: Mutex::new(None),
             conn: Mutex::new(conn),
             child: tokio::sync::Mutex::new(None),

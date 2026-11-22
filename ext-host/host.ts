@@ -25,6 +25,8 @@ interface Ext {
   tools: Map<string, Json>;
   commands: Map<string, Json>;
   flags: Map<string, Json>;
+  /** Link schemes claimed with `registerLinkScheme`, lowercase, in claim order. */
+  linkSchemes: string[];
   label?: string;
 }
 
@@ -37,6 +39,41 @@ const SHUTDOWN_TIMEOUT_MS = 2_000;
 let TRACE = process.env.OMP_EXT_TRACE;
 const PKG_ROOT =
   process.env.OMP_PKG_ROOT ?? join(homedir(), ".bun/install/global/node_modules/@oh-my-pi/pi-coding-agent");
+
+// ---------------------------------------------------------------- link schemes
+/** URL scheme syntax an extension may claim (`registerLinkScheme`, pi loader.ts). */
+const LINK_SCHEME_PATTERN = /^[a-z][a-z0-9+.-]+$/;
+/** Schemes the terminal or the browser owns: never an extension's to claim. */
+const STANDARD_LINK_SCHEMES = new Set([
+  "about",
+  "blob",
+  "data",
+  "file",
+  "ftp",
+  "http",
+  "https",
+  "javascript",
+  "mailto",
+  "ssh",
+  "ws",
+  "wss",
+]);
+/** omp-internal schemes (crates/omp-urls `schemes::register_all`): the core routes these itself. */
+const BUILTIN_LINK_SCHEMES = new Set([
+  "agent",
+  "artifact",
+  "cfg",
+  "history",
+  "local",
+  "mcp",
+  "memory",
+  "omp",
+  "rule",
+  "skill",
+  "xd",
+]);
+/** Schemes already reported as multiply claimed (pi's `#warnedLinkSchemes`). */
+const warnedLinkSchemes = new Set<string>();
 
 // ---------------------------------------------------------------- transport
 // In stdio mode `send` writes to stdout; in shared-daemon Worker mode it posts
@@ -421,6 +458,23 @@ function makeApi(ext: Ext, track: LoadTracker) {
     registerCommand(name: string, options: Json) {
       ext.commands.set(name, { name, ...options });
     },
+    // Claim a link scheme (`cc-stretch:…`): a click on such a link is delivered to this extension as
+    // `link_activate` instead of reaching the terminal or the browser (pi loader.ts validation).
+    registerLinkScheme(scheme: string) {
+      if (typeof scheme !== "string") {
+        throw new TypeError(`registerLinkScheme expects a string, got ${typeof scheme}`);
+      }
+      const normalized = scheme.toLowerCase();
+      if (!LINK_SCHEME_PATTERN.test(normalized)) {
+        throw new Error(
+          `registerLinkScheme: "${scheme}" is not a URL scheme of two or more characters (letters, digits, "+", "-", ".")`,
+        );
+      }
+      if (STANDARD_LINK_SCHEMES.has(normalized) || BUILTIN_LINK_SCHEMES.has(normalized)) {
+        throw new Error(`registerLinkScheme: "${scheme}" is reserved for standard or omp-internal links`);
+      }
+      if (!ext.linkSchemes.includes(normalized)) ext.linkSchemes.push(normalized);
+    },
     registerShortcut: () => unsupportedNow("registerShortcut"),
     // Semantics mirror pi-coding-agent loader.ts: the default seeds flagValues; getFlag only
     // sees flags this extension registered (omp scopes flags per extension).
@@ -528,7 +582,7 @@ async function loadOne(path: string): Promise<{ ext?: Ext; error?: string }> {
   const factory = typeof mod === "function" ? mod : mod.default;
   if (typeof factory !== "function") return { error: `Extension does not export a valid factory function: ${path}` };
   const base = basename(path).replace(/\.(ts|js)$/, "");
-  const ext: Ext = { path: resolved, name: base === "index" ? basename(resolve(path, "..")) : base, handlers: new Map(), tools: new Map(), commands: new Map(), flags: new Map() };
+  const ext: Ext = { path: resolved, name: base === "index" ? basename(resolve(path, "..")) : base, handlers: new Map(), tools: new Map(), commands: new Map(), flags: new Map(), linkSchemes: [] };
   const track: LoadTracker = { subs: [], providers: [], flags: new Map() };
   const api = makeApi(ext, track);
   try {
@@ -567,8 +621,20 @@ async function load(p: Json) {
       tools: [...ext.tools.keys()],
       commands: [...ext.commands.keys()],
       flags: [...ext.flags.values()].map((f) => ({ ...f })),
+      linkSchemes: [...ext.linkSchemes],
     });
   }
+  // Several extensions may claim one scheme; the first loaded gets its clicks (pi warns once).
+  const claims = new Map<string, string>();
+  for (const ext of exts)
+    for (const scheme of ext.linkSchemes) {
+      const owner = claims.get(scheme);
+      if (owner === undefined) claims.set(scheme, ext.path);
+      else if (owner !== ext.path && !warnedLinkSchemes.has(scheme)) {
+        warnedLinkSchemes.add(scheme);
+        log("warn", `Link scheme "${scheme}" is claimed by several extensions; the first loaded gets its clicks`, { owner, ignored: ext.path });
+      }
+    }
   return { loaded, errors };
 }
 
@@ -576,15 +642,20 @@ async function load(p: Json) {
 const TIMEOUT = Symbol("timeout");
 interface HandlerRecord { ext: string; event: string; tool?: string; ms: number; action: string; error?: string }
 
-async function runHandler(ext: Ext, h: Handler, event: Json, timeoutMs: number, rec: HandlerRecord[]): Promise<{ value?: unknown; failed?: "timeout" | "error"; message?: string }> {
+async function runHandler(ext: Ext, h: Handler, event: Json, timeoutMs: number | null, rec: HandlerRecord[]): Promise<{ value?: unknown; failed?: "timeout" | "error"; message?: string }> {
   const t0 = performance.now();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const base = { ext: ext.name, event: String(event.type), tool: typeof event.toolName === "string" ? event.toolName : undefined };
   try {
-    const value = await Promise.race([
-      Promise.resolve().then(() => h(event, ctx())),
-      new Promise<typeof TIMEOUT>((r) => (timer = setTimeout(() => r(TIMEOUT), timeoutMs))),
-    ]);
+    const run = Promise.resolve().then(() => h(event, ctx()));
+    // `null` = no budget: the user's own action (a command, a link click) may open a dialog.
+    const value =
+      timeoutMs === null
+        ? await run
+        : await Promise.race([
+            run,
+            new Promise<typeof TIMEOUT>((r) => (timer = setTimeout(() => r(TIMEOUT), timeoutMs))),
+          ]);
     const ms = Math.round((performance.now() - t0) * 10) / 10;
     if (value === TIMEOUT) {
       const message = `handler timed out after ${timeoutMs}ms`;
@@ -764,6 +835,25 @@ function rebuildMessageUpdate(event: Json): boolean {
     log("warn", `message_update delta rejected (${e.message}); core will resend the full message`);
     return false;
   }
+}
+
+// ---------------------------------------------------------------- link_activate
+/**
+ * Deliver a click on `url` as `link_activate` to the extension that claimed its scheme (the first
+ * loaded one when several did). Returns whether an extension owns the link.
+ *
+ * Like a command or shortcut, a click is the user's own action and its handler may open a dialog:
+ * it runs without the event-handler timeout. A failure is reported, not thrown.
+ */
+async function runLinkActivate(url: string, rec: HandlerRecord[]): Promise<boolean> {
+  const colon = url.indexOf(":");
+  if (colon <= 0) return false;
+  const scheme = url.slice(0, colon).toLowerCase();
+  const owner = exts.find((e) => e.linkSchemes.includes(scheme));
+  if (!owner) return false;
+  const event: Json = { type: "link_activate", url, scheme };
+  for (const h of owner.handlers.get("link_activate") ?? []) await runHandler(owner, h, event, null, rec);
+  return true;
 }
 
 async function emit(p: Json) {
@@ -974,6 +1064,11 @@ async function emit(p: Json) {
           break outer3;
         }
       }
+  } else if (type === "link_activate") {
+    // Never a broadcast: a click belongs to the extension that claimed the URL's scheme only (pi
+    // `emitLinkActivate`). Clicks normally arrive as the `link_activate` request; this keeps a core
+    // that emits it from reaching every extension.
+    result = { handled: await runLinkActivate(String(event.url ?? ""), rec) };
   } else {
     // session_before_* (cancel short-circuits, last result wins), session_stop (block short-circuits), everything else: observe.
     const isBefore = type.startsWith("session_before_");
@@ -1121,6 +1216,12 @@ async function dispatch(method: string, p: Json): Promise<unknown> {
       return exts.flatMap((e) => [...e.commands.values()].map((c) => ({ name: c.name, description: c.description, extension: e.name })));
     case "call_command":
       return callCommand(p);
+    // A click on a link whose scheme an extension claimed (`registerLinkScheme`) goes to that
+    // extension alone (pi `emitLinkActivate`): never to a broadcast emit.
+    case "link_activate": {
+      const rec: HandlerRecord[] = [];
+      return { handled: await runLinkActivate(String(p.url ?? ""), rec) };
+    }
     case "set_ctx":
       state = { ...state, ...(p.ctx as Json) };
       return true;
