@@ -8,6 +8,7 @@
 
 pub mod blocks;
 pub mod code;
+pub mod links;
 pub mod local_time;
 pub mod markdown;
 pub mod messages;

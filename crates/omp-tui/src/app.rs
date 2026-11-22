@@ -396,6 +396,8 @@ pub struct App {
     editor_env: fn(&str) -> Option<String>,
     /// The latest `/btw` answer's steering prompt (`app.btw.inject`).
     btw_inject: Option<BtwInject>,
+    /// System URL opener behind `/open` (tests pin it).
+    url_opener: fn(&str) -> std::io::Result<()>,
     /// Mirror of `tui.mouse` ("Mouse Click-to-Focus"): inline SGR mouse
     /// capture on the normal buffer while no overlay is open (TS
     /// `InteractiveMode#mouseCapture` → `setInlineMouseTrackingProvider`).
@@ -490,6 +492,7 @@ impl App {
             pending_editor: None,
             editor_env: |k| std::env::var(k).ok(),
             btw_inject: None,
+            url_opener: crate::chat::links::open_external,
             mouse_capture: false,
             keys: KeybindingsManager::defaults(),
             title,
@@ -2151,6 +2154,7 @@ impl App {
             "effort" if args.is_empty() => self.open_thinking_selector(),
             "resume" => self.slash_resume(),
             "local" => self.open_local(args, port),
+            "open" => self.slash_open(args),
             "tree" => self.open_tree_view(TreeMode::Tree, port),
             "theme" => self.slash_theme(args),
             // TS `/session` (bare or `info`) opens the session info panel;
@@ -2241,6 +2245,38 @@ impl App {
             self.theme.symbol("nav.selected")
         ));
         true
+    }
+
+    /// `/open [link|url]` (TS builtin-collaboration `open`, TUI-only): open
+    /// the last http(s) link of the latest assistant message that has one.
+    fn slash_open(&mut self, args: &str) {
+        let arg = args.trim().to_lowercase();
+        if !arg.is_empty() && arg != "link" && arg != "url" {
+            self.push_system("Usage: /open [link]  (pick a specific link: /copy link)".into());
+            return;
+        }
+        let link = self.messages.entries().iter().rev().find_map(|entry| {
+            let crate::chat::ChatKind::Assistant(msg) = &entry.kind else {
+                return None;
+            };
+            let text: String = msg
+                .segments
+                .iter()
+                .filter_map(|s| match s {
+                    crate::chat::messages::AssistantSegment::Text { text } => Some(text.as_str()),
+                    crate::chat::messages::AssistantSegment::Thinking { .. } => None,
+                })
+                .collect();
+            crate::chat::links::http_links(&text).pop()
+        });
+        let Some(link) = link else {
+            self.push_system("No link to open.".into());
+            return;
+        };
+        match (self.url_opener)(&link) {
+            Ok(()) => self.push_system(format!("Opening {link}")),
+            Err(e) => self.push_system(format!("Failed to open {link}: {e}")),
+        }
     }
 
     /// `/local [target]` and `app.local.open` (TS `openLocalFileInEditor`):
@@ -3103,6 +3139,34 @@ mod tests {
 
     fn start_streaming(app: &mut App) {
         app.apply_event(&AppEvent::AgentStart);
+    }
+
+    // ---- /open -----------------------------------------------------------
+
+    #[test]
+    fn slash_open_opens_the_last_assistant_link() {
+        let mut app = app();
+        let port = port();
+        app.url_opener = |url| {
+            if url.contains("fail") {
+                Err(std::io::Error::other("no opener"))
+            } else {
+                Ok(())
+            }
+        };
+        app.execute_slash("open", "", &port);
+        assert_eq!(last_system(&app), "No link to open.");
+        app.apply_event(&AppEvent::MessageEnd(json!({"message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "See https://a.dev/x and [b](https://b.dev/y)."}]
+        }})));
+        app.execute_slash("open", "", &port);
+        assert_eq!(last_system(&app), "Opening https://b.dev/y");
+        app.execute_slash("open", "url", &port);
+        assert_eq!(last_system(&app), "Opening https://b.dev/y");
+        app.execute_slash("open", "bogus", &port);
+        assert!(last_system(&app).starts_with("Usage: /open [link]"));
+        assert!(log(&port).is_empty(), "/open stays in the TUI");
     }
 
     // ---- app.btw.inject ----------------------------------------------------

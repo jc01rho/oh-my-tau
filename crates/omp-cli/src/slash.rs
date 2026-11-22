@@ -865,7 +865,7 @@ async fn dispatch_ported(rt: &std::sync::Arc<Runtime>, name: &str, args: &str) -
         "hotkeys" => Some(hotkeys_command(rt, args)),
         // Upstream runs these only in the interactive TUI (`handleTui`), which
         // handles them locally; text-mode dispatch says so.
-        "local" => Some(notice(
+        "local" | "open" => Some(notice(
             rt,
             &format!("/{name} is only available in the interactive TUI."),
         )),
@@ -3102,7 +3102,6 @@ const UNPORTED_RESERVED: &[&str] = &[
     "forget-approvals",
     "join",
     "leave",
-    "open",
     "tan",
     "omfg",
     "cleanse",

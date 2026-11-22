@@ -1049,7 +1049,7 @@
  },
  {
   "name": "open",
-  "description": "Reserved upstream command (not implemented in this build)",
+  "description": "Open the last link from the conversation in your browser (or pick one with /copy)",
   "source": "builtin"
  },
  {
