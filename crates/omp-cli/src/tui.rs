@@ -760,6 +760,16 @@ impl omp_tui::RuntimePort for Port {
             rt.send(frame);
         });
     }
+
+    fn confirm_close(&self) -> Option<omp_tui::port::CloseGate> {
+        let (decision, abort) = self.ext.as_ref()?.confirm_close()?;
+        Some(omp_tui::port::CloseGate::new(
+            decision,
+            Box::new(move || {
+                let _ = abort.send(());
+            }),
+        ))
+    }
 }
 
 #[cfg(test)]

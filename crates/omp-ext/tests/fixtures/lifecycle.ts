@@ -15,13 +15,14 @@ const RESULTS: Record<string, unknown> = {
   session_before_switch: { cancel: true },
   session_before_branch: { cancel: false },
   session_before_tree: { cancel: true },
+  session_before_shutdown: { cancel: true },
   session_stop: { continue: true, additionalContext: "keep going" },
   before_subagent_spawn: { model: ["fx/one:high", "fx/two"], note: "fixture route" },
   user_bash: { result: { output: "handled", exitCode: 0 } },
   user_python: { result: { output: "py", exitCode: 0 } },
   "session.compacting": { context: ["ctx line"], prompt: "CUSTOM PROMPT", preserveData: { keep: 1 } },
-};
   resources_discover: { skillPaths: ["skills/ext-a"], promptPaths: ["prompts/ext-b.md"], themePaths: ["themes/ext-c.json"] },
+};
 
 export default function lifecycle(pi: any): void {
   for (const type of [...OBSERVED, ...Object.keys(RESULTS)]) {

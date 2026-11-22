@@ -2,7 +2,7 @@
 // omp extension host: loads omp ExtensionAPI extensions (unchanged .ts files) and serves them to the Rust core
 // over JSON-RPC 2.0 on stdio (newline-delimited). Handler aggregation mirrors pi-coding-agent's ExtensionRunner.
 //
-// core -> host requests: load, emit, list_tools, call_tool, cancel_tool, list_commands, call_command, set_ctx, bus_emit, shutdown
+// core -> host requests: load, emit, list_tools, call_tool, cancel_tool, list_commands, call_command, set_ctx, bus_emit, abort_emit, shutdown
 // host -> core:          notifications append_entry, send_message, send_user_message, log, ui_notify, set_label,
 //                        provider_registered, provider_unregistered;
 //                        requests compact, navigate_tree, ui_confirm (core may answer with an error → treated as unsupported)
@@ -910,6 +910,16 @@ async function emit(p: Json) {
   // and the core's copy is independent — it came off the wire).
   const event = p.event as Json;
   const type = String(event.type);
+  // Releasing-signal gate (`session_before_shutdown`): the event's `signal` is made here and the core
+  // aborts it with `abort_emit` once the close stops waiting; handlers not yet run are skipped and a
+  // late result is dropped (ExtensionRunner RELEASING_SIGNAL_EVENTS).
+  const abortKey = p.abortId === undefined ? undefined : String(p.abortId);
+  const gate = abortKey === undefined ? undefined : new AbortController();
+  if (abortKey !== undefined && gate) {
+    if (abortedEmits.delete(abortKey)) gate.abort();
+    else emitAborts.set(abortKey, gate);
+    event.signal = gate.signal;
+  }
   if (type === "message_update" && !rebuildMessageUpdate(event)) {
     // Unappliable delta: no handler can see a correct message. Ask the core
     // for a full frame (the next update) instead of running handlers on a
@@ -1121,6 +1131,7 @@ async function emit(p: Json) {
     const isBefore = type.startsWith("session_before_");
     outer2: for (const e of exts)
       for (const h of handlersFor(e)) {
+        if (gate?.signal.aborted) break outer2;
         const hr = (await runHandler(e, h, event, timeoutMs, rec)).value as Json | undefined;
         if (!hr) continue;
         if (isBefore) {
@@ -1136,6 +1147,10 @@ async function emit(p: Json) {
       }
   }
 
+  if (abortKey !== undefined) {
+    emitAborts.delete(abortKey);
+    if (gate?.signal.aborted) result = undefined;
+  }
   if (TRACE) {
     try {
       appendFileSync(TRACE, `${JSON.stringify({ ts: Date.now(), event: type, tool: typeof event.toolName === "string" ? event.toolName : undefined, handlers: rec, result: summarize(result) })}\n`);
@@ -1170,6 +1185,9 @@ function allTools(): { ext: Ext; tool: Json }[] {
 
 // Live tool calls by toolCallId, so a core-side `cancel_tool` can abort them.
 const toolAcs = new Map<string, AbortController>();
+// Live releasing-signal emits by core `abortId`, and aborts that arrived before their emit started.
+const emitAborts = new Map<string, AbortController>();
+const abortedEmits = new Set<string>();
 
 async function callTool(p: Json) {
   if (p.ctx) state = { ...state, ...(p.ctx as Json) };
@@ -1257,6 +1275,14 @@ async function dispatch(method: string, p: Json): Promise<unknown> {
       // Additive: cores that predate `cancel_tool` never call this.
       const ac = toolAcs.get(String(p.toolCallId ?? ""));
       if (ac) ac.abort();
+      return true;
+    }
+    case "abort_emit": {
+      // Additive: cores that predate `abort_emit` never call this.
+      const key = String(p.abortId ?? "");
+      const ac = emitAborts.get(key);
+      if (ac) ac.abort();
+      else abortedEmits.add(key);
       return true;
     }
     case "list_commands":

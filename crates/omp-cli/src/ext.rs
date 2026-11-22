@@ -1799,6 +1799,40 @@ impl Extensions {
         }
     }
 
+    /// `session_before_shutdown` gate for an operator close the UI can still refuse (TS
+    /// `AgentSession.confirmClose`). `None` when no extension subscribes: close at once.
+    /// Otherwise the receiver yields `true` to close (`false` = an extension cancelled);
+    /// sending on or dropping the returned sender aborts the extensions' `signal` and closes.
+    pub fn confirm_close(
+        &self,
+    ) -> Option<(
+        tokio::sync::oneshot::Receiver<bool>,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
+        if !self.host.has_handlers("session_before_shutdown") {
+            return None;
+        }
+        let host = self.host.clone();
+        let (decision_tx, decision) = tokio::sync::oneshot::channel();
+        let (abort, aborted) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let close = host
+                .emit_session_before_shutdown(
+                    async move {
+                        let _ = aborted.await;
+                    },
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("omt: extension session_before_shutdown: {e:#}");
+                    true
+                });
+            let _ = decision_tx.send(close);
+        });
+        Some((decision, abort))
+    }
+
     /// Emit the credential soft-disables the auth store reported before this session attached, then
     /// every later one as it arrives (TS `runner.ts`'s `emitCredentialDisabled`, whose pre-init
     /// buffer is [`CredentialDisabledFeed`]). Runs once per session, after `session_start`.
