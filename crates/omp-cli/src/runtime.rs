@@ -2005,6 +2005,14 @@ impl Runtime {
     fn bump_generation(&self) {
         self.switch_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // A goal belongs to the session that created it.
+        crate::tools::reset_session_goal();
+    }
+
+    /// Counts session switches (new, resume, fork); a value kept across a switch is stale.
+    pub fn switch_generation(&self) -> u64 {
+        self.switch_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Abort the run and wait until the agent is idle.

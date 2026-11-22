@@ -17,6 +17,7 @@
 //!
 //! Goal status words are the gateway's: `active | paused | blocked | complete`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{anyhow, Result};
@@ -29,8 +30,12 @@ use serde_json::{json, Map, Value};
 use super::ask::{self, AskUi, CANCELLED_MESSAGE};
 use super::goal::{completion_budget_report, Goal, GoalRuntime};
 
-/// Delivers a message to the session as if the user had typed it.
-pub type FollowUpSink = Arc<dyn Fn(String) + Send + Sync>;
+/// Delivers one message to the session as if the user had typed it.
+pub type FollowUpDelivery = Box<dyn FnOnce(String) + Send>;
+
+/// Called when a question is asked, so the delivery it returns can stay bound to the
+/// session that asked.
+pub type FollowUpSink = Arc<dyn Fn() -> FollowUpDelivery + Send + Sync>;
 
 const MAX_QUESTIONS: usize = 4;
 const MIN_OPTIONS: usize = 2;
@@ -352,15 +357,27 @@ fn parse_response(questions: &[AskQuestion], response: Option<Value>) -> Outcome
 /// Reads what the `ask` tool reports in `details`: one question carries its fields
 /// directly, several carry `results[]` in question order.
 fn outcome_from_ask_details(questions: &[AskQuestion], details: &Value) -> Outcome {
-    let one = |entry: &Value| Answer {
-        selected: string_list(entry.get("selectedOptions")),
-        other: nonempty(entry.get("customInput")),
+    let one = |entry: &Value| {
+        if entry.get("timedOut").and_then(Value::as_bool) == Some(true) {
+            // `ask` auto-selects a default after a timeout; nobody answered.
+            return Answer::default();
+        }
+        Answer {
+            selected: string_list(entry.get("selectedOptions")),
+            other: nonempty(entry.get("customInput")),
+        }
     };
-    let answers = match details.get("results").and_then(Value::as_array) {
+    let answers: Vec<Answer> = match details.get("results").and_then(Value::as_array) {
         Some(results) => results.iter().map(one).collect(),
         None => vec![one(details)],
     };
     debug_assert_eq!(answers.len(), questions.len());
+    if answers
+        .iter()
+        .all(|a| a.selected.is_empty() && a.other.is_none())
+    {
+        return Outcome::Cancelled;
+    }
     Outcome::Answered {
         answers,
         comment: None,
@@ -498,10 +515,11 @@ fn finish(
 }
 
 fn next_question_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    format!("askq-{nanos:x}")
+    format!("askq-{nanos:x}-{}", SEQ.fetch_add(1, Ordering::SeqCst))
 }
 
 /// The `ask_user_question` tool.
@@ -563,26 +581,28 @@ impl AskUserQuestionTool {
             return Ok(finish(&id, args.required, &args.questions, &outcome));
         };
         // The turn may end before the user answers, so the dialog outlives this call.
+        let deliver = sink();
         let pending_id = id.clone();
         tokio::spawn(async move {
             let message = match collect(ui, &args.questions, &AbortSignal::never()).await {
                 Ok(outcome) => {
                     let result = finish(&pending_id, args.required, &args.questions, &outcome);
-                    format!(
-                        "[ask_user_question answer {pending_id}]\n{}",
-                        result_text(&result)
-                    )
+                    let kind = match result.details.get("errorCode").and_then(Value::as_str) {
+                        Some(code) => format!("error {pending_id} {code}"),
+                        None => format!("answer {pending_id}"),
+                    };
+                    format!("[ask_user_question {kind}]\n{}", result_text(&result))
                 }
-                Err(e) => {
-                    format!("[ask_user_question answer {pending_id}]\nThe question failed: {e}")
-                }
+                Err(e) => format!(
+                    "[ask_user_question error {pending_id} question_failed]\nThe question failed: {e}"
+                ),
             };
-            sink(message);
+            deliver(message);
         });
         Ok(AgentToolResult {
             details: json!({"questionId": id, "pending": true}),
             ..AgentToolResult::text(format!(
-                "Question {id} was posted without waiting. The answer will arrive later as a user message starting with \"[ask_user_question answer {id}]\"; keep working on whatever does not depend on it."
+                "Question {id} was posted without waiting. The answer will arrive later as a user message starting with \"[ask_user_question answer {id}]\" (or \"[ask_user_question error {id} <code>]\" when it fails); keep working on whatever does not depend on it."
             ))
         })
     }
@@ -743,6 +763,15 @@ pub struct GoalCompatTool {
     runtime: Arc<Mutex<GoalRuntime>>,
 }
 
+/// Forgets the session's goal; a goal belongs to the session that created it.
+pub fn reset_session_goal() {
+    reset_goal(&SESSION_GOAL);
+}
+
+fn reset_goal(runtime: &Mutex<GoalRuntime>) {
+    *lock(runtime) = GoalRuntime::default();
+}
+
 /// The three goal tools over the session's shared goal state.
 #[must_use]
 pub fn goal_tools() -> Vec<Arc<dyn AgentTool>> {
@@ -795,16 +824,24 @@ impl GoalCompatTool {
             }
             GoalOp::Update => {
                 let status = params.get("status").and_then(Value::as_str);
-                let reason = params.get("reason").and_then(Value::as_str);
+                let reason = params.get("reason").filter(|r| !r.is_null());
                 let outcome = match (status, reason) {
+                    (Some("complete"), None) => runtime.complete_goal(),
                     (Some("complete"), Some(_)) => {
                         return coded_error(
                             "invalid_arguments",
                             "reason is only allowed when status is blocked",
                         )
                     }
-                    (Some("complete"), None) => runtime.complete_goal(),
-                    (Some("blocked"), reason) => runtime.block_goal(reason.unwrap_or("")),
+                    (Some("blocked"), Some(Value::String(reason))) if !reason.trim().is_empty() => {
+                        runtime.block_goal(reason)
+                    }
+                    (Some("blocked"), _) => {
+                        return coded_error(
+                            "invalid_arguments",
+                            "reason is required when status is blocked",
+                        )
+                    }
                     _ => {
                         return coded_error(
                             "invalid_arguments",
@@ -1211,30 +1248,136 @@ mod tests {
         assert_eq!(text_of(&result), "User answered:\n- Storage: SQLite");
     }
 
+    /// Holds the dialog open until the test releases it.
+    struct GatedUi {
+        response: Value,
+        release: PlMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl AskUi for GatedUi {
+        fn ask(&self, _: Value, _: Option<u64>) -> BoxFut<'static, Result<Option<Value>>> {
+            Box::pin(async { Err(anyhow!("the gateway dialog must not use ask")) })
+        }
+        fn has_question_dialog(&self) -> bool {
+            true
+        }
+        fn question(
+            &self,
+            _: String,
+            _: Value,
+            _: Option<u64>,
+        ) -> BoxFut<'static, Result<Option<Value>>> {
+            let release = self.release.lock().take();
+            let response = self.response.clone();
+            Box::pin(async move {
+                if let Some(release) = release {
+                    release.await.ok();
+                }
+                Ok(Some(response))
+            })
+        }
+    }
+
+    /// A sink that records how often it was asked for a delivery and what it delivered.
+    fn recording_sink() -> (
+        FollowUpSink,
+        Arc<AtomicU64>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (sent, received) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let asked = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&asked);
+        let sink: FollowUpSink = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let sent = sent.clone();
+            Box::new(move |message| {
+                sent.send(message).ok();
+            })
+        });
+        (sink, asked, received)
+    }
+
+    async fn delivered(received: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+            .await
+            .expect("the answer is delivered")
+            .expect("the sink is still open")
+    }
+
     #[tokio::test]
     async fn wait_for_answer_false_returns_at_once_and_delivers_the_answer_later() {
-        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let sink: FollowUpSink = Arc::new(move |message| {
-            sent.send(message).ok();
-        });
-        let ui = Arc::new(GatewayUi {
-            response: Some(json!({"answers": {"q1": {"selected": ["SQLite"]}}})),
-            dialogs: PlMutex::new(Vec::new()),
+        let (sink, asked, mut received) = recording_sink();
+        let (release, held) = tokio::sync::oneshot::channel();
+        let ui = Arc::new(GatedUi {
+            response: json!({"answers": {"q1": {"selected": ["SQLite"]}}}),
+            release: PlMutex::new(Some(held)),
         });
         let tool = tool_with(ui, Some(sink));
         let mut params = storage();
         params["waitForAnswer"] = json!(false);
         let result = call(&tool, params).await.unwrap();
         assert_eq!(result.details["pending"], true);
-        let id = result.details["questionId"].as_str().unwrap().to_string();
-        let message = tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
-            .await
-            .expect("the answer is delivered")
-            .expect("the sink is still open");
         assert_eq!(
-            message,
+            asked.load(Ordering::SeqCst),
+            1,
+            "the delivery is bound when the question is asked"
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "nothing is delivered before the user answers"
+        );
+        release.send(()).unwrap();
+        let id = result.details["questionId"].as_str().unwrap().to_string();
+        assert_eq!(
+            delivered(&mut received).await,
             format!("[ask_user_question answer {id}]\nUser answered:\n- Storage: SQLite")
         );
+    }
+
+    #[tokio::test]
+    async fn a_required_async_question_that_is_dismissed_is_delivered_as_an_error() {
+        let (sink, _, mut received) = recording_sink();
+        let (_, tool) = gateway(Some(json!({"cancelled": true})));
+        let tool = tool_with(tool.ui.clone().unwrap(), Some(sink));
+        let mut params = storage();
+        params["waitForAnswer"] = json!(false);
+        params["required"] = json!(true);
+        let result = call(&tool, params).await.unwrap();
+        let id = result.details["questionId"].as_str().unwrap().to_string();
+        assert_eq!(
+            delivered(&mut received).await,
+            format!(
+                "[ask_user_question error {id} question_cancelled]\nThe user dismissed the question without answering."
+            )
+        );
+    }
+
+    #[test]
+    fn every_pending_question_gets_its_own_id() {
+        let ids: std::collections::HashSet<String> =
+            (0..1000).map(|_| next_question_id()).collect();
+        assert_eq!(ids.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_or_empty_ask_dialog_is_a_dismissal() {
+        let mut params = two_questions();
+        params["required"] = json!(true);
+        for response in [
+            json!({"cancelled": true, "timedOut": true}),
+            json!({"answers": [
+                {"id": "q1", "selectedOptions": []},
+                {"id": "q2", "selectedOptions": []}
+            ]}),
+        ] {
+            let tool = tool_with(Arc::new(TauUi(response.clone())), None);
+            let result = call(&tool, params.clone()).await.unwrap();
+            assert_eq!(result.is_error, Some(true), "{response}");
+            assert_eq!(
+                result.details["errorCode"], "question_cancelled",
+                "{response}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1375,6 +1518,8 @@ mod tests {
         for bad in [
             json!({}),
             json!({"status": "paused"}),
+            json!({"status": "complete", "reason": 7}),
+            json!({"status": "blocked", "reason": 7}),
             json!({"status": "blocked"}),
             json!({"status": "blocked", "reason": "  "}),
             json!({"status": "complete", "reason": "done"}),
@@ -1386,6 +1531,18 @@ mod tests {
         // None of the rejected calls touched the goal.
         let got = goal_call(&tools, "get_goal", json!({})).await;
         assert_eq!(got.details["goal"]["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn a_session_change_forgets_the_goal() {
+        let runtime: Arc<Mutex<GoalRuntime>> = Arc::default();
+        let tools = goal_tools_with(&runtime);
+        goal_call(&tools, "create_goal", json!({"objective": "old session"})).await;
+        reset_goal(&runtime);
+        let got = goal_call(&tools, "get_goal", json!({})).await;
+        assert_eq!(got.details["goal"], Value::Null);
+        let created = goal_call(&tools, "create_goal", json!({"objective": "new session"})).await;
+        assert_eq!(created.is_error, None);
     }
 
     #[tokio::test]
