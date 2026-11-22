@@ -2,7 +2,7 @@
 // omp extension host: loads omp ExtensionAPI extensions (unchanged .ts files) and serves them to the Rust core
 // over JSON-RPC 2.0 on stdio (newline-delimited). Handler aggregation mirrors pi-coding-agent's ExtensionRunner.
 //
-// core -> host requests: load, emit, list_tools, call_tool, cancel_tool, list_commands, call_command, set_ctx, bus_emit, shutdown
+// core -> host requests: load, emit, list_tools, call_tool, cancel_tool, list_commands, call_command, set_ctx, bus_emit, abort_emit, shutdown
 // host -> core:          notifications append_entry, send_message, send_user_message, log, ui_notify, set_label,
 //                        provider_registered, provider_unregistered;
 //                        requests compact, navigate_tree, ui_confirm (core may answer with an error → treated as unsupported)
@@ -25,6 +25,8 @@ interface Ext {
   tools: Map<string, Json>;
   commands: Map<string, Json>;
   flags: Map<string, Json>;
+  /** Link schemes claimed with `registerLinkScheme`, lowercase, in claim order. */
+  linkSchemes: string[];
   /** Extension RPC names this extension registered (`api.rpc.handle`). */
   rpc: string[];
   label?: string;
@@ -39,6 +41,41 @@ const SHUTDOWN_TIMEOUT_MS = 2_000;
 let TRACE = process.env.OMP_EXT_TRACE;
 const PKG_ROOT =
   process.env.OMP_PKG_ROOT ?? join(homedir(), ".bun/install/global/node_modules/@oh-my-pi/pi-coding-agent");
+
+// ---------------------------------------------------------------- link schemes
+/** URL scheme syntax an extension may claim (`registerLinkScheme`, pi loader.ts). */
+const LINK_SCHEME_PATTERN = /^[a-z][a-z0-9+.-]+$/;
+/** Schemes the terminal or the browser owns: never an extension's to claim. */
+const STANDARD_LINK_SCHEMES = new Set([
+  "about",
+  "blob",
+  "data",
+  "file",
+  "ftp",
+  "http",
+  "https",
+  "javascript",
+  "mailto",
+  "ssh",
+  "ws",
+  "wss",
+]);
+/** omp-internal schemes (crates/omp-urls `schemes::register_all`): the core routes these itself. */
+const BUILTIN_LINK_SCHEMES = new Set([
+  "agent",
+  "artifact",
+  "cfg",
+  "history",
+  "local",
+  "mcp",
+  "memory",
+  "omp",
+  "rule",
+  "skill",
+  "xd",
+]);
+/** Schemes already reported as multiply claimed (pi's `#warnedLinkSchemes`). */
+const warnedLinkSchemes = new Set<string>();
 
 // ---------------------------------------------------------------- transport
 // In stdio mode `send` writes to stdout; in shared-daemon Worker mode it posts
@@ -186,10 +223,15 @@ const unsupportedNow = (what: string): never => {
 };
 // `ctx.runEphemeralTurn` (TS EphemeralTurnOptions -> EphemeralTurnResult): the core runs the
 // /btw side turn (`run_ephemeral_turn` request); nothing enters the session history and tool
-// calls are never executed. Callbacks cannot cross the wire, so `onTextDelta` receives the
-// settled reply as one delta and `onUsage` the settled message. Callbacks run marked as inside
-// the side turn, so they cannot start another one (bounded recursion, as in TS).
+// calls are never executed. Callbacks cannot cross the wire, so the request announces them: with
+// `onTextDelta` it carries a `streamId` the core echoes on each `ephemeral_delta` request (awaited
+// in arrival order, so the callback sees the provider's deltas as they stream), and with `onUsage`
+// a `usageCallback` flag (the core skips its own `purpose` journal then, as TS does). Callbacks run
+// marked as inside the side turn, so they cannot start another one (bounded recursion, as in TS).
 const inEphemeral = new AsyncLocalStorage<true>();
+/** Live `onTextDelta` deliveries of running side turns, keyed by the id the core echoes back. */
+const ephemeralDeltas = new Map<number, (delta: string) => unknown>();
+let nextStreamId = 1;
 async function runEphemeralTurn(options: Json): Promise<{ replyText: string; assistantMessage: Json }> {
   if (inEphemeral.getStore()) throw new Error("runEphemeralTurn cannot start inside a running side turn");
   if (!options || typeof options !== "object") throw new Error("runEphemeralTurn: options must be an object");
@@ -199,6 +241,12 @@ async function runEphemeralTurn(options: Json): Promise<{ replyText: string; ass
     onUsage?: (message: Json) => unknown;
   };
   signal?.throwIfAborted();
+  const streamId = onTextDelta ? nextStreamId++ : undefined;
+  if (streamId !== undefined && onTextDelta) {
+    ephemeralDeltas.set(streamId, (delta) => inEphemeral.run(true, () => onTextDelta(delta)));
+    wire.streamId = streamId;
+  }
+  if (onUsage) wire.usageCallback = true;
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<never>((_, reject) => {
     onAbort = () => reject(signal?.reason ?? new Error("runEphemeralTurn aborted"));
@@ -210,6 +258,7 @@ async function runEphemeralTurn(options: Json): Promise<{ replyText: string; ass
       throw new Error("runEphemeralTurn: the core returned a malformed result");
     }
     const result = { replyText: reply.replyText, assistantMessage: reply.assistantMessage as Json };
+    // TS reports usage where the provider settles; the core already streamed every delta.
     await inEphemeral.run(true, async () => {
       if (onUsage) {
         try {
@@ -218,13 +267,45 @@ async function runEphemeralTurn(options: Json): Promise<{ replyText: string; ass
           log("warn", `runEphemeralTurn onUsage failed: ${e instanceof Error ? e.message : e}`);
         }
       }
-      // A delivery failure rejects the side turn (TS: awaited in order).
-      if (onTextDelta && result.replyText) await onTextDelta(result.replyText);
     });
     return result;
   } finally {
     if (onAbort) signal?.removeEventListener("abort", onAbort);
+    if (streamId !== undefined) ephemeralDeltas.delete(streamId);
   }
+}
+// `ctx.resolvePlanReview` / `ctx.getPendingPlanReview` (TS ExtensionContext). The core owns the plan
+// review and mirrors the open one into `state.pendingPlanReview` (the `plan_review_*` emits carry it).
+// TS answers synchronously, so the same acceptance rules run here against that mirror; an accepted
+// answer is forwarded to the core (`resolve_plan_review`), which re-checks it against the live review
+// and closes it with `by: "extension"`. Should the core have closed the review in the meantime it
+// refuses the answer, which is logged.
+const PLAN_APPROVALS = new Set(["execute", "compact", "keep"]);
+function getPendingPlanReview(): Json | undefined {
+  const pending = state.pendingPlanReview as Json | null | undefined;
+  return pending ? structuredClone(pending) : undefined;
+}
+function resolvePlanReview(reviewId: string, choice: string, input?: { feedback?: string; role?: string }): boolean {
+  const pending = state.pendingPlanReview as Json | null | undefined;
+  if (!pending || pending.reviewId !== reviewId) return false;
+  const option = ((pending.options as Json[] | undefined) ?? []).find((o) => o.id === choice);
+  if (!option) return false;
+  if (choice === "refine" && !(typeof input?.feedback === "string" && input.feedback.trim())) return false;
+  if (input?.role !== undefined) {
+    const tiers = (pending.tiers as Json[] | undefined) ?? [];
+    if (!PLAN_APPROVALS.has(choice) || !tiers.some((t) => t.role === input.role)) return false;
+  } else if (option.disabled) {
+    return false;
+  }
+  // Answered: the review takes no second answer (the core's `plan_review_resolved` clears it too).
+  state = { ...state, pendingPlanReview: null };
+  void request("resolve_plan_review", { reviewId, choice, input: { feedback: input?.feedback, role: input?.role } }).then(
+    (accepted) => {
+      if (accepted !== true) log("warn", `resolvePlanReview(${reviewId}, ${choice}): the core refused the answer`);
+    },
+    (e) => log("warn", `resolvePlanReview(${reviewId}, ${choice}) failed: ${e instanceof Error ? e.message : e}`),
+  );
+  return true;
 }
 function makeCtx() {
   const noop = () => {};
@@ -297,6 +378,9 @@ function makeCtx() {
     isProjectTrusted: () => true,
     getSystemPrompt: () => (state.systemPrompt as string[]) ?? [],
     runEphemeralTurn: (options: Json) => runEphemeralTurn(options),
+    resolvePlanReview: (reviewId: string, choice: string, input?: { feedback?: string; role?: string }) =>
+      resolvePlanReview(reviewId, choice, input),
+    getPendingPlanReview: () => getPendingPlanReview(),
     setInterval: (cb: (...a: unknown[]) => void, ms?: number, ...a: unknown[]) => {
       const t = setInterval(() => safe(cb, a), ms);
       t.unref?.();
@@ -445,6 +529,23 @@ function makeApi(ext: Ext, track: LoadTracker) {
     registerCommand(name: string, options: Json) {
       ext.commands.set(name, { name, ...options });
     },
+    // Claim a link scheme (`cc-stretch:…`): a click on such a link is delivered to this extension as
+    // `link_activate` instead of reaching the terminal or the browser (pi loader.ts validation).
+    registerLinkScheme(scheme: string) {
+      if (typeof scheme !== "string") {
+        throw new TypeError(`registerLinkScheme expects a string, got ${typeof scheme}`);
+      }
+      const normalized = scheme.toLowerCase();
+      if (!LINK_SCHEME_PATTERN.test(normalized)) {
+        throw new Error(
+          `registerLinkScheme: "${scheme}" is not a URL scheme of two or more characters (letters, digits, "+", "-", ".")`,
+        );
+      }
+      if (STANDARD_LINK_SCHEMES.has(normalized) || BUILTIN_LINK_SCHEMES.has(normalized)) {
+        throw new Error(`registerLinkScheme: "${scheme}" is reserved for standard or omp-internal links`);
+      }
+      if (!ext.linkSchemes.includes(normalized)) ext.linkSchemes.push(normalized);
+    },
     // `api.rpc.handle(name, fn)` answers `extension_request` from the core. Registration is
     // synchronous so a bad name or a duplicate fails the load instead of surfacing on call.
     rpc: {
@@ -565,7 +666,7 @@ async function loadOne(path: string): Promise<{ ext?: Ext; error?: string }> {
   const factory = typeof mod === "function" ? mod : mod.default;
   if (typeof factory !== "function") return { error: `Extension does not export a valid factory function: ${path}` };
   const base = basename(path).replace(/\.(ts|js)$/, "");
-  const ext: Ext = { path: resolved, name: base === "index" ? basename(resolve(path, "..")) : base, handlers: new Map(), tools: new Map(), commands: new Map(), flags: new Map(), rpc: [] };
+  const ext: Ext = { path: resolved, name: base === "index" ? basename(resolve(path, "..")) : base, handlers: new Map(), tools: new Map(), commands: new Map(), flags: new Map(), linkSchemes: [], rpc: [] };
   const track: LoadTracker = { subs: [], rpc: [], providers: [], flags: new Map() };
   const api = makeApi(ext, track);
   try {
@@ -605,8 +706,20 @@ async function load(p: Json) {
       commands: [...ext.commands.keys()],
       rpc: ext.rpc.slice(),
       flags: [...ext.flags.values()].map((f) => ({ ...f })),
+      linkSchemes: [...ext.linkSchemes],
     });
   }
+  // Several extensions may claim one scheme; the first loaded gets its clicks (pi warns once).
+  const claims = new Map<string, string>();
+  for (const ext of exts)
+    for (const scheme of ext.linkSchemes) {
+      const owner = claims.get(scheme);
+      if (owner === undefined) claims.set(scheme, ext.path);
+      else if (owner !== ext.path && !warnedLinkSchemes.has(scheme)) {
+        warnedLinkSchemes.add(scheme);
+        log("warn", `Link scheme "${scheme}" is claimed by several extensions; the first loaded gets its clicks`, { owner, ignored: ext.path });
+      }
+    }
   return { loaded, errors };
 }
 
@@ -614,15 +727,20 @@ async function load(p: Json) {
 const TIMEOUT = Symbol("timeout");
 interface HandlerRecord { ext: string; event: string; tool?: string; ms: number; action: string; error?: string }
 
-async function runHandler(ext: Ext, h: Handler, event: Json, timeoutMs: number, rec: HandlerRecord[]): Promise<{ value?: unknown; failed?: "timeout" | "error"; message?: string }> {
+async function runHandler(ext: Ext, h: Handler, event: Json, timeoutMs: number | null, rec: HandlerRecord[]): Promise<{ value?: unknown; failed?: "timeout" | "error"; message?: string }> {
   const t0 = performance.now();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const base = { ext: ext.name, event: String(event.type), tool: typeof event.toolName === "string" ? event.toolName : undefined };
   try {
-    const value = await Promise.race([
-      Promise.resolve().then(() => h(event, ctx())),
-      new Promise<typeof TIMEOUT>((r) => (timer = setTimeout(() => r(TIMEOUT), timeoutMs))),
-    ]);
+    const run = Promise.resolve().then(() => h(event, ctx()));
+    // `null` = no budget: the user's own action (a command, a link click) may open a dialog.
+    const value =
+      timeoutMs === null
+        ? await run
+        : await Promise.race([
+            run,
+            new Promise<typeof TIMEOUT>((r) => (timer = setTimeout(() => r(TIMEOUT), timeoutMs))),
+          ]);
     const ms = Math.round((performance.now() - t0) * 10) / 10;
     if (value === TIMEOUT) {
       const message = `handler timed out after ${timeoutMs}ms`;
@@ -804,6 +922,25 @@ function rebuildMessageUpdate(event: Json): boolean {
   }
 }
 
+// ---------------------------------------------------------------- link_activate
+/**
+ * Deliver a click on `url` as `link_activate` to the extension that claimed its scheme (the first
+ * loaded one when several did). Returns whether an extension owns the link.
+ *
+ * Like a command or shortcut, a click is the user's own action and its handler may open a dialog:
+ * it runs without the event-handler timeout. A failure is reported, not thrown.
+ */
+async function runLinkActivate(url: string, rec: HandlerRecord[]): Promise<boolean> {
+  const colon = url.indexOf(":");
+  if (colon <= 0) return false;
+  const scheme = url.slice(0, colon).toLowerCase();
+  const owner = exts.find((e) => e.linkSchemes.includes(scheme));
+  if (!owner) return false;
+  const event: Json = { type: "link_activate", url, scheme };
+  for (const h of owner.handlers.get("link_activate") ?? []) await runHandler(owner, h, event, null, rec);
+  return true;
+}
+
 async function emit(p: Json) {
   if (p.ctx) state = { ...state, ...(p.ctx as Json) };
   // No structuredClone: like the TS runner, every handler for this emit sees
@@ -811,6 +948,16 @@ async function emit(p: Json) {
   // and the core's copy is independent — it came off the wire).
   const event = p.event as Json;
   const type = String(event.type);
+  // Releasing-signal gate (`session_before_shutdown`): the event's `signal` is made here and the core
+  // aborts it with `abort_emit` once the close stops waiting; handlers not yet run are skipped and a
+  // late result is dropped (ExtensionRunner RELEASING_SIGNAL_EVENTS).
+  const abortKey = p.abortId === undefined ? undefined : String(p.abortId);
+  const gate = abortKey === undefined ? undefined : new AbortController();
+  if (abortKey !== undefined && gate) {
+    if (abortedEmits.delete(abortKey)) gate.abort();
+    else emitAborts.set(abortKey, gate);
+    event.signal = gate.signal;
+  }
   if (type === "message_update" && !rebuildMessageUpdate(event)) {
     // Unappliable delta: no handler can see a correct message. Ask the core
     // for a full frame (the next update) instead of running handlers on a
@@ -1012,11 +1159,17 @@ async function emit(p: Json) {
           break outer3;
         }
       }
+  } else if (type === "link_activate") {
+    // Never a broadcast: a click belongs to the extension that claimed the URL's scheme only (pi
+    // `emitLinkActivate`). Clicks normally arrive as the `link_activate` request; this keeps a core
+    // that emits it from reaching every extension.
+    result = { handled: await runLinkActivate(String(event.url ?? ""), rec) };
   } else {
     // session_before_* (cancel short-circuits, last result wins), session_stop (block short-circuits), everything else: observe.
     const isBefore = type.startsWith("session_before_");
     outer2: for (const e of exts)
       for (const h of handlersFor(e)) {
+        if (gate?.signal.aborted) break outer2;
         const hr = (await runHandler(e, h, event, timeoutMs, rec)).value as Json | undefined;
         if (!hr) continue;
         if (isBefore) {
@@ -1032,6 +1185,10 @@ async function emit(p: Json) {
       }
   }
 
+  if (abortKey !== undefined) {
+    emitAborts.delete(abortKey);
+    if (gate?.signal.aborted) result = undefined;
+  }
   if (TRACE) {
     try {
       appendFileSync(TRACE, `${JSON.stringify({ ts: Date.now(), event: type, tool: typeof event.toolName === "string" ? event.toolName : undefined, handlers: rec, result: summarize(result) })}\n`);
@@ -1066,6 +1223,9 @@ function allTools(): { ext: Ext; tool: Json }[] {
 
 // Live tool calls by toolCallId, so a core-side `cancel_tool` can abort them.
 const toolAcs = new Map<string, AbortController>();
+// Live releasing-signal emits by core `abortId`, and aborts that arrived before their emit started.
+const emitAborts = new Map<string, AbortController>();
+const abortedEmits = new Set<string>();
 
 async function callTool(p: Json) {
   if (p.ctx) state = { ...state, ...(p.ctx as Json) };
@@ -1155,10 +1315,24 @@ async function dispatch(method: string, p: Json): Promise<unknown> {
       if (ac) ac.abort();
       return true;
     }
+    case "abort_emit": {
+      // Additive: cores that predate `abort_emit` never call this.
+      const key = String(p.abortId ?? "");
+      const ac = emitAborts.get(key);
+      if (ac) ac.abort();
+      else abortedEmits.add(key);
+      return true;
+    }
     case "list_commands":
       return exts.flatMap((e) => [...e.commands.values()].map((c) => ({ name: c.name, description: c.description, extension: e.name })));
     case "call_command":
       return callCommand(p);
+    // A click on a link whose scheme an extension claimed (`registerLinkScheme`) goes to that
+    // extension alone (pi `emitLinkActivate`): never to a broadcast emit.
+    case "link_activate": {
+      const rec: HandlerRecord[] = [];
+      return { handled: await runLinkActivate(String(p.url ?? ""), rec) };
+    }
     // `extension_request`: answer a named query an extension registered via `api.rpc.handle`.
     case "rpc_request": {
       const name = String(p.name ?? "").trim();
@@ -1185,6 +1359,14 @@ async function dispatch(method: string, p: Json): Promise<unknown> {
     case "bus_emit":
       events.emit(String(p.channel), p.data);
       return true;
+    case "ephemeral_delta": {
+      // A running side turn's next text delta; the core awaits this, so delivery order is the
+      // provider's order and a throwing `onTextDelta` rejects the turn.
+      const deliver = ephemeralDeltas.get(Number(p.streamId));
+      if (!deliver) throw rpcError(-32602, `ephemeral_delta: no running side turn ${p.streamId}`);
+      await deliver(String(p.delta ?? ""));
+      return true;
+    }
     case "shutdown":
       // In a shared-daemon Worker, process.exit would kill every session;
       // close the session transport instead (daemon terminates this Worker).

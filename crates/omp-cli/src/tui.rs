@@ -105,6 +105,9 @@ pub async fn run(
     rt.enable_context_usage_frames();
     crate::slash_extra::mark_interactive_ui();
     rt.publish_context_usage();
+    let link_schemes = extensions
+        .as_ref()
+        .map_or_else(Vec::new, |e| e.link_schemes());
     let port = Port {
         rt,
         ext: extensions,
@@ -119,6 +122,7 @@ pub async fn run(
             models,
             session_sources,
             osc11_bg,
+            link_schemes,
         },
         port,
     )
@@ -794,6 +798,29 @@ impl omp_tui::RuntimePort for Port {
         });
     }
 
+    fn link_activate(&self, url: String) {
+        let Some(ext) = self.ext.clone() else {
+            return;
+        };
+        let rt = self.rt.clone();
+        tokio::spawn(async move {
+            match ext.activate_link(&url).await {
+                Ok(true) => {}
+                // The picker only offers links whose scheme an extension
+                // claimed, so this is a scheme list that went stale (a reload
+                // dropped the extension): say so instead of dropping the click.
+                Ok(false) => rt.send(serde_json::json!({
+                    "type": "command_output",
+                    "text": format!("link: no extension handles {url}"),
+                })),
+                Err(e) => rt.send(serde_json::json!({
+                    "type": "command_output",
+                    "text": format!("link failed: {e:#}"),
+                })),
+            }
+        });
+    }
+
     fn request_session_info(&self) {
         let rt = self.rt.clone();
         tokio::spawn(async move {
@@ -808,6 +835,16 @@ impl omp_tui::RuntimePort for Port {
             let frame = crate::rpc::slash::usage_panel_frame(&rt).await;
             rt.send(frame);
         });
+    }
+
+    fn confirm_close(&self) -> Option<omp_tui::port::CloseGate> {
+        let (decision, abort) = self.ext.as_ref()?.confirm_close()?;
+        Some(omp_tui::port::CloseGate::new(
+            decision,
+            Box::new(move || {
+                let _ = abort.send(());
+            }),
+        ))
     }
 }
 
@@ -1011,19 +1048,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slash_clear_starts_a_new_session() {
+    async fn slash_clear_resets_the_context_in_place() {
         let mut h = harness().await;
         let before = h.port.rt.session_id();
         h.port.run_slash("clear".into(), String::new());
         let frames = until_result(&mut h.rx).await;
         assert_eq!(frames.last().unwrap()["status"], "completed");
         assert!(
-            outputs(&frames)
-                .iter()
-                .any(|t| t.contains("New session started.")),
+            outputs(&frames).iter().any(|t| t.contains("Context reset")),
             "frames: {frames:?}"
         );
-        assert_ne!(before, h.port.rt.session_id());
+        assert_eq!(
+            before,
+            h.port.rt.session_id(),
+            "/clear keeps the session, unlike /new"
+        );
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Map, Value};
 
@@ -822,6 +822,37 @@ pub struct Skill {
     pub hide: bool,
 }
 
+/// Skill paths extensions contributed through `resources_discover` (absolute, discovery order).
+/// Each entry is a skill directory (`SKILL.md` inside) or a skills root whose immediate children
+/// hold `SKILL.md`, the same shapes `.omp/skills` accepts.
+static EXTENSION_SKILL_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Replace the extension-contributed skill paths (a reload re-sends the whole set).
+pub fn set_extension_skill_paths(paths: Vec<PathBuf>) {
+    *EXTENSION_SKILL_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = paths;
+}
+
+/// The extension-contributed skill paths currently registered.
+#[must_use]
+pub fn extension_skill_paths() -> Vec<PathBuf> {
+    EXTENSION_SKILL_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Test-only: these registries (the extension skill paths and the `--skill` roots) are process-global,
+/// so a test that writes them must not overlap one that reads them through [`load_skills`]/[`crate::rpc::slash::load_file_commands`]. Sync tests
+/// take it with `blocking_lock()`, async ones with `lock().await` (a std guard would be held across
+/// an await point).
+#[cfg(test)]
+pub(crate) fn extension_registry_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
+}
+
 /// Record the `--skill` roots shared with [`load_skills`] and `omp_urls` `skill://` resolution.
 pub fn set_skill_paths(paths: Vec<PathBuf>) {
     omp_urls::schemes::skill::set_extra_skill_paths(paths);
@@ -831,12 +862,26 @@ pub fn set_skill_paths(paths: Vec<PathBuf>) {
 /// `skills/` + project `.omp/skills` + `--skill` roots, `hide: true` and
 /// `skills.disabled` dropped, closest priority winning on duplicate names).
 pub fn load_skills(agent: &Path, cwd: &Path, enabled: bool) -> Vec<Skill> {
+    load_skills_with(agent, cwd, enabled, &extension_skill_paths())
+}
+
+/// [`load_skills`] with explicit extension-contributed paths (the registry, or a test's own list).
+pub fn load_skills_with(
+    agent: &Path,
+    cwd: &Path,
+    enabled: bool,
+    extension_paths: &[PathBuf],
+) -> Vec<Skill> {
     if !enabled {
         return Vec::new();
     }
+    // Extension-contributed paths come after project/user skills (a same-named project or user skill
+    // wins) and before the `--skill` roots, so a gateway-provided root cannot shadow either.
+    let mut roots = extension_paths.to_vec();
+    roots.extend(omp_urls::schemes::skill::extra_skill_paths());
     let disabled = settings_string_array(agent, "skills.disabled");
     let mut seen = HashSet::new();
-    omp_urls::schemes::skill::discover_skills(agent, cwd)
+    omp_urls::schemes::skill::discover_skills_with(agent, cwd, &roots)
         .into_iter()
         .filter(|s| seen.insert(s.name.clone()) && !disabled.contains(&s.name))
         .map(|s| Skill {
@@ -2457,14 +2502,11 @@ mod tests {
         assert_eq!(close_code_fence("```\nx\n```\n"), "```\nx\n```\n");
     }
 
-    /// Shared guard across every test in this module that reads or mutates the
-    /// process-global `--skill` roots (`set_skill_paths` / `load_skills` / `build_with`).
-    static SKILL_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_skill_paths() -> std::sync::MutexGuard<'static, ()> {
-        SKILL_PATH_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Shared guard across every test in this module that reads or mutates the process-global
+    /// `--skill` roots or extension registry (`set_skill_paths` / `load_skills` / `build_with`):
+    /// the same lock the rest of the crate's tests take, so a reader here cannot race a writer there.
+    fn lock_skill_paths() -> tokio::sync::MutexGuard<'static, ()> {
+        extension_registry_lock().blocking_lock()
     }
 
     /// Skills: `enabled: false` in config.yml suppresses the listing; hide:
@@ -2532,6 +2574,39 @@ mod tests {
         assert!(res.content.contains("Alpha body"));
 
         set_skill_paths(prev);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `resources_discover` skill paths: a skill directory and a skills root both load (in that
+    /// order, after the agent dir's skills), `hide: true` is dropped, and `enabled: false` still
+    /// suppresses everything.
+    #[test]
+    fn extension_skill_paths_load() {
+        let _guard = lock_skill_paths();
+        let root = tempdir("ext-skills");
+        let agent = root.join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let single = root.join("ext/skills/one");
+        write(
+            &single.join("SKILL.md"),
+            "---\nname: one\ndescription: From an extension.\n---\nbody\n",
+        );
+        let skills_root = root.join("ext/more-skills");
+        write(
+            &skills_root.join("two/SKILL.md"),
+            "---\nname: two\ndescription: Second.\n---\nbody\n",
+        );
+        write(
+            &skills_root.join("hidden/SKILL.md"),
+            "---\nname: hidden\nhide: true\n---\nbody\n",
+        );
+        let paths = vec![single, skills_root];
+        let names: Vec<String> = load_skills_with(&agent, &root, true, &paths)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["one", "two"], "hidden skill dropped");
+        assert!(load_skills_with(&agent, &root, false, &paths).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

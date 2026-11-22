@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -34,6 +34,71 @@ pub enum BranchReason {
     Branch,
     Fork,
     Btw,
+}
+
+/// How a prompt-cache refresh reaches the provider (TS `CacheWarmingRentMethod`):
+/// `prewarm` sends the request with `max_tokens: 0`, `replay` re-sends it under a
+/// one-token output cap and cuts generation off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheWarmingRentMethod {
+    Prewarm,
+    Replay,
+}
+
+/// What the warmer does with a decision: `warm` sends a refresh, `compact`
+/// bridges the wait with compaction, `stop` lets the entry expire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheWarmingAction {
+    Warm,
+    Compact,
+    Stop,
+}
+
+impl CacheWarmingAction {
+    fn from_wire(value: &Value) -> Option<Self> {
+        match value.as_str()? {
+            "warm" => Some(Self::Warm),
+            "compact" => Some(Self::Compact),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// Payload of `cache_warming_decision` (TS `CacheWarmingDecisionEvent`): the warmer's economics for
+/// one decision, plus the action it took. Field order and names follow the TS interface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheWarmingDecisionEvent {
+    /// How the refresh would be sent; `None` when the request cannot be refreshed safely.
+    pub method: Option<CacheWarmingRentMethod>,
+    /// Price of this refresh: a cache read of the prompt, plus the expected billed output for a replay.
+    pub warm_cost: f64,
+    /// Extra price of the next real request if the entry is lost.
+    pub miss_cost: f64,
+    /// Price of bridging the wait with compaction; `None` when compaction is not an option.
+    pub compact_cost: Option<f64>,
+    /// Refresh spend since the last real request.
+    pub spent_cost: f64,
+    /// Estimated chance that a real request arrives before the entry expires.
+    pub continuation_probability: f64,
+    /// The warmer's own decision.
+    pub action: CacheWarmingAction,
+}
+
+/// Outcome of `cache_warming_decision`: the last handler's `action` override, if any.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheWarmingOutcome {
+    pub action: Option<CacheWarmingAction>,
+}
+
+impl CacheWarmingOutcome {
+    fn from_value(v: &Value) -> Self {
+        Self {
+            action: v.get("action").and_then(CacheWarmingAction::from_wire),
+        }
+    }
 }
 
 /// Origin of an `input` event.
@@ -70,6 +135,14 @@ pub enum CompactionAction {
     Snapcompact,
 }
 
+/// Why `resources_discover` fires (`ResourcesDiscoverEvent["reason"]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourcesDiscoverReason {
+    Startup,
+    Reload,
+}
+
 /// Tool approval mode (`tools/approval.ts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ApprovalMode {
@@ -79,6 +152,145 @@ pub enum ApprovalMode {
     Write,
     #[serde(rename = "yolo")]
     Yolo,
+}
+
+/// Status of one built-in session mode (`SessionModeState` in omp's `extensibility/extensions/types.ts`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModeStatus {
+    #[default]
+    Inactive,
+    Active,
+    Paused,
+}
+
+/// Plan mode: `planFilePath` is omitted when no plan file is known (TS optional field).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanModeState {
+    pub status: ModeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_file_path: Option<String>,
+}
+
+/// Vibe mode status.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeModeState {
+    pub status: ModeStatus,
+}
+
+/// Goal mode: `objective`/`tokenBudget` are omitted when no goal is tracked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalModeState {
+    pub status: ModeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+}
+
+/// Loop mode status.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopModeState {
+    pub status: ModeStatus,
+}
+
+/// Detached snapshot of the built-in session modes (TS `SessionModeState`). Field order follows
+/// the TS object literal so the serialized event matches byte for byte.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModeState {
+    pub plan: PlanModeState,
+    pub vibe: VibeModeState,
+    pub goal: GoalModeState,
+    #[serde(rename = "loop")]
+    pub r#loop: LoopModeState,
+}
+
+/// What spawned a subagent (`before_subagent_spawn.invocationKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentInvocationKind {
+    Task,
+    Eval,
+}
+
+/// Stable ids of the interactive plan review's choices (`types.ts` `PlanReviewChoice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanReviewChoice {
+    Execute,
+    Compact,
+    Keep,
+    Refine,
+    Save,
+}
+
+impl PlanReviewChoice {
+    /// Parse a wire id (`"execute"`, ...).
+    #[must_use]
+    pub fn parse(id: &str) -> Option<Self> {
+        Some(match id {
+            "execute" => Self::Execute,
+            "compact" => Self::Compact,
+            "keep" => Self::Keep,
+            "refine" => Self::Refine,
+            "save" => Self::Save,
+            _ => return None,
+        })
+    }
+
+    /// Whether the choice approves the plan (the only choices an execution tier applies to).
+    #[must_use]
+    pub fn approves(self) -> bool {
+        matches!(self, Self::Execute | Self::Compact | Self::Keep)
+    }
+}
+
+/// Who answered a plan review (`plan_review_resolved.by`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanReviewBy {
+    Local,
+    Extension,
+}
+
+/// One plan-review choice as `plan_review_requested` reports it (`PlanReviewOption`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlanReviewOption {
+    pub id: PlanReviewChoice,
+    pub label: String,
+    pub disabled: bool,
+}
+
+/// An execution tier of the plan review's model slider (`PlanReviewTier`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanReviewTier {
+    pub role: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+}
+
+/// `plan_review_requested` payload (`PlanReviewRequestedEvent` minus `type`), field order as in
+/// `interactive-mode.ts` `handlePlanApproval`. Also the value of `ctx.getPendingPlanReview()`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanReviewRequest {
+    pub review_id: String,
+    pub session_id: String,
+    pub title: String,
+    pub plan_file_path: String,
+    pub plan_content: String,
+    pub options: Vec<PlanReviewOption>,
+    /// Omitted when fewer than two tiers resolve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<PlanReviewTier>>,
 }
 
 /// An omp extension event. Message/entry payloads are opaque omp JSON (`AgentMessage`, `SessionEntry`, ...).
@@ -302,6 +514,126 @@ pub enum LifecycleEvent {
         exclude_from_context: bool,
         cwd: String,
     },
+    /// Prompt-cache warming decision, with the warmer's own economics filled in
+    /// (`CacheWarmingDecisionEvent`). A handler's `action` overrides it.
+    #[serde(rename = "cache_warming_decision", rename_all = "camelCase")]
+    CacheWarmingDecision {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        method: Option<CacheWarmingRentMethod>,
+        warm_cost: f64,
+        miss_cost: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compact_cost: Option<f64>,
+        spent_cost: f64,
+        continuation_probability: f64,
+        action: CacheWarmingAction,
+    },
+
+    /// The auth store automatically soft-disabled a credential (TS `CredentialDisabledEvent`):
+    /// a definitive OAuth refresh failure (`invalid_grant`, `revoked`, ...) or an auth-broker
+    /// disable. A user-initiated removal, a logout and the duplicate-credential purge stay
+    /// silent, like upstream. `disabled_cause` is the verbatim error kept for forensics.
+    #[serde(rename = "credential_disabled", rename_all = "camelCase")]
+    CredentialDisabled {
+        provider: String,
+        disabled_cause: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credential_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        org_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        org_name: Option<String>,
+    },
+
+    /// A built-in session mode changed, from any source: a slash command, a tool, RPC, or session
+    /// restore. `previous` is the last state reported through this event (all-inactive at first).
+    #[serde(rename = "mode_changed")]
+    ModeChanged {
+        previous: SessionModeState,
+        state: SessionModeState,
+    },
+
+    /// A subagent is about to spawn, before its model is resolved.
+    #[serde(rename = "before_subagent_spawn", rename_all = "camelCase")]
+    BeforeSubagentSpawn {
+        /// Agent definition name being spawned.
+        agent: String,
+        invocation_kind: SubagentInvocationKind,
+        /// Pre-expansion role alias; absent for an explicit selector.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_role: Option<String>,
+        /// Model patterns the spawn would use, in attempt order.
+        patterns: Vec<String>,
+        /// Stable per-spawn key, when the spawn has one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spawn_key: Option<String>,
+    },
+
+    /// A provider response arrived, before its stream body is read
+    /// (`types.ts` `AfterProviderResponseEvent extends ProviderResponseMetadata`). Observe-only:
+    /// the runner discards handler results. `metadata` is absent here for the same reason it is
+    /// absent upstream: no provider of this core supplies any.
+    #[serde(rename = "after_provider_response", rename_all = "camelCase")]
+    AfterProviderResponse {
+        status: u16,
+        headers: std::collections::BTreeMap<String, String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
+
+    /// Before compaction summarization: handlers may replace the summary prompt, add context
+    /// lines and stash `preserveData` on the entry (the last result wins).
+    #[serde(rename = "session.compacting", rename_all = "camelCase")]
+    SessionCompacting {
+        session_id: String,
+        messages: Vec<Value>,
+    },
+
+    /// Extensions may contribute skill/prompt/theme paths (`ResourcesDiscoverEvent`); emitted after
+    /// `session_start` at startup and on every extension reload.
+    #[serde(rename = "resources_discover", rename_all = "camelCase")]
+    ResourcesDiscover {
+        cwd: String,
+        reason: ResourcesDiscoverReason,
+    },
+
+    /// The live/model context was cleared in place: the session id, title and
+    /// transcript file survive (`/clear`, TS `SessionClearEvent`).
+    #[serde(rename = "session_clear")]
+    SessionClear,
+
+    /// A JSON-RPC notification received from a connected MCP server, after the
+    /// runtime's own handling of the frame (omp `McpNotificationEvent`).
+    #[serde(rename = "mcp_notification")]
+    McpNotification {
+        /// Server name exactly as declared in the MCP config (raw, unsanitized).
+        server: String,
+        /// JSON-RPC method (`notifications/tools/list_changed`, or server-custom).
+        method: String,
+        /// JSON-RPC params, opaque to the runtime.
+        params: Value,
+    },
+    /// The plan review opened (a plan awaits approval).
+    #[serde(rename = "plan_review_requested")]
+    PlanReviewRequested(PlanReviewRequest),
+    /// The plan review closed: a choice, or none when dismissed/cancelled.
+    #[serde(rename = "plan_review_resolved", rename_all = "camelCase")]
+    PlanReviewResolved {
+        review_id: String,
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        choice: Option<PlanReviewChoice>,
+        by: PlanReviewBy,
+    },
+    /// An operator close the host can still refuse (cancellable). The `signal` the TS event
+    /// carries is made host-side and aborted through `abort_emit` (see
+    /// [`ExtHost::emit_session_before_shutdown`]).
+    #[serde(rename = "session_before_shutdown")]
+    SessionBeforeShutdown,
     /// Process exit (the session-ending event).
     #[serde(rename = "session_shutdown")]
     SessionShutdown,
@@ -341,6 +673,38 @@ pub struct CancelOutcome {
     pub result: Value,
 }
 
+/// Outcome of `session.compacting` (TS `SessionCompactingResult`): extra summary context, a
+/// summarization-prompt override, and data the committed `compaction` entry keeps.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactingOutcome {
+    /// Lines appended to the summary request (`<additional-context>`).
+    pub context: Vec<String>,
+    /// Replaces the default summarization prompt.
+    pub prompt: Option<String>,
+    /// Stored on the `compaction` entry as `preserveData`.
+    pub preserve_data: Option<Value>,
+}
+
+impl CompactingOutcome {
+    fn from_value(v: &Value) -> Self {
+        Self {
+            context: v
+                .get("context")
+                .and_then(Value::as_array)
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            prompt: str_of(v, "prompt"),
+            preserve_data: v.get("preserveData").filter(|d| d.is_object()).cloned(),
+        }
+    }
+}
+
 /// Outcome of `session_stop`: a handler may request one continuation turn.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionStopOutcome {
@@ -362,6 +726,25 @@ impl SessionStopOutcome {
 
 fn str_of(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// A `model` handler result: one selector or a list, comma-separated entries flattened and
+/// blanks dropped (TS `normalizeModelPatternList`). `None` when nothing is left, which leaves the
+/// spawn's own patterns in place.
+fn model_patterns(v: &Value) -> Option<Vec<String>> {
+    let raw: Vec<&str> = match v {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        _ => return None,
+    };
+    let patterns: Vec<String> = raw
+        .iter()
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!patterns.is_empty()).then_some(patterns)
 }
 
 impl BeforeAgentStartOutcome {
@@ -412,6 +795,27 @@ impl SessionStopOutcome {
     }
 }
 
+/// Outcome of `before_subagent_spawn`: `block` refuses the spawn, `model` replaces the pattern
+/// list, `note` labels the routing decision (surfaced as `resolvedModelRoute`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BeforeSubagentSpawnOutcome {
+    pub block: bool,
+    pub reason: Option<String>,
+    pub model: Option<Vec<String>>,
+    pub note: Option<String>,
+}
+
+impl BeforeSubagentSpawnOutcome {
+    fn from_value(v: &Value) -> Self {
+        Self {
+            block: v.get("block").and_then(Value::as_bool) == Some(true),
+            reason: str_of(v, "reason"),
+            model: v.get("model").and_then(model_patterns),
+            note: str_of(v, "note"),
+        }
+    }
+}
+
 /// Outcome of `assistant_message`: replacement `content` (text-only rewrites, chained) when a handler changed it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AssistantRewriteOutcome {
@@ -438,6 +842,53 @@ impl UserShellOutcome {
             result: v.get("result").cloned(),
         }
     }
+}
+
+/// One path a `resources_discover` handler contributed, tagged with the extension that returned it
+/// (the host's `{path, extensionPath}` entries).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveredPath {
+    /// Path as the handler spelled it (absolute, `~`-relative or cwd-relative).
+    pub path: String,
+    /// `ext.path` of the contributing extension.
+    pub extension_path: String,
+}
+
+/// Outcome of `resources_discover`: every handler's paths, in load order (`ExtensionRunner.emitResourcesDiscover`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourcesDiscoverOutcome {
+    pub skill_paths: Vec<DiscoveredPath>,
+    pub prompt_paths: Vec<DiscoveredPath>,
+    pub theme_paths: Vec<DiscoveredPath>,
+}
+
+impl ResourcesDiscoverOutcome {
+    fn from_value(v: &Value) -> Self {
+        Self {
+            skill_paths: discovered_paths(v, "skillPaths"),
+            prompt_paths: discovered_paths(v, "promptPaths"),
+            theme_paths: discovered_paths(v, "themePaths"),
+        }
+    }
+}
+
+/// `[{path, extensionPath}]` under `key`; entries without a string `path` are dropped (TS pushes
+/// only the paths it was handed, so a malformed entry has no usable path either).
+fn discovered_paths(v: &Value, key: &str) -> Vec<DiscoveredPath> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    Some(DiscoveredPath {
+                        path: e.get("path").and_then(Value::as_str)?.to_owned(),
+                        extension_path: str_of(e, "extensionPath").unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 macro_rules! notify_helpers {
@@ -522,6 +973,89 @@ impl ExtHost {
         emit_tool_approval_requested(session_id: String, tool_name: String, tool_call_id: String, reason: Option<String>, approval_mode: ApprovalMode) => LifecycleEvent::ToolApprovalRequested { session_id, tool_name, tool_call_id, reason, approval_mode };
         /// `tool_approval_resolved`.
         emit_tool_approval_resolved(session_id: String, tool_name: String, tool_call_id: String, approved: bool, reason: Option<String>) => LifecycleEvent::ToolApprovalResolved { session_id, tool_name, tool_call_id, approved, reason };
+        /// `credential_disabled`: the auth store tore down a credential on its own.
+        #[allow(clippy::too_many_arguments)] // one argument per omp payload field
+        emit_credential_disabled(provider: String, disabled_cause: String, credential_id: Option<i64>, email: Option<String>, account_id: Option<String>, org_id: Option<String>, org_name: Option<String>) => LifecycleEvent::CredentialDisabled { provider, disabled_cause, credential_id, email, account_id, org_id, org_name };
+        /// `mode_changed`: a built-in session mode changed.
+        emit_mode_changed(previous: SessionModeState, state: SessionModeState) => LifecycleEvent::ModeChanged { previous, state };
+        /// `after_provider_response`.
+        emit_after_provider_response(status: u16, headers: std::collections::BTreeMap<String, String>, request_id: Option<String>) => LifecycleEvent::AfterProviderResponse { status, headers, request_id };
+        /// `mcp_notification`: a server→client MCP notification, after the runtime handled it.
+        emit_mcp_notification(server: String, method: String, params: Value) => LifecycleEvent::McpNotification { server, method, params };
+        /// `session_clear`: the context was reset in place, the session kept.
+        emit_session_clear() => LifecycleEvent::SessionClear;
+        /// `plan_review_requested`.
+        emit_plan_review_requested(request: PlanReviewRequest) => LifecycleEvent::PlanReviewRequested(request);
+        /// `plan_review_resolved`.
+        emit_plan_review_resolved(review_id: String, session_id: String, choice: Option<PlanReviewChoice>, by: PlanReviewBy) => LifecycleEvent::PlanReviewResolved { review_id, session_id, choice, by };
+    }
+
+    /// `before_subagent_spawn`: `block` refuses the spawn; `model` replaces the pattern list.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_before_subagent_spawn(
+        &self,
+        agent: String,
+        invocation_kind: SubagentInvocationKind,
+        model_role: Option<String>,
+        patterns: Vec<String>,
+        spawn_key: Option<String>,
+        ctx: Option<Value>,
+    ) -> Result<BeforeSubagentSpawnOutcome> {
+        let ev = LifecycleEvent::BeforeSubagentSpawn {
+            agent,
+            invocation_kind,
+            model_role,
+            patterns,
+            spawn_key,
+        };
+        Ok(BeforeSubagentSpawnOutcome::from_value(
+            &self.emit_event(&ev, ctx).await?.result,
+        ))
+    }
+
+    /// `session.compacting`: before summarization; the last handler result may override the
+    /// prompt, add context lines and set the entry's `preserveData`.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_session_compacting(
+        &self,
+        session_id: String,
+        messages: Vec<Value>,
+        ctx: Option<Value>,
+    ) -> Result<CompactingOutcome> {
+        let ev = LifecycleEvent::SessionCompacting {
+            session_id,
+            messages,
+        };
+        Ok(CompactingOutcome::from_value(
+            &self.emit_event(&ev, ctx).await?.result,
+        ))
+    }
+
+    /// `cache_warming_decision`: a handler may override the warmer's action (the last one wins).
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_cache_warming_decision(
+        &self,
+        event: &CacheWarmingDecisionEvent,
+        ctx: Option<Value>,
+    ) -> Result<CacheWarmingOutcome> {
+        let ev = LifecycleEvent::CacheWarmingDecision {
+            method: event.method,
+            warm_cost: event.warm_cost,
+            miss_cost: event.miss_cost,
+            compact_cost: event.compact_cost,
+            spent_cost: event.spent_cost,
+            continuation_probability: event.continuation_probability,
+            action: event.action,
+        };
+        Ok(CacheWarmingOutcome::from_value(
+            &self.emit_event(&ev, ctx).await?.result,
+        ))
     }
 
     /// `assistant_message`: a handler may rewrite the text of the finalized message (text blocks only).
@@ -623,6 +1157,22 @@ impl ExtHost {
         ))
     }
 
+    /// `resources_discover`: the skill/prompt/theme paths every handler contributed.
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_resources_discover(
+        &self,
+        cwd: String,
+        reason: ResourcesDiscoverReason,
+        ctx: Option<Value>,
+    ) -> Result<ResourcesDiscoverOutcome> {
+        let ev = LifecycleEvent::ResourcesDiscover { cwd, reason };
+        Ok(ResourcesDiscoverOutcome::from_value(
+            &self.emit_event(&ev, ctx).await?.result,
+        ))
+    }
+
     /// `session_before_compact`: cancellable; `result["compaction"]` may carry an extension-made compaction.
     ///
     /// # Errors
@@ -703,6 +1253,41 @@ impl ExtHost {
             &self.emit_event(&event, ctx).await?.result,
         ))
     }
+
+    /// `session_before_shutdown` gate (TS `AgentSession.confirmClose`): `Ok(true)` lets the
+    /// close proceed. Without subscribers nothing is emitted. When `aborted` resolves first the
+    /// close stops waiting: the host's `event.signal` is aborted, a late handler result is
+    /// dropped and the close proceeds; only a `cancel` delivered before that keeps the session.
+    ///
+    /// # Errors
+    /// Transport failure (callers proceed with the close, as TS does on errors).
+    pub async fn emit_session_before_shutdown(
+        &self,
+        aborted: impl Future<Output = ()> + Send,
+        ctx: Option<Value>,
+    ) -> Result<bool> {
+        let Some((abort_id, rx)) =
+            self.emit_abortable(&LifecycleEvent::SessionBeforeShutdown.to_value(), ctx)?
+        else {
+            return Ok(true);
+        };
+        tokio::select! {
+            biased;
+            reply = rx => {
+                let v = match reply {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(m)) => anyhow::bail!("emit: {m}"),
+                    Err(_) => anyhow::bail!("emit: extension host dropped the request"),
+                };
+                let r: EmitResult = serde_json::from_value(v)?;
+                Ok(!CancelOutcome::from_result(r).cancel)
+            }
+            () = aborted => {
+                self.abort_emit(abort_id);
+                Ok(true)
+            }
+        }
+    }
 }
 
 /// Boxed future used by [`HostResponder`] so it stays object safe.
@@ -772,6 +1357,17 @@ pub trait HostResponder: Send + Sync {
     /// `pi.setSessionName(name)`.
     fn set_session_name(&self, _name: String) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async { Ok(()) })
+    }
+    /// `ctx.resolvePlanReview(reviewId, choice, {feedback, role})`; `false` when that review is not
+    /// open or the answer is refused. Without a plan review (the runner default) always `false`.
+    fn resolve_plan_review<'a>(
+        &'a self,
+        _review_id: &'a str,
+        _choice: &'a str,
+        _feedback: Option<&'a str>,
+        _role: Option<&'a str>,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
     }
 }
 
@@ -859,6 +1455,20 @@ pub async fn answer(
             .map(|()| Value::Null),
         "model_complete" => responder.model_complete(params.clone()).await,
         "run_ephemeral_turn" => responder.run_ephemeral_turn(params.clone()).await,
+        "resolve_plan_review" => {
+            let input = params.get("input");
+            let field = |k: &str| input.and_then(|i| i.get(k)).and_then(Value::as_str);
+            Ok(json!(
+                responder
+                    .resolve_plan_review(
+                        s("reviewId"),
+                        s("choice"),
+                        field("feedback"),
+                        field("role"),
+                    )
+                    .await
+            ))
+        }
         other => Err(format!("{other} is not supported by the core")),
     }
 }
@@ -901,4 +1511,56 @@ pub fn serve(
         }
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `block` needs an explicit `true`; `reason`/`note` are plain strings.
+    #[test]
+    fn subagent_spawn_outcome_reads_block_and_reason() {
+        let blocked = BeforeSubagentSpawnOutcome::from_value(&json!({
+            "block": true,
+            "reason": "quota",
+            "note": "routed"
+        }));
+        assert!(blocked.block);
+        assert_eq!(blocked.reason.as_deref(), Some("quota"));
+        assert_eq!(blocked.note.as_deref(), Some("routed"));
+        assert_eq!(blocked.model, None);
+
+        let plain = BeforeSubagentSpawnOutcome::from_value(&json!({"block": false}));
+        assert!(!plain.block);
+        assert_eq!((plain.reason, plain.model, plain.note), (None, None, None));
+        assert!(!BeforeSubagentSpawnOutcome::from_value(&json!({"block": "yes"})).block);
+    }
+
+    /// `model` is a selector string or an array of them, comma-separated entries flatten, blanks
+    /// drop; an empty result means "no replacement".
+    #[test]
+    fn subagent_spawn_outcome_normalizes_model_patterns() {
+        let one = BeforeSubagentSpawnOutcome::from_value(&json!({"model": "a/b:high"}));
+        assert_eq!(one.model, Some(vec!["a/b:high".to_string()]));
+
+        let many = BeforeSubagentSpawnOutcome::from_value(&json!({
+            "model": ["a/b, c/d", " e/f ", ""]
+        }));
+        assert_eq!(
+            many.model,
+            Some(vec![
+                "a/b".to_string(),
+                "c/d".to_string(),
+                "e/f".to_string()
+            ])
+        );
+
+        for empty in [json!({"model": ""}), json!({"model": []}), json!({})] {
+            assert_eq!(
+                BeforeSubagentSpawnOutcome::from_value(&empty).model,
+                None,
+                "{empty}"
+            );
+        }
+    }
 }
