@@ -65,6 +65,9 @@ pub struct RunOutput {
     pub duration: Duration,
     /// Whether the output was truncated by the byte/line cap.
     pub truncated: bool,
+    /// `before_subagent_spawn` routing note for this run's model, when a
+    /// handler chose one (TS `resolvedModelRoute`).
+    pub resolved_model_route: Option<String>,
 }
 
 impl RunOutput {
@@ -99,6 +102,9 @@ pub struct TaskSpec {
     /// Per-spawn model selector (validated by the caller), passed to the
     /// child as `--model` (TS `spawnParamsFor` honors `item.model`).
     pub model: Option<String>,
+    /// Routing note of the `before_subagent_spawn` handler that chose `model`,
+    /// surfaced on the run as `resolvedModelRoute` (TS `policy.modelRoute`).
+    pub model_route: Option<String>,
     /// Per-spawn tool allow-list override, passed to the child as `--tools`.
     pub tools: Option<Vec<String>>,
     /// Task depth stamped on the child as [`TASK_DEPTH_ENV`] (a child of a
@@ -139,6 +145,7 @@ impl TaskSpec {
                     .join(","),
                 _ => String::new(),
             }),
+            model_route: None,
             tools: item.tools.clone(),
             depth: current_task_depth() + 1,
             extra_args: Vec::new(),
@@ -331,6 +338,7 @@ impl TaskRunner {
                         schema: SchemaValidation::NoSchema,
                         duration: Duration::ZERO,
                         truncated: false,
+                        resolved_model_route: None,
                     },
                 )),
             }
@@ -452,6 +460,7 @@ fn collect_output(
         schema,
         duration: start.elapsed(),
         truncated,
+        resolved_model_route: spec.model_route,
     }
 }
 
@@ -473,6 +482,7 @@ fn spawn_failure(
         schema: SchemaValidation::NoSchema,
         duration: start.elapsed(),
         truncated: false,
+        resolved_model_route: spec.model_route,
     }
 }
 
@@ -528,6 +538,7 @@ mod tests {
             output_schema: None,
             schema_mode: SchemaMode::Permissive,
             model: None,
+            model_route: None,
             tools: None,
             depth: 0,
             extra_args: Vec::new(),

@@ -37,6 +37,7 @@ fn spec(prompt: &str, cwd: &Path) -> TaskSpec {
         output_schema: None,
         schema_mode: omp_task::SchemaMode::Permissive,
         model: None,
+        model_route: None,
         tools: None,
         depth: 0,
         extra_args: Vec::new(),

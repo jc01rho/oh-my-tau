@@ -29,10 +29,13 @@ pub mod timeout;
 pub mod transport;
 
 pub use cache::ToolCache;
-pub use client::{call_tool, connect_to_server, list_tools, Connection};
+pub use client::{call_tool, connect_to_server, connect_to_server_with, list_tools, Connection};
 pub use config::{load_configs, McpConfigFile, McpServerConfig, ServerKind};
 pub use errors::{JsonRpcError, McpConnectionTimeoutError, McpError, McpTransportError};
-pub use manager::{DiscoveredTool, McpManager, ServerStatus};
+pub use manager::{
+    DiscoveredTool, McpManager, NotificationListener, ServerNotification, ServerStatus,
+    NOTIFICATION_BUFFER_CAP,
+};
 pub use names::{create_legacy_tool_name, create_tool_name};
 pub use timeout::{describe_timeout, is_timeout_enabled, resolve_timeout_ms, DEFAULT_TIMEOUT_MS};
 pub use transport::{McpTransport, PROTOCOL_VERSION};

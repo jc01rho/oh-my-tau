@@ -256,6 +256,22 @@ impl Persistence {
             .inspect(|_| self.clear_nav())
     }
 
+    /// `reset_boundary` (TS `SessionManager.appendResetBoundary`): the `/clear`
+    /// marker. The live context is already dropped by the caller; this is the
+    /// durable edge a resume rebuilds from, so everything before it stays out of
+    /// the model context while the file keeps the pre-reset history. An append.
+    ///
+    /// # Errors
+    /// Fails on serialization or I/O errors.
+    pub fn append_reset_boundary(&self) -> Result<()> {
+        self.writer
+            .lock()
+            .unwrap()
+            .append_reset_boundary(&now_iso())
+            .map(|_| ())
+            .inspect(|_| self.clear_nav())
+    }
+
     /// Append a finished conversation message.
     ///
     /// # Errors

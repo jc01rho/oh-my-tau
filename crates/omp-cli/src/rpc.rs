@@ -1332,6 +1332,7 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
                 )));
             }
             rt.set(|s| s.cache_warming(mode));
+            crate::cache_warmer::set_mode(crate::cache_warmer::Mode::parse(mode));
             ok(json!({"mode": mode}))
         }
         "set_auto_retry" => {
