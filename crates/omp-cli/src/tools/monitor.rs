@@ -121,6 +121,16 @@ fn feed() -> (WatchSink, WatchFeed) {
 }
 
 impl WatchSink {
+    /// A sink over a bare channel, for tests of a source (see `bash::Notify`).
+    #[cfg(test)]
+    pub(super) fn for_test(tx: UnboundedSender<WatchMsg>) -> Self {
+        Self {
+            tx,
+            queued: Arc::new(AtomicUsize::new(0)),
+            lost: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
     pub(super) fn line(&self, line: String) {
         if self.queued.fetch_add(1, Ordering::AcqRel) >= MAX_QUEUED_LINES {
             self.queued.fetch_sub(1, Ordering::AcqRel);

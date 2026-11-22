@@ -46,6 +46,18 @@ const NOTIFY_MAX_LINE_CHARS: usize = 400;
 /// newlines cannot grow the buffer or make every read rescan it (a reported
 /// line is clamped to [`NOTIFY_MAX_LINE_CHARS`] characters either way).
 const NOTIFY_MAX_PARTIAL_BYTES: usize = NOTIFY_MAX_LINE_CHARS * 4;
+/// Bytes of a line a streaming watch holds while its newline is missing; past it the front is
+/// dropped (the filter already saw it through the windows).
+const STREAM_LINE_BYTES: usize = 1024 * 1024;
+/// Context carried into the next window of a long line, so a filter of up to this length matches
+/// even when the match straddles two reads. Longer filters can miss on lines past
+/// [`STREAM_LINE_BYTES`].
+const STREAM_OVERLAP_BYTES: usize = 4096;
+
+/// The largest char boundary at or below `at`.
+fn next_char_boundary(s: &str, at: usize) -> usize {
+    (0..=at).rev().find(|i| s.is_char_boundary(*i)).unwrap_or(0)
+}
 
 /// omp `formatWallTimeNotice`.
 #[must_use]
@@ -196,8 +208,11 @@ struct NotifyState {
     /// Skipping the remainder of an over-long line already judged from its
     /// bounded prefix (its newline has not arrived yet).
     skipping: bool,
+
     lines: Vec<String>,
     omitted: usize,
+    /// A streaming watch: the current line already matched in an earlier window.
+    line_hit: bool,
 }
 
 impl Notify {
@@ -230,12 +245,67 @@ impl Notify {
     /// Match the complete lines in `text`; the remainder waits for the next
     /// chunk so a line split across reads is still matched whole.
     fn feed(&self, text: &str) {
-        self.collect(text, false);
+        if self.sink.is_some() {
+            self.feed_stream(text, false);
+        } else {
+            self.collect(text, false);
+        }
     }
 
     /// End of output: the trailing unterminated line counts as a line.
     fn finish(&self) {
-        self.collect("", true);
+        if self.sink.is_some() {
+            self.feed_stream("", true);
+        } else {
+            self.collect("", true);
+        }
+    }
+
+    /// A streaming watch cannot judge a line from its prefix and skip the rest the way the
+    /// settle-time report does: the filter must see the whole line. The current line is held up
+    /// to [`STREAM_LINE_BYTES`]; each new window is matched with [`STREAM_OVERLAP_BYTES`] of
+    /// context carried over, so a filter shorter than that context matches wherever it falls.
+    fn feed_stream(&self, text: &str, end: bool) {
+        let Some(sink) = &self.sink else { return };
+        let mut st = self.state.lock().expect("notify poisoned");
+        let mut rest = text;
+        while let Some(i) = rest.find('\n') {
+            st.partial.push_str(&rest[..i]);
+            let line = std::mem::take(&mut st.partial);
+            let hit = std::mem::take(&mut st.line_hit) || self.re.is_match(&line);
+            rest = &rest[i + 1..];
+            if hit && !line.trim().is_empty() {
+                sink.line(clamp_chars(
+                    line.trim_end_matches('\r'),
+                    NOTIFY_MAX_LINE_CHARS,
+                ));
+            }
+        }
+        if !rest.is_empty() {
+            let start = st.partial.len().saturating_sub(STREAM_OVERLAP_BYTES);
+            let mut window = st.partial[start..].to_owned();
+            window.push_str(rest);
+            if !st.line_hit && self.re.is_match(&window) {
+                st.line_hit = true;
+            }
+            st.partial.push_str(rest);
+            if st.partial.len() > STREAM_LINE_BYTES {
+                let cut = st.partial.len() - STREAM_LINE_BYTES;
+                let cut = next_char_boundary(&st.partial, cut);
+                st.partial.drain(..cut);
+            }
+        }
+        if end && !st.partial.is_empty() {
+            let line = std::mem::take(&mut st.partial);
+            let hit = std::mem::take(&mut st.line_hit) || self.re.is_match(&line);
+            if hit && !line.trim().is_empty() {
+                drop(st);
+                sink.line(clamp_chars(
+                    line.trim_end_matches('\r'),
+                    NOTIFY_MAX_LINE_CHARS,
+                ));
+            }
+        }
     }
 
     fn collect(&self, text: &str, end: bool) {
@@ -1952,6 +2022,44 @@ mod tests {
         assert!(report.ends_with("\n… 5 more matching lines"), "{report}");
         let first = report.lines().nth(1).unwrap();
         assert_eq!(first.chars().count(), NOTIFY_MAX_LINE_CHARS);
+    }
+
+    /// A streaming watch must not judge a long line from its prefix: the filter sees every window,
+    /// so a match after the point a settle-time report would have given up still counts.
+    #[test]
+    fn a_streaming_filter_matches_a_long_line_across_read_boundaries() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let n = Notify::streaming("ERROR", super::super::monitor::WatchSink::for_test(tx)).unwrap();
+        n.feed(&"a".repeat(1601));
+        n.feed("ERROR tail\n");
+        n.finish();
+        match rx.try_recv().expect("the long line matched") {
+            super::super::monitor::WatchMsg::Line(line) => {
+                assert_eq!(
+                    line.chars().count(),
+                    NOTIFY_MAX_LINE_CHARS,
+                    "clamped for display"
+                );
+                assert!(line.starts_with("aaa"), "the line's head");
+            }
+            _ => panic!("a line event"),
+        }
+        // The match itself straddling two reads is found through the carried context.
+        let (tx3, mut rx3) = tokio::sync::mpsc::unbounded_channel();
+        let three =
+            Notify::streaming("ERROR", super::super::monitor::WatchSink::for_test(tx3)).unwrap();
+        three.feed(&"b".repeat(5000));
+        three.feed("ER");
+        three.feed("ROR done\n");
+        assert!(
+            rx3.try_recv().is_ok(),
+            "a filter split across reads still matches"
+        );
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let two =
+            Notify::streaming("ERROR", super::super::monitor::WatchSink::for_test(tx2)).unwrap();
+        two.feed("plain\n");
+        assert!(rx2.try_recv().is_err());
     }
 
     /// `notify` matches from the run loop (deterministic: no job polling).

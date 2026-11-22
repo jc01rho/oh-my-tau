@@ -181,6 +181,9 @@ pub struct Runtime {
     /// Serializes read-modify-write updates to `agent.tools()` across `set_host_tools` and
     /// extension `reconcile_tools`.
     tool_list_lock: tokio::sync::Mutex<()>,
+    /// The monitor wake waiting in the follow-up queue while the lane is held or a retry owns the
+    /// turn: a later wake appends to it instead of queueing another entry.
+    monitor_wake: Mutex<Option<String>>,
     /// Set while a manual compaction aborts the live turn (TS
     /// `disconnectFromAgent` around that abort): the empty aborted stub is
     /// neither rendered nor journaled — the turn resumes after the summary.
@@ -597,6 +600,7 @@ impl Runtime {
             stop_epoch: std::sync::atomic::AtomicU64::new(0),
             prompt_admission: tokio::sync::Mutex::new(()),
             tool_list_lock: tokio::sync::Mutex::new(()),
+            monitor_wake: Mutex::new(None),
             compaction_abort: std::sync::atomic::AtomicBool::new(false),
             compaction_stub_start: std::sync::atomic::AtomicBool::new(false),
             ui_context_frames: std::sync::atomic::AtomicBool::new(false),
@@ -2372,16 +2376,38 @@ impl Runtime {
         }));
     }
 
+    /// Hold a `monitor` wake for later without growing the queue: the first one waits in the
+    /// follow-up queue and later ones append to it, so file activity under a held lane costs one
+    /// entry.
+    fn queue_monitor_wake(&self, text: &str) {
+        let mut pending = lock(&self.monitor_wake);
+        let earlier = pending.take();
+        let joined = earlier
+            .as_deref()
+            .map_or_else(|| text.to_owned(), |prev| format!("{prev}\n{text}"));
+        if let Some(prev) = earlier {
+            // Queued batches read as one message: drop the superseded entry.
+            self.remove_queued(&prev, "followUp");
+        }
+        self.follow_up(&joined);
+        *pending = Some(joined);
+    }
+
     /// Put a `monitor` wake into the next turn: queued behind a live run, or the start of a turn
     /// on an idle session. A held lane (`interrupt stop`) only queues it: a monitor never lifts a hold.
     pub async fn inject_monitor_wake(self: &Arc<Self>, text: &str) {
         let retry_pending = lock(&self.retry_task)
             .as_ref()
             .is_some_and(|task| !task.is_finished());
-        // A held lane stays held, and a pending retry is not replaced: the wake waits in the queue.
+        // A held lane stays held, and a pending retry is not replaced: the wake waits in the
+        // queue, where a pending monitor wake takes it instead of one queue entry per batch.
         if retry_pending || lock(&self.pause).paused() {
-            self.follow_up(text);
+            self.queue_monitor_wake(text);
             return;
+        }
+        if let Some(prev) = lock(&self.monitor_wake).take() {
+            // The turn about to start carries its own wake; a queued one would repeat it.
+            self.remove_queued(&prev, "followUp");
         }
         if let Err(e) = self.prompt(None, text, Some("followUp"), Vec::new()).await {
             eprintln!(
