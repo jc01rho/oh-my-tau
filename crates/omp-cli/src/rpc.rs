@@ -693,32 +693,28 @@ fn subagent_id<'a>(cmd: &'a Value, _command: &str) -> Result<&'a str, CmdError> 
         .ok_or_else(|| CmdError::new("`subagentId` must be a non-empty string."))
 }
 
-/// `get_subagent_messages` against an always-empty subagent roster.
+/// `get_subagent_messages`: a background task's session messages from
+/// `fromByte` on.
 fn subagent_messages(cmd: &Value) -> CmdResult {
-    if let Some(from) = cmd.get("fromByte") {
-        if !from.as_f64().is_some_and(f64::is_finite) {
-            return Err(CmdError::new("fromByte must be a finite number"));
-        }
-    }
-    if let Some(id) = cmd
-        .get("subagentId")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        return Err(CmdError::new(format!(
-            "Unknown subagent or session file unavailable: {id}"
-        )));
-    }
-    if cmd
-        .get("sessionFile")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty())
-    {
-        return Err(CmdError::new("Unknown subagent session file"));
-    }
-    Err(CmdError::new(
-        "get_subagent_messages requires subagentId or sessionFile",
-    ))
+    let from = match cmd.get("fromByte") {
+        None | Some(Value::Null) => 0.0,
+        Some(from) => from
+            .as_f64()
+            .filter(|f| f.is_finite())
+            .ok_or_else(|| CmdError::new("fromByte must be a finite number"))?,
+    };
+    let text = |key: &str| {
+        cmd.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // finite, clamped at 0
+    let from = from.max(0.0) as u64;
+    ok(crate::tools::subagents::rpc_subagent_messages(
+        text("subagentId"),
+        text("sessionFile"),
+        from,
+    )?)
 }
 
 /// `predict_word*` validation: `text` string, `cursor` an integer UTF-16 offset within it.
@@ -1253,22 +1249,23 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
             }
             ok(data)
         }
-        "get_subagents" => ok(json!({"subagents": []})),
+        "get_subagents" => ok(crate::tools::subagents::rpc_get_subagents(&rt.session_id())),
         "get_subagent_messages" => subagent_messages(cmd),
         "cancel_subagent" => {
-            subagent_id(cmd, "cancel_subagent")?;
-            ok(json!({"cancelled": false}))
+            let id = subagent_id(cmd, "cancel_subagent")?;
+            let reason = cmd.get("reason").and_then(Value::as_str);
+            ok(crate::tools::subagents::rpc_cancel_subagent(id, reason)?)
         }
         "steer_subagent" => {
             let id = subagent_id(cmd, "steer_subagent")?;
-            if cmd
+            let Some(message) = cmd
                 .get("message")
                 .and_then(Value::as_str)
-                .is_none_or(|m| m.trim().is_empty())
-            {
+                .filter(|m| !m.trim().is_empty())
+            else {
                 return Err(CmdError::new("`message` is required for steer_subagent."));
-            }
-            Err(CmdError::new(format!("Subagent not running: {id}")))
+            };
+            ok(crate::tools::subagents::rpc_steer_subagent(id, message).await?)
         }
         "live_start" => Err(unsupported("Live voice")),
         "live_stop" => none(),
@@ -1835,6 +1832,8 @@ pub async fn run_with(
     if let Some(gate) = crate::approval::Gate::get() {
         gate.bind(&rt, true);
     }
+    // Background tasks report to this session (completions, lifecycle).
+    crate::tools::subagents::attach_runtime(&rt);
 
     // The `ask` tool gets the RPC dialog transport (TS: rich `askDialog` once
     // the client sends `set_ask_dialog`, `select`/`editor` frames otherwise).

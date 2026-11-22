@@ -8,11 +8,13 @@
 //! `<task-result>` envelopes (`agent://<id>` pointers + inline preview).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use omp_task::discovery::{discover_project_agents, discover_user_agents};
 use omp_task::envelope::format_task_result;
 use omp_task::params::{SchemaMode, TaskItem};
+use omp_task::registry::{SpawnRequest, SubagentRegistry};
 use omp_task::runner::{RunStatus, TaskRunner, TaskSpec};
 use pa_agent::types::AgentToolResult;
 use serde::Deserialize;
@@ -61,6 +63,9 @@ Subagents run as child processes with bounded concurrency: `task.maxConcurrency`
 # Results
 `outputSchema` parsed payload, even invalid: `agent://<id>` (field `/<field>`, nested `/reports/0/data`); invalid preview inline.
 
+# Background
+`run_in_background: true` returns `st_...` task ids at once; each child's result arrives as a notification when it settles. Steer a running child or revive a finished one with `task_send`, read it with `task_output`, stop it with `task_cancel`.
+
 # Delegation
 Use most specific agent. Prefer one agent to investigate + edit. Omit `agent` only for default (`task`); NEVER specify it.
 Shared edits need one integration owner; siblings coordinate via `write agent://<id>`. Set interfaces in `context`.
@@ -102,6 +107,7 @@ fn base_schema() -> Value {
         "type": "object",
         "properties": {
             "context": {"type": "string"},
+            "run_in_background": {"type": "boolean"},
             "tasks": {"type": "array", "items": {
                 "type": "object",
                 "properties": {
@@ -470,6 +476,23 @@ struct WireParams {
     /// Flat-shape SERA rubric (see [`WireTaskItem::rubric`]).
     #[serde(default)]
     rubric: Option<Value>,
+    /// Start every item as a background task and return its `st_` id at once
+    /// (OmOMeow `run_in_background`).
+    #[serde(default)]
+    run_in_background: Option<bool>,
+    /// OmOMeow single-spawn spellings: `prompt` for `task`,
+    /// `subagent_type` (then `category`) for `agent`, plus `name` and
+    /// `description` for the spawned task.
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    subagent_type: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// Execute a `task` call: validate, spawn every item, render envelopes.
@@ -483,6 +506,7 @@ pub async fn task(env: std::sync::Arc<Env>, args: Value) -> Result<AgentToolResu
         let Some(task_text) = params
             .task
             .as_deref()
+            .or(params.prompt.as_deref())
             .map(str::trim)
             .filter(|t| !t.is_empty())
         else {
@@ -494,9 +518,14 @@ pub async fn task(env: std::sync::Arc<Env>, args: Value) -> Result<AgentToolResu
                 bail!("{reason}");
             }
         }
+        let agent = params
+            .subagent_type
+            .clone()
+            .or_else(|| params.category.clone())
+            .unwrap_or_else(|| params.agent.clone());
         let item = TaskItem {
-            name: None,
-            agent: params.agent.clone(),
+            name: params.name.clone(),
+            agent,
             task: task_text.to_string(),
             solution_space: solution_space.to_string(),
             model: params.model.clone(),
@@ -561,6 +590,17 @@ pub async fn task(env: std::sync::Arc<Env>, args: Value) -> Result<AgentToolResu
         }
     }
 
+    if params.run_in_background == Some(true) {
+        if rubrics.iter().any(Option::is_some) {
+            bail!("`rubric` scoring waits for the result, so it is not available with `run_in_background`.");
+        }
+        return Ok(spawn_background(
+            &super::subagents::registry(),
+            specs,
+            params.description.as_deref(),
+        ));
+    }
+
     let binary = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("omt"));
     let runner = TaskRunner::new(binary, effective_max_concurrency(&env.cwd));
     if rubrics.iter().all(Option::is_none) {
@@ -579,6 +619,65 @@ pub async fn task(env: std::sync::Arc<Env>, args: Value) -> Result<AgentToolResu
     let mut result = merge_outputs(&outputs)?;
     attach_rubric_scores(&mut result, &outputs, &records);
     Ok(result)
+}
+
+/// Start every spec as a background task of the calling session and report
+/// the new ids at once (each item's `name` becomes its task name).
+pub(crate) fn spawn_background(
+    registry: &Arc<SubagentRegistry>,
+    specs: Vec<TaskSpec>,
+    description: Option<&str>,
+) -> AgentToolResult {
+    use std::fmt::Write as _;
+    let caller = super::subagents::caller_session();
+    let root = super::subagents::root_session(&caller);
+    let mut lines = String::new();
+    let mut rows = Vec::new();
+    let mut failed = 0usize;
+    for mut spec in specs {
+        let name = spec.id.take();
+        let request = SpawnRequest {
+            spec,
+            name: name.clone(),
+            description: description.map(str::to_string),
+            parent_session_id: caller.clone(),
+            root_session_id: root.clone(),
+            env: vec![(super::subagents::ROOT_SESSION_ENV.to_string(), root.clone())],
+        };
+        let label = name.map(|n| format!(" name:{n}")).unwrap_or_default();
+        match registry.spawn(request) {
+            Ok(view) => {
+                let _ = writeln!(
+                    lines,
+                    "- {}{label} agent:{} [{}]",
+                    view.id(),
+                    view.record.agent,
+                    view.status().as_str()
+                );
+                rows.push(json!({
+                    "task_id": view.id(),
+                    "name": view.record.name,
+                    "agent": view.record.agent,
+                    "status": view.status().as_str(),
+                }));
+            }
+            Err(e) => {
+                failed += 1;
+                let _ = writeln!(lines, "- not started{label}: {e}");
+            }
+        }
+    }
+    let text = format!(
+        "Started {} background task(s); each one's result arrives as a notification when it settles.\n{}Steer or revive with task_send, read with task_output, stop with task_cancel.",
+        rows.len(),
+        lines
+    );
+    AgentToolResult {
+        content: vec![pa_agent::types::ToolResultContent::text(text)],
+        details: json!({"background": true, "tasks": rows}),
+        terminate: None,
+        is_error: (failed > 0).then_some(true),
+    }
 }
 
 /// Append the SERA verdicts to the merged result: one `rubric:` line per
@@ -952,9 +1051,11 @@ mod tests {
     fn schema_matches_ts_reference() {
         let s = schema();
         let props = s["properties"].as_object().unwrap();
-        // Golden `getTaskSchema`: `context` + `tasks` only — no top-level `model`.
-        assert_eq!(props.len(), 2, "unexpected top-level keys: {props:?}");
+        // Golden `getTaskSchema`: `context` + `tasks`, no top-level `model`;
+        // plus the OmOMeow gateway's optional `run_in_background`.
+        assert_eq!(props.len(), 3, "unexpected top-level keys: {props:?}");
         assert!(props["context"]["type"] == "string");
+        assert_eq!(props["run_in_background"]["type"], "boolean");
         assert!(!props.contains_key("model"));
         assert!(props["tasks"]["items"]["required"]
             .as_array()
@@ -1146,5 +1247,19 @@ mod tests {
             "no emit without a subscriber"
         );
         host.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn gateway_single_spawn_spelling_parses() {
+        let params: WireParams = serde_json::from_value(json!({
+            "prompt": "scan the repo", "subagent_type": "explore", "category": "quick",
+            "name": "Scan", "description": "repo scan", "run_in_background": true,
+            "task_summary": "ignored extra"
+        }))
+        .unwrap();
+        assert_eq!(params.prompt.as_deref(), Some("scan the repo"));
+        assert_eq!(params.subagent_type.as_deref(), Some("explore"));
+        assert_eq!(params.run_in_background, Some(true));
+        assert_eq!(params.name.as_deref(), Some("Scan"));
     }
 }
