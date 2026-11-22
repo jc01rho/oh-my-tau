@@ -31,6 +31,7 @@ mod jobs;
 pub mod mcp;
 pub(crate) mod memory_backend;
 pub(crate) mod memory_tools;
+pub(crate) mod monitor;
 mod read;
 pub(crate) mod read_fetch;
 pub(crate) mod read_formats;
@@ -466,6 +467,12 @@ pub fn builtin_tools_with_env_and_jobs(
             bash_output::kill_description().to_string(),
             bash_output::kill_schema(),
             blocking(bash_output::kill_bash),
+        ),
+        mk(
+            "monitor",
+            monitor::description().to_string(),
+            monitor::schema(),
+            Arc::new(|env, args, _| Box::pin(async move { monitor::monitor(&env, &args) })),
         ),
         // Own AgentTool: eval needs the abort signal (cell cancel) and on_update
         // (bridge status events), which the `mk` closure signature drops.
@@ -1063,6 +1070,7 @@ mod tests {
                 "wait",
                 "bash_output",
                 "kill_bash",
+                "monitor",
                 "eval",
                 "ast_grep",
                 "ast_edit",

@@ -211,6 +211,9 @@ pub struct Runtime {
     /// Serializes read-modify-write updates to `agent.tools()` across `set_host_tools` and
     /// extension `reconcile_tools`.
     tool_list_lock: tokio::sync::Mutex<()>,
+    /// The monitor wake waiting in the follow-up queue while the lane is held or a retry owns the
+    /// turn: a later wake appends to it instead of queueing another entry.
+    monitor_wake: Mutex<Option<String>>,
     /// Set while a manual compaction aborts the live turn (TS
     /// `disconnectFromAgent` around that abort): the empty aborted stub is
     /// neither rendered nor journaled — the turn resumes after the summary.
@@ -497,6 +500,58 @@ fn message_text(m: &AgentMessage) -> String {
     }
 }
 
+/// The session's `monitor` wake sink: events become turns, and the running-watch count goes to the
+/// gateway as its `wake_source_state` extension event.
+struct MonitorWakes {
+    rt: std::sync::Weak<Runtime>,
+    handle: tokio::runtime::Handle,
+}
+
+/// Bytes of monitor wakes kept queued while the lane is held; older wakes are dropped past it.
+const HELD_WAKE_MAX_BYTES: usize = 64 * 1024;
+
+/// Keep held monitor wakes within [`HELD_WAKE_MAX_BYTES`]: whole older wakes go first (each wake is
+/// one complete `<system-reminder>` block, so a cut at a block start keeps every block intact), and
+/// a note says how many were dropped.
+fn cap_held_wakes(mut joined: String) -> String {
+    const BLOCK: &str = "\n<system-reminder>";
+    let mut dropped = 0usize;
+    while joined.len() > HELD_WAKE_MAX_BYTES {
+        let Some(at) = joined[1..].find(BLOCK).map(|i| i + 1) else {
+            break;
+        };
+        joined.drain(..=at);
+        dropped += 1;
+    }
+    if dropped == 0 {
+        return joined;
+    }
+    format!(
+        "<system-reminder>\n{dropped} earlier monitor wake(s) were dropped while the session was held.\n</system-reminder>\n{joined}"
+    )
+}
+
+impl crate::tools::monitor::WakeSink for MonitorWakes {
+    fn deliver(&self, text: String) {
+        let Some(rt) = self.rt.upgrade() else { return };
+        // Pinned now, while the hub's epoch check still holds: a session switch before the task
+        // runs makes it a stale wake that is dropped instead of landing in the new session.
+        let generation = rt.switch_generation();
+        self.handle
+            .spawn(async move { rt.inject_monitor_wake_in(generation, &text).await });
+    }
+
+    fn active(&self, count: usize) {
+        if let Some(rt) = self.rt.upgrade() {
+            rt.send(json!({
+                "type": "extension_event",
+                "name": "wake_source_state",
+                "data": {"source": "monitor", "activeCount": count},
+            }));
+        }
+    }
+}
+
 impl Runtime {
     /// Wire the agent to the rpc output channel.
     pub async fn start(
@@ -602,6 +657,7 @@ impl Runtime {
             stop_epoch: std::sync::atomic::AtomicU64::new(0),
             prompt_admission: tokio::sync::Mutex::new(()),
             tool_list_lock: tokio::sync::Mutex::new(()),
+            monitor_wake: Mutex::new(None),
             compaction_abort: std::sync::atomic::AtomicBool::new(false),
             compaction_stub_start: std::sync::atomic::AtomicBool::new(false),
             ui_context_frames: std::sync::atomic::AtomicBool::new(false),
@@ -628,6 +684,7 @@ impl Runtime {
             reported_mode: Mutex::new(omp_ext::lifecycle::SessionModeState::default()),
         });
         rt.publish_session_file();
+        rt.bind_monitor_wakes();
         let host: Arc<dyn crate::tools::context_notes::ContextNotesHost> = rt.clone();
         crate::tools::context_host::bind(&host);
         rt.record_model_state().await;
@@ -2245,6 +2302,10 @@ impl Runtime {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // A goal belongs to the session that created it.
         crate::tools::reset_session_goal();
+        // A new session must not inherit the old one's watches (nor their late wakes).
+        if let Some(jobs) = crate::tools::session_jobs() {
+            jobs.monitors.end_session();
+        }
     }
 
     /// Prompt a message bound to session generation `generation`: `None` when the
@@ -2408,6 +2469,73 @@ impl Runtime {
     pub fn follow_up(&self, message: &str) {
         self.agent.follow_up(user_message(message));
         self.emit_queue_update();
+    }
+
+    /// Route `monitor` wakes of this session's job registry into this runtime.
+    fn bind_monitor_wakes(self: &Arc<Self>) {
+        let Some(jobs) = crate::tools::session_jobs() else {
+            return;
+        };
+        jobs.monitors.bind(Arc::new(MonitorWakes {
+            rt: Arc::downgrade(self),
+            handle: tokio::runtime::Handle::current(),
+        }));
+    }
+
+    /// Hold a `monitor` wake for later without growing the queue: the first one waits in the
+    /// follow-up queue and later ones append to it, so file activity under a held lane costs one
+    /// entry.
+    fn queue_monitor_wake(&self, text: &str) {
+        let mut pending = lock(&self.monitor_wake);
+        let joined = match pending.take() {
+            // Only a still-queued wake is folded in: one the user removed stays removed.
+            Some(prev) if self.remove_queued(&prev, "followUp") => format!("{prev}\n{text}"),
+            _ => text.to_owned(),
+        };
+        let joined = cap_held_wakes(joined);
+        self.follow_up(&joined);
+        *pending = Some(joined);
+    }
+
+    /// Put a `monitor` wake into the next turn: queued behind a live run, or the start of a turn
+    /// on an idle session. A held lane (`interrupt stop`) only queues it: a monitor never lifts a hold.
+    #[cfg(test)]
+    pub async fn inject_monitor_wake(self: &Arc<Self>, text: &str) {
+        let generation = self.switch_generation();
+        self.inject_monitor_wake_in(generation, text).await;
+    }
+
+    /// [`Self::inject_monitor_wake`] for a wake raised in session generation `generation`: dropped
+    /// when the session was replaced since. The check and the admission run under the switch lock,
+    /// so a replacement cannot slip between them.
+    pub async fn inject_monitor_wake_in(self: &Arc<Self>, generation: u64, text: &str) {
+        let _serial = self.switch_serial.lock().await;
+        if self.switch_generation() != generation {
+            return;
+        }
+        let retry_pending = lock(&self.retry_task)
+            .as_ref()
+            .is_some_and(|task| !task.is_finished());
+        // A held lane stays held, and a pending retry is not replaced: the wake waits in the
+        // queue, where a pending monitor wake takes it instead of one queue entry per batch.
+        if retry_pending || lock(&self.pause).paused() {
+            self.queue_monitor_wake(text);
+            return;
+        }
+        // A wake still queued behind the hold joins this turn, so it is not lost when the turn starts.
+        let pending = lock(&self.monitor_wake).take();
+        let text = match pending {
+            Some(prev) if self.remove_queued(&prev, "followUp") => format!("{prev}\n{text}"),
+            _ => text.to_owned(),
+        };
+        let text = text.as_str();
+        if let Err(e) = self.prompt(None, text, Some("followUp"), Vec::new()).await {
+            eprintln!(
+                "omt: monitor wake could not start a turn, queued instead: {}",
+                e.message
+            );
+            self.follow_up(text);
+        }
     }
 
     /// Remove the first queued user message whose text is exactly `message` from `queue`

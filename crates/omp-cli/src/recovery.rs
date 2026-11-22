@@ -1332,6 +1332,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_wake_starts_a_turn_on_an_idle_session() {
+        let mut h = harness(&[Ok("noted")], fast_cfg(&[], 1, 1)).await;
+        h.rt.inject_monitor_wake("<system-reminder>\nMonitor event(x): y\n</system-reminder>")
+            .await;
+        let frames = until_settled(&mut h.rx).await;
+        let ks = kinds(&frames);
+        assert!(ks.contains(&"agent_start".to_string()), "{ks:?}");
+        let result = frames
+            .iter()
+            .find(|f| f["type"] == "prompt_result")
+            .unwrap();
+        assert_eq!(result["status"], "completed", "{result}");
+        let entries = session_entries(&h.session_file);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.to_string().contains("Monitor event(x): y")),
+            "the wake is the turn's user message"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_wake_on_a_held_lane_queues_without_starting_a_turn() {
+        let h = harness(&[], fast_cfg(&[], 1, 1)).await;
+        h.rt.set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        h.rt.pause_for_stop().await.unwrap();
+        h.rt.inject_monitor_wake("Monitor event(x): y").await;
+        assert_eq!(h.rt.queued_count(), 1, "queued behind the hold");
+        assert!(!h.rt.agent.is_streaming().await, "no turn was started");
+    }
+
+    #[tokio::test]
+    async fn held_monitor_wakes_coalesce_and_join_the_next_turn() {
+        let mut h = harness(&[Ok("noted")], fast_cfg(&[], 1, 1)).await;
+        h.rt.set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        h.rt.pause_for_stop().await.unwrap();
+        h.rt.inject_monitor_wake("wake A").await;
+        h.rt.inject_monitor_wake("wake B").await;
+        assert_eq!(h.rt.queued_count(), 1, "held wakes share one queue entry");
+        h.rt.release_pause("test");
+        h.rt.inject_monitor_wake("wake C").await;
+        until_settled(&mut h.rx).await;
+        let entries = session_entries(&h.session_file)
+            .iter()
+            .map(Value::to_string)
+            .collect::<String>();
+        for wake in ["wake A", "wake B", "wake C"] {
+            assert!(entries.contains(wake), "{wake} reached the turn");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wake_from_a_replaced_session_is_dropped() {
+        let h = harness(&[], fast_cfg(&[], 1, 1)).await;
+        let stale = h.rt.switch_generation().wrapping_sub(1);
+        h.rt.inject_monitor_wake_in(stale, "old session event")
+            .await;
+        assert_eq!(h.rt.queued_count(), 0, "nothing queued");
+        assert!(!h.rt.agent.is_streaming().await, "no turn started");
+    }
+
+    #[test]
+    fn held_wakes_are_capped_by_bytes_and_keep_whole_blocks() {
+        let block = |i: usize| {
+            format!(
+                "<system-reminder>\nevent {i} {}\n</system-reminder>",
+                "x".repeat(4000)
+            )
+        };
+        let joined = (0..40).map(block).collect::<Vec<_>>().join("\n");
+        assert!(joined.len() > crate::runtime::HELD_WAKE_MAX_BYTES);
+        let capped = crate::runtime::cap_held_wakes(joined);
+        assert!(
+            capped.len() <= crate::runtime::HELD_WAKE_MAX_BYTES + 200,
+            "{}",
+            capped.len()
+        );
+        assert!(capped.starts_with("<system-reminder>\n"), "a note leads");
+        assert!(capped.contains("earlier monitor wake(s) were dropped"));
+        assert!(capped.contains("event 39 "), "the newest wake is kept");
+        assert!(!capped.contains("event 0 "), "the oldest wake is dropped");
+        assert_eq!(
+            capped.matches("<system-reminder>").count(),
+            capped.matches("</system-reminder>").count(),
+            "every kept block is whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_held_wake_is_not_restored() {
+        let h = harness(&[], fast_cfg(&[], 1, 1)).await;
+        h.rt.set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        h.rt.pause_for_stop().await.unwrap();
+        h.rt.inject_monitor_wake("wake A").await;
+        assert!(h.rt.remove_queued("wake A", "followUp"));
+        h.rt.inject_monitor_wake("wake B").await;
+        let (_, follow) = h.rt.queued();
+        assert_eq!(follow, vec!["wake B".to_string()]);
+    }
+
+    #[tokio::test]
     async fn retry_saga_with_fallback_switch_orders_frames_and_entries() {
         let mut h = harness(
             &[

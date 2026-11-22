@@ -24,6 +24,7 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
 use super::jobs::{self, JobRegistry, JobStatus, Service, ServiceState};
+use super::monitor::{WatchMsg, WatchSink};
 use super::util::{
     enforce_inline_byte_cap, notice_with_artifact, resolve_to_cwd, save_artifact, sink_window,
     str_arg, truncate_tail, SpillConfig, DEFAULT_MAX_BYTES,
@@ -45,6 +46,18 @@ const NOTIFY_MAX_LINE_CHARS: usize = 400;
 /// newlines cannot grow the buffer or make every read rescan it (a reported
 /// line is clamped to [`NOTIFY_MAX_LINE_CHARS`] characters either way).
 const NOTIFY_MAX_PARTIAL_BYTES: usize = NOTIFY_MAX_LINE_CHARS * 4;
+/// Bytes of a line a streaming watch holds while its newline is missing; past it the front is
+/// dropped (the filter already saw it through the windows).
+const STREAM_LINE_BYTES: usize = 1024 * 1024;
+/// Context carried into the next window of a long line, so a filter of up to this length matches
+/// even when the match straddles two reads. Longer filters can miss on lines past
+/// [`STREAM_LINE_BYTES`].
+const STREAM_OVERLAP_BYTES: usize = 4096;
+
+/// The largest char boundary at or below `at`.
+fn next_char_boundary(s: &str, at: usize) -> usize {
+    (0..=at).rev().find(|i| s.is_char_boundary(*i)).unwrap_or(0)
+}
 
 /// omp `formatWallTimeNotice`.
 #[must_use]
@@ -181,7 +194,12 @@ pub(super) struct Notify {
     re: regex::Regex,
     /// The regex as given, quoted back in the report.
     source: String,
+    /// The pattern uses `^`/`$`: only a whole line can decide a match.
+    anchored: bool,
     state: Mutex<NotifyState>,
+    /// A `monitor` command watch: matching lines go to this sink as they arrive
+    /// instead of being kept for the settle-time report.
+    sink: Option<WatchSink>,
 }
 
 #[derive(Default)]
@@ -192,30 +210,132 @@ struct NotifyState {
     /// Skipping the remainder of an over-long line already judged from its
     /// bounded prefix (its newline has not arrived yet).
     skipping: bool,
+
     lines: Vec<String>,
     omitted: usize,
+    /// A streaming watch: the current line outgrew the buffer, so its head is gone.
+    overflowed: bool,
+    /// A streaming watch: a window of the overflowing line matched the filter.
+    window_hit: bool,
+    /// A streaming watch: the current line has non-blank text somewhere, including a dropped head.
+    nonblank: bool,
 }
 
 impl Notify {
     /// Compile a `notify` regex; the caller's bad pattern fails the call.
     fn new(source: &str) -> Result<Self> {
         let re = regex::Regex::new(source).map_err(|e| anyhow!("Invalid notify regex: {e}"))?;
+        let anchored = source.contains('^') || source.contains('$');
         Ok(Self {
+            anchored,
             re,
             source: source.to_string(),
             state: Mutex::new(NotifyState::default()),
+            sink: None,
         })
+    }
+
+    /// A `notify` that streams every matching line to `sink` (a `monitor` command).
+    pub(super) fn streaming(source: &str, sink: WatchSink) -> Result<Self> {
+        Ok(Self {
+            sink: Some(sink),
+            ..Self::new(source)?
+        })
+    }
+
+    /// Tell a streaming watcher the job is final (after the registry update).
+    fn settled(&self, status: JobStatus) {
+        if let Some(sink) = &self.sink {
+            sink.end(WatchMsg::Settled(status));
+        }
     }
 
     /// Match the complete lines in `text`; the remainder waits for the next
     /// chunk so a line split across reads is still matched whole.
     fn feed(&self, text: &str) {
-        self.collect(text, false);
+        if self.sink.is_some() {
+            self.feed_stream(text, false);
+        } else {
+            self.collect(text, false);
+        }
     }
 
     /// End of output: the trailing unterminated line counts as a line.
     fn finish(&self) {
-        self.collect("", true);
+        if self.sink.is_some() {
+            self.feed_stream("", true);
+        } else {
+            self.collect("", true);
+        }
+    }
+
+    /// A streaming watch matches whole lines: the filter sees a line only once its newline (or the
+    /// end of output) arrives, so an anchored pattern keeps its meaning. A line past
+    /// [`STREAM_LINE_BYTES`] keeps only its tail, and then only a filter without `^`/`$`
+    /// still matches it (its windows carry [`STREAM_OVERLAP_BYTES`] of context between reads).
+    fn feed_stream(&self, text: &str, end: bool) {
+        let Some(sink) = &self.sink else { return };
+        let mut st = self.state.lock().expect("notify poisoned");
+        let mut rest = text;
+        let mut hits: Vec<String> = Vec::new();
+        while let Some(i) = rest.find('\n') {
+            st.nonblank |= !rest[..i].trim().is_empty();
+            st.partial.push_str(&rest[..i]);
+            rest = &rest[i + 1..];
+            let line = std::mem::take(&mut st.partial);
+            if self.stream_hit(&mut st, &line) {
+                hits.push(line);
+            }
+        }
+        if !rest.is_empty() {
+            if st.overflowed && !st.window_hit {
+                let start = next_char_boundary(
+                    &st.partial,
+                    st.partial.len().saturating_sub(STREAM_OVERLAP_BYTES),
+                );
+                let mut window = st.partial[start..].to_owned();
+                window.push_str(rest);
+                st.window_hit = self.re.is_match(&window);
+            }
+            st.nonblank |= !rest.trim().is_empty();
+            st.partial.push_str(rest);
+            if st.partial.len() > STREAM_LINE_BYTES {
+                if !st.overflowed {
+                    // The head about to be dropped is judged once, before it goes.
+                    st.window_hit = self.re.is_match(&st.partial);
+                    st.overflowed = true;
+                }
+                let cut = next_char_boundary(&st.partial, st.partial.len() - STREAM_LINE_BYTES);
+                st.partial.drain(..cut);
+            }
+        }
+        if end && !st.partial.is_empty() {
+            let line = std::mem::take(&mut st.partial);
+            if self.stream_hit(&mut st, &line) {
+                hits.push(line);
+            }
+        }
+        drop(st);
+        for line in hits {
+            sink.line(clamp_chars(
+                line.trim_end_matches('\r'),
+                NOTIFY_MAX_LINE_CHARS,
+            ));
+        }
+    }
+
+    /// Whether a completed line is an event; clears the overflow state for the next line.
+    fn stream_hit(&self, st: &mut NotifyState, line: &str) -> bool {
+        let overflowed = std::mem::take(&mut st.overflowed);
+        let window_hit = std::mem::take(&mut st.window_hit);
+        let nonblank = std::mem::take(&mut st.nonblank);
+        if overflowed {
+            // The head is gone: blankness is the whole line's, and an anchored filter cannot be
+            // judged on the tail (it no longer starts where the line did).
+            nonblank && !self.anchored && (window_hit || self.re.is_match(line))
+        } else {
+            !line.trim().is_empty() && self.re.is_match(line)
+        }
     }
 
     fn collect(&self, text: &str, end: bool) {
@@ -260,6 +380,10 @@ impl Notify {
         }
         for line in lines {
             if line.trim().is_empty() || !self.re.is_match(&line) {
+                continue;
+            }
+            if let Some(sink) = &self.sink {
+                sink.line(clamp_chars(&line, NOTIFY_MAX_LINE_CHARS));
                 continue;
             }
             if st.lines.len() < NOTIFY_MAX_LINES {
@@ -449,11 +573,24 @@ async fn run_remote_ssh(
             () = signal.aborted() => { outcome = Some("aborted"); break; }
         }
     }
+    // Output can close while the command still runs: the wait must honour the deadline and abort too.
     let code = if outcome.is_some() {
         let _ = child.kill().await;
         None
     } else {
-        child.wait().await.context("waiting for command")?.code()
+        tokio::select! {
+            status = child.wait() => status.context("waiting for command")?.code(),
+            () = &mut deadline => {
+                outcome = Some("timeout");
+                let _ = child.kill().await;
+                None
+            }
+            () = signal.aborted() => {
+                outcome = Some("aborted");
+                let _ = child.kill().await;
+                None
+            }
+        }
     };
     if !carry.is_empty() {
         // End of output: a truncated sequence now really is invalid text.
@@ -1037,7 +1174,7 @@ fn append_notify_report(text: &str, report: &str, spill: &SpillConfig) -> String
 /// omp `BashTool` async mode: register a `bg_N` job, run it detached, and
 /// return `formatBackgroundNotice` (the result is read later via `proc://`).
 #[allow(clippy::too_many_arguments)] // job plumbing: registry, command, limits, spill policy, request query
-fn start_background(
+pub(super) fn start_background(
     registry: &JobRegistry,
     dir: std::path::PathBuf,
     command: String,
@@ -1126,6 +1263,9 @@ fn start_background(
             job.error = error;
             job.ended = Some(job.started.elapsed());
         });
+        if let Some(notify) = &task_notify {
+            notify.settled(status);
+        }
     });
     let mut lines: Vec<String> = Vec::new();
     lines.extend(notices);
@@ -1139,6 +1279,27 @@ fn start_background(
     let mut result = AgentToolResult::text(lines.join("\n"));
     result.details = serde_json::json!({"bash_id": job_id, "status": "running"});
     result
+}
+
+/// Run `command` as a background job with no deadline of its own, its matching lines streaming
+/// into `notify` (a `monitor` command watch). Returns the job's `bg_N` id.
+pub(super) fn start_watch(env: &super::Env, command: String, notify: &Arc<Notify>) -> String {
+    let started = start_background(
+        &env.jobs,
+        env.cwd.clone(),
+        command,
+        None,
+        Vec::new(),
+        SpillConfig::load(&env.cwd),
+        env.query(),
+        Some(notify),
+        env.dyn_tools(),
+        &AbortSignal::never(),
+    );
+    started.details["bash_id"]
+        .as_str()
+        .expect("start_background reports details.bash_id")
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -1891,6 +2052,107 @@ mod tests {
         assert!(report.ends_with("\n… 5 more matching lines"), "{report}");
         let first = report.lines().nth(1).unwrap();
         assert_eq!(first.chars().count(), NOTIFY_MAX_LINE_CHARS);
+    }
+
+    /// A streaming watch must not judge a long line from its prefix: the filter sees every window,
+    /// so a match after the point a settle-time report would have given up still counts.
+    #[test]
+    fn a_streaming_filter_matches_a_long_line_across_read_boundaries() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let n = Notify::streaming("ERROR", super::super::monitor::WatchSink::for_test(tx)).unwrap();
+        n.feed(&"a".repeat(1601));
+        n.feed("ERROR tail\n");
+        n.finish();
+        match rx.try_recv().expect("the long line matched") {
+            super::super::monitor::WatchMsg::Line(line) => {
+                assert_eq!(
+                    line.chars().count(),
+                    NOTIFY_MAX_LINE_CHARS,
+                    "clamped for display"
+                );
+                assert!(line.starts_with("aaa"), "the line's head");
+            }
+            _ => panic!("a line event"),
+        }
+        // The match itself straddling two reads is found through the carried context.
+        let (tx3, mut rx3) = tokio::sync::mpsc::unbounded_channel();
+        let three =
+            Notify::streaming("ERROR", super::super::monitor::WatchSink::for_test(tx3)).unwrap();
+        three.feed(&"b".repeat(5000));
+        three.feed("ER");
+        three.feed("ROR done\n");
+        assert!(
+            rx3.try_recv().is_ok(),
+            "a filter split across reads still matches"
+        );
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let two =
+            Notify::streaming("ERROR", super::super::monitor::WatchSink::for_test(tx2)).unwrap();
+        two.feed("plain\n");
+        assert!(rx2.try_recv().is_err());
+    }
+
+    /// A chunk boundary is not a line end: an anchored filter judges the completed line only.
+    #[test]
+    fn a_streaming_anchored_filter_waits_for_the_whole_line() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let n =
+            Notify::streaming("^ERROR$", super::super::monitor::WatchSink::for_test(tx)).unwrap();
+        n.feed("ERROR");
+        n.feed(" tail\n");
+        assert!(rx.try_recv().is_err(), "\"ERROR tail\" is not ^ERROR$");
+        n.feed("ERR");
+        n.feed("OR\n");
+        assert!(rx.try_recv().is_ok(), "the completed line matches");
+    }
+
+    /// A line past the buffer keeps its tail on a character boundary, and an unanchored filter
+    /// still sees the dropped head.
+    #[test]
+    fn a_streaming_overflowing_multibyte_line_neither_panics_nor_loses_its_match() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let n = Notify::streaming("ERROR", super::super::monitor::WatchSink::for_test(tx)).unwrap();
+        n.feed("ERROR ");
+        n.feed(&"\u{20ac}".repeat(STREAM_LINE_BYTES / 3 + 7));
+        n.feed(&"\u{20ac}".repeat(5));
+        n.feed("\n");
+        assert!(
+            rx.try_recv().is_ok(),
+            "the head's match survives the overflow"
+        );
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let anchored =
+            Notify::streaming("^ERROR", super::super::monitor::WatchSink::for_test(tx2)).unwrap();
+        anchored.feed("ERROR ");
+        anchored.feed(&"x".repeat(STREAM_LINE_BYTES + 10));
+        anchored.feed("\n");
+        assert!(
+            rx2.try_recv().is_err(),
+            "an anchored filter cannot judge a line whose head is gone"
+        );
+
+        let (tx3, mut rx3) = tokio::sync::mpsc::unbounded_channel();
+        let spaced =
+            Notify::streaming("ERROR", super::super::monitor::WatchSink::for_test(tx3)).unwrap();
+        spaced.feed("ERROR");
+        spaced.feed(&" ".repeat(STREAM_LINE_BYTES + 10));
+        spaced.feed("\n");
+        assert!(
+            rx3.try_recv().is_ok(),
+            "a blank tail does not make the whole line blank"
+        );
+
+        let (tx4, mut rx4) = tokio::sync::mpsc::unbounded_channel();
+        let tail =
+            Notify::streaming("^ERROR", super::super::monitor::WatchSink::for_test(tx4)).unwrap();
+        tail.feed(&"p".repeat(20));
+        tail.feed("ERROR");
+        tail.feed(&"q".repeat(STREAM_LINE_BYTES - 5));
+        tail.feed("\n");
+        assert!(
+            rx4.try_recv().is_err(),
+            "a truncated tail starting with ERROR is not ^ERROR"
+        );
     }
 
     /// `notify` matches from the run loop (deterministic: no job polling).

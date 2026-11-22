@@ -2731,6 +2731,7 @@ dependencies = [
  "image",
  "mimalloc",
  "nix 0.31.4",
+ "notify",
  "omp-collab",
  "omp-compact",
  "omp-core",

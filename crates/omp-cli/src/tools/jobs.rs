@@ -130,6 +130,8 @@ pub(crate) struct JobsInner {
 #[derive(Clone, Default)]
 pub struct JobRegistry {
     pub(crate) inner: Arc<Mutex<JobsInner>>,
+    /// `monitor` watches ride with the jobs so a tool-list rebuild keeps them.
+    pub(crate) monitors: Arc<super::monitor::Hub>,
 }
 
 impl JobRegistry {
