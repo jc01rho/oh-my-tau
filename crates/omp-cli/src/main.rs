@@ -27,6 +27,8 @@ mod title;
 mod tools;
 mod tree;
 mod tui;
+#[allow(dead_code)] // worktree isolation PAL, consumed by task isolation in a follow-up
+mod vcs;
 
 use std::path::{Path, PathBuf};
 
