@@ -729,6 +729,9 @@ pub async fn dispatch_builtin(
                     agent_invoked: false,
                 });
             }
+            if verb == "delete" && rest.is_empty() {
+                return Some(session_delete_command(rt).await);
+            }
             Some(usage(rt, "Usage: /session [info|delete|pin [account]]"))
         }
         _ => dispatch_builtin_more(rt, name, args).await,
@@ -792,25 +795,23 @@ async fn dispatch_builtin_more(
             }
             Some(crate::slash_extra::interactive::jobs_command(rt, verb == "full").await)
         }
-        "advisor" => {
-            let (verb, _rest) = subcommand(args);
-            match verb.as_str() {
-                "" | "toggle" | "on" => output(rt, ADVISOR_INACTIVE_ON),
-                "off" | "status" => output(rt, "Advisor disabled."),
-                "dump" => output(rt, "Advisor is not active for this session."),
-                "configure" => output(
-                    rt,
-                    "/advisor configure opens an interactive editor and is only available in the interactive TUI.",
-                ),
-                _ => return Some(usage(rt, "Usage: /advisor [on|off|status|dump [raw]|configure]")),
-            }
-            Some(Handled {
-                agent_invoked: false,
-            })
-        }
+        "advisor" => Some(crate::features::advisor::command(rt, args).await),
         "memory" => {
             match crate::features::memory::handle_memory_command(&rt.cwd, args) {
-                crate::features::memory::MemoryCommandOutput::Output(text) => output(rt, &text),
+                crate::features::memory::MemoryCommandOutput::Output(text) => {
+                    // TS `clear`/`reset` refresh what the session caches from
+                    // memory: here the `memory://` book.
+                    if matches!(
+                        args.split_whitespace()
+                            .next()
+                            .map(str::to_lowercase)
+                            .as_deref(),
+                        Some("clear" | "reset")
+                    ) {
+                        rt.publish_memory_urls();
+                    }
+                    output(rt, &text);
+                }
                 crate::features::memory::MemoryCommandOutput::Usage(text) => {
                     return Some(usage(rt, text));
                 }
@@ -820,7 +821,7 @@ async fn dispatch_builtin_more(
             })
         }
         "reload-plugins" => {
-            output(rt, RELOAD_PLUGINS_UNSUPPORTED);
+            output(rt, &rt.reload_plugins().await.join("\n"));
             Some(Handled {
                 agent_invoked: false,
             })
@@ -833,7 +834,26 @@ async fn dispatch_builtin_more(
             if tool.is_empty() {
                 return Some(usage(rt, "Usage: /force:<tool-name> [prompt]"));
             }
-            output(rt, &force_unsupported(tool, !prompt.is_empty()));
+            // TS `setForcedToolChoice`: the next model call must call `tool`,
+            // the call after it gets `none` (`tool_choice::wrap_stream`).
+            let active: Vec<String> = rt
+                .agent
+                .tools()
+                .await
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect();
+            let model = rt
+                .provider_target()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|target| serde_json::to_value(&target.model).ok())
+                .unwrap_or(Value::Null);
+            if let Err(e) = crate::tool_choice::force(tool, &active, &model) {
+                return Some(usage(rt, &e));
+            }
+            output(rt, &format!("Next turn forced to use {tool}."));
             if prompt.is_empty() {
                 Some(Handled {
                     agent_invoked: false,
@@ -916,7 +936,8 @@ async fn dispatch_ported(rt: &std::sync::Arc<Runtime>, name: &str, args: &str) -
         "hotkeys" => Some(hotkeys_command(rt, args)),
         // Upstream runs these only in the interactive TUI (`handleTui`), which
         // handles them locally; text-mode dispatch says so.
-        "local" | "open" => Some(notice(
+        "delete" => Some(delete_command(rt).await),
+        "local" | "open" | "settings" | "tree" | "resume" | "exit" => Some(notice(
             rt,
             &format!("/{name} is only available in the interactive TUI."),
         )),
@@ -936,7 +957,7 @@ async fn dispatch_ported(rt: &std::sync::Arc<Runtime>, name: &str, args: &str) -
         )),
         "computer" => Some(crate::features::browser::computer_command(rt, args).await),
         "ratchet" => Some(notice(rt, "/ratchet needs the ratchet eval-harness subsystem (eval preludes + hill-climb runner), which is not ported to omt.")),
-        "prewalk" => Some(notice(rt, "Prewalk is a startup-time feature in omt (the --prewalk/--no-prewalk/--prewalk-into flags); arming or restarting it mid-session is not supported.")),
+        "prewalk" => Some(crate::features::prewalk::command(rt, args).await),
         "security" => Some(crate::features::security::command(rt, args).await),
         "share" => Some(crate::features::share::command(rt, args).await),
         "browser" => Some(crate::features::browser::command(rt, args).await),
@@ -3090,6 +3111,54 @@ async fn plugins_command(rt: &Runtime, args: &str) -> Outcome {
     }
 }
 
+/// `/session delete` (TS builtin-session `handle`): the text-mode delete,
+/// reporting the deleted file and the new session.
+async fn session_delete_command(rt: &Arc<Runtime>) -> Outcome {
+    if rt.state().await.get("isStreaming").and_then(Value::as_bool) == Some(true) {
+        return usage(rt, "Cannot delete the session while streaming.");
+    }
+    let Some(old) = rt.session_file_on_disk() else {
+        return usage(rt, "No session file to delete (in-memory session).");
+    };
+    match rt.delete_session().await {
+        Ok(()) => output(
+            rt,
+            &format!(
+                "Session deleted: {}. New session: {} ({}).",
+                old.display(),
+                rt.session_id(),
+                rt.session_file().display()
+            ),
+        ),
+        Err(e) if crate::runtime::is_switch_cancelled(&e) => {
+            return usage(rt, "Session deletion cancelled.");
+        }
+        Err(e) => return usage(rt, &format!("{e:#}")),
+    }
+    Handled {
+        agent_invoked: false,
+    }
+}
+
+/// `/delete` (TS `handleDeleteCommand`): delete the current session's file
+/// and artifacts and continue in a new session.
+async fn delete_command(rt: &Arc<Runtime>) -> Outcome {
+    if rt.state().await.get("isStreaming").and_then(Value::as_bool) == Some(true) {
+        return usage(
+            rt,
+            "Wait for the current response to finish or abort it before deleting the session.",
+        );
+    }
+    match rt.delete_session().await {
+        Ok(()) => output(rt, "Session deleted"),
+        Err(e) if crate::runtime::is_switch_cancelled(&e) => {}
+        Err(e) => output(rt, &format!("{e:#}")),
+    }
+    Handled {
+        agent_invoked: false,
+    }
+}
+
 /// `/handoff [focus]` — TS `handoff` (alias for `/compact handoff`): generate a
 /// handoff document over the live context and compact in place with it.
 async fn handoff_command(rt: &Arc<Runtime>, args: &str) -> Outcome {
@@ -3108,9 +3177,6 @@ async fn handoff_command(rt: &Arc<Runtime>, args: &str) -> Outcome {
         agent_invoked: false,
     }
 }
-
-const ADVISOR_INACTIVE_ON: &str =
-    "Advisor setting enabled, but no model is assigned to the 'advisor' role.";
 
 /// Compact context report (simplified TS `buildContextReportText`).
 fn context_report(_state: &Value, usage: &Value) -> String {
@@ -3135,17 +3201,12 @@ fn context_report(_state: &Value, usage: &Value) -> String {
 /// `commands/*.md` cannot claim them, whose behaviour omp has not ported yet.
 /// Each one answers with an explicit not-ported notice.
 const UNPORTED_RESERVED: &[&str] = &[
-    "settings",
     "setup",
     "plan-review",
     "vibe",
     "guided-goal",
     "git",
     "hub",
-    "tree",
-    "resume",
-    "delete",
-    "exit",
     "commit",
     "live",
     "record",
@@ -3161,23 +3222,6 @@ const UNPORTED_RESERVED: &[&str] = &[
 fn unported_reserved_notice(name: &str) -> String {
     format!(
         "/{name} is reserved for parity with upstream omp but is not implemented in this build."
-    )
-}
-
-/// `/reload-plugins`: omp loads WASM plugins and extensions once per session
-/// and has no hot-reload path, so say that instead of claiming a reload.
-const RELOAD_PLUGINS_UNSUPPORTED: &str = "Plugin hot reload is not supported: plugins and extensions load when the session starts. Run /restart to pick up plugin changes.";
-
-/// `/force:<tool>`: the agent loop sends no forced `tool_choice`, so the tool
-/// cannot be pinned; the prompt (if any) still runs as a normal turn.
-fn force_unsupported(tool: &str, has_prompt: bool) -> String {
-    let tail = if has_prompt {
-        " Sending the prompt as a normal turn."
-    } else {
-        ""
-    };
-    format!(
-        "Cannot force {tool}: forcing a tool choice for the next turn is not supported yet.{tail}"
     )
 }
 
@@ -3434,13 +3478,6 @@ mod tests {
                 "/{name} is not an upstream-only name"
             );
         }
-    }
-
-    #[test]
-    fn stub_notices_do_not_claim_success() {
-        assert!(!RELOAD_PLUGINS_UNSUPPORTED.contains("reloaded"));
-        assert!(force_unsupported("bash", true).starts_with("Cannot force bash"));
-        assert!(!force_unsupported("bash", false).contains("forced to use"));
     }
 
     #[test]

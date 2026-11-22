@@ -4,8 +4,9 @@
 //! The slash entry point is deliberately thin: [`handle_memory_command`] parses
 //! the verb out of the raw argument string and routes it through the
 //! [`MemorySlashBackend`] trait. The concrete implementation,
-//! [`OmpMemoryBackend`], is backed by `omp_memory`'s runtime and the
-//! `memory.*` settings domain.
+//! [`OmpMemoryBackend`], is backed by the session's shared `omp_memory`
+//! runtime (`tools::memory_backend::shared_runtime`, the one the memory tools
+//! use) and the `memory.*` settings domain.
 //!
 //! Wiring into `slash.rs`, replacing the stub at the `"memory"` arm:
 //!
@@ -22,7 +23,7 @@
 //! # Adapter surface
 //!
 //! Everything that names an `omp_memory` or `omp_settings` API lives in the
-//! block marked "engine adapter" ([`backend_kind`], [`start_runtime`],
+//! block marked "engine adapter" ([`backend_kind`], [`mnemopi_settings`],
 //! [`render_json`], [`OmpMemoryBackend`] and its trait impl). The verb table,
 //! dispatch, support matrix and error rendering above it are pure and unit
 //! tested without a database.
@@ -30,7 +31,7 @@
 //! The engine calls made by the adapter are, and must stay, exactly this set:
 //!
 //! * `omp_settings::Settings::{load, get_string, get_bool, get_number}`
-//! * `omp_memory::MemoryRuntime::start(RuntimeStart) -> Result<Arc<MemoryRuntime>, _>`
+//! * `omp_memory::MemoryRuntime::start`, through the shared session runtime
 //! * `MemoryRuntime::{prompt_snapshot, stats, diagnose, status, clear, enqueue}`
 //! * `MemoryRuntime::mnemopi_settings`
 //! * `omp_memory::INACTIVE_MESSAGE`
@@ -41,10 +42,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use omp_memory::runtime::{PromptSnapshot, RuntimeStart};
+use omp_memory::runtime::PromptSnapshot;
 use omp_memory::{
-    config::MemoryLlmMode, BankScoping, MemoryBackend, MemoryRuntime, MnemopiSettings,
-    INACTIVE_MESSAGE,
+    config::MemoryLlmMode, BankScoping, MemoryRuntime, MnemopiSettings, INACTIVE_MESSAGE,
 };
 use omp_settings::Settings;
 
@@ -388,7 +388,7 @@ fn backend_kind(settings: &Settings) -> BackendKind {
 
 /// Project the `mnemopi.*` settings domain onto the engine's typed config.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // finite, non-negative counts
-fn mnemopi_settings(settings: &Settings) -> MnemopiSettings {
+pub(crate) fn mnemopi_settings(settings: &Settings) -> MnemopiSettings {
     let defaults = MnemopiSettings::default();
     let text = |id: &str| {
         settings
@@ -441,29 +441,6 @@ fn mnemopi_settings(settings: &Settings) -> MnemopiSettings {
     }
 }
 
-/// Session identity for a slash-command runtime (one per process).
-fn slash_session_id() -> String {
-    format!("slash-memory-{}", std::process::id())
-}
-
-/// Private memory data root (`$OMP_AGENT_DIR` or `~/.omp/agent`).
-fn memory_data_dir() -> PathBuf {
-    omp_providers::AgentDir::default().0.join("memory")
-}
-
-/// Open the on-disk engine for an engine-backed kind.
-fn start_runtime(cwd: &Path, settings: &Settings) -> Result<Arc<MemoryRuntime>, String> {
-    let input = RuntimeStart {
-        session_id: slash_session_id(),
-        data_dir: memory_data_dir(),
-        workspace_root: cwd.to_path_buf(),
-        canonical_primary_root: None,
-        backend: MemoryBackend::Mnemopi,
-        mnemopi: mnemopi_settings(settings),
-    };
-    MemoryRuntime::start(input).map_err(|err| err.to_string())
-}
-
 /// Flatten the non-empty prompt slots of one snapshot into displayable text.
 fn snapshot_text(snapshot: &PromptSnapshot) -> String {
     [&snapshot.memory, &snapshot.standing, &snapshot.recall]
@@ -509,12 +486,14 @@ impl OmpMemoryBackend {
         Ok(Self::from_settings(cwd, &settings))
     }
 
-    /// Build from an already-loaded settings value.
+    /// Build from an already-loaded settings value, over the session's
+    /// shared engine (the one the memory tools retain through and recall
+    /// from, `tools::memory_backend::shared_runtime`), not a private one.
     pub fn from_settings(cwd: &Path, settings: &Settings) -> Self {
         let kind = backend_kind(settings);
         let (runtime, start_error) = if kind.is_engine_backed() {
-            match start_runtime(cwd, settings) {
-                Ok(runtime) => (Some(runtime), None),
+            match crate::tools::memory_backend::shared_runtime(cwd, settings) {
+                Ok(runtime) => (runtime, None),
                 Err(err) => (None, Some(err)),
             }
         } else {

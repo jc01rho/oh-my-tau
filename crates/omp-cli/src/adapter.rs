@@ -405,7 +405,9 @@ pub fn stream_once(
         reasoning: reasoning_for_request(model, options.reasoning),
         thinking_budgets: None,
         disable_reasoning: false,
-        tool_choice: None,
+        // `/force`: the main agent's call carries the queued choice
+        // (`tool_choice::wrap_stream` scopes it around this call).
+        tool_choice: crate::tool_choice::FORCED.try_with(Clone::clone).ok(),
     };
     let stream = pa_ai::stream_simple(model, &ai_context, Some(stream_options))
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;

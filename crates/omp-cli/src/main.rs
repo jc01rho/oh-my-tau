@@ -27,6 +27,7 @@ mod slash_extra;
 pub mod subcmd;
 mod sysprompt;
 mod title;
+mod tool_choice;
 mod tools;
 mod tree;
 mod tui;
@@ -65,8 +66,8 @@ modes need a session id prefix or path):
 
 Flags parsed for TS parity whose subsystems are not in omt (no-op or
 reported, see GapInventory): --config, --add-dir, --smol/--slow/--plan,
---models, --service-tier, --prewalk*/--plan-yolo*, --skills/--no-skills,
---no-rules, --no-title, --no-lsp, --no-pty, --advisor, --external-thinking,
+--models, --service-tier, --plan-yolo*, --skills/--no-skills,
+--no-rules, --no-title, --no-lsp, --no-pty, --external-thinking,
 --hide-thinking, --auto-approve/--approval-mode, --profile, --alias.
 ";
 
@@ -501,6 +502,27 @@ async fn async_main() -> Result<()> {
     if args.sandbox || omp_settings::Settings::load(&cwd).get_bool("sandbox.enabled") == Some(true)
     {
         crate::features::sandbox::set_enabled(true);
+    }
+    // `--advisor`: the advisor starts enabled for this session.
+    if args.advisor {
+        crate::features::advisor::enable_at_startup();
+    }
+    // `--prewalk-into` / `--prewalk` / `prewalk.enabled` arm the one-shot
+    // handoff (`--no-prewalk` keeps the configured default off).
+    {
+        let settings = omp_settings::Settings::load(&cwd);
+        let into = || {
+            settings
+                .get_string("prewalk.into")
+                .unwrap_or_else(|| "@smol".to_string())
+        };
+        if let Some(target) = args.prewalk_into.clone() {
+            crate::features::prewalk::arm_at_startup(target);
+        } else if args.prewalk
+            || (!args.no_prewalk && settings.get_bool("prewalk.enabled") == Some(true))
+        {
+            crate::features::prewalk::arm_at_startup(into());
+        }
     }
     approval::Gate::install(
         args.approval_mode.as_deref().and_then(approval::parse_mode),

@@ -135,6 +135,10 @@ pub struct Runtime {
     resolver: Resolver,
     /// Slash-command catalog behind `get_available_commands` / `available_commands_update`.
     commands: Mutex<Vec<Value>>,
+    /// The session's advisor (`/advisor`, `features::advisor`).
+    pub(crate) advisor: crate::features::advisor::Advisor,
+    /// The session's one-shot model handoff (`/prewalk`, `features::prewalk`).
+    pub(crate) prewalk: crate::features::prewalk::Prewalk,
     announced: std::sync::atomic::AtomicBool,
     settled: tokio::sync::Notify,
     /// The task running the current retry saga (`recover`); awaited after cancelling it.
@@ -556,6 +560,8 @@ impl Runtime {
             recovery: Mutex::new(recovery),
             resolver,
             commands: Mutex::new(Vec::new()),
+            advisor: crate::features::advisor::Advisor::default(),
+            prewalk: crate::features::prewalk::Prewalk::default(),
             announced: std::sync::atomic::AtomicBool::new(false),
             settled: tokio::sync::Notify::new(),
             retry_task: Mutex::new(None),
@@ -637,8 +643,10 @@ impl Runtime {
 
     /// Publish the `memory://` book for this session's project when
     /// `memory.backend` selects a live engine; clear it otherwise so a stale
-    /// session cannot leak records into the next one.
-    fn publish_memory_urls(&self) {
+    /// session cannot leak records into the next one. The book is read from
+    /// the session's shared engine (the memory tools' and `/memory`'s), so a
+    /// `/memory clear` republishes an empty book.
+    pub(crate) fn publish_memory_urls(&self) {
         use omp_urls::schemes::memory as memory_scheme;
         let settings = omp_settings::Settings::load(&self.cwd);
         let backend = settings
@@ -649,15 +657,8 @@ impl Runtime {
             memory_scheme::set_memory_records(Vec::new());
             return;
         }
-        let input = omp_memory::runtime::RuntimeStart {
-            session_id: self.persist.session_id(),
-            data_dir: omp_providers::AgentDir::default().0.join("memory"),
-            workspace_root: self.cwd.clone(),
-            canonical_primary_root: None,
-            backend,
-            mnemopi: omp_memory::MnemopiSettings::default(),
-        };
-        let Ok(runtime) = omp_memory::MemoryRuntime::start(input) else {
+        let Ok(Some(runtime)) = crate::tools::memory_backend::shared_runtime(&self.cwd, &settings)
+        else {
             memory_scheme::set_memory_records(Vec::new());
             return;
         };
@@ -901,8 +902,12 @@ impl Runtime {
             } => {
                 self.on_tool_result_settled(tr);
             }
-            AgentEvent::TurnEnd { .. } => {
+            AgentEvent::TurnEnd { tool_results, .. } => {
                 self.maybe_apply_rewind();
+                // TS `advanceAtTurnEnd`: a pending prewalk handoff advances.
+                crate::features::prewalk::on_turn_end(self, tool_results);
+                // TS `onPrimaryTurnEnd`: the advisor reviews the update.
+                crate::features::advisor::on_primary_turn_end(self, tool_results.is_empty());
             }
             _ => {}
         }
@@ -1472,7 +1477,7 @@ impl Runtime {
         anyhow::bail!("agent stayed busy")
     }
 
-    fn live_provider_id(&self) -> Option<(String, String)> {
+    pub(crate) fn live_provider_id(&self) -> Option<(String, String)> {
         let t = self
             .target
             .read()
@@ -2028,7 +2033,11 @@ impl Runtime {
                 self.agent.set_system_prompt(updated).await;
             }
         }
-        let notices = self.prompt_notices(message, true).await;
+        let mut notices = self.prompt_notices(message, true).await;
+        // Advisor notes held since the last run ride ahead of the prompt.
+        if let Some(advice) = crate::features::advisor::take_pending_message(self) {
+            notices.insert(0, advice);
+        }
         let input = prompt_input(message, images, notices, injected);
         if let Err(e) = self.ensure_session(session) {
             lock(&self.prompts)
@@ -2680,6 +2689,37 @@ impl Runtime {
     }
 
     /// Clear the conversation and start a fresh session file.
+    /// The session file on disk (`None` for an in-memory session).
+    pub(crate) fn session_file_on_disk(&self) -> Option<PathBuf> {
+        self.persist.file()
+    }
+
+    /// TS `/delete` (`handleDeleteCommand` → `newSession({ drop: true })`):
+    /// start a new session, then delete the previous session file with its
+    /// artifacts directory. An in-memory session has nothing to delete.
+    ///
+    /// # Errors
+    /// No session file, or the new session could not start (the old file is
+    /// then kept).
+    pub async fn delete_session(&self) -> Result<()> {
+        let Some(previous) = self.persist.file() else {
+            anyhow::bail!("Nothing to delete (in-memory session)");
+        };
+        self.new_session(None)
+            .await
+            .context("Failed to start a new session")?;
+        if let Some(artifacts) = omp_urls::artifacts_directory_for(&previous) {
+            let _ = std::fs::remove_dir_all(artifacts);
+        }
+        match std::fs::remove_file(&previous) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+                "Failed to delete {}: {e}",
+                previous.display()
+            )),
+            _ => Ok(()),
+        }
+    }
+
     pub async fn new_session(&self, dir: Option<&Path>) -> Result<()> {
         let _serial = self.switch_serial.lock().await;
         self.check_switch("new", None).await?;
@@ -2696,6 +2736,10 @@ impl Runtime {
         if stripped_prompt != current_prompt {
             self.agent.set_system_prompt(stripped_prompt).await;
         }
+        // A forced tool choice belongs to the session it was set in.
+        crate::tool_choice::clear();
+        crate::features::advisor::reset_for_new_session(self).await;
+        crate::features::prewalk::reset_for_new_session(self);
         self.persist.start_new(&self.cwd, dir)?;
         self.bump_generation();
         self.publish_session_file();
@@ -4035,6 +4079,18 @@ impl Runtime {
 
     // -------------------------------------------------------------- models
 
+    /// Resolve a model reference (`provider/id[:level]` or a role) through
+    /// the session's resolver, the one `set_model` uses.
+    ///
+    /// # Errors
+    /// The reference names no known model.
+    pub(crate) async fn resolve_model_ref(
+        &self,
+        reference: &str,
+    ) -> anyhow::Result<omp_providers::ResolvedModel> {
+        (self.resolver)(reference.to_string()).await
+    }
+
     /// `set_model`: `model_change` entry with role `default`.
     pub async fn set_model(&self, provider: &str, model_id: &str) -> Result<Value, CmdError> {
         self.select_model(provider, model_id, Some("default")).await
@@ -4196,6 +4252,83 @@ impl Runtime {
                 .append_model_change(&selector, role, is_fallback);
         }
         true
+    }
+
+    /// `/reload-plugins` (TS `reloadTuiPluginState` / `runtime.reloadPlugins`):
+    /// re-discover what omp-rs loads from plugin sources and swap it into the
+    /// live session without a restart — WASM plugin tools (the old registry's
+    /// tools leave the tool list, the new one's join it, gated like the rest),
+    /// the base system prompt (skills and the tool surface re-read), and the
+    /// slash catalog (WASM plugin commands and `commands/*.md` files). Returns
+    /// the report lines; extension hosts and MCP connections are named as
+    /// needing `/restart` because they are not reloaded live.
+    pub async fn reload_plugins(self: &Arc<Self>) -> Vec<String> {
+        let settings = omp_settings::Settings::load(&self.cwd);
+        let wasm = crate::tools::wasm::rediscover(&self.cwd);
+        let mut tools: Vec<Arc<dyn pa_agent::types::AgentTool>> = self
+            .agent
+            .tools()
+            .await
+            .into_iter()
+            .filter(|tool| !wasm.old_names.iter().any(|name| name == tool.name()))
+            .collect();
+        tools.extend(match crate::approval::Gate::get() {
+            Some(gate) => gate.wrap_tools(wasm.tools.clone()),
+            None => wasm.tools.clone(),
+        });
+        if let Some(env) = crate::tools::session_env() {
+            env.set_dyn_tools(&tools);
+        }
+        crate::tools::eval_bridge::set_session_tools(tools.clone());
+        if let Some(opts) = crate::sysprompt::session_options() {
+            let model = self
+                .target
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|target| target.model.clone());
+            let hidden = crate::tools::hidden_tools(&settings, model.as_ref(), false, false);
+            let surface: Vec<_> = tools
+                .iter()
+                .filter(|tool| tool.name() != crate::context::TOOL_NAME)
+                .cloned()
+                .collect();
+            self.agent
+                .set_system_prompt(crate::agent::base_prompt(
+                    &self.cwd, &opts, &hidden, &surface,
+                ))
+                .await;
+        }
+        self.agent.set_tools(tools).await;
+        let catalog = crate::rpc::slash::dynamic_commands(self).await;
+        let file_commands = catalog
+            .iter()
+            .filter(|c| c.get("source").and_then(Value::as_str) == Some("file"))
+            .count();
+        self.set_available_commands(catalog);
+        let mut lines = vec![
+            "Plugins reloaded.".to_string(),
+            format!(
+                "WASM plugins: {} ({} tools)",
+                wasm.plugins,
+                wasm.tools.len()
+            ),
+            format!("File commands: {file_commands}"),
+            format!(
+                "Skills: {}",
+                crate::sysprompt::visible_skills(&self.cwd).len()
+            ),
+        ];
+        lines.extend(
+            wasm.failures
+                .iter()
+                .map(|failure| format!("WASM plugin load error: {failure}")),
+        );
+        lines.push(
+            "Extensions and MCP server connections are not reloaded live; run /restart to pick up changes there."
+                .to_string(),
+        );
+        lines
     }
 
     /// `ModelControls.setThinkingLevel`: clamp to the live model; journal and announce only a change.
@@ -6537,6 +6670,155 @@ mod compaction_guard_tests {
         .await;
         std::mem::forget(provider);
         Harness { rt, rx, _dir: dir }
+    }
+
+    #[tokio::test]
+    async fn advisor_command_reports_the_real_state() {
+        let mut h = harness(0).await;
+        for args in ["off", "status", "dump", "bogus"] {
+            crate::features::advisor::command(&h.rt, args).await;
+        }
+        let texts: Vec<String> = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter(|f| f["type"] == "command_output")
+            .filter_map(|f| f["text"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Advisor disabled.",
+                "Advisor is disabled.",
+                "Advisor is not active for this session.",
+                "Usage: /advisor [on|off|status|dump [raw]|configure]",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn advisor_review_sends_the_delta_and_its_concern_continues_the_run() {
+        let mut h = harness_scripted(|p| {
+            p.push_text_turn("first answer");
+            p.push_text_turn("addressed the advice");
+        })
+        .await;
+        h.rt.prompt(None, "build the feature", None, Vec::new())
+            .await
+            .unwrap();
+        until_settled(&mut h.rx).await;
+        let advisor_model: pa_agent::types::Model = json_round_trip(&model()).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(advisor_model.clone()));
+        provider.push_tool_call_turn(
+            None,
+            vec![(
+                "c1",
+                "advise",
+                json!({"note": "Run the tests before calling it done", "severity": "concern"}),
+            )],
+        );
+        provider.push_text_turn("silent now");
+        let live = crate::features::advisor::install_live(
+            &h.rt,
+            advisor_model,
+            "p/a".into(),
+            provider.stream_fn(),
+            None,
+            4,
+        )
+        .await;
+        let tuning =
+            crate::features::advisor::Tuning::load(&omp_settings::Settings::load(&h.rt.cwd));
+        crate::features::advisor::review(&h.rt, &live, &tuning, true).await;
+        until_settled(&mut h.rx).await;
+        let sent = provider.calls()[0].messages.clone();
+        let delta = serde_json::to_string(&sent).unwrap();
+        assert!(
+            delta.contains("## User") && delta.contains("build the feature"),
+            "{delta}"
+        );
+        assert!(
+            !delta.contains("in progress"),
+            "a terminal review is not marked in progress"
+        );
+        let messages = h.rt.agent.messages_snapshot().await.into_vec();
+        let advisory = messages
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .find(|m| m["customType"] == "advisor")
+            .expect("advisory delivered to the primary");
+        let text = advisory["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("severity=\"concern\""), "{text}");
+        assert!(
+            text.contains("Run the tests before calling it done"),
+            "{text}"
+        );
+        assert!(
+            crate::runtime::message_text(messages.last().unwrap()).contains("addressed the advice"),
+            "the concern continued the run"
+        );
+        std::mem::forget(provider);
+    }
+
+    #[tokio::test]
+    async fn session_delete_reports_the_deleted_file_and_the_new_session() {
+        let mut h = harness(1).await;
+        h.rt.prompt(None, "hello", None, Vec::new()).await.unwrap();
+        until_settled(&mut h.rx).await;
+        let old = h.rt.session_file_on_disk().expect("on disk");
+        crate::rpc::slash::try_dispatch(&h.rt, "/session delete").await;
+        let text = std::iter::from_fn(|| h.rx.try_recv().ok())
+            .filter(|f| f["type"] == "command_output")
+            .filter_map(|f| f["text"].as_str().map(str::to_string))
+            .last()
+            .unwrap_or_default();
+        assert!(
+            text.starts_with(&format!(
+                "Session deleted: {}. New session: ",
+                old.display()
+            )),
+            "{text}"
+        );
+        assert!(!old.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_the_file_and_artifacts_and_starts_fresh() {
+        let mut h = harness(1).await;
+        h.rt.prompt(None, "hello", None, Vec::new()).await.unwrap();
+        until_settled(&mut h.rx).await;
+        let old = h.rt.persist.file().expect("session file");
+        let old_id = h.rt.session_id();
+        let artifacts = omp_urls::artifacts_directory_for(&old).unwrap();
+        std::fs::create_dir_all(artifacts.join("local")).unwrap();
+        std::fs::write(artifacts.join("local/note.md"), "x").unwrap();
+        assert!(old.exists());
+        h.rt.delete_session().await.unwrap();
+        assert!(!old.exists(), "session file deleted");
+        assert!(!artifacts.exists(), "artifacts deleted");
+        assert_ne!(h.rt.session_id(), old_id, "continues in a new session");
+        assert!(h.rt.messages().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_plugins_picks_up_commands_added_after_start() {
+        let h = harness(0).await;
+        h.rt.set_available_commands(crate::rpc::slash::dynamic_commands(&h.rt).await);
+        let has = |rt: &Runtime, name: &str| {
+            rt.available_commands()
+                .iter()
+                .any(|c| c.get("name").and_then(Value::as_str) == Some(name))
+        };
+        assert!(!has(&h.rt, "p8b2-late"));
+        let commands = h.rt.cwd.join(".omp/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(commands.join("p8b2-late.md"), "Say late things\n").unwrap();
+        let tools_before = h.rt.agent.tools().await.len();
+        let report = h.rt.reload_plugins().await;
+        assert_eq!(report[0], "Plugins reloaded.");
+        assert!(report.iter().any(|l| l.starts_with("File commands: ")));
+        assert!(has(&h.rt, "p8b2-late"), "the reload refreshed the catalog");
+        assert_eq!(
+            h.rt.agent.tools().await.len(),
+            tools_before + crate::tools::wasm::wasm_tools(&h.rt.cwd).len()
+        );
     }
 
     async fn until_settled(rx: &mut UnboundedReceiver<Value>) {

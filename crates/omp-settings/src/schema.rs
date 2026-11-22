@@ -2231,6 +2231,20 @@ pub static SETTINGS: &[SettingDef] = &[
         credential: false,
     },
     SettingDef {
+        id: "prewalk.from",
+        ty: crate::SettingType::String,
+        env: None,
+        default_yaml: Some("\"@default\""),
+        credential: false,
+    },
+    SettingDef {
+        id: "prewalk.into",
+        ty: crate::SettingType::String,
+        env: None,
+        default_yaml: Some("\"@smol\""),
+        credential: false,
+    },
+    SettingDef {
         id: "proseOnlyThinking",
         ty: crate::SettingType::Boolean,
         env: None,

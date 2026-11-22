@@ -23,8 +23,8 @@
 //!   fact is immutable (`NotEditable`).
 //! * The store keeps one timestamp, so `updated_at` equals `created_at`.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{anyhow, bail, Result};
 use omp_memory::bank::DEFAULT_SHARED_BANK;
@@ -33,7 +33,9 @@ use omp_memory::runtime::{
     EditOperation, EditStatus, MemoryProjection, RuntimeStart, MAX_PROJECTION_BYTES,
 };
 use omp_memory::store::{MemoryRecord, MemoryTier};
-use omp_memory::{MemoryBackend, MemoryRuntime, MnemopiSettings};
+#[cfg(test)]
+use omp_memory::MnemopiSettings;
+use omp_memory::{MemoryBackend, MemoryRuntime};
 use pa_agent::types::AgentTool;
 use serde_json::Value;
 
@@ -55,9 +57,9 @@ impl StoreBackend {
         Self { runtime }
     }
 
-    /// Start the Mnemopi runtime for `cwd` the way the session does
-    /// (`Runtime::publish_memory_urls`): default Mnemopi settings, data under
-    /// `data_dir`.
+    /// Start a private Mnemopi runtime for `cwd` with default settings and
+    /// data under `data_dir` (tests; sessions use [`shared_runtime`]).
+    #[cfg(test)]
     pub fn open(cwd: &Path, data_dir: &Path, session_id: String) -> Result<Self> {
         let runtime = MemoryRuntime::start(RuntimeStart {
             session_id,
@@ -270,21 +272,72 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// The engines this process opened, one per `(workspace, data dir)`: the
+/// memory tools, `/memory` and the `memory://` book of a session all use the
+/// same [`MemoryRuntime`], so a retain through a tool is what `/memory
+/// stats`/`queue` count and `clear` empties what the tools read.
+static SHARED: Mutex<Vec<(PathBuf, PathBuf, Arc<MemoryRuntime>)>> = Mutex::new(Vec::new());
+
+/// The private memory data root (`$OMP_AGENT_DIR` or `~/.omp/agent`).
+fn default_data_dir() -> PathBuf {
+    omp_providers::AgentDir::default().0.join("memory")
+}
+
+/// The session's shared memory engine for `cwd`: the one already open, else
+/// one started now with the configured `mnemopi.*` settings and kept for the
+/// other callers. `Ok(None)` when `memory.backend` names no local engine
+/// (`off`, unset, or a remote backend).
+///
+/// # Errors
+/// The engine failed to start.
+pub fn shared_runtime(
+    cwd: &Path,
+    settings: &omp_settings::Settings,
+) -> Result<Option<Arc<MemoryRuntime>>, String> {
+    shared_runtime_in(cwd, settings, &default_data_dir())
+}
+
+fn shared_runtime_in(
+    cwd: &Path,
+    settings: &omp_settings::Settings,
+    data_dir: &Path,
+) -> Result<Option<Arc<MemoryRuntime>>, String> {
+    let engine = settings
+        .get_string("memory.backend")
+        .is_some_and(|id| matches!(id.trim(), "local" | "mnemopi"));
+    if !engine {
+        return Ok(None);
+    }
+    let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, _, runtime)) = shared
+        .iter()
+        .find(|(root, dir, _)| root == cwd && dir == data_dir)
+    {
+        return Ok(Some(runtime.clone()));
+    }
+    let runtime = MemoryRuntime::start(RuntimeStart {
+        session_id: format!("omt-{}", std::process::id()),
+        data_dir: data_dir.to_path_buf(),
+        workspace_root: cwd.to_path_buf(),
+        canonical_primary_root: None,
+        backend: MemoryBackend::Mnemopi,
+        mnemopi: crate::features::memory::mnemopi_settings(settings),
+    })
+    .map_err(|err| format!("memory store could not be opened: {err}"))?;
+    shared.push((cwd.to_path_buf(), data_dir.to_path_buf(), runtime.clone()));
+    Ok(Some(runtime))
+}
+
 /// The memory tool set for one session: empty while `memory.backend` is off or
 /// unset (or names an engine the store cannot serve), otherwise the tools
-/// gated by `settings` over a store opened under the agent dir's `memory/`.
+/// gated by `settings` over the session's shared engine ([`shared_runtime`]).
 #[must_use]
 pub fn session_tools(
     env: &Arc<Env>,
     cwd: &Path,
     settings: &omp_settings::Settings,
 ) -> Vec<Arc<dyn AgentTool>> {
-    session_tools_in(
-        env,
-        cwd,
-        settings,
-        &omp_providers::AgentDir::default().0.join("memory"),
-    )
+    session_tools_in(env, cwd, settings, &default_data_dir())
 }
 
 /// [`session_tools`] with an explicit memory data directory.
@@ -301,9 +354,11 @@ fn session_tools_in(
     if selected == MemoryBackend::Off {
         return Vec::new();
     }
-    let session_id = format!("omt-tools-{}", std::process::id());
-    match StoreBackend::open(cwd, data_dir, session_id) {
-        Ok(backend) => memory_tools::tools(env, Arc::new(backend), settings),
+    match shared_runtime_in(cwd, settings, data_dir) {
+        Ok(Some(runtime)) => {
+            memory_tools::tools(env, Arc::new(StoreBackend::new(runtime)), settings)
+        }
+        Ok(None) => Vec::new(),
         Err(err) => {
             tracing::warn!(%err, "memory tools unavailable: store failed to open");
             Vec::new()
@@ -562,6 +617,59 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
         assert_eq!(names, vec!["retain", "recall", "reflect", "memory_edit"]);
         assert_ne!(std::fs::read_dir(data.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn tools_and_memory_slash_share_one_engine() {
+        let cwd = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let settings = settings(Some("mnemopi"));
+        let for_tools = shared_runtime_in(cwd.path(), &settings, data.path())
+            .unwrap()
+            .expect("engine for mnemopi");
+        let id = StoreBackend::new(for_tools.clone())
+            .retain(draft("rotate the staging key quarterly"))
+            .unwrap();
+        let for_slash = shared_runtime_in(cwd.path(), &settings, data.path())
+            .unwrap()
+            .expect("same engine");
+        assert!(
+            Arc::ptr_eq(&for_tools, &for_slash),
+            "one runtime per session"
+        );
+        let slash = crate::features::memory::OmpMemoryBackend::new(
+            crate::features::memory::BackendKind::Mnemopi,
+            cwd.path(),
+            Some(for_slash),
+        );
+        use crate::features::memory::MemorySlashBackend as _;
+        let stats: Value = serde_json::from_str(&slash.stats().unwrap()).unwrap();
+        assert_ne!(stats, Value::Null);
+        slash.clear().unwrap();
+        assert!(
+            StoreBackend::new(for_tools).get(&id).unwrap().is_none(),
+            "/memory clear empties what the tools read"
+        );
+        // Another workspace gets its own engine.
+        let other = tempfile::tempdir().unwrap();
+        let elsewhere = shared_runtime_in(other.path(), &settings, data.path())
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &elsewhere,
+            &for_tools_again(cwd.path(), data.path())
+        ));
+        assert!(
+            shared_runtime_in(cwd.path(), &self::settings(Some("off")), data.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn for_tools_again(cwd: &Path, data: &Path) -> Arc<MemoryRuntime> {
+        shared_runtime_in(cwd, &settings(Some("mnemopi")), data)
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
