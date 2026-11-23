@@ -14,7 +14,7 @@
 {"dir":"out","frame":{"type":"extension_request","name":"omomeow.move-readiness","id":"gw-7"}}
 {"dir":"in","frame":{"id":"gw-7","type":"response","command":"extension_request","success":true,"data":{"activeSources":[]}}}
 {"dir":"out","frame":{"type":"resume_session","id":"gw-8"}}
-{"dir":"in","frame":{"id":"gw-8","type":"response","command":"resume_session","success":true}}
+{"dir":"in","frame":{"id":"gw-8","type":"response","command":"resume_session","success":true,"data":{"resumed":true,"pauseSeq":2,"turnStarted":false,"deliveredNotices":0,"deliveredHeldInputs":0}}}
 {"dir":"in","frame":{"type":"session_resumed","pauseSeq":2,"cause":"resume_session","at":"<TIMESTAMP>"}}
 {"dir":"out","frame":{"type":"extension_request","name":"omomeow.move-readiness","id":"gw-9"}}
 {"dir":"in","frame":{"id":"gw-9","type":"response","command":"extension_request","success":true,"data":{"activeSources":[]}}}
