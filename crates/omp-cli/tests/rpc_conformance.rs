@@ -2518,3 +2518,81 @@ fn memory_repo_is_discovered_projected_and_pinned() {
     assert_eq!(after_reload["data"]["systemPrompt"][0], prompt.as_str());
     h.finish();
 }
+
+/// B5: a lane the gateway keeps busy (every later message is queued into the run in flight, so
+/// no prompt ever starts on an idle agent) still gets the late <memory_notice> with the queued
+/// message, and the pin's `noticedThrough` moves to the new head.
+#[test]
+fn memory_notice_reaches_a_message_queued_into_a_running_turn() {
+    let repo_cell = Arc::new(Mutex::new(None));
+    let repo_slot = Arc::clone(&repo_cell);
+    let mut h = RpcHarness::spawn_prepared(true, &["--no-extensions"], move |home, work| {
+        let work = work.canonicalize().expect("canonical work dir");
+        let id = omp_memory::identity::memory_agent_ids(&work).id;
+        let repo = home.join(".omo/memory/agents").join(&id).join("repo");
+        std::fs::create_dir_all(&repo).expect("create memory repo");
+        memory_git(&repo, &["init", "-q"]);
+        let head = memory_commit(
+            &repo,
+            &[(
+                "system/persona.md",
+                "---\ndescription: Persona\n---\npersona-body\n",
+            )],
+        );
+        *repo_slot.lock().expect("repo slot") = Some((repo, head));
+    });
+    let (repo, pinned) = repo_cell
+        .lock()
+        .expect("repo slot")
+        .take()
+        .expect("prepared");
+
+    let (set, _) = h.request(json!({"type": "set_model", "provider": "mock", "modelId": "hold"}));
+    assert_eq!(set["success"], true, "{set}");
+    let (_p, from_first) = h.request(json!({"type": "prompt", "message": "hold turn"}));
+    h.expect_frame(from_first, |f| f["type"] == "agent_start", FRAME_TIMEOUT);
+
+    // The commit lands while the turn is held open, after the prompt-start check ran.
+    let head = memory_commit(
+        &repo,
+        &[("reference/c.md", "---\ndescription: Ref C\n---\nc\n")],
+    );
+    let (queued, _) = h.request(json!({
+        "type": "prompt",
+        "message": "queued while running",
+        "streamingBehavior": "steer",
+    }));
+    assert_eq!(queued["success"], true, "{queued}");
+    h.release_hold();
+    h.expect_frame(from_first, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+
+    let requests = h._mock.requests.lock().expect("requests").clone();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        !all_message_text(&requests[0]).contains("<memory_notice>"),
+        "{}",
+        requests[0]
+    );
+    let text = all_message_text(&requests[1]);
+    let line = format!(
+        "Memory changed after this session's prompt was pinned to {}: added reference/c.md. The prompt keeps the pinned copy; read a file when it matters now.",
+        &pinned[..7]
+    );
+    assert!(text.contains("queued while running"), "{text}");
+    assert!(text.contains("<memory_notice>"), "{text}");
+    assert!(text.contains(&line), "{text}");
+
+    let lane = std::fs::read_to_string(h.lane_file("lane.jsonl")).expect("session file");
+    let last_pin = lane
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .rfind(|e| e["customType"] == "omo-memory:projection-pin")
+        .unwrap_or_else(|| panic!("no projection pin entry: {lane}"));
+    assert_eq!(last_pin["data"]["revision"], pinned.as_str(), "{last_pin}");
+    assert_eq!(
+        last_pin["data"]["noticedThrough"],
+        head.as_str(),
+        "{last_pin}"
+    );
+    h.finish();
+}
