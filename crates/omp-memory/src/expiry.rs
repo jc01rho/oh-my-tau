@@ -45,7 +45,7 @@ pub fn render_expired_line(expired: &[MemoryExpiry]) -> String {
     let listed = expired
         .iter()
         .take(MAX_LISTED_PATHS)
-        .map(|expiry| expiry.path.as_str())
+        .map(|expiry| crate::projection::redact_secret_like_material(&expiry.path))
         .collect::<Vec<_>>()
         .join(", ");
     let more = if hidden > 0 {
@@ -201,5 +201,15 @@ mod tests {
             render_expired_line(&got),
             "- Expired since this prompt was pinned (no longer true): system/c.md."
         );
+    }
+
+    #[test]
+    fn expired_line_masks_secret_shaped_paths() {
+        let line = render_expired_line(&[MemoryExpiry {
+            path: "system/sk-proj-abc123.md".into(),
+            expires_at_ms: 1,
+        }]);
+        assert!(!line.contains("abc123"), "{line}");
+        assert!(line.contains("system/***.md"), "{line}");
     }
 }

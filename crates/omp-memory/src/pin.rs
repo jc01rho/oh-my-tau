@@ -568,7 +568,11 @@ pub fn render_projected_changes_line(
         if paths.is_empty() {
             continue;
         }
-        let shown: Vec<String> = paths.iter().take(budget).cloned().collect();
+        let shown: Vec<String> = paths
+            .iter()
+            .take(budget)
+            .map(|path| crate::projection::redact_secret_like_material(path))
+            .collect();
         budget = budget.saturating_sub(shown.len());
         let hidden = paths.len() - shown.len();
         let mut listed = shown;
