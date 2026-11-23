@@ -179,6 +179,7 @@ pub struct Runtime {
     pub(crate) prewalk: crate::features::prewalk::Prewalk,
     /// The session's additional workspace roots (`/add-dir`, `features::workspace_dirs`).
     pub(crate) workspace_dirs: crate::features::workspace_dirs::WorkspaceDirs,
+    pub(crate) memory_projection: crate::memory_projection::MemoryProjectionController,
     announced: std::sync::atomic::AtomicBool,
     settled: tokio::sync::Notify,
     /// The task running the current retry saga (`recover`); awaited after cancelling it.
@@ -265,6 +266,7 @@ pub struct Runtime {
     compaction_hooks: Mutex<Option<Arc<dyn CompactionHooks>>>,
     /// Extension `before_agent_start` hook run at every prompt admission.
     before_start: Mutex<Option<BeforeStartHook>>,
+    restore_prompt: Mutex<Option<RestorePromptHook>>,
     /// Native Herdr agent-state reporter (`HERDR_ENV=1` only; `None` elsewhere).
     herdr: Option<std::sync::Arc<crate::herdr::Herdr>>,
     /// `ask`-tool runs currently waiting on the user: >0 means Blocked.
@@ -376,6 +378,9 @@ pub type BeforeStartHook = Arc<
         + Send
         + Sync,
 >;
+
+pub type RestorePromptHook =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Gate run before a session switch (`session_before_switch`): `true` cancels it.
 pub type SwitchGate = Arc<
@@ -631,6 +636,8 @@ impl Runtime {
             h.set_session(persist.file().as_deref(), Some(&model_ref), "startup");
             h.report(crate::herdr::State::Idle, None);
         });
+        let memory_projection =
+            crate::memory_projection::MemoryProjectionController::discover(&cwd);
         let rt = Arc::new(Self {
             agent,
             target,
@@ -664,6 +671,7 @@ impl Runtime {
             advisor: crate::features::advisor::Advisor::default(),
             prewalk: crate::features::prewalk::Prewalk::default(),
             workspace_dirs: crate::features::workspace_dirs::WorkspaceDirs::default(),
+            memory_projection,
             announced: std::sync::atomic::AtomicBool::new(false),
             settled: tokio::sync::Notify::new(),
             retry_task: Mutex::new(None),
@@ -687,6 +695,7 @@ impl Runtime {
             ext_host: Mutex::new(None),
             ext_frames: Mutex::new(None),
             before_start: Mutex::new(None),
+            restore_prompt: Mutex::new(None),
             compaction_hooks: Mutex::new(None),
             herdr,
             ask_blocked: std::sync::atomic::AtomicU64::new(0),
@@ -720,6 +729,7 @@ impl Runtime {
             crate::features::workspace_dirs::configured(&rt.cwd),
         )
         .await;
+        rt.sync_memory_projection().await;
         rt.bind_monitor_wakes();
         let host: Arc<dyn crate::tools::context_notes::ContextNotesHost> = rt.clone();
         crate::tools::context_host::bind(&host);
@@ -2197,6 +2207,11 @@ impl Runtime {
             });
             starts
         };
+        let restore = lock(&self.restore_prompt).clone();
+        if let Some(restore) = restore {
+            restore().await;
+        }
+        let memory_notice = self.prepare_memory_turn().await;
         let hook = lock(&self.before_start).clone();
         let mut injected = Vec::new();
         if let Some(hook) = hook {
@@ -2204,6 +2219,9 @@ impl Runtime {
                 .then(|| serde_json::to_value(&images).ok())
                 .flatten();
             injected = hook(message.to_string(), images_json).await;
+        }
+        if let Some(notice) = memory_notice {
+            injected.push(notice);
         }
         if crate::sysprompt::contains_ultrawork(message) {
             let current = self.agent.system_prompt().await;
@@ -3099,6 +3117,7 @@ impl Runtime {
             crate::features::workspace_dirs::configured_for_new_session(&self.cwd),
         )
         .await;
+        self.sync_memory_projection().await;
         self.bump_generation();
         self.publish_session_file();
         self.herdr_session("new");
@@ -3425,6 +3444,7 @@ impl Runtime {
             crate::features::workspace_dirs::configured(&self.cwd),
         )
         .await;
+        self.sync_memory_projection().await;
         self.notify_session_switch(
             if branched {
                 "branch"
@@ -3609,6 +3629,30 @@ impl Runtime {
     /// Install the extension `before_agent_start` hook (see [`BeforeStartHook`]).
     pub fn set_before_start_hook(&self, f: Option<BeforeStartHook>) {
         *lock(&self.before_start) = f;
+    }
+
+    pub fn set_restore_prompt_hook(&self, f: Option<RestorePromptHook>) {
+        *lock(&self.restore_prompt) = f;
+    }
+
+    pub(crate) async fn sync_memory_projection(&self) {
+        let branch = self.branch_entries();
+        let session_id = self.session_id();
+        self.memory_projection
+            .sync_session(&self.agent, &self.persist, &session_id, &branch)
+            .await;
+    }
+
+    pub(crate) async fn prepare_memory_turn(&self) -> Option<AgentMessage> {
+        let branch = self.branch_entries();
+        let session_id = self.session_id();
+        self.memory_projection
+            .prepare_turn(&self.agent, &self.persist, &session_id, &branch)
+            .await
+    }
+
+    pub(crate) fn request_memory_recompile(&self) -> Option<String> {
+        self.memory_projection.request_recompile()
     }
 
     /// Sink completed session switches (the ext bridge's `session_switch`).
@@ -4366,6 +4410,7 @@ impl Runtime {
             return Ok(data);
         }
         self.agent.set_messages(rebuilt).await;
+        self.sync_memory_projection().await;
         if trace {
             turn_trace!("[turn-trace] compact-set rss={}kB", rss_kb());
         }
@@ -4674,6 +4719,7 @@ impl Runtime {
                 &self.cwd, &opts, &hidden, &surface,
             ))
             .await;
+        self.memory_projection.apply_cached(&self.agent).await;
     }
 
     /// Replace the session's additional workspace roots (TS

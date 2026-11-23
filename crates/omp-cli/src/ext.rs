@@ -1491,6 +1491,23 @@ impl Extensions {
         discover_resources(&self.host, &self.cwd, reason).await;
     }
 
+    pub async fn restore_prompt_override(&self, agent: &Agent) {
+        let base = agent.system_prompt().await;
+        let restore = {
+            let mut applied = self
+                .prompt_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            applied
+                .take()
+                .filter(|(_, set)| base == *set)
+                .map(|(orig, _)| orig)
+        };
+        if let Some(orig) = restore {
+            agent.set_system_prompt(orig).await;
+        }
+    }
+
     /// TS `before_agent_start` (agent-session `#promptAgent`, every mode): handlers may
     /// replace the system prompt and inject messages ahead of the prompt.
     ///
@@ -1504,21 +1521,8 @@ impl Extensions {
     ) -> Result<Vec<AgentMessage>> {
         // TS keeps the override per turn (`setTurnSystemPromptOverride`, cleared on the next
         // prompt): start every prompt from the base prompt, never from the last override.
-        let mut base = agent.system_prompt().await;
-        let restore = {
-            let mut applied = self
-                .prompt_override
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            applied
-                .take()
-                .filter(|(_, set)| base == *set)
-                .map(|(orig, _)| orig)
-        };
-        if let Some(orig) = restore {
-            agent.set_system_prompt(orig.clone()).await;
-            base = orig;
-        }
+        self.restore_prompt_override(agent).await;
+        let base = agent.system_prompt().await;
         let outcome = self
             .host
             .emit_before_agent_start(prompt.to_string(), images, vec![base.clone()], None)
@@ -1571,6 +1575,16 @@ impl Extensions {
         self.serve_incoming(&rt);
         rt.set_compaction_hooks(Some(Arc::new(CompactBridge {
             host: self.host.clone(),
+        })));
+        let ext = self.clone();
+        let weak = Arc::downgrade(&rt);
+        rt.set_restore_prompt_hook(Some(Arc::new(move || {
+            let (ext, weak) = (ext.clone(), weak.clone());
+            Box::pin(async move {
+                if let Some(rt) = weak.upgrade() {
+                    ext.restore_prompt_override(&rt.agent).await;
+                }
+            })
         })));
         // `before_agent_start` runs inside every prompt admission, like TS `#promptAgent`.
         let ext = self.clone();
