@@ -232,7 +232,7 @@ fn create(
     }
     repo.reject_ignored(&rel).map_err(|e| err(e.message()))?;
     affected.push(rel);
-    let block = Block::new(description, params.file_text.as_deref().unwrap_or(""))
+    let block = Block::from_file_text(description, params.file_text.as_deref().unwrap_or(""))
         .map_err(|e| err(e.message()))?;
     write_file(&path, &block.render())
 }
@@ -516,6 +516,39 @@ mod tests {
             "---\ndescription: a block\n---\nhello\n"
         );
         assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn create_merges_a_frontmatter_that_file_text_brings() {
+        let repo = repo("create-fm");
+        let text = "---\ndescription: from text\nkind: note\nexpires: 2030-01-01T00:00:00Z\n---\n- entry\n";
+        run_memory(&repo, &create_params("notes/a.md", text)).unwrap();
+        assert_eq!(
+            read(&repo, "notes/a.md"),
+            "---\ndescription: a block\nkind: note\nexpires: 2030-01-01T00:00:00Z\n---\n- entry\n"
+        );
+        let no_desc = "---\nkind: note\n---\nbody\n";
+        run_memory(&repo, &create_params("notes/b.md", no_desc)).unwrap();
+        assert_eq!(
+            read(&repo, "notes/b.md"),
+            "---\ndescription: a block\nkind: note\n---\nbody\n"
+        );
+        let locked = "---\ndescription: x\nread_only: \"true\"\n---\nbody\n";
+        run_memory(&repo, &create_params("notes/c.md", locked)).unwrap();
+        assert_eq!(
+            read(&repo, "notes/c.md"),
+            "---\ndescription: a block\nread_only: \"true\"\n---\nbody\n"
+        );
+    }
+
+    #[test]
+    fn create_keeps_an_unclosed_fence_as_body_text() {
+        let repo = repo("create-fence");
+        run_memory(&repo, &create_params("notes/a.md", "---\nnot a header\n")).unwrap();
+        assert_eq!(
+            read(&repo, "notes/a.md"),
+            "---\ndescription: a block\n---\n---\nnot a header\n"
+        );
     }
 
     #[test]
