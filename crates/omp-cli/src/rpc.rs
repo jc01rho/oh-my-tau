@@ -347,6 +347,7 @@ pub const RPC_COMMANDS: &[&str] = &[
     "abort_retry",
     "abort_bash",
     "get_session_stats",
+    "memory_report",
     "export_html",
     "get_branch_messages",
     "get_last_assistant_text",
@@ -358,6 +359,17 @@ pub const RPC_COMMANDS: &[&str] = &[
     "login",
     "predict_word",
     "predict_word_feedback",
+];
+
+/// What this engine does, by name, for the gateway to branch on instead of a version string
+/// (`get_protocol_info.features`). A name is listed only while the behavior ships here.
+/// `resume_run` is deliberately absent: there is no run fence (`runPaused` is always false), so
+/// a gateway must treat this engine as having none.
+pub const FEATURES: &[&str] = &[
+    "memory_report",
+    "agent_settled",
+    "session_settled",
+    "prompt_result",
 ];
 
 /// Success/failure response frame in omp's key order.
@@ -1422,6 +1434,12 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
             none()
         }
         "get_session_stats" => ok(rt.session_stats().await),
+        "memory_report" => {
+            crate::memory_report::handle(vec![
+                crate::memory_report::SessionSample::of(rt, rt.session_id()).await,
+            ])
+            .await
+        }
         "export_html" => {
             if let Some(v) = cmd.get("outputPath") {
                 if !v.is_string() {
@@ -1557,6 +1575,7 @@ fn protocol_info(rt: &Arc<Runtime>) -> Value {
         "mode": "classic",
         "capabilities": RPC_COMMANDS,
         "commands": RPC_COMMANDS,
+        "features": FEATURES,
         "agentDir": omp_providers::AgentDir::default().0.display().to_string(),
         "sessionId": rt.session_id(),
     })
@@ -2337,6 +2356,18 @@ mod tests {
         assert_eq!(ENGINE, "oh-my-tau");
         assert!(RPC_COMMANDS.contains(&"get_protocol_info"));
         assert!(RPC_COMMANDS.contains(&"get_state"));
+    }
+
+    #[test]
+    fn features_name_shipped_behavior_and_leave_out_resume_run() {
+        let unique: std::collections::BTreeSet<_> = FEATURES.iter().collect();
+        assert_eq!(unique.len(), FEATURES.len(), "duplicate feature");
+        assert!(FEATURES.contains(&"memory_report"));
+        assert!(
+            RPC_COMMANDS.contains(&"memory_report"),
+            "a feature that is a command must be dispatched"
+        );
+        assert!(!FEATURES.contains(&"resume_run"));
     }
 
     fn big_response(id: &str) -> Value {

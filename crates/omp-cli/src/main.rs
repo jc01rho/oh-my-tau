@@ -15,6 +15,7 @@ mod features;
 mod herdr;
 mod host;
 mod images;
+mod memory_report;
 mod methodology;
 mod model;
 mod move_cmd;

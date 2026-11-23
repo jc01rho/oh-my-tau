@@ -1,0 +1,6 @@
+{"dir":"out","frame":{"type":"memory_report","id":"gw-1"}}
+{"dir":"in","frame":{"id":"gw-1","type":"response","command":"memory_report","success":true,"data":{"path":"<REPORT_PATH>","footprintBytes":"<BYTES>"}}}
+{"dir":"out","frame":{"type":"prompt","message":"Reply deterministically","streamingBehavior":"followUp","id":"gw-2"}}
+{"dir":"in","frame":{"id":"gw-2","type":"response","command":"prompt","success":true}}
+{"dir":"out","frame":{"type":"memory_report","id":"gw-3"}}
+{"dir":"in","frame":{"id":"gw-3","type":"response","command":"memory_report","success":true,"data":{"path":"<REPORT_PATH>","footprintBytes":"<BYTES>"}}}

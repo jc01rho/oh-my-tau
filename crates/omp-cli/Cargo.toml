@@ -90,6 +90,7 @@ nix.workspace = true
 # Landlock + seccomp confinement for tool subprocesses (`/sandbox`,
 # features/sandbox.rs); omt re-executes itself as the confinement launcher.
 omp-sandbox = { path = "../omp-sandbox" }
+omp-procmem = { path = "../omp-procmem" }
 
 [dev-dependencies]
 tempfile = "3"

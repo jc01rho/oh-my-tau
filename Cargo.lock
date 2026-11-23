@@ -2743,6 +2743,7 @@ dependencies = [
  "omp-lsp",
  "omp-mcp",
  "omp-memory",
+ "omp-procmem",
  "omp-proto",
  "omp-providers",
  "omp-sandbox",
@@ -2957,6 +2958,13 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "omp-procmem"
+version = "0.12.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

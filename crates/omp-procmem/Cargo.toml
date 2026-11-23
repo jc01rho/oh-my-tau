@@ -1,0 +1,17 @@
+[package]
+name = "omp-procmem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Process memory readings for the `memory_report` RPC. This crate exists as a
+# separate member (not inside `omp-cli`) because macOS only reports a process's
+# `phys_footprint` through the Mach `task_info` / `proc_pid_rusage` calls, which
+# are `unsafe` and which the `omp-cli` workspace `forbid`s; the public API here
+# is safe and the confined unsafe regions are isolated to this crate. Linux
+# reads `/proc`, and every other platform answers `Unsupported`.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[lints.rust]
+unsafe_code = "allow"
