@@ -589,6 +589,37 @@ pub fn resolve_agent_dir() -> Option<PathBuf> {
     Some(resolve_agent_dir_with_home(&home, omp_profile.as_deref()))
 }
 
+/// Entries that make an agent dir a real config source: config and credential
+/// files plus the user-authored content the system prompt loads from it. The
+/// artifacts omt itself writes (`memory-reports`, `session-moves`, `projects`,
+/// `sessions`, `cache`, `managed-skills`, ...) are deliberately absent: a dir
+/// holding only those is not a config dir and must not shadow `~/.omo/agent`.
+const AGENT_DIR_CONFIG_ENTRIES: &[&str] = &[
+    "config.yml",
+    "config.yaml",
+    "agent.db",
+    "models.yml",
+    "models.yaml",
+    "models.json",
+    "settings.json",
+    "auth.json",
+    "mcp.json",
+    "AGENTS.md",
+    "skills",
+    "rules",
+    "commands",
+    "agents",
+    "extensions",
+];
+
+fn holds_agent_config(dir: &Path) -> bool {
+    AGENT_DIR_CONFIG_ENTRIES
+        .iter()
+        .any(|name| dir.join(name).exists())
+}
+
+/// `OMP_PROFILE` profile dir when it exists, else `~/.omp/agent` while it holds
+/// config, else `~/.omo/agent` when present, else `~/.omp/agent`.
 #[must_use]
 pub fn resolve_agent_dir_with_home(home: &Path, omp_profile: Option<&str>) -> PathBuf {
     let omp_root = home.join(".omp");
@@ -599,7 +630,7 @@ pub fn resolve_agent_dir_with_home(home: &Path, omp_profile: Option<&str>) -> Pa
         }
     }
     let primary_agent = omp_root.join("agent");
-    if primary_agent.is_dir() {
+    if holds_agent_config(&primary_agent) {
         return primary_agent;
     }
     let fallback_agent = home.join(".omo").join("agent");

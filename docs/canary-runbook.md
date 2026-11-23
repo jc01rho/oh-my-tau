@@ -69,7 +69,7 @@
 
 ### 2.2 `~/.omo` 프로필 및 하네스 연동 확인 (`#26` 반영)
 
-- `omt`는 `OMP_AGENT_DIR`이 비어 있을 때 `~/.omp/agent`를 우선 보고, 없으면 `~/.omo/agent`로 폴백한다.
+- `omt`는 `OMP_AGENT_DIR`이 비어 있을 때 `~/.omp/agent`가 설정(config.yml·agent.db·models·AGENTS.md·skills 등)을 담고 있을 때만 우선 보고, 아니면 `~/.omo/agent`로 폴백한다. omt가 만드는 산출물(`memory-reports`, `session-moves`, `projects` 등)만 있는 `~/.omp/agent`는 설정 출처를 바꾸지 않는다.
 - `~/.omo/omo.jsonc`(또는 `omo.json`)가 존재하면 `OMO_PROFILE` / `OMP_PROFILE` / `--profile` 기준 프로필의 `categories`, `task.maxConcurrency` 등을 읽어 반영한다.
 - `gateway.ts`가 넘기는 기동 인자(`--mode rpc --session <path> --append-system-prompt ... --skill <dir> --model ... --thinking ... --extension ... --no-model-fallback --no-recommended-models`)가 모두 파싱되는지 확인한다.
 
