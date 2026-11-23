@@ -2216,10 +2216,14 @@ impl Runtime {
                 }
             }
             let mut batch = self.prompt_notices(message, false).await;
-            let queued = if batch.is_empty() {
+            // A run that never idles (queued messages keep it going) would otherwise never reach
+            // the prompt-start check below, so a memory commit made during it would go unnoticed.
+            let memory_notice = self.prepare_memory_turn().await;
+            let queued = if batch.is_empty() && memory_notice.is_none() {
                 pa_agent::agent::AgentMessageBatch::Single(user_message(message))
             } else {
                 batch.push(user_message(message));
+                batch.extend(memory_notice);
                 pa_agent::agent::AgentMessageBatch::Batch(batch)
             };
             self.ensure_session(session)?;
