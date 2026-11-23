@@ -2694,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "omp-auth-broker"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2713,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "omp-cli"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2783,7 +2783,7 @@ dependencies = [
 
 [[package]]
 name = "omp-collab"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "futures",
@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "omp-compact"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "omp-session",
@@ -2844,7 +2844,7 @@ dependencies = [
 
 [[package]]
 name = "omp-dap"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "omp-eval"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "libc",
  "nix 0.29.0",
@@ -2872,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "omp-ext"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "pa-agent",
@@ -2884,14 +2884,14 @@ dependencies = [
 
 [[package]]
 name = "omp-goose"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "omp-judge"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "laya-ort",
@@ -2904,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "omp-lsp"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -2929,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "omp-mcp"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -2948,7 +2948,7 @@ dependencies = [
 
 [[package]]
 name = "omp-memory"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "parking_lot",
  "regex",
@@ -2965,7 +2965,7 @@ dependencies = [
 
 [[package]]
 name = "omp-procmem"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "libc",
 ]
@@ -2976,7 +2976,7 @@ version = "0.1.0"
 
 [[package]]
 name = "omp-providers"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3001,7 +3001,7 @@ dependencies = [
 
 [[package]]
 name = "omp-sandbox"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "landlock",
  "libc",
@@ -3010,7 +3010,7 @@ dependencies = [
 
 [[package]]
 name = "omp-session"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "memchr",
@@ -3025,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "omp-settings"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "parking_lot",
  "serde",
@@ -3142,14 +3142,14 @@ dependencies = [
 
 [[package]]
 name = "omp-sot"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "omp-stats"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "fancy-regex 0.14.0",
@@ -3173,7 +3173,7 @@ dependencies = [
 
 [[package]]
 name = "omp-task"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "jsonschema",
  "nix 0.29.0",
@@ -3197,7 +3197,7 @@ dependencies = [
 
 [[package]]
 name = "omp-tui"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -3224,7 +3224,7 @@ dependencies = [
 
 [[package]]
 name = "omp-urls"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3275,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "omp-wasm"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -3421,7 +3421,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "pa-agent"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "futures",
@@ -3434,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "pa-ai"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3463,7 +3463,7 @@ dependencies = [
 
 [[package]]
 name = "pa-models"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "hex",
  "hmac",
@@ -3481,7 +3481,7 @@ dependencies = [
 
 [[package]]
 name = "pa-types"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "libc",
