@@ -61,7 +61,7 @@ const HELP: &str = r"usage: omt [--mode text|json|rpc] [-p|--print] [--model pro
        [--system-prompt TEXT] [--system-prompt-template FILE] [--append-system-prompt TEXT]
        [-e|--extension PATH]... [--hook PATH]... [--trusted-extension ABS]...
        [--no-extensions] [--no-session] [--no-skills] [--no-rules] [--no-title]
-       [--no-lsp] [--no-pty] [--no-ui] [--allow-home] [--auto-approve|--yolo]
+       [--no-lsp] [--no-pty] [--no-ui] [--allow-home] [--auto-approve|--yolo] [--approve]
        [--approval-mode always-ask|write|yolo] [--export FILE] [--version] [--] <prompt...|@file>
 
 Session control (bare --resume in a terminal opens the session picker; headless

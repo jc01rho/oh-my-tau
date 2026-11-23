@@ -464,6 +464,10 @@ pub fn parse_from<I: Iterator<Item = String>>(it: I) -> Result<Args> {
                 "-c" | "--continue" => a.continue_prev = true,
                 "-p" | "--print" => a.print = true,
                 "--no-extensions" => a.no_extensions = true,
+                // mhc's "trust project-local files for this run", which the OmOMeow gateway
+                // passes to every lane. omt reads project-local `.omp/` files without a trust
+                // gate, so the trust this flag asks for is already in effect.
+                "--approve" => {}
                 "--dump-system-prompt" => a.dump_system_prompt = true,
                 other if other.starts_with('@') => {
                     push_message(&mut messages, &mut images, other.to_string())?
@@ -999,6 +1003,7 @@ mod tests {
             "in-process",
             "--no-model-fallback",
             "--no-recommended-models",
+            "--approve",
         ])
         .unwrap();
         assert_eq!(a.mode.as_deref(), Some("rpc"));
