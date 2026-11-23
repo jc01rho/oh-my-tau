@@ -1984,3 +1984,85 @@ fn extension_provider_boot() {
 
     h.finish();
 }
+
+/// `provider/id` of every model `get_available_models` lists, duplicates kept.
+fn available_model_ids(h: &mut RpcHarness) -> Vec<String> {
+    let (listed, _) = h.request(json!({"type": "get_available_models"}));
+    listed["data"]["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .map(|m| {
+            format!(
+                "{}/{}",
+                m["provider"].as_str().unwrap_or_default(),
+                m["id"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+/// B4 with B1: a reload unloads the extension, whose provider is unregistered, and loads it
+/// again; the core registry then holds the provider exactly once, and the session model on it still
+/// streams. `session_start_notify_ext.ts` loads after `provider_ext.ts`, so its `session_start`
+/// notification reaches the core after that load's provider notifications: waiting for its frame
+/// orders the model listing after them.
+#[test]
+fn extension_provider_survives_reload() {
+    if !bun_on_path() {
+        eprintln!("skipping extension_provider_survives_reload: bun not found on PATH");
+        return;
+    }
+    let provider = fixture_path("provider_ext.ts").display().to_string();
+    let barrier = fixture_path("session_start_notify_ext.ts")
+        .display()
+        .to_string();
+    let mut h = RpcHarness::spawn(&[
+        "-e",
+        &provider,
+        "-e",
+        &barrier,
+        "--model",
+        "fx-prov/m1",
+        "--no-model-fallback",
+    ]);
+    let count = |ids: &[String], id: &str| ids.iter().filter(|i| *i == id).count();
+
+    let ids = available_model_ids(&mut h);
+    assert_eq!(count(&ids, "fx-prov/m1"), 1, "{ids:?}");
+    for round in 1..=2 {
+        let (reloaded, from_reload) = h.request(json!({"type": "reload"}));
+        assert_eq!(reloaded["data"], json!({"cancelled": false}), "{reloaded}");
+        h.expect_frame(
+            from_reload,
+            |f| {
+                f["type"] == "extension_ui_request" && f["params"]["message"] == "fx-barrier:reload"
+            },
+            FRAME_TIMEOUT,
+        );
+        let ids = available_model_ids(&mut h);
+        assert_eq!(count(&ids, "fx-prov/m1"), 1, "round {round}: {ids:?}");
+        assert_eq!(count(&ids, "fx-prov/m2"), 1, "round {round}: {ids:?}");
+        assert!(
+            !ids.iter().any(|i| i.starts_with("fx-gone/")),
+            "round {round}: {ids:?}"
+        );
+    }
+
+    let (_, from_prompt) = h.request(json!({"type": "prompt", "message": "after reload"}));
+    h.expect_frame(from_prompt, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    let sent: Vec<String> = h
+        ._mock
+        .requests
+        .lock()
+        .expect("requests lock")
+        .iter()
+        .map(|b| b["model"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(sent.last().map(String::as_str), Some("m1"), "{sent:?}");
+
+    let stderr = Arc::clone(&h.stderr);
+    h.finish();
+    let stderr = stderr.lock().expect("stderr lock").clone();
+    assert!(!stderr.contains("failed to load"), "{stderr}");
+}

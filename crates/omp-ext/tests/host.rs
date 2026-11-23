@@ -1463,8 +1463,12 @@ async fn reload_twice_keeps_one_registration_of_each_kind() {
         assert!(unloaded.errors.is_empty(), "round {round}: {unloaded:?}");
         assert!(!host.has_rpc_handler("fx.reload-ping"), "round {round}");
         assert!(!host.has_handlers("turn_end"), "round {round}");
+        let live: Value = host.request("list_providers", json!({})).await.unwrap();
+        assert_eq!(live, json!([]), "round {round}");
         let r = host.load(Some(&paths), None, "/tmp", None).await.unwrap();
         assert!(r.errors.is_empty(), "round {round}: {r:?}");
+        let alive: Vec<&str> = r.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(alive, ["fx-reload"], "round {round}");
         assert_eq!(
             drain(&mut rx),
             [
