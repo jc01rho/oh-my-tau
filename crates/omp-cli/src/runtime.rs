@@ -4520,6 +4520,16 @@ impl Runtime {
             return;
         };
         opts.additional_workspace_roots = self.workspace_dirs.list();
+        // The launch prompt's ultrawork directive survives only while the live
+        // prompt still carries it: `/new` strips it and a rebuild must not restore it.
+        if !self
+            .agent
+            .system_prompt()
+            .await
+            .contains(crate::sysprompt::ULTRAWORK_DIRECTIVE_OPEN_TAG)
+        {
+            opts.prompt = None;
+        }
         let model = self
             .target
             .read()
@@ -4545,18 +4555,27 @@ impl Runtime {
     /// next turn sees the change.
     ///
     /// # Errors
-    /// The session header could not be rewritten (the list is left unchanged).
+    /// The session header could not be rewritten (the list is left unchanged), or
+    /// it was rewritten but the directory sync failed (the list and prompt are
+    /// updated, the durability error is still reported).
     pub(crate) async fn set_workspace_directories(&self, dirs: Vec<String>) -> Result<()> {
-        if self.persist.file().is_some() {
-            self.persist
+        let unsynced = match self.persist.file() {
+            Some(_) => self
+                .persist
                 .with_writer(|w| w.set_additional_directories(&dirs))
-                .context("Failed to save the workspace directories")?;
-        }
+                .context("Failed to save the workspace directories")?,
+            None => None,
+        };
         self.workspace_dirs.replace(dirs);
         let settings = omp_settings::Settings::load(&self.cwd);
         let tools = self.agent.tools().await;
         self.reassemble_base_prompt(&settings, &tools).await;
-        Ok(())
+        match unsynced {
+            Some(e) => Err(e.context(
+                "Workspace directories saved, but the session directory could not be synced",
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Bind the roots of the session just opened: its header's list merged with
@@ -7131,6 +7150,28 @@ mod compaction_guard_tests {
         assert_eq!(
             h.rt.agent.tools().await.len(),
             tools_before + crate::tools::wasm::wasm_tools(&h.rt.cwd).len()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_rebuild_does_not_replay_a_stripped_ultrawork_directive() {
+        let h = harness(0).await;
+        crate::sysprompt::remember_session_options(&crate::sysprompt::Options {
+            prompt: Some("ultrawork fix it".into()),
+            ..crate::sysprompt::Options::default()
+        });
+        let extra = tempfile::tempdir().unwrap();
+        h.rt.set_workspace_directories(vec![extra.path().to_string_lossy().into_owned()])
+            .await
+            .expect("set roots");
+        let prompt = h.rt.agent.system_prompt().await;
+        assert!(
+            prompt.contains("<workspace-roots>"),
+            "rebuilt with the roots"
+        );
+        assert!(
+            !prompt.contains(crate::sysprompt::ULTRAWORK_DIRECTIVE_OPEN_TAG),
+            "the live prompt had no directive, so the rebuild must not add one"
         );
     }
 

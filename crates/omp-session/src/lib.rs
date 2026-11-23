@@ -377,7 +377,10 @@ impl SessionWriter {
     ///
     /// # Errors
     /// The first line is not a session header, or I/O failure.
-    pub fn set_additional_directories(&mut self, directories: &[String]) -> Result<()> {
+    pub fn set_additional_directories(
+        &mut self,
+        directories: &[String],
+    ) -> Result<Option<anyhow::Error>> {
         let text = std::fs::read_to_string(&self.path)
             .with_context(|| format!("read {}", self.path.display()))?;
         // An optional title slot may precede the header; its bytes are kept as is.
@@ -409,8 +412,9 @@ impl SessionWriter {
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("replace {}", self.path.display()))?;
         self.file = handle;
-        sync_parent_dir(&self.path)?;
-        Ok(())
+        // The rename has committed: a failed directory sync is reported, not
+        // turned into a failure the caller would treat as "nothing changed".
+        Ok(sync_parent_dir(&self.path).err())
     }
 
     /// Append a `message` entry; returns the new entry id.
@@ -1270,7 +1274,7 @@ mod tests {
         .unwrap();
         let first = w.append_message(&msg, T1).unwrap();
         let dirs = vec!["/srv/a".to_owned(), "/srv/b".to_owned()];
-        w.set_additional_directories(&dirs).unwrap();
+        assert!(w.set_additional_directories(&dirs).unwrap().is_none());
         assert_eq!(header_additional_directories(w.path()), dirs);
         // The handle points at the renamed file: the next entry lands in it, chained.
         let second = w.append_message(&msg, T1).unwrap();
