@@ -153,6 +153,17 @@ pub struct LoadError {
     pub error: String,
 }
 
+/// Outcome of [`ExtHost::unload_all`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UnloadResult {
+    /// Names of the extensions that were unloaded, in load order.
+    #[serde(default)]
+    pub unloaded: Vec<String>,
+    /// `session_shutdown` handlers that threw; the unload went ahead regardless.
+    #[serde(default)]
+    pub errors: Vec<Value>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct HandlerRecord {
     pub ext: String,
@@ -592,6 +603,23 @@ impl ExtHost {
             .flat_map(|e| e.rpc.iter().cloned())
             .collect();
         *lock(&self.loaded_rpc) = Some(rpc);
+        Ok(result)
+    }
+
+    /// Unload every loaded extension (`unload_all`, the first half of a reload): each gets
+    /// `session_shutdown` with reason `reload`, then the host releases what its load registered
+    /// (event subscriptions, RPC names, providers, flag values, link schemes) and forgets it, so the
+    /// next [`Self::load`] starts from an empty host instead of registering everything twice. The
+    /// handler, link-scheme and RPC sets learned from the last `load` are emptied with it.
+    ///
+    /// # Errors
+    /// Transport failure. `session_shutdown` handler failures are in [`UnloadResult::errors`].
+    pub async fn unload_all(&self) -> Result<UnloadResult> {
+        let result: UnloadResult =
+            serde_json::from_value(self.request("unload_all", json!({})).await?)?;
+        *lock(&self.subscribed) = Some(HashSet::new());
+        lock(&self.link_schemes).clear();
+        *lock(&self.loaded_rpc) = Some(HashSet::new());
         Ok(result)
     }
 

@@ -143,6 +143,14 @@ pub enum ResourcesDiscoverReason {
     Reload,
 }
 
+/// Why `session_start` fires again (mhc `SessionStartEvent.reason`): a `reload` re-created the
+/// extensions. The startup `session_start` carries no reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionStartReason {
+    Reload,
+}
+
 /// Tool approval mode (`tools/approval.ts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ApprovalMode {
@@ -298,7 +306,10 @@ pub struct PlanReviewRequest {
 #[serde(tag = "type")]
 pub enum LifecycleEvent {
     #[serde(rename = "session_start")]
-    SessionStart,
+    SessionStart {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<SessionStartReason>,
+    },
     #[serde(rename = "before_agent_start", rename_all = "camelCase")]
     BeforeAgentStart {
         prompt: String,
@@ -634,6 +645,10 @@ pub enum LifecycleEvent {
     /// [`ExtHost::emit_session_before_shutdown`]).
     #[serde(rename = "session_before_shutdown")]
     SessionBeforeShutdown,
+    /// A `reload` is about to unload and re-create the extensions; a handler may cancel it
+    /// (`{cancel: true, reason?}`, mhc `session_before_reload`).
+    #[serde(rename = "session_before_reload")]
+    SessionBeforeReload,
     /// A moving session's out-of-folder state: handlers write what must follow the session into
     /// `dir` while its runtime is live (the host hands each handler an `AbortSignal` as `signal`).
     #[serde(rename = "session_move_export", rename_all = "camelCase")]
@@ -931,8 +946,8 @@ impl ExtHost {
     }
 
     notify_helpers! {
-        /// `session_start`: initial session load.
-        emit_session_start() => LifecycleEvent::SessionStart;
+        /// `session_start`: initial session load, or the extensions a `reload` re-created.
+        emit_session_start(reason: Option<SessionStartReason>) => LifecycleEvent::SessionStart { reason };
         /// `agent_start`: an agent loop starts (once per user prompt).
         emit_agent_start() => LifecycleEvent::AgentStart;
         /// `agent_end`: an agent loop ended; `will_continue` when a continuation is already scheduled.
@@ -1251,6 +1266,17 @@ impl ExtHost {
     ) -> Result<CancelOutcome> {
         let ev = LifecycleEvent::SessionBeforeTree { preparation };
         Ok(CancelOutcome::from_result(self.emit_event(&ev, ctx).await?))
+    }
+
+    /// `session_before_reload`: cancellable; `result["reason"]` may say why (mhc `check_reload_veto`).
+    ///
+    /// # Errors
+    /// Transport failure.
+    pub async fn emit_session_before_reload(&self, ctx: Option<Value>) -> Result<CancelOutcome> {
+        Ok(CancelOutcome::from_result(
+            self.emit_event(&LifecycleEvent::SessionBeforeReload, ctx)
+                .await?,
+        ))
     }
 
     /// `session_stop`: a handler may request one continuation turn.

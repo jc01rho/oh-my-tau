@@ -1415,3 +1415,113 @@ async fn duplicate_rpc_name_fails_the_second_load() {
     host.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Provider notifications as `(method, name)` and `append_entry` notifications as
+/// `(customType, data)`, received so far. One reader routes the host's lines in wire order, so
+/// whatever the host sent before answering an awaited request is already in the channel.
+fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<HostMessage>) -> Vec<(String, Value)> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|msg| match msg {
+            HostMessage::Notification { method, params } if method.starts_with("provider_") => {
+                Some((method, params["name"].clone()))
+            }
+            HostMessage::Notification { method, params } if method == "append_entry" => Some((
+                params["customType"].as_str().unwrap_or_default().to_owned(),
+                params["data"].clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A reload is `unload_all` then `load` (omp-cli `Extensions::reload`). Reloading twice must leave
+/// one registration of each kind: the RPC name still answers (a second `rpc.handle` used to fail
+/// the load with `duplicate extension rpc handler`), the tool list keeps its length, an event
+/// reaches one handler, the flag and the bus subscription exist once, and each reload hands the
+/// provider back once and registers it once, after the extension saw `session_shutdown` with
+/// reason `reload`.
+#[tokio::test]
+async fn reload_twice_keeps_one_registration_of_each_kind() {
+    if common::bun_missing("reload_twice_keeps_one_registration_of_each_kind") {
+        return;
+    }
+    let host = ExtHost::spawn(&config()).await.unwrap();
+    let mut rx = host.take_incoming().unwrap();
+    let paths = [fixture("reload.ts")];
+    let first = host.load(Some(&paths), None, "/tmp", None).await.unwrap();
+    assert!(first.errors.is_empty(), "{first:?}");
+    let tools = host.list_tools().await.unwrap().len();
+    assert_eq!(tools, 1);
+    assert_eq!(
+        drain(&mut rx),
+        [("provider_registered".to_owned(), json!("fx-reload"))]
+    );
+
+    for round in 1..=2 {
+        let unloaded = host.unload_all().await.unwrap();
+        assert_eq!(unloaded.unloaded, ["reload"], "round {round}");
+        assert!(unloaded.errors.is_empty(), "round {round}: {unloaded:?}");
+        assert!(!host.has_rpc_handler("fx.reload-ping"), "round {round}");
+        assert!(!host.has_handlers("turn_end"), "round {round}");
+        let live: Value = host.request("list_providers", json!({})).await.unwrap();
+        assert_eq!(live, json!([]), "round {round}");
+        let r = host.load(Some(&paths), None, "/tmp", None).await.unwrap();
+        assert!(r.errors.is_empty(), "round {round}: {r:?}");
+        let alive: Vec<&str> = r.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(alive, ["fx-reload"], "round {round}");
+        assert_eq!(
+            drain(&mut rx),
+            [
+                ("fx-reload-shutdown".to_owned(), json!({"reason": "reload"})),
+                ("provider_unregistered".to_owned(), json!("fx-reload")),
+                ("provider_registered".to_owned(), json!("fx-reload")),
+            ],
+            "round {round}"
+        );
+
+        let pong = host
+            .request_extension("fx.reload-ping", Value::Null, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(pong, json!({"pong": true}), "round {round}");
+        assert_eq!(
+            host.list_tools().await.unwrap().len(),
+            tools,
+            "round {round}"
+        );
+        let out = host
+            .emit(
+                json!({"type": "turn_end", "turnIndex": 0, "message": {}, "toolResults": []}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.handlers
+                .iter()
+                .filter(|h| h.event == "turn_end")
+                .count(),
+            1,
+            "round {round}: {:?}",
+            out.handlers
+        );
+        let flags: Value = host.request("list_flags", json!({})).await.unwrap();
+        assert_eq!(
+            flags.as_array().map(Vec::len),
+            Some(1),
+            "round {round}: {flags}"
+        );
+        host.request(
+            "bus_emit",
+            json!({"channel": "fx.reload-bus", "data": null}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            drain(&mut rx),
+            [("fx-reload-bus".to_owned(), Value::Null)],
+            "round {round}"
+        );
+    }
+    host.shutdown().await.unwrap();
+}

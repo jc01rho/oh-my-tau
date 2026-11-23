@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use omp_ext::lifecycle::{
     BoxFuture, BranchReason, HeadlessResponder, HostResponder, InputSource, LifecycleEvent,
-    SwitchReason,
+    SessionStartReason, SwitchReason,
 };
 use omp_ext::{ExtHost, HostConfig, HostMessage};
 use serde_json::{json, Value};
@@ -85,7 +85,11 @@ async fn observed_events_reach_extensions_with_omp_payloads() {
     let tr = json!({"role":"toolResult","toolCallId":"c1","toolName":"bash","content":[],"isError":false});
 
     let cases: Vec<(LifecycleEvent, String)> = vec![
-        (LifecycleEvent::SessionStart, r#"{"type":"session_start"}"#.into()),
+        (LifecycleEvent::SessionStart { reason: None }, r#"{"type":"session_start"}"#.into()),
+        (
+            LifecycleEvent::SessionStart { reason: Some(SessionStartReason::Reload) },
+            r#"{"type":"session_start","reason":"reload"}"#.into(),
+        ),
         (LifecycleEvent::AgentStart, r#"{"type":"agent_start"}"#.into()),
         (
             LifecycleEvent::AgentEnd { messages: vec![msg.clone()], will_continue: None },
@@ -154,6 +158,10 @@ async fn observed_events_reach_extensions_with_omp_payloads() {
         (
             LifecycleEvent::SessionBeforeShutdown,
             r#"{"type":"session_before_shutdown"}"#.into(),
+        ),
+        (
+            LifecycleEvent::SessionBeforeReload,
+            r#"{"type":"session_before_reload"}"#.into(),
         ),
         (LifecycleEvent::SessionClear, r#"{"type":"session_clear"}"#.into()),
         (LifecycleEvent::SessionShutdown, r#"{"type":"session_shutdown"}"#.into()),
@@ -289,6 +297,13 @@ async fn events_with_results_are_aggregated_and_shaped() {
     assert_eq!(
         entry(&mut rx, "seen:session_before_tree").await,
         json!(r#"{"type":"session_before_tree","preparation":{"targetId":"t"}}"#)
+    );
+    let veto = host.emit_session_before_reload(None).await.unwrap();
+    assert!(veto.cancel);
+    assert_eq!(veto.result["reason"], json!("fixture veto"));
+    assert_eq!(
+        entry(&mut rx, "seen:session_before_reload").await,
+        json!(r#"{"type":"session_before_reload"}"#)
     );
 
     let stop = LifecycleEvent::SessionStop {

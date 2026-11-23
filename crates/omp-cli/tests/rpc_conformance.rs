@@ -1189,6 +1189,65 @@ fn golden_lane_hold_stop_reload_resume() {
     assert_golden("lane_hold_stop_reload_resume", &rows);
 }
 
+/// `lane_hold_stop_reload_resume` with the RPC extension (`rpc_ext.ts`) loaded: it answers before
+/// the stop, after each of two reloads and after the resume. A reload used to load the extension a
+/// second time into the same host, where `rpc.handle` failed with `duplicate extension rpc handler`.
+#[test]
+fn golden_lane_hold_stop_reload_resume_rpc_ext() {
+    if !bun_on_path() {
+        eprintln!("skipping golden_lane_hold_stop_reload_resume_rpc_ext: bun not found on PATH");
+        return;
+    }
+    let ext_arg = fixture_path("rpc_ext.ts").display().to_string();
+    let mut h = RpcHarness::spawn(&["-e", &ext_arg]);
+    let stderr = Arc::clone(&h.stderr);
+    let move_ready = json!({"type": "extension_request", "name": "omomeow.move-readiness"});
+
+    let (sci, _) = h.request(json!({
+        "type": "set_client_info",
+        "width": 80,
+        "capabilities": ["interactive_user"],
+    }));
+    assert_eq!(sci["success"], true);
+
+    let (ready, _) = h.request(move_ready.clone());
+    assert_eq!(ready["data"], json!({"activeSources": []}), "{ready}");
+
+    let (stop_ok, from_stop) = h.request(json!({"type": "interrupt", "intent": "stop"}));
+    assert_eq!(stop_ok["success"], true);
+    let paused_evt = h.expect_frame(from_stop, |f| f["type"] == "session_paused", FRAME_TIMEOUT);
+    h.record_in(paused_evt);
+
+    for _ in 0..2 {
+        let (reloaded, _) = h.request(json!({"type": "reload"}));
+        assert_eq!(reloaded["success"], true, "{reloaded}");
+        assert_eq!(reloaded["data"]["cancelled"], false);
+        let (ready, _) = h.request(move_ready.clone());
+        assert_eq!(ready["data"], json!({"activeSources": []}), "{ready}");
+    }
+
+    let (resumed, from_resume) = h.request(json!({"type": "resume_session"}));
+    assert_eq!(resumed["success"], true);
+    let resumed_evt = h.expect_frame(
+        from_resume,
+        |f| f["type"] == "session_resumed",
+        FRAME_TIMEOUT,
+    );
+    h.record_in(resumed_evt);
+
+    let (ready, _) = h.request(move_ready);
+    assert_eq!(ready["data"], json!({"activeSources": []}), "{ready}");
+
+    let rows = h.transcript.clone();
+    h.finish();
+    let stderr = stderr.lock().expect("stderr lock").clone();
+    assert!(
+        !stderr.contains("failed to load"),
+        "a reload must not load the extension on top of itself:\n{stderr}"
+    );
+    assert_golden("lane_hold_stop_reload_resume_rpc_ext", &rows);
+}
+
 #[test]
 fn golden_prompt_settled_and_read() {
     let mut h = RpcHarness::spawn(&["--no-extensions"]);
@@ -1201,6 +1260,9 @@ fn golden_prompt_settled_and_read() {
     }));
 
     let settled = h.expect_frame(from_prompt, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    // `agent_idle` is the last settle frame and follows `agent_settled` at once: snapshotting on
+    // `agent_settled` alone recorded it or not depending on when the reader thread got to it.
+    let idle = h.expect_frame(from_prompt, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
 
     let frames_snapshot = h.inbox.0.lock().expect("inbox lock").frames.clone();
     let mut saw_agent_start = false;
@@ -1234,7 +1296,6 @@ fn golden_prompt_settled_and_read() {
             _ => {}
         }
     }
-    let idle = h.expect_frame(from_prompt, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
     assert_eq!(idle, json!({"type": "agent_idle"}));
     let order: Vec<String> = h
         .frames_since(from_prompt)
@@ -2187,6 +2248,88 @@ fn extension_provider_boot() {
     assert_eq!(gone["success"], false, "{gone}");
 
     h.finish();
+}
+
+/// `provider/id` of every model `get_available_models` lists, duplicates kept.
+fn available_model_ids(h: &mut RpcHarness) -> Vec<String> {
+    let (listed, _) = h.request(json!({"type": "get_available_models"}));
+    listed["data"]["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .map(|m| {
+            format!(
+                "{}/{}",
+                m["provider"].as_str().unwrap_or_default(),
+                m["id"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+/// B4 with B1: a reload unloads the extension, whose provider is unregistered, and loads it
+/// again; the core registry then holds the provider exactly once, and the session model on it still
+/// streams. `session_start_notify_ext.ts` loads after `provider_ext.ts`, so its `session_start`
+/// notification reaches the core after that load's provider notifications: waiting for its frame
+/// orders the model listing after them.
+#[test]
+fn extension_provider_survives_reload() {
+    if !bun_on_path() {
+        eprintln!("skipping extension_provider_survives_reload: bun not found on PATH");
+        return;
+    }
+    let provider = fixture_path("provider_ext.ts").display().to_string();
+    let barrier = fixture_path("session_start_notify_ext.ts")
+        .display()
+        .to_string();
+    let mut h = RpcHarness::spawn(&[
+        "-e",
+        &provider,
+        "-e",
+        &barrier,
+        "--model",
+        "fx-prov/m1",
+        "--no-model-fallback",
+    ]);
+    let count = |ids: &[String], id: &str| ids.iter().filter(|i| *i == id).count();
+
+    let ids = available_model_ids(&mut h);
+    assert_eq!(count(&ids, "fx-prov/m1"), 1, "{ids:?}");
+    for round in 1..=2 {
+        let (reloaded, from_reload) = h.request(json!({"type": "reload"}));
+        assert_eq!(reloaded["data"], json!({"cancelled": false}), "{reloaded}");
+        h.expect_frame(
+            from_reload,
+            |f| {
+                f["type"] == "extension_ui_request" && f["params"]["message"] == "fx-barrier:reload"
+            },
+            FRAME_TIMEOUT,
+        );
+        let ids = available_model_ids(&mut h);
+        assert_eq!(count(&ids, "fx-prov/m1"), 1, "round {round}: {ids:?}");
+        assert_eq!(count(&ids, "fx-prov/m2"), 1, "round {round}: {ids:?}");
+        assert!(
+            !ids.iter().any(|i| i.starts_with("fx-gone/")),
+            "round {round}: {ids:?}"
+        );
+    }
+
+    let (_, from_prompt) = h.request(json!({"type": "prompt", "message": "after reload"}));
+    h.expect_frame(from_prompt, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    let sent: Vec<String> = h
+        ._mock
+        .requests
+        .lock()
+        .expect("requests lock")
+        .iter()
+        .map(|b| b["model"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(sent.last().map(String::as_str), Some("m1"), "{sent:?}");
+
+    let stderr = Arc::clone(&h.stderr);
+    h.finish();
+    let stderr = stderr.lock().expect("stderr lock").clone();
+    assert!(!stderr.contains("failed to load"), "{stderr}");
 }
 
 /// Run git in a test memory repository with a fixed author.

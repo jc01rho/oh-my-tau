@@ -1609,7 +1609,16 @@ async fn reload_with_ext(
     // lane). Failures propagate to the client via `CmdError` without dropping session, hold or
     // the previously published command catalog.
     if let Some(ext) = ext {
-        ext.reload().await.map_err(CmdError::from)?;
+        let veto = ext.reload().await.map_err(CmdError::from)?;
+        if veto.cancelled {
+            // A `session_before_reload` handler refused (mhc `reload_veto_json`): nothing was
+            // unloaded, so the published catalog still holds.
+            let mut data = json!({"cancelled": true});
+            if let Some(reason) = veto.reason {
+                data["reason"] = json!(reason);
+            }
+            return ok(data);
+        }
     }
     let commands = slash::try_dynamic_commands_for(rt, ext)
         .await
@@ -2768,6 +2777,132 @@ mod tests {
             kept_names.contains(&"new_cmd".to_string()),
             "{kept_names:?}"
         );
+
+        ext.host.shutdown().await.unwrap();
+    }
+
+    /// `reload` keeps mhc's order: `session_before_reload` first, and a veto answers
+    /// `{cancelled, reason}` with nothing unloaded or loaded. Unvetoed, the flags are read, every
+    /// extension is unloaded, the extensions load again, the flag value the load put back to its
+    /// default is set again, and only then comes `session_start` with reason `reload`.
+    #[tokio::test]
+    async fn reload_honours_the_veto_and_restores_flags_before_session_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.jsonl");
+        let veto = dir.path().join("veto");
+        std::fs::write(&veto, "1").unwrap();
+        let script = dir.path().join("reload-order-host.sh");
+        std::fs::write(
+            &script,
+            concat!(
+                "while IFS= read -r line; do\n",
+                "  printf '%s\\n' \"$line\" >> \"$REQ_LOG\"\n",
+                "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n",
+                "  case \"$line\" in\n",
+                "    *'\"type\":\"session_before_reload\"'*)\n",
+                "      if [ -f \"$VETO_FILE\" ]; then r='{\"cancel\":true,\"reason\":\"busy\"}'; else r=null; fi\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"result\":%s,\"handlers\":[],\"errors\":[]}}\\n' \"$id\" \"$r\";;\n",
+                "    *'\"method\":\"list_flags\"'*)\n",
+                "      if grep -q '\"method\":\"load\"' \"$REQ_LOG\"; then v=default; else v=custom; fi\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[{\"name\":\"mode\",\"extension\":\"ext\",\"value\":\"%s\"},{\"name\":\"unset\",\"extension\":\"ext\"}]}\\n' \"$id\" \"$v\";;\n",
+                "    *'\"method\":\"load\"'*)\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"loaded\":[{\"path\":\"ext.ts\",\"name\":\"ext\",\"handlers\":{\"session_start\":1,\"session_before_reload\":1}}],\"errors\":[]}}\\n' \"$id\";;\n",
+                "    *'\"method\":\"list_commands\"'*|*'\"method\":\"list_tools\"'*)\n",
+                "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":[]}\\n' \"$id\";;\n",
+                "    *)\n",
+                "      if [ -n \"$id\" ]; then\n",
+                "        printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{}}\\n' \"$id\"\n",
+                "      fi;;\n",
+                "  esac\n",
+                "done\n",
+            ),
+        )
+        .unwrap();
+        let host = omp_ext::ExtHost::spawn(&omp_ext::HostConfig {
+            bun: "/bin/sh".into(),
+            host_script: script,
+            trace: None,
+            handler_timeout_ms: None,
+            env: vec![
+                ("REQ_LOG".into(), log.display().to_string()),
+                ("VETO_FILE".into(), veto.display().to_string()),
+            ],
+            shared_socket: None,
+        })
+        .await
+        .unwrap();
+        let ext = crate::ext::Extensions::for_test(host, dir.path());
+        let (rt, _rx) = rpc_test_runtime(dir.path()).await;
+        // Every request the host answered, in wire order (it logs a line before answering it).
+        let sent = || -> Vec<Value> {
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+
+        let vetoed = response(
+            Some(&json!("r1")),
+            "reload",
+            reload_with_ext(&rt, Some(&ext)).await,
+        );
+        assert_eq!(vetoed["success"], json!(true), "{vetoed}");
+        assert_eq!(vetoed["data"], json!({"cancelled": true, "reason": "busy"}));
+        let vetoed_requests = sent();
+        assert_eq!(vetoed_requests.len(), 1, "{vetoed_requests:?}");
+        assert_eq!(
+            vetoed_requests[0]["params"]["event"]["type"],
+            "session_before_reload"
+        );
+
+        std::fs::remove_file(&veto).unwrap();
+        let reloaded = response(
+            Some(&json!("r2")),
+            "reload",
+            reload_with_ext(&rt, Some(&ext)).await,
+        );
+        assert_eq!(reloaded["data"], json!({"cancelled": false}), "{reloaded}");
+        let requests = sent();
+        let steps: Vec<String> = requests[1..]
+            .iter()
+            .map(|r| match r["method"].as_str().unwrap_or_default() {
+                "emit" => format!(
+                    "emit:{}",
+                    r["params"]["event"]["type"].as_str().unwrap_or_default()
+                ),
+                method => method.to_owned(),
+            })
+            .collect();
+        let at = |step: &str| {
+            steps
+                .iter()
+                .position(|s| s == step)
+                .unwrap_or_else(|| panic!("{step} missing: {steps:?}"))
+        };
+        for pair in [
+            "emit:session_before_reload",
+            "list_flags",
+            "unload_all",
+            "load",
+            "set_flag_value",
+            "emit:session_start",
+        ]
+        .windows(2)
+        {
+            assert!(at(pair[0]) < at(pair[1]), "{steps:?}");
+        }
+        let restored: Vec<&Value> = requests
+            .iter()
+            .filter(|r| r["method"] == "set_flag_value")
+            .map(|r| &r["params"])
+            .collect();
+        assert_eq!(restored, [&json!({"name": "mode", "value": "custom"})]);
+        let start = requests
+            .iter()
+            .find(|r| r["params"]["event"]["type"] == "session_start")
+            .unwrap();
+        assert_eq!(start["params"]["event"]["reason"], "reload");
 
         ext.host.shutdown().await.unwrap();
     }

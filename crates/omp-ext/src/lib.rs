@@ -12,5 +12,5 @@ pub mod lifecycle;
 
 pub use host::{
     CommandInfo, EmitResult, ExtHost, HandlerRecord, HostConfig, HostMessage, LoadResult,
-    LoadedExtension, LoadedProvider, ToolInfo,
+    LoadedExtension, LoadedProvider, ToolInfo, UnloadResult,
 };
