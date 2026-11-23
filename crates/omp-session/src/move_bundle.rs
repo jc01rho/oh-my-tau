@@ -797,7 +797,7 @@ pub fn export_session(o: &ExportOptions<'_>) -> Result<MoveManifest, MoveError> 
     ));
     remove(&staging)?;
     let session_copy = staging.join(SESSION_BUNDLE_PATH);
-    copy_file(o.session_file, &session_copy)?;
+    copy_session_for_export(o.session_file, &session_copy)?;
     let mut state_files = Vec::new();
     if let Some(state) = &state {
         for from in files_under(state)? {
@@ -1700,6 +1700,47 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), MoveError> {
         .map_err(|e| MoveError::io("write", path, &e))
 }
 
+fn line_is_type(bytes: &[u8], expected: &str) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(text.trim_end_matches(['\r', '\n']))
+        .ok()
+        .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|t| t == expected)
+}
+
+/// Copy a sealed session file into a move bundle, dropping any leading `title` slot line so
+/// line 1 is always the `session` header (`mhc`/`senpi` and `session-identity` require it).
+fn copy_session_for_export(source: &Path, destination: &Path) -> Result<(), MoveError> {
+    use std::io::BufRead;
+    let file = fs::File::open(source).map_err(|e| MoveError::io("open", source, &e))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut first = Vec::new();
+    let n1 = reader
+        .read_until(b'\n', &mut first)
+        .map_err(|e| MoveError::io("read", source, &e))?;
+    if n1 > 0 && line_is_type(&first, "title") {
+        let mut second = Vec::new();
+        let n2 = reader
+            .read_until(b'\n', &mut second)
+            .map_err(|e| MoveError::io("read", source, &e))?;
+        if n2 > 0 && line_is_type(&second, "session") {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(|e| MoveError::io("create", parent, &e))?;
+            }
+            let mut out = fs::File::create(destination)
+                .map_err(|e| MoveError::io("create", destination, &e))?;
+            out.write_all(&second)
+                .and_then(|()| std::io::copy(&mut reader, &mut out).map(|_| ()))
+                .map_err(|e| MoveError::io("write", destination, &e))?;
+            return Ok(());
+        }
+    }
+    drop(reader);
+    copy_file(source, destination)
+}
+
 fn copy_file(from: &Path, to: &Path) -> Result<(), MoveError> {
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent).map_err(|e| MoveError::io("create", parent, &e))?;
@@ -1974,9 +2015,11 @@ mod tests {
         assert_eq!(read_manifest(&bundle).unwrap(), manifest);
         assert_eq!(manifest.dropped_user_messages, vec!["owed".to_owned()]);
         assert_eq!(manifest.source_cwd, "/repo");
+        let original = fs::read_to_string(&file).unwrap();
+        let (_, expected_body) = original.split_once('\n').unwrap();
         assert_eq!(
-            fs::read(bundle.join(SESSION_BUNDLE_PATH)).unwrap(),
-            fs::read(&file).unwrap()
+            fs::read_to_string(bundle.join(SESSION_BUNDLE_PATH)).unwrap(),
+            expected_body
         );
         verify_bundle(&bundle, &manifest).unwrap();
         let mut bytes = fs::read(bundle.join(SESSION_BUNDLE_PATH)).unwrap();
@@ -2041,17 +2084,17 @@ mod tests {
         let sessions = dir.path().join("b");
         let landed = import(&bundle, Path::new("/laptop/repo"), &sessions, &ledger).unwrap();
         assert_eq!(landed, sessions.join(&manifest.session_file_name));
-        // Only the header changed: the title slot and every later line are the sender's bytes.
+        // The exported bundle drops the leading title slot so line 1 is the `session` header;
+        // only the header's `cwd` changes on landing, and every later line stays byte for byte.
         let original = fs::read_to_string(&file).unwrap();
         let moved = fs::read_to_string(&landed).unwrap();
         let (sent, got): (Vec<&str>, Vec<&str>) =
             (original.lines().collect(), moved.lines().collect());
-        assert_eq!(sent[0], got[0], "title slot");
         assert_eq!(
-            serde_json::from_str::<Value>(got[1]).unwrap()["cwd"],
+            serde_json::from_str::<Value>(got[0]).unwrap()["cwd"],
             "/laptop/repo"
         );
-        assert_eq!(sent[2..], got[2..sent.len()]);
+        assert_eq!(sent[2..], got[1..sent.len() - 1]);
         let entries = entries(&landed).unwrap();
         assert_eq!(custom_type(entries.last().unwrap()), Some(SESSION_MOVED_IN));
         assert_eq!(session_ownership(&entries), Ownership::Writable);
@@ -2334,5 +2377,37 @@ mod tests {
             prepare_outgoing_state(&file, "../m").unwrap_err().code,
             MoveError::INVALID_REQUEST
         );
+    }
+
+    #[test]
+    fn exported_bundle_puts_session_header_on_first_line_even_with_title_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let titled = session(&dir.path().join("titled"), "s1", "/repo");
+        seal(&titled, "m1", None);
+        let bundle = dir.path().join("bundle-titled");
+        let manifest = export(&titled, "m1", &bundle).unwrap();
+        let exported_text = fs::read_to_string(bundle.join(SESSION_BUNDLE_PATH)).unwrap();
+        let first_line = exported_text.lines().next().expect("header line");
+        let first: Value = serde_json::from_str(first_line).expect("json first line");
+        assert_eq!(first["type"], "session", "line 1 was {first_line}");
+        assert_eq!(first["id"], manifest.session_id);
+        let original = fs::read_to_string(&titled).unwrap();
+        let (_, expected_body) = original.split_once('\n').expect("title slot newline");
+        assert_eq!(exported_text, expected_body);
+        verify_bundle(&bundle, &manifest).unwrap();
+
+        // A session without a leading title slot keeps an exact byte-for-byte copy.
+        let untitled_dir = dir.path().join("untitled");
+        let untitled = untitled_dir.join("2026-11-23T00-00-00-000Z_s2.jsonl");
+        fs::create_dir_all(&untitled_dir).unwrap();
+        fs::write(&untitled, format!("{}\n", header_line("s2", "/repo"))).unwrap();
+        seal(&untitled, "m2", None);
+        let bundle_untitled = dir.path().join("bundle-untitled");
+        let manifest_untitled = export(&untitled, "m2", &bundle_untitled).unwrap();
+        assert_eq!(
+            fs::read(bundle_untitled.join(SESSION_BUNDLE_PATH)).unwrap(),
+            fs::read(&untitled).unwrap()
+        );
+        verify_bundle(&bundle_untitled, &manifest_untitled).unwrap();
     }
 }
