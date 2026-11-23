@@ -174,8 +174,15 @@ try {
     assert((idleState as { persistent?: unknown }).persistent === true, "persistent: true");
   });
 
+  let turns = 0;
+  const prompt = async (message: string) => {
+    turns += 1;
+    const from = lane.frames.length;
+    await lane.request({ type: "prompt", message, streamingBehavior: "followUp" });
+    await lane.expect(f => f.type === "agent_start", from);
+  };
   const settled = lane.frames.length;
-  await lane.request({ type: "prompt", message: "say ok", streamingBehavior: "followUp" });
+  await prompt("say ok");
   await lane.expect(f => f.type === "agent_idle", settled);
   check("a turn opens with agent_start and closes with agent_idle", () => {
     const types = lane.frames.slice(settled).map(f => f.type);
@@ -194,19 +201,17 @@ try {
   await lane.request({ type: "set_client_info", width: 80, capabilities: ["interactive_user"] });
   await lane.request({ type: "set_model", provider: "mock", modelId: "hold" });
   let mark = lane.frames.length;
-  await lane.request({ type: "prompt", message: "hold one", streamingBehavior: "followUp" });
-  await lane.expect(f => f.type === "agent_start", mark);
+  await prompt("hold one");
   check("the gateway lists the lane running after agent_start", () => assert(lane.observed.turn === "running", "running"));
   const interrupted = await lane.request({ type: "interrupt" });
   check("interrupt names the turn it stopped", () => {
     const answer = interruptSchema.parse(interrupted);
-    assert(answer.interrupted && answer.turnId === "2", JSON.stringify(answer));
+    assert(answer.interrupted && answer.turnId === String(turns), JSON.stringify(answer));
   });
   await lane.expect(f => f.type === "agent_idle", mark);
 
   mark = lane.frames.length;
-  await lane.request({ type: "prompt", message: "hold two", streamingBehavior: "followUp" });
-  await lane.expect(f => f.type === "agent_start", mark);
+  await prompt("hold two");
   const effectId = `move-abort-${crypto.randomUUID()}`;
   const aborted = await lane.request({ type: "abort", awaitIdle: true, effectId });
   check("abort awaitIdle answers {idle:true} after the turn ended", () => {
@@ -220,12 +225,11 @@ try {
 
   // Stop, then resume.
   mark = lane.frames.length;
-  await lane.request({ type: "prompt", message: "hold three", streamingBehavior: "followUp" });
-  await lane.expect(f => f.type === "agent_start", mark);
+  await prompt("hold three");
   const stopped = await lane.request({ type: "interrupt", intent: "stop" });
   check("interrupt stop names its turn and pauses the lane", () => {
     const answer = interruptSchema.parse(stopped);
-    assert(answer.interrupted && answer.turnId === "4", JSON.stringify(answer));
+    assert(answer.interrupted && answer.turnId === String(turns), JSON.stringify(answer));
   });
   await lane.expect(f => f.type === "agent_idle", mark);
   check("the gateway lists the lane paused", () => assert(lane.observed.paused, "paused"));
