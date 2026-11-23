@@ -883,6 +883,21 @@ fn tree(entries: &[Value]) -> Vec<Value> {
     build(entries, None, &known)
 }
 
+/// How long `abort` with `awaitIdle` waits for the session to go idle.
+const AWAIT_IDLE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn await_idle_limit(cmd: &Value) -> Result<std::time::Duration, CmdError> {
+    match cmd.get("awaitIdleTimeoutMs") {
+        None | Some(Value::Null) => Ok(AWAIT_IDLE_DEFAULT),
+        Some(v) => v
+            .as_u64()
+            .map(std::time::Duration::from_millis)
+            .ok_or_else(|| {
+                CmdError::coded_params("awaitIdleTimeoutMs must be a non-negative integer.")
+            }),
+    }
+}
+
 async fn run_bash(rt: &Arc<Runtime>, command: &str) -> CmdResult {
     // TS `executeBash`: a `user_bash` handler's result replaces the execution.
     if let Some(host) = rt.ext_host().filter(|h| h.has_handlers("user_bash")) {
@@ -908,6 +923,7 @@ async fn run_bash(rt: &Arc<Runtime>, command: &str) -> CmdResult {
     rt.set(|s| s.running_bash(Some(controller)));
     let result = shell::execute(&rt.cwd, command, &signal).await;
     rt.set(|s| s.running_bash(None));
+    rt.bash_finished();
     let r = result.map_err(CmdError::from)?;
     let mut v = json!({
         "output": r.output,
@@ -1046,15 +1062,33 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
             ok(json!({"promoted": rt.promote_queued(message)}))
         }
         "abort" => {
-            rt.abort().await;
-            none()
+            let await_idle = cmd.get("awaitIdle").and_then(Value::as_bool) == Some(true);
+            let limit = await_idle_limit(cmd)?;
+            let run = async {
+                rt.abort().await;
+                let idle = if await_idle {
+                    rt.await_idle(limit).await
+                } else {
+                    rt.is_idle().await
+                };
+                json!({"idle": idle})
+            };
+            match cmd.get("effectId").and_then(Value::as_str) {
+                Some(effect) => ok(rt.once_per_effect(effect, run).await),
+                None => ok(run.await),
+            }
         }
         "interrupt" => {
-            match crate::pause::parse_intent(cmd).map_err(CmdError::coded_params)? {
+            let intent = crate::pause::parse_intent(cmd).map_err(CmdError::coded_params)?;
+            let turn = rt.running_turn_id().await;
+            match intent {
                 crate::pause::InterruptIntent::Stop => rt.pause_for_stop().await?,
                 crate::pause::InterruptIntent::Abort => rt.abort().await,
             }
-            ok(json!({"interrupted": false}))
+            match turn {
+                Some(turn_id) => ok(json!({"interrupted": true, "turnId": turn_id})),
+                None => ok(json!({"interrupted": false})),
+            }
         }
         "set_client_info" => {
             rt.set_client_info(cmd)?;
@@ -1099,8 +1133,29 @@ async fn dispatch(rt: &Arc<Runtime>, cmd: &Value, kind: &str) -> CmdResult {
         }
         "reload" => reload_with_ext(rt, crate::rpc::slash::extensions().as_ref()).await,
         "resume_session" => {
-            rt.release_pause("resume_session");
-            none()
+            let Some(released) = rt.release_pause("resume_session") else {
+                return ok(json!({
+                    "resumed": false,
+                    "pauseSeq": rt.pause_seq(),
+                    "turnStarted": false,
+                    "deliveredNotices": 0,
+                    "deliveredHeldInputs": 0,
+                }));
+            };
+            let flushed = match released.flush {
+                Some(pass) => pass.await.unwrap_or_default(),
+                None => crate::tools::subagents::Flushed::default(),
+            };
+            // Input queued while held (steering, follow-ups, monitor wakes) stays queued for the
+            // next turn (pinned by `monitor_wake_held_next_turn`), so the resume itself delivers
+            // no held input and only a delivered notice can start a turn.
+            ok(json!({
+                "resumed": true,
+                "pauseSeq": released.seq,
+                "turnStarted": flushed.turn_started,
+                "deliveredNotices": flushed.notices,
+                "deliveredHeldInputs": 0,
+            }))
         }
         "abort_and_prompt" => {
             let message = str_field(cmd, "message")?.to_string();
