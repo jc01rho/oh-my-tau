@@ -2586,8 +2586,7 @@ fn memory_notice_reaches_a_message_queued_into_a_running_turn() {
     let last_pin = lane
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|e| e["customType"] == "omo-memory:projection-pin")
-        .next_back()
+        .rfind(|e| e["customType"] == "omo-memory:projection-pin")
         .unwrap_or_else(|| panic!("no projection pin entry: {lane}"));
     assert_eq!(last_pin["data"]["revision"], pinned.as_str(), "{last_pin}");
     assert_eq!(
