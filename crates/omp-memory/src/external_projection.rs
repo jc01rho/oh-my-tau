@@ -86,6 +86,8 @@ struct Layout {
     legend: bool,
     directories: Vec<DirectoryListing>,
     allowances: Vec<usize>,
+    /// How many rows of `directories` the section keeps; the rest are omitted whole.
+    kept: usize,
 }
 
 /// Locale-style case-insensitive comparison (`a.localeCompare(b)`).
@@ -721,7 +723,7 @@ fn marker(omitted: usize, pointer: &str) -> String {
     format!("(+{omitted} more; read {pointer} to list)")
 }
 
-fn layout(paths: &[String], input: Option<&ExternalProjectionInput>) -> Layout {
+fn layout(paths: &[String], input: Option<&ExternalProjectionInput>) -> Option<Layout> {
     let limits = input.map_or(
         ExternalProjectionLimits {
             max_entries_per_directory: 0,
@@ -770,12 +772,55 @@ fn layout(paths: &[String], input: Option<&ExternalProjectionInput>) -> Layout {
             legend,
         );
     }
-    Layout {
+    // Directory labels alone can exceed the budget: omit whole rows (from the end of the
+    // deterministic order) and report the count, rather than emitting an over-budget section.
+    let mut kept = directories.len();
+    if limits.max_bytes > 0 {
+        while section_bytes(&directories, &allowances, kept, root_bare, legend) > limits.max_bytes {
+            kept -= 1;
+            if kept == 0 {
+                break;
+            }
+        }
+        if section_bytes(&directories, &allowances, kept, root_bare, legend) > limits.max_bytes {
+            return None;
+        }
+    }
+    Some(Layout {
         root_bare,
         legend,
         directories,
         allowances,
+        kept,
+    })
+}
+
+/// Bytes `render` would emit for `directories[..kept]`, including the omitted-row summary.
+fn section_bytes(
+    directories: &[DirectoryListing],
+    allowances: &[usize],
+    kept: usize,
+    root_bare: bool,
+    legend: bool,
+) -> usize {
+    let mut total = OPEN.len()
+        + (if legend { NAME_LEGEND } else { NAME_NOTE }).len()
+        + CLOSE.len()
+        + if root_bare {
+            format!("{MEMORY_DIR}/").len()
+        } else {
+            0
+        };
+    let kept = kept.min(directories.len());
+    for (directory, allowance) in directories.iter().zip(allowances).take(kept) {
+        total += line_bytes(std::slice::from_ref(directory), 0, *allowance) + 1;
     }
+    let dropped = directories.len() - kept;
+    if dropped > 0 {
+        total += marker(dropped, &format!("{MEMORY_DIR}/")).len() + 1;
+    }
+    // The opening frame, the name note, the root pointer and the closing tag are separate lines.
+    total + (2 + usize::from(root_bare) + usize::from(kept > 0))
 }
 
 fn line_bytes(directories: &[DirectoryListing], index: usize, allowance: usize) -> usize {
@@ -857,7 +902,12 @@ fn render(layout: &Layout) -> String {
     if layout.root_bare {
         lines.push(format!("{MEMORY_DIR}/"));
     }
-    for (directory, allowance) in layout.directories.iter().zip(&layout.allowances) {
+    for (directory, allowance) in layout
+        .directories
+        .iter()
+        .zip(&layout.allowances)
+        .take(layout.kept)
+    {
         let allowance = (*allowance).min(directory.items.len());
         let shown = directory.items[..allowance]
             .iter()
@@ -876,11 +926,88 @@ fn render(layout: &Layout) -> String {
         };
         lines.push(format!("{}: {shown}{suffix}", directory.label));
     }
+    let dropped = layout.directories.len() - layout.kept;
+    if dropped > 0 {
+        lines.push(marker(dropped, &format!("{MEMORY_DIR}/")));
+    }
     lines.push(CLOSE.to_owned());
     lines.join("\n")
 }
 
 #[must_use]
 pub fn render_external_projection(paths: &[String], input: &ExternalProjectionInput) -> String {
-    render(&layout(paths, Some(input)))
+    layout(paths, Some(input)).map_or(String::new(), |layout| render(&layout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn budget(max_bytes: usize) -> ExternalProjectionInput {
+        ExternalProjectionInput {
+            limits: ExternalProjectionLimits {
+                max_entries_per_directory: 0,
+                max_bytes,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// One note in each of `count` distinct directories whose names are `width` bytes long. The
+    /// notes differ, so no two directories fold into one row.
+    fn wide_directories(count: usize, width: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| {
+                let head = format!("dir-{index:04}-");
+                let tail = "q".repeat(width - head.len());
+                format!("{head}{tail}/note-{index}.md")
+            })
+            .collect()
+    }
+
+    fn kept_rows(rendered: &str) -> usize {
+        rendered
+            .lines()
+            .filter(|line| line.starts_with("dir-"))
+            .count()
+    }
+
+    #[test]
+    fn directory_rows_alone_over_the_budget_are_omitted_whole_and_counted() {
+        let paths = wide_directories(1000, 80);
+        let rendered = render_external_projection(&paths, &budget(40_960));
+
+        assert!(rendered.len() <= 40_960, "{} bytes", rendered.len());
+        let kept = kept_rows(&rendered);
+        assert!(kept > 0 && kept < paths.len(), "{kept} rows kept");
+        let summary = marker(paths.len() - kept, &format!("{MEMORY_DIR}/"));
+        assert!(rendered.contains(&summary), "missing {summary}");
+        assert!(rendered.starts_with(OPEN) && rendered.ends_with(CLOSE));
+        // Whole rows: every kept row is the full label and its one note.
+        for line in rendered.lines().filter(|line| line.starts_with("dir-")) {
+            assert!(line.ends_with(".md") || line.contains(": note-"), "{line}");
+        }
+        assert_eq!(
+            rendered,
+            render_external_projection(&paths, &budget(40_960)),
+            "the same input renders the same section"
+        );
+    }
+
+    #[test]
+    fn budget_below_the_frame_and_summary_omits_the_section() {
+        let paths = wide_directories(50, 80);
+        assert_eq!(render_external_projection(&paths, &budget(10)), "");
+    }
+
+    #[test]
+    fn projection_that_fits_keeps_its_layout() {
+        let paths = wide_directories(5, 20);
+        let unbounded = render_external_projection(&paths, &budget(0));
+        assert_eq!(
+            render_external_projection(&paths, &budget(40_960)),
+            unbounded
+        );
+        assert_eq!(kept_rows(&unbounded), 5);
+    }
 }

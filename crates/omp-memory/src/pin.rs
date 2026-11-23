@@ -76,6 +76,8 @@ struct ResolvedPin {
 pub struct NativeProjectionPins {
     now: Box<dyn Fn() -> i64 + Send + Sync>,
     live: Mutex<BTreeMap<String, LivePin>>,
+    /// Records whose journal append failed: retried verbatim, never re-selected.
+    pending: Mutex<BTreeMap<String, ProjectionPinRecord>>,
     refresh_epoch: AtomicU64,
     refresh_requested_at_ms: Mutex<i64>,
 }
@@ -102,8 +104,53 @@ impl NativeProjectionPins {
         Self {
             now,
             live: Mutex::new(BTreeMap::new()),
+            pending: Mutex::new(BTreeMap::new()),
             refresh_epoch: AtomicU64::new(0),
             refresh_requested_at_ms: Mutex::new(i64::MIN),
+        }
+    }
+
+    /// Journal the record, or keep it for a verbatim retry when the append failed.
+    fn record_or_defer(
+        &self,
+        session_id: &str,
+        record: ProjectionPinRecord,
+        writer: &dyn Fn(&ProjectionPinRecord) -> bool,
+    ) {
+        if writer(&record) {
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(session_id);
+            return;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_owned(), record);
+    }
+
+    /// Retry a record whose append failed earlier: the same revision and pinned time, so a
+    /// restart restores what this session actually showed rather than the previous pin.
+    fn flush_pending(
+        &self,
+        session_id: &str,
+        writer: &dyn Fn(&ProjectionPinRecord) -> bool,
+    ) {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned();
+        let Some(record) = pending else {
+            return;
+        };
+        if writer(&record) {
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(session_id);
         }
     }
 
@@ -160,12 +207,7 @@ impl NativeProjectionPins {
         let reason = if stale_by_refresh {
             Some(ProjectionRepinReason::Refresh)
         } else {
-            repin_reason(
-                repo,
-                state.as_ref(),
-                cached.is_none(),
-                compaction_id.as_deref(),
-            )?
+            repin_reason(repo, state.as_ref(), compaction_id.as_deref())?
         };
         Ok(ResolvedPin {
             compaction_id,
@@ -184,8 +226,9 @@ impl NativeProjectionPins {
         repo: &MemoryRepo,
         session_id: &str,
         branch: &[Value],
-        record: &dyn Fn(&ProjectionPinRecord),
+        record: &dyn Fn(&ProjectionPinRecord) -> bool,
     ) -> Result<ProjectionTurn, RepoError> {
+        self.flush_pending(session_id, record);
         let ResolvedPin {
             compaction_id,
             state,
@@ -220,7 +263,7 @@ impl NativeProjectionPins {
             suppression_generation: None,
         };
         self.store_live(session_id, fresh.clone());
-        record(&fresh);
+        self.record_or_defer(session_id, fresh, record);
         Ok(ProjectionTurn {
             revision: head,
             as_of_ms: now,
@@ -241,8 +284,9 @@ impl NativeProjectionPins {
         repo: &MemoryRepo,
         session_id: &str,
         branch: &[Value],
-        record: &dyn Fn(&ProjectionPinRecord),
+        record: &dyn Fn(&ProjectionPinRecord) -> bool,
     ) -> Result<ProjectionTurn, RepoError> {
+        self.flush_pending(session_id, record);
         let head = repo.head()?;
         let ResolvedPin {
             compaction_id,
@@ -263,7 +307,7 @@ impl NativeProjectionPins {
                 suppression_generation: None,
             };
             self.store_live(session_id, fresh.clone());
-            record(&fresh);
+            self.record_or_defer(session_id, fresh, record);
             return Ok(ProjectionTurn {
                 revision: head,
                 as_of_ms: now,
@@ -301,7 +345,7 @@ impl NativeProjectionPins {
             ..state.clone()
         };
         self.store_live(session_id, advanced.clone());
-        record(&advanced);
+        self.record_or_defer(session_id, advanced, record);
         if changes.is_empty() {
             return Ok(ProjectionTurn {
                 revision: state.revision,
@@ -333,7 +377,7 @@ impl NativeProjectionPins {
         &self,
         session_id: &str,
         through_ms: i64,
-        record: &dyn Fn(&ProjectionPinRecord),
+        record: &dyn Fn(&ProjectionPinRecord) -> bool,
     ) {
         let cached = self
             .live
@@ -358,7 +402,7 @@ impl NativeProjectionPins {
                     epoch,
                 },
             );
-        record(&noticed);
+        self.record_or_defer(session_id, noticed, record);
     }
 
     /// Clear cached live pin for `session_id` (e.g. on `/clear` or reload).
@@ -373,7 +417,6 @@ impl NativeProjectionPins {
 fn repin_reason(
     repo: &MemoryRepo,
     state: Option<&ProjectionPinRecord>,
-    loaded_from_branch: bool,
     compaction_id: Option<&str>,
 ) -> Result<Option<ProjectionRepinReason>, RepoError> {
     let Some(state) = state else {
@@ -382,9 +425,8 @@ fn repin_reason(
     if state.compaction_id.as_deref() != compaction_id {
         return Ok(Some(ProjectionRepinReason::Compaction));
     }
-    if !loaded_from_branch {
-        return Ok(None);
-    }
+    // A live pin can lose its commits to a history rewrite and prune just like a journaled one:
+    // reusing it would keep compiling a revision that no longer exists.
     for rev in [state.revision.as_deref(), state.noticed_through.as_deref()]
         .into_iter()
         .flatten()
@@ -684,7 +726,10 @@ mod tests {
         let pins = NativeProjectionPins::with_now(Box::new(|| 100));
         let recorded = RefCell::new(Vec::new());
         let first = pins
-            .advance(&repo, "s1", &[], &|r| recorded.borrow_mut().push(r.clone()))
+            .advance(&repo, "s1", &[], &|r| {
+                recorded.borrow_mut().push(r.clone());
+                true
+            })
             .unwrap();
         assert_eq!(first.repinned, Some(ProjectionRepinReason::FirstTurn));
         assert!(first.changes.is_none());
@@ -692,7 +737,10 @@ mod tests {
         commit_file(&repo, "reference/new.md", "new");
         commit_file(&repo, "system/persona.md", "second");
         let second = pins
-            .advance(&repo, "s1", &[], &|r| recorded.borrow_mut().push(r.clone()))
+            .advance(&repo, "s1", &[], &|r| {
+                recorded.borrow_mut().push(r.clone());
+                true
+            })
             .unwrap();
         assert_eq!(second.revision, first.revision);
         assert_eq!(second.repinned, None);
@@ -702,7 +750,10 @@ mod tests {
         assert!(notice.contains("updated system/persona.md"));
 
         let third = pins
-            .advance(&repo, "s1", &[], &|r| recorded.borrow_mut().push(r.clone()))
+            .advance(&repo, "s1", &[], &|r| {
+                recorded.borrow_mut().push(r.clone());
+                true
+            })
             .unwrap();
         assert!(third.changes.is_none());
     }
@@ -715,20 +766,23 @@ mod tests {
         let original = NativeProjectionPins::with_now(Box::new(|| 42));
         let recorded = RefCell::new(Vec::new());
         let first = original
-            .ensure_pinned(&repo, "s1", &[], &|r| recorded.borrow_mut().push(r.clone()))
+            .ensure_pinned(&repo, "s1", &[], &|r| {
+                recorded.borrow_mut().push(r.clone());
+                true
+            })
             .unwrap();
         commit_file(&repo, "reference/later.md", "later");
 
         let resumed = NativeProjectionPins::with_now(Box::new(|| 99));
         let branch = [pin_entry(&recorded.borrow()[0])];
         let restored = resumed
-            .ensure_pinned(&repo, "s1", &branch, &|_| {})
+            .ensure_pinned(&repo, "s1", &branch, &|_| true)
             .unwrap();
         assert_eq!(restored.revision, first.revision);
         assert_eq!(restored.as_of_ms, 42);
         assert_eq!(restored.repinned, None);
 
-        let turn = resumed.advance(&repo, "s1", &branch, &|_| {}).unwrap();
+        let turn = resumed.advance(&repo, "s1", &branch, &|_| true).unwrap();
         assert_eq!(turn.revision, first.revision);
         assert_eq!(turn.changes.unwrap().added, vec!["reference/later.md"]);
     }
@@ -740,14 +794,18 @@ mod tests {
         commit_file(&repo, "system/persona.md", "v1");
         let pins = NativeProjectionPins::with_now(Box::new(|| 1));
         let records = RefCell::new(Vec::new());
-        pins.advance(&repo, "s1", &[], &|r| records.borrow_mut().push(r.clone()))
+        pins.advance(&repo, "s1", &[], &|r| {
+            records.borrow_mut().push(r.clone());
+            true
+        })
             .unwrap();
         commit_file(&repo, "system/persona.md", "v2");
 
         let compact_branch = [json!({"type": "compaction", "id": "c1"})];
         let after_compact = pins
             .advance(&repo, "s1", &compact_branch, &|r| {
-                records.borrow_mut().push(r.clone())
+                records.borrow_mut().push(r.clone());
+                true
             })
             .unwrap();
         assert_eq!(
@@ -760,7 +818,8 @@ mod tests {
         pins.request_refresh();
         let after_refresh = pins
             .advance(&repo, "s1", &compact_branch, &|r| {
-                records.borrow_mut().push(r.clone())
+                records.borrow_mut().push(r.clone());
+                true
             })
             .unwrap();
         assert_eq!(after_refresh.repinned, Some(ProjectionRepinReason::Refresh));
@@ -778,7 +837,7 @@ mod tests {
         };
         let fresh_pins = NativeProjectionPins::new();
         let after_missing = fresh_pins
-            .advance(&repo, "s2", &[pin_entry(&vanished)], &|_| {})
+            .advance(&repo, "s2", &[pin_entry(&vanished)], &|_| true)
             .unwrap();
         assert_eq!(
             after_missing.repinned,
@@ -801,5 +860,124 @@ mod tests {
         assert!(line.contains("reference/19.md"));
         assert!(!line.contains("reference/20.md"));
         assert!(line.contains("5 more"));
+    }
+
+    /// Drop a commit's loose object, the way a history rewrite followed by a prune does.
+    fn prune_commit(repo: &MemoryRepo, sha: &str) {
+        let object = repo
+            .root()
+            .join(".git/objects")
+            .join(&sha[..2])
+            .join(&sha[2..]);
+        std::fs::remove_file(object).unwrap();
+    }
+
+    #[test]
+    fn live_pin_whose_commit_was_pruned_repins_to_head() {
+        let root = init_repo("pin-live-pruned-revision");
+        let repo = MemoryRepo::open(&root, "pin-agent").unwrap();
+        commit_file(&repo, "system/persona.md", "v1");
+        let pinned = repo.head().unwrap().unwrap();
+        let pins = NativeProjectionPins::with_now(Box::new(|| 1));
+        pins.advance(&repo, "s1", &[], &|_| true).unwrap();
+        commit_file(&repo, "system/persona.md", "v2");
+        // The notice cursor reaches the second commit while the pin stays on the first.
+        pins.advance(&repo, "s1", &[], &|_| true).unwrap();
+        prune_commit(&repo, &pinned);
+
+        let turn = pins.advance(&repo, "s1", &[], &|_| true).unwrap();
+        assert_eq!(turn.repinned, Some(ProjectionRepinReason::MissingRevision));
+        assert_eq!(turn.revision, repo.head().unwrap());
+    }
+
+    #[test]
+    fn live_notice_cursor_that_was_pruned_repins_instead_of_failing_the_range_lookup() {
+        let root = init_repo("pin-live-pruned-cursor");
+        let repo = MemoryRepo::open(&root, "pin-agent").unwrap();
+        commit_file(&repo, "system/persona.md", "v1");
+        let pins = NativeProjectionPins::with_now(Box::new(|| 1));
+        pins.advance(&repo, "s1", &[], &|_| true).unwrap();
+        commit_file(&repo, "system/persona.md", "v2");
+        pins.advance(&repo, "s1", &[], &|_| true).unwrap();
+        let cursor = repo.head().unwrap().unwrap();
+        commit_file(&repo, "system/persona.md", "v3");
+        prune_commit(&repo, &cursor);
+
+        let turn = pins
+            .advance(&repo, "s1", &[], &|_| true)
+            .expect("a pruned cursor repins instead of failing");
+        assert_eq!(turn.repinned, Some(ProjectionRepinReason::MissingRevision));
+        assert_eq!(turn.revision, repo.head().unwrap());
+    }
+
+    #[test]
+    fn live_pin_with_both_commits_present_is_kept() {
+        let root = init_repo("pin-live-intact");
+        let repo = MemoryRepo::open(&root, "pin-agent").unwrap();
+        commit_file(&repo, "system/persona.md", "v1");
+        let pinned = repo.head().unwrap();
+        let pins = NativeProjectionPins::with_now(Box::new(|| 1));
+        pins.advance(&repo, "s1", &[], &|_| true).unwrap();
+        commit_file(&repo, "reference/new.md", "new");
+
+        let turn = pins.advance(&repo, "s1", &[], &|_| true).unwrap();
+        assert_eq!(turn.repinned, None);
+        assert_eq!(turn.revision, pinned);
+        assert!(turn.changes.is_some());
+    }
+
+    #[test]
+    fn failed_pin_write_is_retried_verbatim_without_repinning() {
+        let root = init_repo("pin-retry-write");
+        let repo = MemoryRepo::open(&root, "pin-agent").unwrap();
+        commit_file(&repo, "system/persona.md", "v1");
+        let pins = NativeProjectionPins::with_now(Box::new(|| 1));
+        pins.advance(&repo, "s1", &[], &|_| true).unwrap();
+        pins.request_refresh();
+        let written = RefCell::new(Vec::new());
+        let failing = |r: &ProjectionPinRecord| {
+            written.borrow_mut().push(r.clone());
+            false
+        };
+        let selected = pins.advance(&repo, "s1", &[], &failing).unwrap();
+        assert_eq!(selected.repinned, Some(ProjectionRepinReason::Refresh));
+        // The repo moves on while the record is still unwritten.
+        commit_file(&repo, "system/persona.md", "v2");
+
+        let records = RefCell::new(Vec::new());
+        let retried = pins
+            .advance(&repo, "s1", &[], &|r| {
+                records.borrow_mut().push(r.clone());
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            records.borrow().first(),
+            written.borrow().first(),
+            "the retry writes the same record"
+        );
+        assert_eq!(retried.repinned, None, "the retry is not a repin");
+        assert_eq!(retried.revision, selected.revision);
+        assert_eq!(retried.as_of_ms, selected.as_of_ms);
+        assert_eq!(retried.now_ms, selected.now_ms);
+        assert_ne!(retried.revision, repo.head().unwrap());
+    }
+
+    #[test]
+    fn retried_pin_write_stops_once_it_lands() {
+        let root = init_repo("pin-retry-once");
+        let repo = MemoryRepo::open(&root, "pin-agent").unwrap();
+        commit_file(&repo, "system/persona.md", "v1");
+        let pins = NativeProjectionPins::with_now(Box::new(|| 1));
+        pins.advance(&repo, "s1", &[], &|_| false).unwrap();
+        pins.advance(&repo, "s1", &[], &|_| true).unwrap();
+
+        let after = RefCell::new(0usize);
+        pins.advance(&repo, "s1", &[], &|_| {
+            *after.borrow_mut() += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(*after.borrow(), 0, "a landed record is not rewritten");
     }
 }

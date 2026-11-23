@@ -311,15 +311,24 @@ fn render_projection(
     }
 
     if !system_files.is_empty() || !external_paths.is_empty() {
-        lines.push(String::new());
-        lines.push("<memory>".to_string());
-        if !system_files.is_empty() {
-            lines.push(render_system_tree(system_files));
+        // A bounded external section can be omitted whole when it cannot fit its budget; the
+        // `<memory>` wrapper then covers only what is actually rendered.
+        let external_section = if external_paths.is_empty() {
+            String::new()
+        } else {
+            render_external_projection(external_paths, external)
+        };
+        if !system_files.is_empty() || !external_section.is_empty() {
+            lines.push(String::new());
+            lines.push("<memory>".to_string());
+            if !system_files.is_empty() {
+                lines.push(render_system_tree(system_files));
+            }
+            if !external_section.is_empty() {
+                lines.push(external_section);
+            }
+            lines.push("</memory>".to_string());
         }
-        if !external_paths.is_empty() {
-            lines.push(render_external_projection(external_paths, external));
-        }
-        lines.push("</memory>".to_string());
     }
 
     lines.join("\n")
@@ -829,5 +838,40 @@ mod tests {
                 expires_at_ms: expires,
             }]
         );
+    }
+
+    #[test]
+    fn external_section_over_a_tiny_budget_leaves_no_empty_memory_slot() {
+        let root = init_repo("proj-tiny-budget");
+        let repo = MemoryRepo::open(&root, "prompt-agent").unwrap();
+        commit_file(
+            &repo,
+            "system/human.md",
+            "---\ndescription: Human\n---\nfixture person\n",
+        );
+        commit_file(
+            &repo,
+            "notes/facts/example.md",
+            "---\ndescription: Example\n---\nfixture fact\n",
+        );
+        let head = repo.head().unwrap();
+        let compiled = compile_memory_block_at_revision(
+            &repo,
+            head.as_deref(),
+            &CompileMemoryBlockOptions {
+                agent_id: "prompt-agent".into(),
+                projection: Some(ExternalProjectionLimits {
+                    max_entries_per_directory: 0,
+                    max_bytes: 10,
+                }),
+            },
+            now_ms(),
+        )
+        .unwrap();
+
+        assert!(compiled.degraded.is_empty(), "{:?}", compiled.degraded);
+        assert!(compiled.block.contains("fixture person"));
+        assert!(!compiled.block.contains("<external_projection>"));
+        assert!(!compiled.block.contains("\n\n</memory>"), "{}", compiled.block);
     }
 }
