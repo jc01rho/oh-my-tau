@@ -1921,3 +1921,66 @@ fn golden_monitor_completion_joins_the_next_turn_after_a_hold() {
     h.finish();
     assert_golden("monitor_wake_held_next_turn", &rows);
 }
+
+/// B1: a provider an extension registers is resolvable at launch (`--model` names it before
+/// any notification is served), listed by `get_available_models`, selectable with
+/// `set_model`, and streams to its own base URL; an unregistered one stays gone.
+#[test]
+fn extension_provider_boot() {
+    if !bun_on_path() {
+        eprintln!("skipping extension_provider_boot: bun not found on PATH");
+        return;
+    }
+    let ext_file = fixture_path("provider_ext.ts");
+    let ext_arg = ext_file.display().to_string();
+    let mut h = RpcHarness::spawn(&[
+        "-e",
+        &ext_arg,
+        "--model",
+        "fx-prov/m1",
+        "--no-model-fallback",
+    ]);
+
+    let (state, _) = h.request(json!({"type": "get_state"}));
+    let stderr = h.stderr_text();
+    assert_eq!(state["success"], true, "{state}\nstderr: {stderr}");
+    assert_eq!(state["data"]["model"]["provider"], "fx-prov", "{state}");
+    assert_eq!(state["data"]["model"]["id"], "m1", "{state}");
+
+    let (listed, _) = h.request(json!({"type": "get_available_models"}));
+    let ids: Vec<String> = listed["data"]["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .map(|m| {
+            format!(
+                "{}/{}",
+                m["provider"].as_str().unwrap_or_default(),
+                m["id"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    assert!(ids.iter().any(|i| i == "fx-prov/m1"), "{ids:?}");
+    assert!(ids.iter().any(|i| i == "fx-prov/m2"), "{ids:?}");
+    assert!(!ids.iter().any(|i| i.starts_with("fx-gone/")), "{ids:?}");
+
+    let (_, from_prompt) = h.request(json!({"type": "prompt", "message": "hello"}));
+    h.expect_frame(from_prompt, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    let sent: Vec<String> = h
+        ._mock
+        .requests
+        .lock()
+        .expect("requests lock")
+        .iter()
+        .map(|b| b["model"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(sent.last().map(String::as_str), Some("m1"), "{sent:?}");
+
+    let (switched, _) =
+        h.request(json!({"type": "set_model", "provider": "fx-prov", "modelId": "m2"}));
+    assert_eq!(switched["success"], true, "{switched}");
+    let (gone, _) = h.request(json!({"type": "set_model", "provider": "fx-gone", "modelId": "g1"}));
+    assert_eq!(gone["success"], false, "{gone}");
+
+    h.finish();
+}

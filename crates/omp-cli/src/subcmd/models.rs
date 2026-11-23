@@ -204,7 +204,7 @@ pub fn browser_models(dir: &omp_providers::AgentDir) -> Vec<BrowserModel> {
             put(&provider, &entry, &mut map, &mut meta);
         }
     }
-    for (provider, entry) in yml_custom_models(&yml_path) {
+    for (provider, entry) in custom_models_with_extensions(&yml_path) {
         if let Some(model) = custom_model(&provider, &entry) {
             let key = (model.provider.clone(), model.id.clone());
             meta.insert(key.clone(), (String::new(), None));
@@ -310,7 +310,7 @@ fn collect_all(
         }
     }
 
-    for (provider, entry) in yml_custom_models(&yml_path) {
+    for (provider, entry) in custom_models_with_extensions(&yml_path) {
         if let Some(model) = custom_model(&provider, &entry) {
             out.insert(
                 (model.provider.clone(), model.id.clone()),
@@ -489,10 +489,15 @@ fn apply_overrides(
 
 /// TS availability: `models.yml` providers ∪ credential-backed providers.
 fn available_providers(models_yml: &Path, agent_db: &Path) -> std::collections::BTreeSet<String> {
-    let mut set: std::collections::BTreeSet<String> = yml_custom_models(models_yml)
+    let mut set: std::collections::BTreeSet<String> = custom_models_with_extensions(models_yml)
         .into_iter()
         .map(|(provider, _)| provider)
         .collect();
+    set.extend(
+        omp_providers::extension::snapshot()
+            .into_iter()
+            .map(|(name, _)| name),
+    );
     // Any provider declared in models.yml is available (TS `Config.providers`
     // ∪ credentials), not just ones with inline `models:` entries — a
     // baseUrl + apiKey provider with discovery-fed cache rows resolves too.
@@ -580,6 +585,22 @@ fn yml_custom_models(path: &Path) -> Vec<(String, Value)> {
                     out.push((name.clone(), entry.clone()));
                 }
             }
+        }
+    }
+    out
+}
+
+/// [`yml_custom_models`] with the extension-registered providers laid over it: a
+/// registration replaces the file's provider of the same name.
+fn custom_models_with_extensions(path: &Path) -> Vec<(String, Value)> {
+    let registered = omp_providers::extension::snapshot();
+    let mut out: Vec<(String, Value)> = yml_custom_models(path)
+        .into_iter()
+        .filter(|(provider, _)| !registered.iter().any(|(name, _)| name == provider))
+        .collect();
+    for (name, config) in registered {
+        if let Some(models) = config.get("models").and_then(Value::as_array) {
+            out.extend(models.iter().map(|entry| (name.clone(), entry.clone())));
         }
     }
     out

@@ -133,6 +133,18 @@ pub struct LoadedExtension {
 pub struct LoadResult {
     pub loaded: Vec<LoadedExtension>,
     pub errors: Vec<LoadError>,
+    /// Providers registered (`pi.registerProvider`) and still alive after the load.
+    #[serde(default)]
+    pub providers: Vec<LoadedProvider>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LoadedProvider {
+    pub name: String,
+    #[serde(default)]
+    pub extension: String,
+    #[serde(default)]
+    pub config: Value,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

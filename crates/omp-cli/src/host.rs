@@ -721,6 +721,15 @@ async fn open_session(
     let failed =
         |what: &str, e: anyhow::Error| CmdError::coded(format!("{what}: {e:#}"), "open_failed");
     let cwd = &request.cwd;
+    // Extensions start before the model resolves: `--model` may name a provider an extension
+    // registers (`pi.registerProvider`).
+    let mut ext = None;
+    if !launch.no_extensions && crate::ext::has_extensions(&launch.extensions) {
+        match crate::ext::Extensions::start(cwd, &launch.extensions).await {
+            Ok(e) => ext = Some(e),
+            Err(e) => eprintln!("omt: {}: extensions disabled: {e:#}", request.id),
+        }
+    }
     let mut selected = match crate::model::select(launch.model.as_deref()).await {
         Ok(selected) => selected,
         // The gateway's move host launches without `--model`, and a move never prompts: a
@@ -747,13 +756,6 @@ async fn open_session(
         selected.thinking = crate::runtime::parse_level(level).ok_or_else(|| {
             CmdError::coded(format!("unknown thinking level: {level}"), "open_failed")
         })?;
-    }
-    let mut ext = None;
-    if !launch.no_extensions && crate::ext::has_extensions(&launch.extensions) {
-        match crate::ext::Extensions::start(cwd, &launch.extensions).await {
-            Ok(e) => ext = Some(e),
-            Err(e) => eprintln!("omt: {}: extensions disabled: {e:#}", request.id),
-        }
     }
     let extra_tools = match ext.as_ref() {
         Some(e) => e.tools().await.unwrap_or_default(),
