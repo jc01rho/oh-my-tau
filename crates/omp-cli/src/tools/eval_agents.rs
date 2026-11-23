@@ -106,6 +106,14 @@ fn hooks() -> Result<std::sync::RwLockReadGuard<'static, Option<EvalRuntimeHooks
         .map(|slot| slot.read().expect("eval runtime hooks lock"))
 }
 
+/// The parent session's live model as a child `--model` candidate (TS
+/// `parentActiveModelPattern`); `None` when this process has no live target.
+pub(crate) fn parent_model_selector() -> Option<String> {
+    provider_target()
+        .ok()
+        .map(|target| format!("{}/{}", target.model.provider, target.model.id))
+}
+
 /// The live provider target (TS `session.getActiveModel`-backed `default` tier).
 fn provider_target() -> Result<crate::adapter::ProviderTarget, String> {
     if let Some(scope) = crate::scope::current() {

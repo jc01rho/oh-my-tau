@@ -258,14 +258,33 @@ fn agent_model_chain(agent: &omp_task::agent::AgentDefinition) -> Option<String>
         .map(|chain| chain.join(","))
 }
 
-/// Effective `--model` for one spawn: the caller's per-task selector first,
-/// then the agent definition's chain; `None` leaves the child on its
-/// configured default (`modelRoles.default`), the TS last-resort fallback.
-fn effective_model(item_model: Option<&str>, agent_model: Option<&str>) -> Option<String> {
-    item_model
-        .or(agent_model)
-        .filter(|model| !model.trim().is_empty())
-        .map(str::to_owned)
+/// Effective `--model` for one spawn: the caller's per-task selector alone
+/// (an explicit request is never substituted), else the agent definition's
+/// chain or the configured `default` role, followed by the parent's live model
+/// (TS `resolveModelOverrideWithAuthFallback`'s `parentActiveModelPattern`).
+/// Without that last entry a child on an install with no `modelRoles.default`
+/// died at startup ("'default' is neither 'provider/id' nor a modelRoles
+/// role") while its parent ran fine on an extension-registered model.
+fn effective_model(
+    item_model: Option<&str>,
+    agent_model: Option<&str>,
+    parent_model: Option<&str>,
+) -> Option<String> {
+    if let Some(item) = item_model {
+        return (!item.trim().is_empty()).then(|| item.to_owned());
+    }
+    let agent = agent_model.filter(|model| !model.trim().is_empty());
+    match parent_model.filter(|model| !model.trim().is_empty()) {
+        Some(parent) => {
+            let chain = agent.unwrap_or("default");
+            if chain.split(',').any(|entry| entry.trim() == parent) {
+                Some(chain.to_owned())
+            } else {
+                Some(format!("{chain},{parent}"))
+            }
+        }
+        None => agent.map(str::to_owned),
+    }
 }
 
 /// Stamp one spawn with its agent definition's model chain. [`TaskSpec`]
@@ -277,7 +296,12 @@ pub(crate) fn apply_agent_model(spec: &mut TaskSpec) {
         .as_deref()
         .and_then(|home| find_agent(&spec.cwd, home, &spec.agent))
         .and_then(|agent| agent_model_chain(&agent));
-    spec.model = effective_model(spec.model.as_deref(), agent_model.as_deref());
+    let parent_model = super::eval_agents::parent_model_selector();
+    spec.model = effective_model(
+        spec.model.as_deref(),
+        agent_model.as_deref(),
+        parent_model.as_deref(),
+    );
 }
 
 /// The role a selector names before expansion (`@smol:high` → `smol`), reported
@@ -884,16 +908,40 @@ mod tests {
     fn model_precedence_task_over_agent_over_default() {
         let agent = Some("anthropic/claude-haiku-5-5");
         assert_eq!(
-            effective_model(Some("zai/glm-5.3-flash"), agent).as_deref(),
+            effective_model(Some("zai/glm-5.3-flash"), agent, None).as_deref(),
             Some("zai/glm-5.3-flash")
         );
         assert_eq!(
-            effective_model(None, agent).as_deref(),
+            effective_model(None, agent, None).as_deref(),
             Some("anthropic/claude-haiku-5-5")
         );
-        assert_eq!(effective_model(None, None), None);
+        assert_eq!(effective_model(None, None, None), None);
         // An empty selector is no override at all.
-        assert_eq!(effective_model(Some("  "), agent), None);
+        assert_eq!(effective_model(Some("  "), agent, None), None);
+    }
+
+    /// The parent's live model closes every chain the caller did not pick
+    /// explicitly, so a child never depends on `modelRoles.default` existing.
+    #[test]
+    fn parent_model_backs_up_default_and_agent_chains() {
+        let parent = Some("omomeow-opus/claude-opus-5-5");
+        assert_eq!(
+            effective_model(None, None, parent).as_deref(),
+            Some("default,omomeow-opus/claude-opus-5-5")
+        );
+        assert_eq!(
+            effective_model(None, Some("anthropic/claude-haiku-5-5"), parent).as_deref(),
+            Some("anthropic/claude-haiku-5-5,omomeow-opus/claude-opus-5-5")
+        );
+        assert_eq!(
+            effective_model(None, Some("omomeow-opus/claude-opus-5-5"), parent).as_deref(),
+            Some("omomeow-opus/claude-opus-5-5")
+        );
+        // An explicit per-call model is never substituted.
+        assert_eq!(
+            effective_model(Some("zai/glm-5.3-flash"), None, parent).as_deref(),
+            Some("zai/glm-5.3-flash")
+        );
     }
 
     /// A project `.omp/agents` definition shadows the user-level one, and a
