@@ -70,15 +70,15 @@ Origin: `PrimeIntellect-ai/prime-agent` (Rust crates). MIT, with the prime-agent
 crediting the original TypeScript product. License text:
 [`vendor/LICENSE-prime-agent`](../vendor/LICENSE-prime-agent).
 These crates are **modified** here — they are not verbatim upstream copies — and they are
-co-versioned with this workspace (`version.workspace = true`, currently `0.13.1`) rather
+co-versioned with this workspace (`version.workspace = true`, currently `0.13.2`) rather
 than tracking an upstream crate version.
 
 | Crate | Version | Fork base commit | Modification record |
 | --- | --- | --- | --- |
-| `pa-types` | `0.13.1` (workspace) | **not recorded** | delta note: `vendor/pa-types/NOTICE` |
-| `pa-ai` | `0.13.1` (workspace) | **not recorded** | delta note: `vendor/pa-ai/NOTICE`; bedrock h2c transport, provider registry extensions |
-| `pa-models` | `0.13.1` (workspace) | **not recorded** | delta note: `vendor/pa-models/NOTICE`; `src/models_generated.rs` is hand-maintained (no generator — §4.10) |
-| `pa-agent` | `0.13.1` (workspace) | **not recorded** | delta note: `vendor/pa-agent/NOTICE` |
+| `pa-types` | `0.13.2` (workspace) | **not recorded** | delta note: `vendor/pa-types/NOTICE` |
+| `pa-ai` | `0.13.2` (workspace) | **not recorded** | delta note: `vendor/pa-ai/NOTICE`; bedrock h2c transport, provider registry extensions |
+| `pa-models` | `0.13.2` (workspace) | **not recorded** | delta note: `vendor/pa-models/NOTICE`; `src/models_generated.rs` is hand-maintained (no generator — §4.10) |
+| `pa-agent` | `0.13.2` (workspace) | **not recorded** | delta note: `vendor/pa-agent/NOTICE` |
 
 `vendor-src.lock` carries no `pa-*` entries — that gap is deliberate here rather than
 forgotten: the fork base has not been established, so there is nothing to pin yet.
