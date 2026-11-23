@@ -1012,6 +1012,65 @@ fn golden_lane_hold_stop_reload_resume() {
     assert_golden("lane_hold_stop_reload_resume", &rows);
 }
 
+/// `lane_hold_stop_reload_resume` with the RPC extension (`rpc_ext.ts`) loaded: it answers before
+/// the stop, after each of two reloads and after the resume. A reload used to load the extension a
+/// second time into the same host, where `rpc.handle` failed with `duplicate extension rpc handler`.
+#[test]
+fn golden_lane_hold_stop_reload_resume_rpc_ext() {
+    if !bun_on_path() {
+        eprintln!("skipping golden_lane_hold_stop_reload_resume_rpc_ext: bun not found on PATH");
+        return;
+    }
+    let ext_arg = fixture_path("rpc_ext.ts").display().to_string();
+    let mut h = RpcHarness::spawn(&["-e", &ext_arg]);
+    let stderr = Arc::clone(&h.stderr);
+    let move_ready = json!({"type": "extension_request", "name": "omomeow.move-readiness"});
+
+    let (sci, _) = h.request(json!({
+        "type": "set_client_info",
+        "width": 80,
+        "capabilities": ["interactive_user"],
+    }));
+    assert_eq!(sci["success"], true);
+
+    let (ready, _) = h.request(move_ready.clone());
+    assert_eq!(ready["data"], json!({"activeSources": []}), "{ready}");
+
+    let (stop_ok, from_stop) = h.request(json!({"type": "interrupt", "intent": "stop"}));
+    assert_eq!(stop_ok["success"], true);
+    let paused_evt = h.expect_frame(from_stop, |f| f["type"] == "session_paused", FRAME_TIMEOUT);
+    h.record_in(paused_evt);
+
+    for _ in 0..2 {
+        let (reloaded, _) = h.request(json!({"type": "reload"}));
+        assert_eq!(reloaded["success"], true, "{reloaded}");
+        assert_eq!(reloaded["data"]["cancelled"], false);
+        let (ready, _) = h.request(move_ready.clone());
+        assert_eq!(ready["data"], json!({"activeSources": []}), "{ready}");
+    }
+
+    let (resumed, from_resume) = h.request(json!({"type": "resume_session"}));
+    assert_eq!(resumed["success"], true);
+    let resumed_evt = h.expect_frame(
+        from_resume,
+        |f| f["type"] == "session_resumed",
+        FRAME_TIMEOUT,
+    );
+    h.record_in(resumed_evt);
+
+    let (ready, _) = h.request(move_ready);
+    assert_eq!(ready["data"], json!({"activeSources": []}), "{ready}");
+
+    let rows = h.transcript.clone();
+    h.finish();
+    let stderr = stderr.lock().expect("stderr lock").clone();
+    assert!(
+        !stderr.contains("failed to load"),
+        "a reload must not load the extension on top of itself:\n{stderr}"
+    );
+    assert_golden("lane_hold_stop_reload_resume_rpc_ext", &rows);
+}
+
 #[test]
 fn golden_prompt_settled_and_read() {
     let mut h = RpcHarness::spawn(&["--no-extensions"]);

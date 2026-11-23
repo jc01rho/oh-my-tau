@@ -4,7 +4,7 @@
 //! registers extension tools, serves host->core requests (`append_entry`,
 //! `send_message`, ui frames), and emits omp lifecycle events.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,7 +24,7 @@ use omp_ext::hooks::ExtHooks;
 use omp_ext::lifecycle::{
     self, CacheWarmingDecisionEvent, CacheWarmingOutcome, CompactingOutcome, DiscoveredPath,
     InputSource, LifecycleEvent, PlanReviewBy, PlanReviewChoice, PlanReviewRequest,
-    ResourcesDiscoverOutcome, ResourcesDiscoverReason, SwitchReason,
+    ResourcesDiscoverOutcome, ResourcesDiscoverReason, SessionStartReason, SwitchReason,
 };
 use omp_ext::{ExtHost, HostConfig, HostMessage, ToolInfo};
 use omp_providers::auth::{
@@ -969,6 +969,47 @@ pub struct Extensions {
     mcp: McpNotificationSink,
 }
 
+/// What [`Extensions::reload`] did (mhc `ReloadVetoDecision`): `cancelled` when a
+/// `session_before_reload` handler refused the reload, with the handler's `reason` if it gave one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadVeto {
+    pub cancelled: bool,
+    pub reason: Option<String>,
+}
+
+/// The loaded extensions' flags (`list_flags`) by name, with the current value (`None`: registered
+/// without a default and never set).
+async fn registered_flags(host: &ExtHost) -> Result<BTreeMap<String, Option<Value>>> {
+    let flags = host.request("list_flags", json!({})).await?;
+    Ok(flags
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| {
+            let name = f.get("name")?.as_str()?.to_owned();
+            Some((name, f.get("value").filter(|v| !v.is_null()).cloned()))
+        })
+        .collect())
+}
+
+/// Give the extensions a reload loaded again the flag values read before its unload (mhc
+/// `rebuild_runtime_for_reload`): each name the new load registered gets its old value back where
+/// the load left a different one (its default).
+async fn restore_flags(host: &ExtHost, previous: &BTreeMap<String, Option<Value>>) -> Result<()> {
+    let current = registered_flags(host).await?;
+    for (name, value) in previous {
+        let Some(value) = value else { continue };
+        if current
+            .get(name)
+            .is_some_and(|now| now.as_ref() != Some(value))
+        {
+            host.request("set_flag_value", json!({"name": name, "value": value}))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// `resources_discover` round trip: emit (only when an extension subscribes, TS `hasHandlers`),
 /// then register every returned path with the loader that owns it. Extracted from
 /// [`Extensions::resources_discover`] so the fake-host tests can drive it.
@@ -1478,7 +1519,7 @@ impl Extensions {
 
     /// `session_start` (once per session).
     pub async fn session_start(&self) {
-        emit_silent(self.host.emit_session_start(None).await);
+        emit_silent(self.host.emit_session_start(None, None).await);
     }
 
     /// `resources_discover`: extensions contribute skill, prompt-template and theme paths. Emitted
@@ -1670,13 +1711,44 @@ impl Extensions {
         }
     }
 
-    /// Reload extensions into the live host (`reload`): same `load` + ctx re-send as a
-    /// reconnect recovery, but callable on demand. The session and any hold survive.
+    /// `reload` (mhc `AgentSession::reload`): re-create the extensions in the live host. A
+    /// `session_before_reload` handler may cancel it, and then nothing changes. Otherwise a running
+    /// turn is aborted, every extension gets `session_shutdown` (reason `reload`) and is unloaded
+    /// ([`ExtHost::unload_all`]), the extensions load again and get back the flag values read
+    /// before the unload, and `session_start` (reason `reload`) and `resources_discover` follow.
+    /// The session and any hold survive.
     ///
     /// # Errors
-    /// Transport failure on reload or ctx re-send.
-    pub async fn reload(self: &Arc<Self>) -> Result<()> {
-        self.recover().await
+    /// Transport failure on the veto, the unload, the reload, the flag restore or the ctx re-send.
+    pub async fn reload(self: &Arc<Self>) -> Result<ReloadVeto> {
+        let veto = self.host.emit_session_before_reload(None).await?;
+        if veto.cancel {
+            return Ok(ReloadVeto {
+                cancelled: true,
+                reason: veto
+                    .result
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+        }
+        let rt = self
+            .rt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(rt) = rt {
+            if rt.agent.is_streaming().await {
+                rt.abort().await;
+            }
+        }
+        let flags = registered_flags(&self.host).await?;
+        let unloaded = self.host.unload_all().await?;
+        for err in &unloaded.errors {
+            eprintln!("omt: extension session_shutdown on reload: {err}");
+        }
+        self.load_and_start(Some(&flags)).await?;
+        Ok(ReloadVeto::default())
     }
 
     /// Re-establish session state on a transparently reconnected host.
@@ -1684,6 +1756,21 @@ impl Extensions {
     /// # Errors
     /// Transport failure on reload or ctx re-send.
     async fn recover(self: &Arc<Self>) -> Result<()> {
+        self.load_and_start(None).await
+    }
+
+    /// `load` into the host, then bring the session back to its extensions: ctx re-send, tool
+    /// reconciliation, `session_start`, `resources_discover`, host->core serving. Shared by
+    /// reconnect recovery (`flags: None`: a fresh host) and [`Self::reload`], which hands over the
+    /// flags it read before unloading: their values are set again before `session_start`, which
+    /// then carries reason `reload` (mhc order).
+    ///
+    /// # Errors
+    /// Transport failure on load, flag restore or ctx re-send.
+    async fn load_and_start(
+        self: &Arc<Self>,
+        flags: Option<&BTreeMap<String, Option<Value>>>,
+    ) -> Result<()> {
         let loaded = self
             .host
             .load(
@@ -1699,6 +1786,9 @@ impl Extensions {
             .await?;
         for err in &loaded.errors {
             eprintln!("omt: extension failed to load: {}: {}", err.path, err.error);
+        }
+        if let Some(previous) = flags {
+            restore_flags(&self.host, previous).await?;
         }
         self.send_ctx().await?;
         if !self.extra.is_empty() || self.dir.is_some() {
@@ -1723,7 +1813,8 @@ impl Extensions {
                 self.refresh_branch(rt);
             }
         }
-        emit_silent(self.host.emit_session_start(None).await);
+        let reason = flags.map(|_| SessionStartReason::Reload);
+        emit_silent(self.host.emit_session_start(reason, None).await);
         // A reload re-sends the whole discovered resource set (TS emits `resources_discover` on
         // extension reload); the loaders keep only the newest set.
         self.resources_discover(ResourcesDiscoverReason::Reload)

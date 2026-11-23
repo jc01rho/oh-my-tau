@@ -16,6 +16,7 @@ const RESULTS: Record<string, unknown> = {
   session_before_branch: { cancel: false },
   session_before_tree: { cancel: true },
   session_before_shutdown: { cancel: true },
+  session_before_reload: { cancel: true, reason: "fixture veto" },
   session_stop: { continue: true, additionalContext: "keep going" },
   before_subagent_spawn: { model: ["fx/one:high", "fx/two"], note: "fixture route" },
   user_bash: { result: { output: "handled", exitCode: 0 } },
