@@ -776,14 +776,36 @@ fn layout(paths: &[String], input: Option<&ExternalProjectionInput>) -> Option<L
     // deterministic order) and report the count, rather than emitting an over-budget section.
     let mut kept = directories.len();
     if limits.max_bytes > 0 {
-        while section_bytes(&directories, &allowances, kept, root_bare, legend) > limits.max_bytes {
-            kept -= 1;
-            if kept == 0 {
+        let row_bytes: Vec<usize> = (0..directories.len())
+            .map(|index| line_bytes(&directories, index, allowances[index]))
+            .collect();
+        let fixed_bytes = OPEN.len()
+            + (if legend { NAME_LEGEND } else { NAME_NOTE }).len()
+            + CLOSE.len()
+            + if root_bare {
+                format!("{MEMORY_DIR}/").len()
+            } else {
+                0
+            }
+            + 2
+            + usize::from(root_bare);
+        let root_pointer = format!("{MEMORY_DIR}/");
+        let mut kept_bytes: usize = row_bytes.iter().map(|len| len + 1).sum();
+        loop {
+            let dropped = directories.len() - kept;
+            let summary_bytes = if dropped > 0 {
+                marker(dropped, &root_pointer).len() + 1
+            } else {
+                0
+            };
+            if fixed_bytes + kept_bytes + summary_bytes <= limits.max_bytes {
                 break;
             }
-        }
-        if section_bytes(&directories, &allowances, kept, root_bare, legend) > limits.max_bytes {
-            return None;
+            if kept == 0 {
+                return None;
+            }
+            kept -= 1;
+            kept_bytes -= row_bytes[kept] + 1;
         }
     }
     Some(Layout {
@@ -793,34 +815,6 @@ fn layout(paths: &[String], input: Option<&ExternalProjectionInput>) -> Option<L
         allowances,
         kept,
     })
-}
-
-/// Bytes `render` would emit for `directories[..kept]`, including the omitted-row summary.
-fn section_bytes(
-    directories: &[DirectoryListing],
-    allowances: &[usize],
-    kept: usize,
-    root_bare: bool,
-    legend: bool,
-) -> usize {
-    let mut total = OPEN.len()
-        + (if legend { NAME_LEGEND } else { NAME_NOTE }).len()
-        + CLOSE.len()
-        + if root_bare {
-            format!("{MEMORY_DIR}/").len()
-        } else {
-            0
-        };
-    let kept = kept.min(directories.len());
-    for (directory, allowance) in directories.iter().zip(allowances).take(kept) {
-        total += line_bytes(std::slice::from_ref(directory), 0, *allowance) + 1;
-    }
-    let dropped = directories.len() - kept;
-    if dropped > 0 {
-        total += marker(dropped, &format!("{MEMORY_DIR}/")).len() + 1;
-    }
-    // The opening frame, the name note, the root pointer and the closing tag are separate lines.
-    total + (2 + usize::from(root_bare) + usize::from(kept > 0))
 }
 
 fn line_bytes(directories: &[DirectoryListing], index: usize, allowance: usize) -> usize {
@@ -1005,9 +999,12 @@ mod tests {
         let paths = wide_directories(5, 20);
         let unbounded = render_external_projection(&paths, &budget(0));
         assert_eq!(
-            render_external_projection(&paths, &budget(40_960)),
+            render_external_projection(&paths, &budget(unbounded.len())),
             unbounded
         );
         assert_eq!(kept_rows(&unbounded), 5);
+        let one_less = render_external_projection(&paths, &budget(unbounded.len() - 1));
+        assert!(one_less.len() < unbounded.len(), "{one_less}");
+        assert!(kept_rows(&one_less) < 5, "{one_less}");
     }
 }

@@ -132,11 +132,7 @@ impl NativeProjectionPins {
 
     /// Retry a record whose append failed earlier: the same revision and pinned time, so a
     /// restart restores what this session actually showed rather than the previous pin.
-    fn flush_pending(
-        &self,
-        session_id: &str,
-        writer: &dyn Fn(&ProjectionPinRecord) -> bool,
-    ) {
+    fn flush_pending(&self, session_id: &str, writer: &dyn Fn(&ProjectionPinRecord) -> bool) {
         let pending = self
             .pending
             .lock()
@@ -798,7 +794,7 @@ mod tests {
             records.borrow_mut().push(r.clone());
             true
         })
-            .unwrap();
+        .unwrap();
         commit_file(&repo, "system/persona.md", "v2");
 
         let compact_branch = [json!({"type": "compaction", "id": "c1"})];

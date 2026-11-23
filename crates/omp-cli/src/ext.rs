@@ -1508,6 +1508,24 @@ impl Extensions {
         }
     }
 
+    /// Keep an installed `before_agent_start` override pair `(orig, set)` aligned when memory
+    /// projection synchronization rewrites the live system prompt (`before -> after`).
+    pub fn sync_prompt_override(&self, before: &str, after: &str, apply: &dyn Fn(&str) -> String) {
+        let mut applied = self
+            .prompt_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((orig, set)) = applied.as_mut() else {
+            return;
+        };
+        if *set != before {
+            *applied = None;
+            return;
+        }
+        *orig = apply(orig);
+        *set = after.to_owned();
+    }
+
     /// TS `before_agent_start` (agent-session `#promptAgent`, every mode): handlers may
     /// replace the system prompt and inject messages ahead of the prompt.
     ///
@@ -1585,6 +1603,10 @@ impl Extensions {
                     ext.restore_prompt_override(&rt.agent).await;
                 }
             })
+        })));
+        let ext = self.clone();
+        rt.set_sync_prompt_override_hook(Some(Arc::new(move |before, after, apply| {
+            ext.sync_prompt_override(before, after, apply);
         })));
         // `before_agent_start` runs inside every prompt admission, like TS `#promptAgent`.
         let ext = self.clone();
@@ -4368,5 +4390,278 @@ mod tests {
             resolve_discovered_path("~/ext/themes", cwd),
             PathBuf::from(home).join("ext/themes")
         );
+    }
+
+    async fn prompt_override_compaction_case(mode: &str, expect_base_in_override: bool) {
+        use std::process::Command;
+
+        use omp_compact::CompactionSettings;
+        use omp_memory::identity::BoundMemoryRepo;
+        use omp_memory::repo::MemoryRepo;
+        use pa_agent::agent::{AgentInitialState, AgentOptions};
+        use pa_agent::scripted::ScriptedProvider;
+        use pa_types::ai::{AssistantMessage, Model};
+
+        use crate::adapter::{json_round_trip, ProviderTarget};
+        use crate::compact::SummarizeFn;
+        use crate::memory_projection::MemoryProjectionController;
+
+        fn git(repo: &Path, args: &[&str]) {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        fn commit_persona(repo: &Path, body: &str) {
+            let full = repo.join("system/persona.md");
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, format!("---\ndescription: Persona\n---\n{body}\n")).unwrap();
+            git(repo, &["add", "-A"]);
+            git(repo, &["commit", "-q", "-m", "update persona"]);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("memory");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        git(&repo_dir, &["init", "-q"]);
+        git(&repo_dir, &["config", "core.hooksPath", ".git/hooks"]);
+        commit_persona(&repo_dir, "persona-v1");
+
+        let mode_file = dir.path().join("mode.txt");
+        std::fs::write(&mode_file, mode).unwrap();
+
+        let host_py = dir.path().join("host.py");
+        std::fs::write(
+            &host_py,
+            concat!(
+                "import json, os, sys\n",
+                "mode_file = os.environ['MODE_FILE']\n",
+                "for line in sys.stdin:\n",
+                "    line = line.strip()\n",
+                "    if not line:\n",
+                "        continue\n",
+                "    req = json.loads(line)\n",
+                "    rid = req.get('id')\n",
+                "    if rid is None:\n",
+                "        continue\n",
+                "    method = req.get('method')\n",
+                "    if method == 'load':\n",
+                "        res = {'loaded': [{'path': 'ext.ts', 'name': 'ext', 'handlers': {'before_agent_start': 1}}], 'errors': []}\n",
+                "    elif method == 'emit' and req.get('params', {}).get('event', {}).get('type') == 'before_agent_start':\n",
+                "        cur = open(mode_file).read().strip()\n",
+                "        if cur == 'append':\n",
+                "            prompts = req['params']['event'].get('systemPrompt') or ['']\n",
+                "            res = {'result': {'systemPrompt': [prompts[0] + '\\n\\nEXT_OVERRIDE_MARKER']}, 'handlers': [], 'errors': []}\n",
+                "        elif cur == 'replace':\n",
+                "            res = {'result': {'systemPrompt': ['EXT_WHOLE_REPLACEMENT']}, 'handlers': [], 'errors': []}\n",
+                "        else:\n",
+                "            res = {'result': None, 'handlers': [], 'errors': []}\n",
+                "    else:\n",
+                "        res = {'result': None, 'handlers': [], 'errors': []}\n",
+                "    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': res}) + '\\n')\n",
+                "    sys.stdout.flush()\n",
+            ),
+        )
+        .unwrap();
+
+        let host = sh_host(
+            dir.path(),
+            "exec python3 -u \"$HOST_PY\"\n",
+            vec![
+                ("MODE_FILE".into(), mode_file.display().to_string()),
+                ("HOST_PY".into(), host_py.display().to_string()),
+            ],
+        )
+        .await;
+
+        let pa_model: Model = serde_json::from_value(json!({
+            "id": "a", "name": "a", "api": "openai-completions", "provider": "p",
+            "baseUrl": "http://127.0.0.1:9", "reasoning": false, "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 100_000, "maxTokens": 4096
+        }))
+        .unwrap();
+        let provider = Arc::new(ScriptedProvider::new(
+            json_round_trip(&pa_model).expect("agent model"),
+        ));
+        for i in 0..3 {
+            provider.push_text_turn(&format!("answer {i} {}", "y".repeat(400)));
+        }
+        let agent = Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                system_prompt: Some("base prompt".into()),
+                model: json_round_trip(&pa_model),
+                thinking_level: Some(pa_agent::types::ThinkingLevel::Off),
+                tools: Some(Vec::new()),
+                messages: None,
+            },
+            stream_fn: Some(provider.stream_fn()),
+            ..AgentOptions::default()
+        });
+        let persist = crate::persist::attach_in(
+            &agent,
+            dir.path(),
+            dir.path(),
+            None,
+            crate::persist::uuid_v7(),
+        )
+        .await
+        .expect("session");
+        let target = Arc::new(std::sync::RwLock::new(Some(ProviderTarget {
+            api_key: Some("k".into()),
+            model: pa_model,
+            service_tier: None,
+            headers: None,
+            credential_id: None,
+        })));
+        let bound = BoundMemoryRepo {
+            repo: MemoryRepo::open(&repo_dir, "agent").expect("open memory repo"),
+            root: repo_dir.clone(),
+            agent_id: "agent".to_owned(),
+            from_env: false,
+            used_legacy: false,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = Runtime::start_with_memory(
+            Arc::new(agent),
+            target,
+            dir.path().to_path_buf(),
+            persist,
+            tx,
+            MemoryProjectionController::for_test_bound(bound),
+        )
+        .await;
+        let ext = sh_ext(host, dir.path());
+        ext.attach(rt.clone());
+        rt.set_compaction_settings(CompactionSettings {
+            enabled: false,
+            keep_recent_tokens: 50,
+            ..CompactionSettings::default()
+        });
+        let summarizer: SummarizeFn = Arc::new(|_req| {
+            Box::pin(async move {
+                let msg: AssistantMessage = serde_json::from_value(json!({
+                    "content": [{"type": "text", "text": "FAKE SUMMARY"}],
+                    "api": "openai-completions", "provider": "p", "model": "a",
+                    "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                              "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+                    "stopReason": "stop", "timestamp": 1
+                }))
+                .unwrap();
+                Ok(msg)
+            })
+        });
+        rt.set_summarizer(Some(summarizer));
+
+        for i in 0..2 {
+            rt.prompt(
+                None,
+                &format!("question {i} {}", "x".repeat(400)),
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect("prompt");
+            loop {
+                let f = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                    .await
+                    .expect("frame")
+                    .expect("open");
+                if f["type"] == "session_settled" {
+                    break;
+                }
+            }
+        }
+        let before_compact_prompt = provider
+            .calls()
+            .last()
+            .and_then(|c| c.system_prompt.clone())
+            .unwrap_or_default();
+        if expect_base_in_override {
+            assert!(
+                before_compact_prompt.contains("EXT_OVERRIDE_MARKER")
+                    && before_compact_prompt.contains("persona-v1"),
+                "{before_compact_prompt}"
+            );
+        } else {
+            assert!(
+                before_compact_prompt.contains("EXT_WHOLE_REPLACEMENT"),
+                "{before_compact_prompt}"
+            );
+        }
+
+        // Advance memory while the extension prompt override is still installed, then compact.
+        commit_persona(&repo_dir, "persona-v2");
+        rt.compact(None, None).await.expect("compact");
+        let after_compact_live = rt.agent.system_prompt().await;
+        assert!(
+            after_compact_live.contains("persona-v2"),
+            "compaction should sync memory: {after_compact_live}"
+        );
+
+        // Next turn has no extension override: the original base prompt must be restored with v2.
+        std::fs::write(&mode_file, "none").unwrap();
+        rt.prompt(None, "after compaction", None, Vec::new())
+            .await
+            .expect("post-compaction prompt");
+        loop {
+            let f = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("frame")
+                .expect("open");
+            if f["type"] == "session_settled" {
+                break;
+            }
+        }
+
+        let final_prompt = provider
+            .calls()
+            .last()
+            .and_then(|c| c.system_prompt.clone())
+            .unwrap_or_default();
+        assert!(
+            final_prompt.contains("base prompt"),
+            "original base prompt was lost: {final_prompt}"
+        );
+        assert!(
+            final_prompt.contains("persona-v2"),
+            "restored base prompt kept stale memory: {final_prompt}"
+        );
+        assert!(
+            !final_prompt.contains("persona-v1"),
+            "restored base prompt still has old memory: {final_prompt}"
+        );
+        assert!(
+            !final_prompt.contains("EXT_OVERRIDE_MARKER")
+                && !final_prompt.contains("EXT_WHOLE_REPLACEMENT"),
+            "extension prompt override leaked into later turn: {final_prompt}"
+        );
+        ext.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_memory_sync_preserves_restorable_base_across_extension_prompt_override() {
+        prompt_override_compaction_case("append", true).await;
+    }
+
+    #[tokio::test]
+    async fn compaction_memory_sync_preserves_restorable_base_after_full_override() {
+        prompt_override_compaction_case("replace", false).await;
     }
 }

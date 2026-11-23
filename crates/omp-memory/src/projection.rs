@@ -872,6 +872,10 @@ mod tests {
         assert!(compiled.degraded.is_empty(), "{:?}", compiled.degraded);
         assert!(compiled.block.contains("fixture person"));
         assert!(!compiled.block.contains("<external_projection>"));
-        assert!(!compiled.block.contains("\n\n</memory>"), "{}", compiled.block);
+        assert!(
+            !compiled.block.contains("\n\n</memory>"),
+            "{}",
+            compiled.block
+        );
     }
 }

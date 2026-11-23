@@ -19,8 +19,16 @@ use serde_json::{json, Value};
 
 use crate::persist::Persistence;
 
+#[derive(Clone, PartialEq, Eq)]
+struct CacheKey {
+    session_id: String,
+    revision: Option<String>,
+    as_of_ms: i64,
+}
+
 #[derive(Default)]
 struct CachedProjection {
+    key: Option<CacheKey>,
     sentinel_block: Option<String>,
     expiries: Vec<MemoryExpiry>,
 }
@@ -45,6 +53,15 @@ impl MemoryProjectionController {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test_bound(bound: BoundMemoryRepo) -> Self {
+        Self {
+            bound: Some(bound),
+            pins: NativeProjectionPins::new(),
+            state: Mutex::default(),
+        }
+    }
+
     #[must_use]
     pub fn request_recompile(&self) -> Option<String> {
         let bound = self.bound.as_ref()?;
@@ -60,14 +77,7 @@ impl MemoryProjectionController {
         branch: &[Value],
     ) {
         let Some(bound) = self.bound.as_ref() else {
-            {
-                let mut guard = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.sentinel_block = None;
-                guard.expiries.clear();
-            }
+            self.clear_cache();
             let current = agent.system_prompt().await;
             let stripped = strip_memory_block(&current);
             if stripped != current {
@@ -83,29 +93,63 @@ impl MemoryProjectionController {
             }) {
             Ok(turn) => turn,
             Err(err) => {
+                self.clear_cache();
                 eprintln!("omt: memory projection pin failed: {err}");
                 return;
             }
         };
 
-        self.compile_and_apply(agent, bound, turn.revision.as_deref(), turn.as_of_ms)
-            .await;
+        let expected = CacheKey {
+            session_id: session_id.to_owned(),
+            revision: turn.revision.clone(),
+            as_of_ms: turn.as_of_ms,
+        };
+        if !self.cache_matches(&expected, turn.repinned.is_some()) {
+            self.clear_cache();
+        }
+        self.compile_and_apply(agent, bound, expected).await;
     }
 
-    pub async fn apply_cached(&self, agent: &Agent) {
+    fn clear_cache(&self) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.key = None;
+        guard.sentinel_block = None;
+        guard.expiries.clear();
+    }
+
+    fn cache_matches(&self, expected: &CacheKey, repinned: bool) -> bool {
+        if repinned {
+            return false;
+        }
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.key.as_ref() == Some(expected) && guard.sentinel_block.is_some()
+    }
+
+    #[must_use]
+    pub fn apply_cached_to_prompt(&self, prompt: &str) -> String {
         let sentinel = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .sentinel_block
             .clone();
-        let current = agent.system_prompt().await;
-        let updated = match sentinel.as_deref() {
+        match sentinel.as_deref() {
             Some(block) => {
-                replace_memory_block(&current, block).unwrap_or_else(|_| current.clone())
+                replace_memory_block(prompt, block).unwrap_or_else(|_| prompt.to_owned())
             }
-            None => strip_memory_block(&current),
-        };
+            None => strip_memory_block(prompt),
+        }
+    }
+
+    pub async fn apply_cached(&self, agent: &Agent) {
+        let current = agent.system_prompt().await;
+        let updated = self.apply_cached_to_prompt(&current);
         if updated != current {
             agent.set_system_prompt(updated).await;
         }
@@ -129,16 +173,28 @@ impl MemoryProjectionController {
             }
         };
 
-        let needs_compile = turn.repinned.is_some()
-            || self
+        let expected = CacheKey {
+            session_id: session_id.to_owned(),
+            revision: turn.revision.clone(),
+            as_of_ms: turn.as_of_ms,
+        };
+        let needs_compile = {
+            let mut guard = self
                 .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .sentinel_block
-                .is_none();
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let matches = turn.repinned.is_none()
+                && guard.key.as_ref() == Some(&expected)
+                && guard.sentinel_block.is_some();
+            if !matches {
+                guard.key = None;
+                guard.sentinel_block = None;
+                guard.expiries.clear();
+            }
+            !matches
+        };
         if needs_compile {
-            self.compile_and_apply(agent, bound, turn.revision.as_deref(), turn.as_of_ms)
-                .await;
+            self.compile_and_apply(agent, bound, expected).await;
         }
 
         let expiries = self
@@ -169,21 +225,15 @@ impl MemoryProjectionController {
         ))
     }
 
-    async fn compile_and_apply(
-        &self,
-        agent: &Agent,
-        bound: &BoundMemoryRepo,
-        revision: Option<&str>,
-        as_of_ms: i64,
-    ) {
+    async fn compile_and_apply(&self, agent: &Agent, bound: &BoundMemoryRepo, key: CacheKey) {
         let compiled = match compile_memory_block_at_revision(
             &bound.repo,
-            revision,
+            key.revision.as_deref(),
             &CompileMemoryBlockOptions {
                 agent_id: bound.agent_id.clone(),
                 projection: None,
             },
-            as_of_ms,
+            key.as_of_ms,
         ) {
             Ok(compiled) => compiled,
             Err(err) => {
@@ -194,12 +244,16 @@ impl MemoryProjectionController {
         for warning in &compiled.degraded {
             eprintln!("omt: memory projection degraded: {warning}");
         }
+        if !compiled.degraded.is_empty() {
+            return;
+        }
         let sentinel = mark_memory_block(&bound.agent_id, &compiled.block);
         {
             let mut guard = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.key = Some(key);
             guard.sentinel_block = Some(sentinel.clone());
             guard.expiries = compiled.expiries;
         }
@@ -464,7 +518,7 @@ mod tests {
             &f.repo,
             &[("system/persona.md", &memory_file("Persona", "persona-v2"))],
         );
-        f.controller.request_recompile();
+        let _ = f.controller.request_recompile();
         let unreadable = HiddenObject::new(&f.repo, &git(&f.repo, &["rev-parse", "HEAD^{tree}"]));
         f.at(2_000);
         f.prepare().await;
@@ -479,7 +533,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_pending_compile_does_not_borrow_the_previous_pins_expiries() {
-        let gone = |expires: &str| format!("---\ndescription: Gone\nexpires: {expires}\n---\ngone-body\n");
+        let gone =
+            |expires: &str| format!("---\ndescription: Gone\nexpires: {expires}\n---\ngone-body\n");
         let f = Fixture::new(&[
             ("system/persona.md", &memory_file("Persona", "persona-v1")),
             ("system/gone.md", &gone("1970-01-01T00:00:05Z")),
@@ -495,7 +550,7 @@ mod tests {
                 ("system/gone.md", &gone("1970-01-01T00:01:00Z")),
             ],
         );
-        f.controller.request_recompile();
+        let _ = f.controller.request_recompile();
         let unreadable = HiddenObject::new(&f.repo, &git(&f.repo, &["rev-parse", "HEAD^{tree}"]));
         f.at(2_000);
         assert_eq!(f.prepare().await, None);
@@ -522,7 +577,7 @@ mod tests {
             &f.repo,
             &[("system/persona.md", &memory_file("Persona", "persona-v2"))],
         );
-        f.controller.request_recompile();
+        let _ = f.controller.request_recompile();
         let unreadable = HiddenObject::new(&f.repo, &git(&f.repo, &["rev-parse", "HEAD^{tree}"]));
         f.at(2_000);
         f.prepare().await;
@@ -543,7 +598,7 @@ mod tests {
             &f.repo,
             &[("system/persona.md", &memory_file("Persona", "persona-v2"))],
         );
-        f.controller.request_recompile();
+        let _ = f.controller.request_recompile();
         f.persist.set_fail_append(true);
         f.at(2_000);
         f.prepare().await;

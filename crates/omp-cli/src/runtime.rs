@@ -267,6 +267,7 @@ pub struct Runtime {
     /// Extension `before_agent_start` hook run at every prompt admission.
     before_start: Mutex<Option<BeforeStartHook>>,
     restore_prompt: Mutex<Option<RestorePromptHook>>,
+    sync_prompt_override: Mutex<Option<SyncPromptOverrideHook>>,
     /// Native Herdr agent-state reporter (`HERDR_ENV=1` only; `None` elsewhere).
     herdr: Option<std::sync::Arc<crate::herdr::Herdr>>,
     /// `ask`-tool runs currently waiting on the user: >0 means Blocked.
@@ -381,6 +382,8 @@ pub type BeforeStartHook = Arc<
 
 pub type RestorePromptHook =
     Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
+pub type SyncPromptOverrideHook = Arc<dyn Fn(&str, &str, &dyn Fn(&str) -> String) + Send + Sync>;
 
 /// Gate run before a session switch (`session_before_switch`): `true` cancels it.
 pub type SwitchGate = Arc<
@@ -605,6 +608,54 @@ impl Runtime {
         resolver: Resolver,
         recovery_cfg: Option<RecoveryConfig>,
     ) -> Arc<Self> {
+        let memory_projection =
+            crate::memory_projection::MemoryProjectionController::discover(&cwd);
+        Self::start_with_projection(
+            agent,
+            target,
+            cwd,
+            persist,
+            out,
+            resolver,
+            recovery_cfg,
+            memory_projection,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_with_memory(
+        agent: Arc<Agent>,
+        target: Target,
+        cwd: PathBuf,
+        persist: Persistence,
+        out: UnboundedSender<Value>,
+        memory_projection: crate::memory_projection::MemoryProjectionController,
+    ) -> Arc<Self> {
+        Self::start_with_projection(
+            agent,
+            target,
+            cwd,
+            persist,
+            out,
+            recovery::default_resolver(),
+            None,
+            memory_projection,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_projection(
+        agent: Arc<Agent>,
+        target: Target,
+        cwd: PathBuf,
+        persist: Persistence,
+        out: UnboundedSender<Value>,
+        resolver: Resolver,
+        recovery_cfg: Option<RecoveryConfig>,
+        memory_projection: crate::memory_projection::MemoryProjectionController,
+    ) -> Arc<Self> {
         let live = agent.model().await;
         let edit_mode = edit_mode_for(&live.id);
         let recovery_cfg = match recovery_cfg {
@@ -636,8 +687,6 @@ impl Runtime {
             h.set_session(persist.file().as_deref(), Some(&model_ref), "startup");
             h.report(crate::herdr::State::Idle, None);
         });
-        let memory_projection =
-            crate::memory_projection::MemoryProjectionController::discover(&cwd);
         let rt = Arc::new(Self {
             agent,
             target,
@@ -696,6 +745,7 @@ impl Runtime {
             ext_frames: Mutex::new(None),
             before_start: Mutex::new(None),
             restore_prompt: Mutex::new(None),
+            sync_prompt_override: Mutex::new(None),
             compaction_hooks: Mutex::new(None),
             herdr,
             ask_blocked: std::sync::atomic::AtomicU64::new(0),
@@ -3102,6 +3152,10 @@ impl Runtime {
         self.agent.abort();
         self.agent.wait_for_idle().await;
         self.agent.reset().await;
+        let restore = lock(&self.restore_prompt).clone();
+        if let Some(restore) = restore {
+            restore().await;
+        }
         let current_prompt = self.agent.system_prompt().await;
         let stripped_prompt = crate::sysprompt::strip_ultrawork_hook(&current_prompt);
         if stripped_prompt != current_prompt {
@@ -3352,6 +3406,10 @@ impl Runtime {
         self.agent.abort();
         self.agent.wait_for_idle().await;
         self.agent.reset().await;
+        let restore = lock(&self.restore_prompt).clone();
+        if let Some(restore) = restore {
+            restore().await;
+        }
         if fork {
             // TS fork: a NEW file seeded with the branch; the startup file never held anything.
             if self.persist.path() != path {
@@ -3635,12 +3693,26 @@ impl Runtime {
         *lock(&self.restore_prompt) = f;
     }
 
+    pub fn set_sync_prompt_override_hook(&self, f: Option<SyncPromptOverrideHook>) {
+        *lock(&self.sync_prompt_override) = f;
+    }
+
     pub(crate) async fn sync_memory_projection(&self) {
+        let before = self.agent.system_prompt().await;
         let branch = self.branch_entries();
         let session_id = self.session_id();
         self.memory_projection
             .sync_session(&self.agent, &self.persist, &session_id, &branch)
             .await;
+        let after = self.agent.system_prompt().await;
+        if after != before {
+            let sync = lock(&self.sync_prompt_override).clone();
+            if let Some(sync) = sync {
+                sync(&before, &after, &|prompt| {
+                    self.memory_projection.apply_cached_to_prompt(prompt)
+                });
+            }
+        }
     }
 
     pub(crate) async fn prepare_memory_turn(&self) -> Option<AgentMessage> {
