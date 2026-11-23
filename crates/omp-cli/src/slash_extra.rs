@@ -234,6 +234,7 @@ pub fn is_extra_command(name: &str) -> bool {
             | "rlm"
             | "ultra"
             | "collab"
+            | "recompile"
     )
 }
 
@@ -745,7 +746,7 @@ mod tests {
     #[test]
     fn test_extra_catalog_names_all_handled() {
         let catalog = extra_catalog();
-        assert_eq!(catalog.len(), 20, "expected 20 extra commands in catalog");
+        assert_eq!(catalog.len(), 21, "expected 21 extra commands in catalog");
         for cmd in &catalog {
             let name = cmd["name"].as_str().expect("command must have name");
             assert!(
