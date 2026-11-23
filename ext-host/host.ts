@@ -2,7 +2,7 @@
 // omp extension host: loads omp ExtensionAPI extensions (unchanged .ts files) and serves them to the Rust core
 // over JSON-RPC 2.0 on stdio (newline-delimited). Handler aggregation mirrors pi-coding-agent's ExtensionRunner.
 //
-// core -> host requests: load, emit, list_tools, call_tool, cancel_tool, list_commands, call_command, set_ctx, bus_emit, abort_emit, shutdown
+// core -> host requests: load, unload_all, emit, list_tools, call_tool, cancel_tool, list_commands, call_command, set_ctx, bus_emit, abort_emit, shutdown
 // host -> core:          notifications append_entry, send_message, send_user_message, log, ui_notify, set_label,
 //                        provider_registered, provider_unregistered;
 //                        requests compact, navigate_tree, ui_confirm (core may answer with an error → treated as unsupported)
@@ -29,6 +29,9 @@ interface Ext {
   linkSchemes: string[];
   /** Extension RPC names this extension registered (`api.rpc.handle`). */
   rpc: string[];
+  /** What this extension registered on host-wide state, kept after a successful load (and fed by
+   *  its later `api` calls) so `unload_all` can release it; a failed load replays it at once. */
+  track: LoadTracker;
   label?: string;
 }
 
@@ -447,7 +450,8 @@ interface FlagWrite {
   rev: number;
 }
 
-/** Undo everything a failed load registered, so nothing of it outlives the error. */
+/** Undo everything a load registered, so nothing of it outlives the extension: a failed load at
+ *  once, every loaded extension on `unload_all`. */
 function rollbackLoad(ext: Ext, track: LoadTracker) {
   for (const name of track.rpc.splice(0)) {
     if (rpcHandlers.get(name)?.ext === ext.name) rpcHandlers.delete(name);
@@ -666,8 +670,8 @@ async function loadOne(path: string): Promise<{ ext?: Ext; error?: string }> {
   const factory = typeof mod === "function" ? mod : mod.default;
   if (typeof factory !== "function") return { error: `Extension does not export a valid factory function: ${path}` };
   const base = basename(path).replace(/\.(ts|js)$/, "");
-  const ext: Ext = { path: resolved, name: base === "index" ? basename(resolve(path, "..")) : base, handlers: new Map(), tools: new Map(), commands: new Map(), flags: new Map(), linkSchemes: [], rpc: [] };
   const track: LoadTracker = { subs: [], rpc: [], providers: [], flags: new Map() };
+  const ext: Ext = { path: resolved, name: base === "index" ? basename(resolve(path, "..")) : base, handlers: new Map(), tools: new Map(), commands: new Map(), flags: new Map(), linkSchemes: [], rpc: [], track };
   const api = makeApi(ext, track);
   try {
     await (factory as (a: unknown) => unknown)(api);
@@ -721,6 +725,21 @@ async function load(p: Json) {
       }
     }
   return { loaded, errors };
+}
+
+/**
+ * `unload_all` (the core's `reload`, before it loads again): every loaded extension gets
+ * `session_shutdown` with reason `reload`, then what its load registered is released newest load
+ * first, under `rollbackLoad`'s ownership rules: event-bus subscriptions, RPC names, providers
+ * (with `provider_unregistered`) and flag values. Tools, commands, handlers and link schemes live on
+ * the extension records and leave with them, so the next `load` starts from an empty host instead of
+ * registering everything a second time.
+ */
+async function unloadAll() {
+  const shutdown = await emit({ event: { type: "session_shutdown", reason: "reload" } });
+  const unloaded = exts.map((e) => e.name);
+  for (const ext of exts.splice(0).reverse()) rollbackLoad(ext, ext.track);
+  return { unloaded, errors: shutdown.errors };
 }
 
 // ---------------------------------------------------------------- emit
@@ -1308,13 +1327,15 @@ async function dispatch(method: string, p: Json): Promise<unknown> {
     loading = run.catch(() => undefined);
     return run;
   }
-  // Awaited emit / call_tool: run after every queued fire-and-forget emit.
-  const barrier = method === "emit" || method === "call_tool" ? nowaitTail : undefined;
+  // Awaited emit / call_tool / unload_all: run after every queued fire-and-forget emit.
+  const barrier = method === "emit" || method === "call_tool" || method === "unload_all" ? nowaitTail : undefined;
   await loading;
   if (barrier) await awaitBarrier(barrier);
   switch (method) {
     case "emit":
       return emit(p);
+    case "unload_all":
+      return unloadAll();
     case "list_tools":
       return allTools().map(({ ext, tool }) => ({ name: tool.name, label: tool.label, description: tool.description, parameters: jsonSchema(tool.parameters), approval: tool.approval, extension: ext.name }));
     case "call_tool":
