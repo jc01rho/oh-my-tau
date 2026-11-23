@@ -56,7 +56,9 @@ jobs:
             strip: copy
             musl: true
           - target: x86_64-apple-darwin
-            runner: macos-14  # Intel runners are retired; cross-compile on Apple silicon
+            # Intel runners are retired; cross-compile on Apple silicon. macos-14 is retired
+            # too ("configuration 'macos-14-arm64-us-default' is not supported", v0.13.0).
+            runner: macos-latest
             asset: omt-macos-x64
             tarball: omt-macos-x64.tar.gz
             bin: omt
@@ -64,7 +66,7 @@ jobs:
             # No prebuilt ONNX Runtime for Intel macOS: build without the Laya ONNX heads.
             cargo_args: --no-default-features
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-latest
             asset: omt-macos-arm64
             tarball: omt-macos-arm64.tar.gz
             bin: omt
