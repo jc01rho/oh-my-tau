@@ -6,7 +6,7 @@
 //! tree and `AGENT_ID` the commit identity (`<id>@omo.local`, default `omt`).
 //! Without a `MEMORY_DIR` that is a git repository the tools are not advertised.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -196,13 +196,6 @@ pub fn tools_for(repo: &MemoryRepo) -> Vec<Arc<dyn AgentTool>> {
     .collect()
 }
 
-/// The tools for the bound memory repository of the process working directory.
-#[must_use]
-pub fn session_tools() -> Vec<Arc<dyn AgentTool>> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    session_tools_for(&cwd, false)
-}
-
 /// Discover the memory repository for `cwd` (`MEMORY_DIR` or `<memory_home>/agents/<slug>-<hash>/repo`)
 /// without creating directories on disk. When absent and `log_missing` is set, logs one startup line.
 #[must_use]
@@ -245,26 +238,26 @@ where
     }
 }
 
+/// [`session_tools_for_with`] given only `MEMORY_DIR` and `AGENT_ID`, with a home that
+/// holds no memory repository.
 #[cfg(test)]
-fn session_tools_in(root: Option<PathBuf>, identity: Option<&str>) -> Vec<Arc<dyn AgentTool>> {
-    let Some(root) = root.filter(|r| !r.as_os_str().is_empty()) else {
-        return Vec::new();
+fn session_tools_in(
+    root: Option<std::path::PathBuf>,
+    identity: Option<&str>,
+) -> Vec<Arc<dyn AgentTool>> {
+    let home = std::env::temp_dir().join(format!("omt-memory-no-home-{}", std::process::id()));
+    let env = |key: &str| match key {
+        "MEMORY_DIR" => root.as_ref().map(|r| r.display().to_string()),
+        "AGENT_ID" => identity.map(str::to_owned),
+        "HOME" => Some(home.display().to_string()),
+        _ => None,
     };
-    let identity = identity
-        .map(str::trim)
-        .filter(|i| !i.is_empty())
-        .unwrap_or("omt");
-    match MemoryRepo::open(&root, identity) {
-        Ok(repo) => tools_for(&repo),
-        Err(err) => {
-            tracing::warn!(%err, root = %root.display(), "memory repo tools unavailable");
-            Vec::new()
-        }
-    }
+    session_tools_for_with(&home, false, &env)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::process::Command;
 
     use super::*;

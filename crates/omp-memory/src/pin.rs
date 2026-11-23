@@ -622,10 +622,7 @@ fn synced_sources(commits: &[RepoCommit], changes: &ProjectedChanges) -> Vec<Str
 
 /// Render the late `<memory_notice>` message, or `None` when nothing changed or expired.
 #[must_use]
-pub fn render_memory_notice(
-    turn: &ProjectionTurn,
-    expired: &[MemoryExpiry],
-) -> Option<String> {
+pub fn render_memory_notice(turn: &ProjectionTurn, expired: &[MemoryExpiry]) -> Option<String> {
     let mut lines = Vec::new();
     if let Some(changes) = &turn.changes {
         lines.push(render_projected_changes_line(
@@ -720,7 +717,9 @@ mod tests {
 
         let resumed = NativeProjectionPins::with_now(Box::new(|| 99));
         let branch = [pin_entry(&recorded.borrow()[0])];
-        let restored = resumed.ensure_pinned(&repo, "s1", &branch, &|_| {}).unwrap();
+        let restored = resumed
+            .ensure_pinned(&repo, "s1", &branch, &|_| {})
+            .unwrap();
         assert_eq!(restored.revision, first.revision);
         assert_eq!(restored.as_of_ms, 42);
         assert_eq!(restored.repinned, None);

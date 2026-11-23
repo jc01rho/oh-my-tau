@@ -151,7 +151,8 @@ mod tests {
 
     #[test]
     fn parses_dates_and_offsets_and_rejects_naive_datetimes() {
-        let block = Block::parse("---\ndescription: x\nexpires: 2026-10-27T06:33Z\n---\nb").unwrap();
+        let block =
+            Block::parse("---\ndescription: x\nexpires: 2026-10-27T06:33Z\n---\nb").unwrap();
         let expected = 20_753 * 86_400_000 + (6 * 60 + 33) * 60_000;
         assert_eq!(memory_expires_at_ms(&block), Some(expected));
         assert!(is_memory_expired(Some(expected), expected));

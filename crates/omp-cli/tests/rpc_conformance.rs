@@ -363,12 +363,23 @@ impl RpcHarness {
     }
 
     fn spawn_with(single_session: bool, extra_args: &[&str]) -> Self {
+        Self::spawn_prepared(single_session, extra_args, |_, _| {})
+    }
+
+    /// [`Self::spawn_with`] after `prepare(home, work)` set up files the process reads at
+    /// startup.
+    fn spawn_prepared(
+        single_session: bool,
+        extra_args: &[&str],
+        prepare: impl FnOnce(&std::path::Path, &std::path::Path),
+    ) -> Self {
         let mock = MockServer::start();
         let home = tempfile::tempdir().expect("tempdir");
         let agent = home.path().join(".omp/agent");
         let work = home.path().join("work");
         std::fs::create_dir_all(&agent).expect("create agent dir");
         std::fs::create_dir_all(&work).expect("create work dir");
+        prepare(home.path(), &work);
         std::fs::write(
             agent.join("models.yml"),
             format!(
@@ -399,6 +410,10 @@ impl RpcHarness {
             .env_remove("OMO_PROFILE")
             .env_remove("OMP_PROFILE")
             .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("MEMORY_DIR")
+            .env_remove("AGENT_ID")
+            .env_remove("MAHO_MEMORY_HOME")
+            .env_remove("OMO_MEMORY_HOME")
             .env("OMP_RS_EXT_SHARED", "0")
             .env("OMP_RS_NO_TITLE", "1")
             .env("NO_COLOR", "1")
@@ -1923,5 +1938,192 @@ fn extension_provider_boot() {
     let (gone, _) = h.request(json!({"type": "set_model", "provider": "fx-gone", "modelId": "g1"}));
     assert_eq!(gone["success"], false, "{gone}");
 
+    h.finish();
+}
+
+/// Run git in a test memory repository with a fixed author.
+fn memory_git(repo: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+fn memory_commit(repo: &std::path::Path, files: &[(&str, &str)]) -> String {
+    for (path, text) in files {
+        let full = repo.join(path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+        std::fs::write(full, text).expect("write memory file");
+    }
+    memory_git(repo, &["add", "-A"]);
+    memory_git(repo, &["commit", "-q", "-m", "memory fixture"]);
+    memory_git(repo, &["rev-parse", "HEAD"])
+}
+
+fn all_message_text(body: &Value) -> String {
+    body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| m["content"].to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// B5: started like a gateway lane (no MEMORY_DIR, no AGENT_ID), the session finds
+/// <home>/.omo/memory/agents/<slug>-<hash8>/repo, exposes the memory tools, projects system/
+/// blocks into the prompt pinned at HEAD, and reports a later commit as a late
+/// <memory_notice> while the prompt keeps the pinned copy.
+#[test]
+fn memory_repo_is_discovered_projected_and_pinned() {
+    let repo_cell = Arc::new(Mutex::new(None));
+    let repo_slot = Arc::clone(&repo_cell);
+    let mut h = RpcHarness::spawn_prepared(true, &["--no-extensions"], move |home, work| {
+        let work = work.canonicalize().expect("canonical work dir");
+        let id = omp_memory::identity::memory_agent_ids(&work).id;
+        let repo = home.join(".omo/memory/agents").join(&id).join("repo");
+        std::fs::create_dir_all(&repo).expect("create memory repo");
+        memory_git(&repo, &["init", "-q"]);
+        let head = memory_commit(
+            &repo,
+            &[
+                (
+                    "system/persona.md",
+                    "---\ndescription: Persona\n---\npersona-body\n",
+                ),
+                (
+                    "system/a.md",
+                    "---\ndescription: Alpha block\n---\nalpha-body-v1\n",
+                ),
+                (
+                    "system/old.md",
+                    "---\ndescription: Old block\nexpires: 2020-01-01\n---\nold-body\n",
+                ),
+                ("reference/b.md", "---\ndescription: Ref B\n---\nref-body\n"),
+            ],
+        );
+        *repo_slot.lock().expect("repo slot") = Some((repo, id, head));
+    });
+    let (repo, id, pinned) = repo_cell
+        .lock()
+        .expect("repo slot")
+        .take()
+        .expect("prepared");
+
+    let (state, _) = h.request(json!({"type": "get_state"}));
+    let prompt = state["data"]["systemPrompt"][0]
+        .as_str()
+        .expect("systemPrompt")
+        .to_owned();
+    assert!(prompt.contains("persona-body"), "{prompt}");
+    assert!(
+        prompt.contains("<description>Alpha block</description>"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("alpha-body-v1"), "{prompt}");
+    assert!(prompt.contains("reference/: b"), "{prompt}");
+    assert!(
+        !prompt.contains("old-body"),
+        "expired block projected: {prompt}"
+    );
+    assert!(
+        !prompt.contains("ref-body"),
+        "non-system body projected: {prompt}"
+    );
+    assert!(prompt.contains(&format!("- AGENT_ID: {id}")), "{prompt}");
+    let tools: Vec<&str> = state["data"]["dumpTools"]
+        .as_array()
+        .expect("dumpTools")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(tools.contains(&"memory"), "{tools:?}");
+    assert!(tools.contains(&"memory_apply_patch"), "{tools:?}");
+
+    let (_p, from) = h.request(json!({"type": "prompt", "message": "first turn"}));
+    h.expect_frame(from, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    let first = h
+        ._mock
+        .requests
+        .lock()
+        .expect("requests")
+        .last()
+        .cloned()
+        .expect("request");
+    assert!(
+        !all_message_text(&first).contains("<memory_notice>"),
+        "{first}"
+    );
+
+    let lane = std::fs::read_to_string(h.lane_file("lane.jsonl")).expect("session file");
+    let pin = lane
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|e| e["customType"] == "omo-memory:projection-pin")
+        .unwrap_or_else(|| panic!("no projection pin entry: {lane}"));
+    assert_eq!(pin["data"]["version"], 1, "{pin}");
+    assert_eq!(pin["data"]["revision"], pinned.as_str(), "{pin}");
+    assert_eq!(
+        pin["data"]["sessionId"], state["data"]["sessionId"],
+        "{pin}"
+    );
+    for key in ["noticedThrough", "compactionId", "pinnedAtMs"] {
+        assert!(pin["data"].get(key).is_some(), "{key} missing: {pin}");
+    }
+
+    memory_commit(
+        &repo,
+        &[
+            (
+                "system/a.md",
+                "---\ndescription: Alpha block\n---\nalpha-body-v2\n",
+            ),
+            ("reference/c.md", "---\ndescription: Ref C\n---\nc\n"),
+        ],
+    );
+    let (_p, from) = h.request(json!({"type": "prompt", "message": "second turn"}));
+    h.expect_frame(from, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    let second = h
+        ._mock
+        .requests
+        .lock()
+        .expect("requests")
+        .last()
+        .cloned()
+        .expect("request");
+    let text = all_message_text(&second);
+    let line = format!(
+        "Memory changed after this session's prompt was pinned to {}: added reference/c.md; updated system/a.md. The prompt keeps the pinned copy; read a file when it matters now.",
+        &pinned[..7]
+    );
+    assert!(text.contains("<memory_notice>"), "{text}");
+    assert!(text.contains(&line), "{text}");
+    assert!(
+        text.contains("alpha-body-v1") && !text.contains("alpha-body-v2"),
+        "{text}"
+    );
+
+    let (after, _) = h.request(json!({"type": "get_state"}));
+    assert_eq!(after["data"]["systemPrompt"][0], prompt.as_str());
+    let (reloaded, _) = h.request(json!({"type": "reload"}));
+    assert_eq!(reloaded["success"], true, "{reloaded}");
+    let (after_reload, _) = h.request(json!({"type": "get_state"}));
+    assert_eq!(after_reload["data"]["systemPrompt"][0], prompt.as_str());
     h.finish();
 }

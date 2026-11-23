@@ -639,11 +639,7 @@ fn split_agreement_line(line: &str) -> Option<(AgreementScope, &str, &str)> {
     Some((scope, rest, ""))
 }
 
-fn parse_agreement_meta(
-    raw: &str,
-    text: &str,
-    scope: AgreementScope,
-) -> Result<AgreementItem, ()> {
+fn parse_agreement_meta(raw: &str, text: &str, scope: AgreementScope) -> Result<AgreementItem, ()> {
     let mut fields: Vec<(String, String)> = Vec::new();
     for segment in raw.split(';') {
         if segment.trim().is_empty() {
@@ -817,8 +813,8 @@ mod tests {
             agent_id: "test".into(),
             projection: None,
         };
-        let before = compile_memory_block_at_revision(&repo, head.as_deref(), &opts, expires - 1)
-            .unwrap();
+        let before =
+            compile_memory_block_at_revision(&repo, head.as_deref(), &opts, expires - 1).unwrap();
         let after =
             compile_memory_block_at_revision(&repo, head.as_deref(), &opts, expires).unwrap();
 

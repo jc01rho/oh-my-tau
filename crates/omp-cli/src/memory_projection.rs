@@ -101,7 +101,9 @@ impl MemoryProjectionController {
             .clone();
         let current = agent.system_prompt().await;
         let updated = match sentinel.as_deref() {
-            Some(block) => replace_memory_block(&current, block).unwrap_or_else(|_| current.clone()),
+            Some(block) => {
+                replace_memory_block(&current, block).unwrap_or_else(|_| current.clone())
+            }
             None => strip_memory_block(&current),
         };
         if updated != current {
@@ -117,11 +119,9 @@ impl MemoryProjectionController {
         branch: &[Value],
     ) -> Option<AgentMessage> {
         let bound = self.bound.as_ref()?;
-        let turn = match self
-            .pins
-            .advance(&bound.repo, session_id, branch, &|rec| {
-                append_pin_entry(persist, rec);
-            }) {
+        let turn = match self.pins.advance(&bound.repo, session_id, branch, &|rec| {
+            append_pin_entry(persist, rec);
+        }) {
             Ok(turn) => turn,
             Err(err) => {
                 eprintln!("omt: memory turn check failed: {err}");

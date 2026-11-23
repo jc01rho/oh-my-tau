@@ -435,8 +435,7 @@ async fn async_main() -> Result<()> {
         let mut built = sysprompt::build(&cwd, &sp_opts, &metas);
         if let Some(sentinel) = memory_projection::dump_system_prompt_block(&cwd) {
             if let Some(last) = built.blocks.last_mut() {
-                if let Ok(updated) = omp_memory::projection::replace_memory_block(last, &sentinel)
-                {
+                if let Ok(updated) = omp_memory::projection::replace_memory_block(last, &sentinel) {
                     *last = updated;
                 }
             } else {
