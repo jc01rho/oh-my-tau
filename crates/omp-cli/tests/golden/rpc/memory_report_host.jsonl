@@ -1,0 +1,12 @@
+{"dir":"out","frame":{"type":"memory_report","id":"gw-1"}}
+{"dir":"in","frame":{"id":"gw-1","type":"response","command":"memory_report","success":true,"data":{"path":"<REPORT_PATH>","footprintBytes":"<BYTES>"}}}
+{"dir":"out","frame":{"type":"open_session","sessionPath":"<SESSION_PATH>","cwd":"<CWD>","attended":false,"id":"gw-2"}}
+{"dir":"in","frame":{"id":"gw-2","type":"response","command":"open_session","success":true,"data":{"sessionId":"rpc-1","durableSessionId":"<SESSION_ID>","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","resumed":false}}}
+{"dir":"out","frame":{"type":"open_session","sessionPath":"<SESSION_PATH>","cwd":"<CWD>","attended":false,"id":"gw-3"}}
+{"dir":"in","frame":{"id":"gw-3","type":"response","command":"open_session","success":true,"data":{"sessionId":"rpc-2","durableSessionId":"<SESSION_ID>","sessionFile":"<SESSION_FILE>","cwd":"<CWD>","resumed":false}}}
+{"dir":"out","frame":{"type":"prompt","message":"Reply deterministically","streamingBehavior":"followUp","sessionId":"rpc-2","id":"gw-4"}}
+{"dir":"in","frame":{"id":"gw-4","type":"response","command":"prompt","success":true,"sessionId":"rpc-2"}}
+{"dir":"out","frame":{"type":"memory_report","id":"gw-5"}}
+{"dir":"in","frame":{"id":"gw-5","type":"response","command":"memory_report","success":true,"data":{"path":"<REPORT_PATH>","footprintBytes":"<BYTES>"}}}
+{"dir":"out","frame":{"type":"memory_report","sessionId":"rpc-1","id":"gw-6"}}
+{"dir":"in","frame":{"id":"gw-6","type":"response","command":"memory_report","success":true,"data":{"path":"<REPORT_PATH>","footprintBytes":"<BYTES>"},"sessionId":"rpc-1"}}

@@ -909,6 +909,12 @@ impl ExtHost {
         Ok(())
     }
 
+    /// Process id of the private host child; `None` in shared mode (the daemon is not this
+    /// session's) or once the child was reaped.
+    pub async fn child_pid(&self) -> Option<u32> {
+        self.child.lock().await.as_ref().and_then(Child::id)
+    }
+
     /// Graceful exit: ask the host to exit, wait up to 2 s, then kill.
     ///
     /// # Errors

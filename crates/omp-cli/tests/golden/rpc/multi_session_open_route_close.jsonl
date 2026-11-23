@@ -1,6 +1,6 @@
 {"dir":"in","frame":{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864,"multiSession":true,"capabilities":"<RPC_COMMANDS>","launchProfile":{"multi_session":true,"session_runtime":"in-process"}}}
 {"dir":"out","frame":{"type":"get_protocol_info","id":"gw-1"}}
-{"dir":"in","frame":{"id":"gw-1","type":"response","command":"get_protocol_info","success":true,"data":{"protocolVersion":2,"serverVersion":"<SERVER_VERSION>","engine":"oh-my-tau","mode":"multi_session","capabilities":"<RPC_COMMANDS>","commands":"<RPC_COMMANDS>","agentDir":"<AGENT_DIR>","launchProfile":{"multi_session":true,"session_runtime":"in-process"}}}}
+{"dir":"in","frame":{"id":"gw-1","type":"response","command":"get_protocol_info","success":true,"data":{"protocolVersion":2,"serverVersion":"<SERVER_VERSION>","engine":"oh-my-tau","mode":"multi_session","capabilities":"<RPC_COMMANDS>","commands":"<RPC_COMMANDS>","features":["memory_report","agent_settled","session_settled","prompt_result"],"agentDir":"<AGENT_DIR>","launchProfile":{"multi_session":true,"session_runtime":"in-process"}}}}
 {"dir":"out","frame":{"type":"list_sessions","id":"gw-2"}}
 {"dir":"in","frame":{"id":"gw-2","type":"response","command":"list_sessions","success":true,"data":{"sessions":[]}}}
 {"dir":"out","frame":{"type":"get_state","id":"gw-3"}}
