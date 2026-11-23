@@ -115,21 +115,49 @@ pub fn has_extensions(extra: &[PathBuf]) -> bool {
     })
 }
 
-/// Locate `ext-host/host.ts`: `$OMP_RS_EXT_HOST`, else the workspace's copy
-/// found by walking up from the binary's location.
+/// The extension host inside an installed prefix: a release tarball lays out
+/// `<prefix>/bin/omt` with the host at `<prefix>/share/omt/ext-host/host.ts`.
+const SHARE_EXT_HOST: &str = "share/omt/ext-host/host.ts";
+
+/// Locate `ext-host/host.ts`: `$OMP_RS_EXT_HOST`, else a copy found by walking
+/// up from the binary's location — `<dir>/ext-host/host.ts` (a source checkout
+/// such as `target/release/omt`, or a tarball unpacked anywhere) or
+/// `<dir>/share/omt/ext-host/host.ts` (the installed prefix of `bin/omt`).
+///
+/// The location is resolved through symlinks first: `install.sh` links
+/// `~/.local/bin/omt` at a versioned prefix, and the host ships beside the real
+/// binary, not beside the link.
 #[must_use]
 pub fn host_script() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("OMP_RS_EXT_HOST") {
-        let p = PathBuf::from(p);
+    let env = std::env::var_os("OMP_RS_EXT_HOST").map(PathBuf::from);
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    find_host_script(env.as_deref(), &exe)
+}
+
+/// The lookup behind [`host_script`], with its inputs passed in so a test can
+/// lay out each shape in a temp dir.
+fn find_host_script(env: Option<&Path>, exe: &Path) -> Option<PathBuf> {
+    // `OMP_RS_EXT_HOST=private` selects the per-process host elsewhere; only a
+    // file path overrides the search. Any other value that is not a file is a
+    // mistake worth reporting instead of silently running a different copy.
+    if let Some(p) = env {
         if p.is_file() {
-            return Some(p);
+            return Some(p.to_path_buf());
+        }
+        if p != Path::new("private") {
+            eprintln!(
+                "omt: OMP_RS_EXT_HOST={} is not a file; searching for the extension host",
+                p.display()
+            );
         }
     }
-    let exe = std::env::current_exe().ok()?;
     for dir in exe.ancestors() {
-        let cand = dir.join("ext-host").join("host.ts");
-        if cand.is_file() {
-            return Some(cand);
+        for rel in ["ext-host/host.ts", SHARE_EXT_HOST] {
+            let cand = dir.join(rel);
+            if cand.is_file() {
+                return Some(cand);
+            }
         }
     }
     None
@@ -4370,6 +4398,83 @@ mod tests {
 
         crate::sysprompt::set_extension_skill_paths(Vec::new());
         host.shutdown().await.unwrap();
+    }
+
+    /// `host_script` resolution order: `$OMP_RS_EXT_HOST` first, then the source
+    /// checkout shape (`<dir>/ext-host/host.ts`) and the installed prefix shape
+    /// (`<prefix>/share/omt/ext-host/host.ts`).
+    #[test]
+    fn host_script_finds_source_and_installed_layouts() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("bin").join("omt");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"").unwrap();
+
+        // Installed prefix: bin/omt + share/omt/ext-host/host.ts.
+        let installed = root.path().join(SHARE_EXT_HOST);
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, b"// host\n").unwrap();
+        assert_eq!(find_host_script(None, &exe), Some(installed.clone()));
+
+        // The override wins over any discovered copy; a non-file value (the
+        // `private` selector) falls back to the search.
+        let override_path = root.path().join("elsewhere/host.ts");
+        std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        std::fs::write(&override_path, b"// override\n").unwrap();
+        assert_eq!(
+            find_host_script(Some(&override_path), &exe),
+            Some(override_path)
+        );
+        assert_eq!(
+            find_host_script(Some(Path::new("private")), &exe),
+            Some(installed)
+        );
+
+        // Source checkout: target/release/omt with ext-host/host.ts at the root.
+        let checkout = root.path().join("checkout");
+        let built = checkout.join("target/release/omt");
+        std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+        std::fs::write(&built, b"").unwrap();
+        let source_host = checkout.join("ext-host/host.ts");
+        std::fs::create_dir_all(source_host.parent().unwrap()).unwrap();
+        std::fs::write(&source_host, b"// host\n").unwrap();
+        assert_eq!(find_host_script(None, &built), Some(source_host));
+
+        // install.sh links the launcher at a versioned prefix, and the search has
+        // to start from the real binary, not the link (as `host_script` does with
+        // `canonicalize`).
+        #[cfg(unix)]
+        {
+            let linked = tempfile::tempdir().unwrap();
+            let prefix = linked.path().join("installed/versions/0.12.0");
+            let real_bin = prefix.join("bin/omt");
+            std::fs::create_dir_all(real_bin.parent().unwrap()).unwrap();
+            std::fs::write(&real_bin, b"").unwrap();
+            let real_host = prefix.join(SHARE_EXT_HOST);
+            std::fs::create_dir_all(real_host.parent().unwrap()).unwrap();
+            std::fs::write(&real_host, b"// host\n").unwrap();
+            let link = linked.path().join("linked/bin/omt");
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&real_bin, &link).unwrap();
+
+            assert_eq!(find_host_script(None, &link), None);
+            let resolved = std::fs::canonicalize(&link).unwrap();
+            // macOS resolves the `/var` prefix itself, so the expected path goes
+            // through the same canonicalization.
+            let expected = std::fs::canonicalize(&prefix).unwrap().join(SHARE_EXT_HOST);
+            assert_eq!(find_host_script(None, &resolved), Some(expected));
+        }
+
+        // Nothing anywhere: no host, instead of a bogus path. (Its own temp root:
+        // the search walks every ancestor, so a sibling layout would be found.)
+        let empty = tempfile::tempdir().unwrap();
+        let bare = empty.path().join("bare/bin/omt");
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        std::fs::write(&bare, b"").unwrap();
+        assert_eq!(
+            find_host_script(Some(Path::new("private")), &bare),
+            None::<PathBuf>
+        );
     }
 
     /// `resources_discover` paths resolve like upstream `resolvePath`: an absolute path stays,
