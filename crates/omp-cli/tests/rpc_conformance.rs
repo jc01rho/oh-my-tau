@@ -210,6 +210,7 @@ fn sse_chunk(model: &str, delta: &Value, finish_reason: Option<&str>) -> String 
 /// The watcher the mock provider starts when a prompt asks for it: it ends once the test creates
 /// the gate file named by the `G12C_GATE` environment variable of the `omt` process.
 const MONITOR_TRIGGER: &str = "[[run-monitor]]";
+const MONITOR_MID_TURN_TRIGGER: &str = "[[run-monitor-mid-turn]]";
 const MONITOR_COMMAND: &str = "until [ -e \"$G12C_GATE\" ]; do sleep 0.05; done";
 
 /// A request asks for the watcher while no tool result is in its history yet.
@@ -219,6 +220,32 @@ fn wants_monitor(body: &Value) -> bool {
         .iter()
         .any(|m| m["role"] == "user" && m["content"].to_string().contains(MONITOR_TRIGGER))
         && !messages.iter().any(|m| m["role"] == "tool")
+}
+
+fn has_trigger(body: &Value, trigger: &str) -> bool {
+    body["messages"].as_array().is_some_and(|msgs| {
+        msgs.iter()
+            .any(|m| m["role"] == "user" && m["content"].to_string().contains(trigger))
+    })
+}
+
+fn tool_result_count(body: &Value) -> usize {
+    body["messages"].as_array().map_or(0, |msgs| {
+        msgs.iter().filter(|m| m["role"] == "tool").count()
+    })
+}
+
+fn user_after_last_tool_contains(body: &Value, needle: &str) -> bool {
+    let Some(msgs) = body["messages"].as_array() else {
+        return false;
+    };
+    let after_idx = msgs
+        .iter()
+        .rposition(|m| m["role"] == "tool")
+        .map_or(0, |i| i + 1);
+    msgs[after_idx..]
+        .iter()
+        .any(|m| m["role"] == "user" && m["content"].to_string().contains(needle))
 }
 
 fn handle_http(
@@ -256,6 +283,77 @@ fn handle_http(
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     if stream.write_all(head.as_bytes()).is_err() {
         return;
+    }
+
+    if has_trigger(&body, MONITOR_MID_TURN_TRIGGER) {
+        match tool_result_count(&body) {
+            0 => {
+                let arguments = json!({
+                    "description": "mid-turn watcher",
+                    "command": MONITOR_COMMAND,
+                    "filter": "^NEVER-MATCHES$",
+                    "timeout_ms": 120_000,
+                })
+                .to_string();
+                let call = sse_chunk(
+                    &model,
+                    &json!({"role": "assistant", "tool_calls": [{
+                        "index": 0,
+                        "id": "call_monitor_mid_1",
+                        "type": "function",
+                        "function": {"name": "monitor", "arguments": arguments},
+                    }]}),
+                    None,
+                );
+                let end = sse_chunk(&model, &json!({}), Some("tool_calls"));
+                for chunk in [call, end, "data: [DONE]\n\n".to_string()] {
+                    if stream.write_all(chunk.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+                let _ = stream.flush();
+                return;
+            }
+            1 => {
+                let call = sse_chunk(
+                    &model,
+                    &json!({"role": "assistant", "tool_calls": [{
+                        "index": 0,
+                        "id": "call_hold_step_1",
+                        "type": "function",
+                        "function": {"name": "hold_step", "arguments": "{}"},
+                    }]}),
+                    None,
+                );
+                let end = sse_chunk(&model, &json!({}), Some("tool_calls"));
+                for chunk in [call, end, "data: [DONE]\n\n".to_string()] {
+                    if stream.write_all(chunk.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+                let _ = stream.flush();
+                return;
+            }
+            _ => {
+                let text = if user_after_last_tool_contains(
+                    &body,
+                    "Monitor mon_1(mid-turn watcher) ended",
+                ) {
+                    "SAW-MONITOR-AT-TOOL-BOUNDARY"
+                } else {
+                    "MISSING-MONITOR-AT-TOOL-BOUNDARY"
+                };
+                let c1 = sse_chunk(&model, &json!({"role": "assistant", "content": text}), None);
+                let c2 = sse_chunk(&model, &json!({}), Some("stop"));
+                for chunk in [c1, c2, "data: [DONE]\n\n".to_string()] {
+                    if stream.write_all(chunk.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+                let _ = stream.flush();
+                return;
+            }
+        }
     }
 
     if wants_monitor(&body) {
@@ -2185,6 +2283,153 @@ fn golden_monitor_completion_joins_the_next_turn_after_a_hold() {
     let rows = h.transcript.clone();
     h.finish();
     assert_golden("monitor_wake_held_next_turn", &rows);
+}
+
+#[test]
+fn monitor_completion_injects_at_tool_boundary_during_streaming_turn() {
+    if !cfg!(unix) {
+        return;
+    }
+    let mut h = RpcHarness::spawn(&["--no-extensions", "--auto-approve"]);
+    let (tools_resp, _) = h.request(json!({
+        "type": "set_host_tools",
+        "tools": [{
+            "name": "hold_step",
+            "description": "Blocks until host returns a tool result",
+            "parameters": {"type": "object", "properties": {}},
+        }],
+    }));
+    assert_eq!(tools_resp["success"], true, "{tools_resp}");
+
+    let (_p, from_prompt) = h.request(json!({
+        "type": "prompt",
+        "message": "Start the watcher [[run-monitor-mid-turn]]",
+        "streamingBehavior": "followUp",
+    }));
+
+    // Wait until the turn is mid-tool inside `hold_step` (still streaming, no agent_end yet).
+    let host_call = h.expect_frame(
+        from_prompt,
+        |f| f["type"] == "host_tool_call" && f["toolName"] == "hold_step",
+        FRAME_TIMEOUT,
+    );
+    let call_id = host_call["id"]
+        .as_str()
+        .expect("host_tool_call id")
+        .to_string();
+
+    // Complete the monitor while the turn is mid-tool: it must enter `steering`, not `followUp`.
+    let from_gate = h.current_len();
+    open_gate(&h);
+    let queued = h.expect_frame(
+        from_gate,
+        |f| f["type"] == "queue_update" && f["steering"].to_string().contains("mid-turn watcher"),
+        FRAME_TIMEOUT,
+    );
+    assert_eq!(
+        queued["followUp"],
+        json!([]),
+        "monitor wake must queue into steering, not followUp: {queued}"
+    );
+    h.expect_frame(
+        from_gate,
+        |f| {
+            f["type"] == "extension_event"
+                && f["name"] == "wake_source_state"
+                && f["data"]["activeCount"] == 0
+        },
+        FRAME_TIMEOUT,
+    );
+    assert!(
+        h.frames_since(from_prompt)
+            .iter()
+            .all(|f| f["type"] != "agent_end" && f["type"] != "agent_settled"),
+        "turn must still be active before hold_step resolves"
+    );
+
+    // Release `hold_step`: the monitor wake must inject at this tool boundary in the same run.
+    let from_release = h.current_len();
+    h.send_raw_line(
+        &json!({
+            "type": "host_tool_result",
+            "id": call_id,
+            "result": {"content": [{"type": "text", "text": "hold released"}]},
+        })
+        .to_string(),
+    );
+    h.expect_frame(from_release, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
+
+    let all_frames = h.frames_since(from_prompt);
+    assert_eq!(
+        all_frames
+            .iter()
+            .filter(|f| f["type"] == "agent_start")
+            .count(),
+        1,
+        "must stay inside the single active run: {all_frames:?}"
+    );
+    assert_eq!(
+        all_frames
+            .iter()
+            .filter(|f| f["type"] == "agent_end")
+            .count(),
+        1,
+        "must emit a single agent_end after observing the monitor wake: {all_frames:?}"
+    );
+
+    let (last, _) = h.request(json!({"type": "get_last_assistant_text"}));
+    assert_eq!(last["data"]["text"], json!("SAW-MONITOR-AT-TOOL-BOUNDARY"));
+    let wake = last_user_text(&h);
+    assert!(
+        wake.contains("Monitor mon_1(mid-turn watcher) ended: the command exited with code 0."),
+        "{wake}"
+    );
+    h.finish();
+}
+
+#[test]
+fn monitor_completion_wakes_idle_session_after_user_abort() {
+    if !cfg!(unix) {
+        return;
+    }
+    let mut h = RpcHarness::spawn(&["--no-extensions", "--auto-approve"]);
+    let (tools_resp, _) = h.request(json!({
+        "type": "set_host_tools",
+        "tools": [{
+            "name": "hold_step",
+            "description": "Blocks until host returns a tool result",
+            "parameters": {"type": "object", "properties": {}},
+        }],
+    }));
+    assert_eq!(tools_resp["success"], true, "{tools_resp}");
+
+    let (_p, from_prompt) = h.request(json!({
+        "type": "prompt",
+        "message": "Start the watcher [[run-monitor-mid-turn]]",
+        "streamingBehavior": "followUp",
+    }));
+    h.expect_frame(
+        from_prompt,
+        |f| f["type"] == "host_tool_call" && f["toolName"] == "hold_step",
+        FRAME_TIMEOUT,
+    );
+
+    let (aborted, from_abort) = h.request(json!({"type": "abort", "awaitIdle": true}));
+    assert_eq!(aborted["success"], true, "{aborted}");
+    assert_eq!(aborted["data"]["idle"], true, "{aborted}");
+    h.expect_frame(from_abort, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
+
+    // The monitor started before abort still runs and must wake the idle session.
+    let from_gate = h.current_len();
+    open_gate(&h);
+    h.expect_frame(from_gate, |f| f["type"] == "agent_start", FRAME_TIMEOUT);
+    h.expect_frame(from_gate, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
+    let wake = last_user_text(&h);
+    assert!(
+        wake.contains("Monitor mon_1(mid-turn watcher) ended: the command exited with code 0."),
+        "{wake}"
+    );
+    h.finish();
 }
 
 /// B1: a provider an extension registers is resolvable at launch (`--model` names it before
