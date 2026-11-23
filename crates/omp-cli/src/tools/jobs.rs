@@ -13,6 +13,7 @@
 //! session end).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -132,9 +133,34 @@ pub struct JobRegistry {
     pub(crate) inner: Arc<Mutex<JobsInner>>,
     /// `monitor` watches ride with the jobs so a tool-list rebuild keeps them.
     pub(crate) monitors: Arc<super::monitor::Hub>,
+    /// Foreground `bash` tool calls in flight (`get_state.isBashRunning`); rides with the
+    /// registry so a tool-list rebuild keeps counting the call that started before it.
+    foreground: Arc<AtomicUsize>,
+}
+
+/// One foreground `bash` call in flight: the count drops when the call ends, however it ends
+/// (finished, failed, cancelled or dropped).
+pub struct ForegroundBash(Arc<AtomicUsize>);
+
+impl Drop for ForegroundBash {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl JobRegistry {
+    /// Count a foreground `bash` call until the returned guard drops.
+    pub fn begin_foreground(&self) -> ForegroundBash {
+        self.foreground.fetch_add(1, Ordering::SeqCst);
+        ForegroundBash(self.foreground.clone())
+    }
+
+    /// Whether a foreground `bash` call is running (background jobs are not counted).
+    #[must_use]
+    pub fn foreground_running(&self) -> bool {
+        self.foreground.load(Ordering::SeqCst) > 0
+    }
+
     /// Register a job with a fresh `bg_N` id (omp `JobManager.#resolveJobId`).
     pub fn insert(&self, job: Job) -> String {
         let mut inner = self.inner.lock().expect("job registry poisoned");

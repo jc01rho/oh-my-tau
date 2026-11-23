@@ -753,6 +753,15 @@ fn normalize_in_place(v: &mut Value) {
                 }
             }
 
+            if frame_type.as_deref() == Some("response")
+                && command.as_deref() == Some("memory_report")
+            {
+                if let Some(Value::Object(data)) = map.get_mut("data") {
+                    data.insert("path".into(), json!("<REPORT_PATH>"));
+                    data.insert("footprintBytes".into(), json!("<BYTES>"));
+                }
+            }
+
             if frame_type.as_deref() == Some("response") && command.as_deref() == Some("get_state")
             {
                 if let Some(Value::Object(data)) = map.get_mut("data") {
@@ -908,6 +917,18 @@ fn golden_handshake_and_protocol_info() {
         );
     }
     assert_eq!(proto["data"]["capabilities"], proto["data"]["commands"]);
+    assert!(cmds.contains(&"memory_report"), "{cmds:?}");
+    let features: Vec<&str> = proto["data"]["features"]
+        .as_array()
+        .expect("features array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(features.contains(&"memory_report"), "{features:?}");
+    assert!(
+        !features.contains(&"resume_run"),
+        "no run fence, so no resume_run: {features:?}"
+    );
 
     let (state, _) = h.request(json!({"type": "get_state"}));
     assert_eq!(state["success"], true);
@@ -936,6 +957,139 @@ fn golden_handshake_and_protocol_info() {
     rows.extend(h.transcript.clone());
     h.finish();
     assert_golden("handshake_and_protocol", &rows);
+}
+
+/// The report file a successful `memory_report` answer names, after checking it sits in the
+/// agent dir and that `footprintBytes` is the footprint the file records.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_memory_report(h: &RpcHarness, answer: &Value) -> Value {
+    assert_eq!(answer["success"], true, "{answer}");
+    let path = PathBuf::from(answer["data"]["path"].as_str().expect("report path"));
+    assert!(
+        path.starts_with(h.home_dir.join(".omp/agent/memory-reports")),
+        "{}",
+        path.display()
+    );
+    let text = std::fs::read_to_string(&path).expect("read report file");
+    let report: Value = serde_json::from_str(&text).expect("report is JSON");
+    assert_eq!(
+        report["main"]["footprint"]["bytes"],
+        answer["data"]["footprintBytes"]
+    );
+    assert!(answer["data"]["footprintBytes"]
+        .as_u64()
+        .is_some_and(|bytes| bytes > 0));
+    report
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn golden_memory_report() {
+    let mut h = RpcHarness::spawn(&["--no-extensions"]);
+
+    let (idle, _) = h.request(json!({"type": "memory_report"}));
+    let report = read_memory_report(&h, &idle);
+    assert_eq!(report["sessions"]["count"], 1);
+    assert_eq!(report["sessions"]["messages"], 0);
+    assert_eq!(report["extensionHosts"]["count"], 0);
+
+    let (_prompt, from_prompt) = h.request(json!({
+        "type": "prompt",
+        "message": "Reply deterministically",
+        "streamingBehavior": "followUp",
+    }));
+    h.expect_frame(from_prompt, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    let (after_turn, _) = h.request(json!({"type": "memory_report"}));
+    let report = read_memory_report(&h, &after_turn);
+    assert_eq!(
+        report["sessions"]["messages"], 2,
+        "one prompt and its reply"
+    );
+    assert_eq!(report["sessions"]["items"][0]["messages"], 2);
+
+    let rows = h.transcript.clone();
+    h.finish();
+    assert_golden("memory_report", &rows);
+
+    if !bun_on_path() {
+        eprintln!("skipping extension host RSS check: bun not found on PATH");
+        return;
+    }
+    let ext_file = fixture_path("rpc_ext.ts");
+    let ext_arg = ext_file.display().to_string();
+    let mut h_ext = RpcHarness::spawn(&["-e", &ext_arg]);
+    let (ready, _) = h_ext.request(json!({
+        "type": "extension_request",
+        "name": "omomeow.move-readiness",
+    }));
+    assert_eq!(ready["success"], true, "{ready}");
+    let (with_ext, _) = h_ext.request(json!({"type": "memory_report"}));
+    let report = read_memory_report(&h_ext, &with_ext);
+    let hosts = &report["extensionHosts"];
+    assert_eq!(hosts["count"], 1, "{report}");
+    assert!(hosts["items"][0]["pid"].as_u64().is_some_and(|p| p > 0));
+    assert!(hosts["items"][0]["rssBytes"]
+        .as_u64()
+        .is_some_and(|b| b > 0));
+    assert_eq!(hosts["rssBytes"], hosts["items"][0]["rssBytes"]);
+    h_ext.finish();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn golden_memory_report_host() {
+    let mut h = RpcHarness::spawn_host();
+
+    let (none, _) = h.request(json!({"type": "memory_report"}));
+    let report = read_memory_report(&h, &none);
+    assert_eq!(report["sessions"]["count"], 0);
+
+    h.open_session("a.jsonl");
+    h.open_session("b.jsonl");
+    let (_prompt, from_prompt) = h.request_in(
+        "rpc-2",
+        json!({
+            "type": "prompt",
+            "message": "Reply deterministically",
+            "streamingBehavior": "followUp",
+        }),
+    );
+    h.expect_tagged(from_prompt, "rpc-2", |f| f["type"] == "agent_settled");
+
+    let (both, _) = h.request(json!({"type": "memory_report"}));
+    let report = read_memory_report(&h, &both);
+    assert_eq!(report["sessions"]["count"], 2);
+    assert_eq!(report["sessions"]["messages"], 2);
+    assert_eq!(report["sessions"]["items"][0]["sessionId"], "rpc-1");
+    assert_eq!(report["sessions"]["items"][0]["messages"], 0);
+    assert_eq!(report["sessions"]["items"][1]["sessionId"], "rpc-2");
+    assert_eq!(report["sessions"]["items"][1]["messages"], 2);
+
+    let (tagged, _) = h.request_in("rpc-1", json!({"type": "memory_report"}));
+    assert_eq!(
+        tagged["sessionId"], "rpc-1",
+        "the answer carries the routing id"
+    );
+    let report = read_memory_report(&h, &tagged);
+    assert_eq!(
+        report["sessions"]["count"], 2,
+        "the report is of the whole process"
+    );
+
+    let rows = h.transcript.clone();
+    h.finish();
+    assert_golden("memory_report_host", &rows);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn memory_report_is_unsupported_off_linux_and_macos() {
+    let mut h = RpcHarness::spawn(&["--no-extensions"]);
+    let (answer, _) = h.request(json!({"type": "memory_report"}));
+    assert_eq!(answer["success"], false);
+    assert_eq!(answer["code"], "unsupported");
+    assert_eq!(answer["errorCode"], "unsupported");
+    h.finish();
 }
 
 #[test]
@@ -992,6 +1146,14 @@ fn golden_lane_hold_stop_reload_resume() {
 
     let (resumed, from_resume) = h.request(json!({"type": "resume_session"}));
     assert_eq!(resumed["success"], true);
+    assert_eq!(
+        resumed["data"],
+        json!({
+            "resumed": true, "pauseSeq": 2, "turnStarted": false,
+            "deliveredNotices": 0, "deliveredHeldInputs": 0,
+        }),
+        "{resumed}"
+    );
     let resumed_evt = h.expect_frame(
         from_resume,
         |f| f["type"] == "session_resumed",
@@ -1041,6 +1203,7 @@ fn golden_prompt_settled_and_read() {
                 | "prompt_result"
                 | "session_settled"
                 | "agent_settled"
+                | "agent_idle"
         ) {
             h.transcript.push(json!({"dir": "in", "frame": f}));
         }
@@ -1056,6 +1219,16 @@ fn golden_prompt_settled_and_read() {
             _ => {}
         }
     }
+    let idle = h.expect_frame(from_prompt, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
+    assert_eq!(idle, json!({"type": "agent_idle"}));
+    let order: Vec<String> = h
+        .frames_since(from_prompt)
+        .iter()
+        .filter_map(|f| f["type"].as_str().map(str::to_owned))
+        .collect();
+    let at = |name: &str| order.iter().position(|t| t == name);
+    assert!(at("agent_settled") < at("agent_idle"), "{order:?}");
+    assert_eq!(order.iter().filter(|t| *t == "agent_idle").count(), 1);
     assert!(saw_agent_start, "missing agent_start");
     assert!(saw_agent_end, "missing agent_end");
     assert!(saw_prompt_result, "missing prompt_result");
@@ -1073,6 +1246,22 @@ fn golden_prompt_settled_and_read() {
     let (state, _) = h.request(json!({"type": "get_state"}));
     assert_eq!(state["data"]["isStreaming"], false);
     assert_eq!(state["data"]["isSettled"], true);
+    assert_eq!(state["data"]["pendingMessageCount"], 0);
+    assert_eq!(state["data"]["isBashRunning"], false);
+    assert_eq!(state["data"]["persistent"], true);
+    assert!(
+        state["data"]["sessionFile"]
+            .as_str()
+            .is_some_and(|f| !f.is_empty()),
+        "{state}"
+    );
+    assert!(state["data"]["cwd"].as_str().is_some(), "{state}");
+    for key in ["input", "output", "cacheRead", "cacheWrite", "cost"] {
+        assert!(
+            state["data"]["usageTotals"][key].is_number(),
+            "{key}: {state}"
+        );
+    }
 
     let rows = h.transcript.clone();
     h.finish();
@@ -1106,10 +1295,17 @@ fn golden_interrupt_abort_and_stop_mid_turn() {
 
     let (abort_resp, from_abort) = h.request(json!({"type": "interrupt"}));
     assert_eq!(abort_resp["success"], true);
+    assert_eq!(
+        abort_resp["data"],
+        json!({"interrupted": true, "turnId": "1"}),
+        "{abort_resp}"
+    );
     let end1 = h.expect_frame(from_abort, |f| f["type"] == "agent_end", FRAME_TIMEOUT);
     let settled1 = h.expect_frame(from_abort, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    let idle1 = h.expect_frame(from_abort, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
     h.transcript.push(json!({"dir": "in", "frame": end1}));
     h.transcript.push(json!({"dir": "in", "frame": settled1}));
+    h.transcript.push(json!({"dir": "in", "frame": idle1}));
 
     let (state_after_abort, _) = h.request(json!({"type": "get_state"}));
     assert_eq!(state_after_abort["data"]["paused"], false);
@@ -1124,10 +1320,17 @@ fn golden_interrupt_abort_and_stop_mid_turn() {
 
     let (stop_resp, from_stop) = h.request(json!({"type": "interrupt", "intent": "stop"}));
     assert_eq!(stop_resp["success"], true);
+    assert_eq!(
+        stop_resp["data"],
+        json!({"interrupted": true, "turnId": "2"}),
+        "{stop_resp}"
+    );
     let paused = h.expect_frame(from_stop, |f| f["type"] == "session_paused", FRAME_TIMEOUT);
     let settled2 = h.expect_frame(from_stop, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    let idle2 = h.expect_frame(from_stop, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
     h.transcript.push(json!({"dir": "in", "frame": paused}));
     h.transcript.push(json!({"dir": "in", "frame": settled2}));
+    h.transcript.push(json!({"dir": "in", "frame": idle2}));
 
     let (state_after_stop, _) = h.request(json!({"type": "get_state"}));
     assert_eq!(state_after_stop["data"]["paused"], true);
@@ -1135,9 +1338,54 @@ fn golden_interrupt_abort_and_stop_mid_turn() {
 
     let (resumed, from_res) = h.request(json!({"type": "resume_session"}));
     assert_eq!(resumed["success"], true);
+    assert_eq!(
+        resumed["data"],
+        json!({
+            "resumed": true, "pauseSeq": 2, "turnStarted": false,
+            "deliveredNotices": 0, "deliveredHeldInputs": 0,
+        }),
+        "{resumed}"
+    );
     let resumed_evt = h.expect_frame(from_res, |f| f["type"] == "session_resumed", FRAME_TIMEOUT);
     h.transcript
         .push(json!({"dir": "in", "frame": resumed_evt}));
+
+    // The gateway's move path: `abort` with `awaitIdle` answers only once the turn is over.
+    let (_p3, from_p3) = h.request(json!({
+        "type": "prompt",
+        "message": "Hold turn 3",
+        "streamingBehavior": "followUp",
+    }));
+    let _start3 = h.expect_frame(from_p3, |f| f["type"] == "agent_start", FRAME_TIMEOUT);
+    let (moved, from_move) = h.request(json!({
+        "type": "abort",
+        "awaitIdle": true,
+        "effectId": "move-abort-1",
+    }));
+    assert_eq!(moved["data"], json!({"idle": true}), "{moved}");
+    let order: Vec<String> = h
+        .frames_since(from_move)
+        .iter()
+        .filter_map(|f| match f["type"].as_str() {
+            Some("response") => Some(format!("response:{}", f["command"].as_str()?)),
+            other => other.map(str::to_owned),
+        })
+        .collect();
+    let at = |name: &str| order.iter().position(|t| t == name);
+    assert!(
+        at("agent_end") < at("response:abort"),
+        "abort answered before the turn ended: {order:?}"
+    );
+    let end3 = h.expect_frame(from_move, |f| f["type"] == "agent_end", FRAME_TIMEOUT);
+    h.transcript.push(json!({"dir": "in", "frame": end3}));
+    let idle3 = h.expect_frame(from_move, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
+    h.transcript.push(json!({"dir": "in", "frame": idle3}));
+    let (retry, _) = h.request(json!({
+        "type": "abort",
+        "awaitIdle": true,
+        "effectId": "move-abort-1",
+    }));
+    assert_eq!(retry["data"], json!({"idle": true}), "{retry}");
 
     h.release_hold();
     let rows = h.transcript.clone();
@@ -1861,4 +2109,67 @@ fn golden_monitor_completion_joins_the_next_turn_after_a_hold() {
     let rows = h.transcript.clone();
     h.finish();
     assert_golden("monitor_wake_held_next_turn", &rows);
+}
+
+/// B1: a provider an extension registers is resolvable at launch (`--model` names it before
+/// any notification is served), listed by `get_available_models`, selectable with
+/// `set_model`, and streams to its own base URL; an unregistered one stays gone.
+#[test]
+fn extension_provider_boot() {
+    if !bun_on_path() {
+        eprintln!("skipping extension_provider_boot: bun not found on PATH");
+        return;
+    }
+    let ext_file = fixture_path("provider_ext.ts");
+    let ext_arg = ext_file.display().to_string();
+    let mut h = RpcHarness::spawn(&[
+        "-e",
+        &ext_arg,
+        "--model",
+        "fx-prov/m1",
+        "--no-model-fallback",
+    ]);
+
+    let (state, _) = h.request(json!({"type": "get_state"}));
+    let stderr = h.stderr_text();
+    assert_eq!(state["success"], true, "{state}\nstderr: {stderr}");
+    assert_eq!(state["data"]["model"]["provider"], "fx-prov", "{state}");
+    assert_eq!(state["data"]["model"]["id"], "m1", "{state}");
+
+    let (listed, _) = h.request(json!({"type": "get_available_models"}));
+    let ids: Vec<String> = listed["data"]["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .map(|m| {
+            format!(
+                "{}/{}",
+                m["provider"].as_str().unwrap_or_default(),
+                m["id"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    assert!(ids.iter().any(|i| i == "fx-prov/m1"), "{ids:?}");
+    assert!(ids.iter().any(|i| i == "fx-prov/m2"), "{ids:?}");
+    assert!(!ids.iter().any(|i| i.starts_with("fx-gone/")), "{ids:?}");
+
+    let (_, from_prompt) = h.request(json!({"type": "prompt", "message": "hello"}));
+    h.expect_frame(from_prompt, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    let sent: Vec<String> = h
+        ._mock
+        .requests
+        .lock()
+        .expect("requests lock")
+        .iter()
+        .map(|b| b["model"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(sent.last().map(String::as_str), Some("m1"), "{sent:?}");
+
+    let (switched, _) =
+        h.request(json!({"type": "set_model", "provider": "fx-prov", "modelId": "m2"}));
+    assert_eq!(switched["success"], true, "{switched}");
+    let (gone, _) = h.request(json!({"type": "set_model", "provider": "fx-gone", "modelId": "g1"}));
+    assert_eq!(gone["success"], false, "{gone}");
+
+    h.finish();
 }

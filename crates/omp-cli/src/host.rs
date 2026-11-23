@@ -296,6 +296,22 @@ impl Host {
             "get_protocol_info" => {
                 self.reply(&cmd, &kind, Ok(Some(protocol_info())), session.as_deref());
             }
+            "memory_report" => {
+                let host = self.clone();
+                work.spawn(async move {
+                    let live: Vec<(String, Arc<Runtime>)> = lock(&host.sessions)
+                        .iter()
+                        .filter_map(|(id, hosted)| Some((id.clone(), hosted.rt.upgrade()?)))
+                        .collect();
+                    let mut samples = Vec::with_capacity(live.len());
+                    for (id, rt) in live {
+                        samples.push(crate::memory_report::SessionSample::of(&rt, id).await);
+                    }
+                    samples.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+                    let result = crate::memory_report::handle(samples).await;
+                    host.reply(&cmd, "memory_report", result, session.as_deref());
+                });
+            }
             "negotiate_protocol" if session.is_none() => {
                 let result = match cmd.get("protocolVersion").and_then(Value::as_i64) {
                     Some(2) => Ok(Some(json!({"protocolVersion": 2}))),
@@ -576,6 +592,7 @@ fn protocol_info() -> Value {
         "mode": "multi_session",
         "capabilities": capabilities(),
         "commands": commands,
+        "features": crate::rpc::FEATURES,
         "agentDir": omp_providers::AgentDir::default().0.display().to_string(),
         "launchProfile": launch_profile(),
     })
@@ -721,6 +738,15 @@ async fn open_session(
     let failed =
         |what: &str, e: anyhow::Error| CmdError::coded(format!("{what}: {e:#}"), "open_failed");
     let cwd = &request.cwd;
+    // Extensions start before the model resolves: `--model` may name a provider an extension
+    // registers (`pi.registerProvider`).
+    let mut ext = None;
+    if !launch.no_extensions && crate::ext::has_extensions(&launch.extensions) {
+        match crate::ext::Extensions::start(cwd, &launch.extensions).await {
+            Ok(e) => ext = Some(e),
+            Err(e) => eprintln!("omt: {}: extensions disabled: {e:#}", request.id),
+        }
+    }
     let mut selected = match crate::model::select(launch.model.as_deref()).await {
         Ok(selected) => selected,
         // The gateway's move host launches without `--model`, and a move never prompts: a
@@ -747,13 +773,6 @@ async fn open_session(
         selected.thinking = crate::runtime::parse_level(level).ok_or_else(|| {
             CmdError::coded(format!("unknown thinking level: {level}"), "open_failed")
         })?;
-    }
-    let mut ext = None;
-    if !launch.no_extensions && crate::ext::has_extensions(&launch.extensions) {
-        match crate::ext::Extensions::start(cwd, &launch.extensions).await {
-            Ok(e) => ext = Some(e),
-            Err(e) => eprintln!("omt: {}: extensions disabled: {e:#}", request.id),
-        }
     }
     let extra_tools = match ext.as_ref() {
         Some(e) => e.tools().await.unwrap_or_default(),

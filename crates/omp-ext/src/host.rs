@@ -133,6 +133,18 @@ pub struct LoadedExtension {
 pub struct LoadResult {
     pub loaded: Vec<LoadedExtension>,
     pub errors: Vec<LoadError>,
+    /// Providers registered (`pi.registerProvider`) and still alive after the load.
+    #[serde(default)]
+    pub providers: Vec<LoadedProvider>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LoadedProvider {
+    pub name: String,
+    #[serde(default)]
+    pub extension: String,
+    #[serde(default)]
+    pub config: Value,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -867,6 +879,12 @@ impl ExtHost {
     pub async fn set_ctx(&self, ctx: Value) -> Result<()> {
         self.request("set_ctx", json!({ "ctx": ctx })).await?;
         Ok(())
+    }
+
+    /// Process id of the private host child; `None` in shared mode (the daemon is not this
+    /// session's) or once the child was reaped.
+    pub async fn child_pid(&self) -> Option<u32> {
+        self.child.lock().await.as_ref().and_then(Child::id)
     }
 
     /// Graceful exit: ask the host to exit, wait up to 2 s, then kill.

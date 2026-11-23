@@ -720,7 +720,10 @@ async function load(p: Json) {
         log("warn", `Link scheme "${scheme}" is claimed by several extensions; the first loaded gets its clicks`, { owner, ignored: ext.path });
       }
     }
-  return { loaded, errors };
+  // Every provider alive after this load: the core reconciles its registry with this list, so a
+  // registration made before the core serves notifications is not lost.
+  const live = [...providers.values()].map((p) => ({ name: p.name, extension: p.extension, config: p.config }));
+  return { loaded, errors, providers: live };
 }
 
 // ---------------------------------------------------------------- emit

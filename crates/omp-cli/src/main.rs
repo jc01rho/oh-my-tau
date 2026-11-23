@@ -9,12 +9,14 @@ mod compact;
 mod context;
 mod context_policy;
 mod dedup;
+mod effects;
 mod events;
 mod ext;
 mod features;
 mod herdr;
 mod host;
 mod images;
+mod memory_report;
 mod methodology;
 mod model;
 mod move_cmd;
@@ -460,23 +462,9 @@ async fn async_main() -> Result<()> {
     if args.thinking.is_some() {
         runtime::THINKING_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let mut selected = model::select(reference.as_deref()).await?;
-    if !selected.fallbacks.is_empty() {
-        let primary = format!("{}/{}", selected.model.provider, selected.model.id);
-        let _ = runtime::LAUNCH_FALLBACKS.set((primary, std::mem::take(&mut selected.fallbacks)));
-    }
-    if let Some(key) = args.api_key.clone() {
-        selected.api_key = Some(key);
-        selected.credential_id = None;
-    }
-    if let Some(level) = args.thinking.as_deref() {
-        if level != "auto" {
-            selected.thinking = runtime::parse_level(level)
-                .ok_or_else(|| anyhow::anyhow!("unknown thinking level: {level}"))?;
-        }
-    }
-
-    // Extension host: hooks + tools feed agent construction, so it starts first.
+    // Extension host: hooks + tools feed agent construction, so it starts first. It also starts
+    // before the model is resolved: a provider an extension registers (`pi.registerProvider`)
+    // must be in the registry when `--model` names it.
     let mut extensions: Option<std::sync::Arc<ext::Extensions>> = None;
     if !args.no_extensions {
         let extra: Vec<PathBuf> = args
@@ -500,6 +488,22 @@ async fn async_main() -> Result<()> {
             }
         }
     }
+    let mut selected = model::select(reference.as_deref()).await?;
+    if !selected.fallbacks.is_empty() {
+        let primary = format!("{}/{}", selected.model.provider, selected.model.id);
+        let _ = runtime::LAUNCH_FALLBACKS.set((primary, std::mem::take(&mut selected.fallbacks)));
+    }
+    if let Some(key) = args.api_key.clone() {
+        selected.api_key = Some(key);
+        selected.credential_id = None;
+    }
+    if let Some(level) = args.thinking.as_deref() {
+        if level != "auto" {
+            selected.thinking = runtime::parse_level(level)
+                .ok_or_else(|| anyhow::anyhow!("unknown thinking level: {level}"))?;
+        }
+    }
+
     let extra_tools = match extensions.as_ref() {
         Some(e) => e.tools().await.unwrap_or_default(),
         None => Vec::new(),

@@ -24,3 +24,4 @@ bench/results/
 bench/context/results/
 bench/context/RESULTS-*.md
 bench/rlm/results/
+tests-e2e/node_modules/
