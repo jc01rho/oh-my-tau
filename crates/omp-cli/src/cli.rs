@@ -50,7 +50,7 @@ pub struct Args {
     pub service_tier: Option<String>,
     pub system_prompt: Option<String>,
     pub system_prompt_template: Option<String>,
-    pub append_system_prompt: Option<String>,
+    pub append_system_prompt: Vec<String>,
     pub allow_home: bool,
     pub profile: Option<String>,
     pub alias: Option<String>,
@@ -297,7 +297,7 @@ fn set_string(a: &mut Args, flag: &str, value: String, invalid: &mut Vec<String>
         },
         "--system-prompt" => a.system_prompt = Some(value),
         "--system-prompt-template" => a.system_prompt_template = Some(value),
-        "--append-system-prompt" => a.append_system_prompt = Some(value),
+        "--append-system-prompt" => a.append_system_prompt.push(value),
         // Parsed but unused in omp-rs (no provider-session / plugin subsystem):
         "--provider-session-id" | "--prompt-cache-key" | "--plugin-dir" => {}
         "--session-dir" => a.session_dir = Some(PathBuf::from(value)),
@@ -772,6 +772,26 @@ mod tests {
         .unwrap();
         assert_eq!(a.config, ["a.yml", "b.yml"]);
         assert_eq!(a.add_dir, [PathBuf::from("/tmp"), PathBuf::from("/var")]);
+    }
+
+    /// The gateway passes `--append-system-prompt` twice (OMOCAT.md, then
+    /// the owner-authority line); both values must survive in argv order.
+    #[test]
+    fn append_system_prompt_repeatable() {
+        let a = parse(&[
+            "--append-system-prompt",
+            "/sec/OMOCAT.md",
+            "--append-system-prompt",
+            "owner authority",
+            "msg",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.append_system_prompt,
+            ["/sec/OMOCAT.md", "owner authority"]
+        );
+        let a = parse(&["msg"]).unwrap();
+        assert!(a.append_system_prompt.is_empty());
     }
 
     #[test]
