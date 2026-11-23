@@ -1,15 +1,19 @@
 #!/bin/sh
 # Install omt (oh my tau).
-#   curl -fsSL https://raw.githubusercontent.com/kanashimi1/oh-my-tau/main/install.sh | sh
-# Picks the release asset for Linux x86_64/aarch64 and macOS x86_64/arm64,
-# verifies the sha256 against SHA256SUMS.txt, then installs to
-# ${OMT_INSTALL_DIR:-$HOME/.local/bin}/omt.
+#   curl -fsSL https://raw.githubusercontent.com/jc01rho/oh-my-tau/main/install.sh | sh
+# Picks the release tarball for Linux x86_64/aarch64 and macOS x86_64/arm64,
+# verifies its sha256 against SHA256SUMS.txt, and unpacks it under
+# ${OMT_HOME:-$HOME/.local/share/omt}/versions/<version>/ with bin/omt,
+# ext-host/ (the Bun extension host) and the license files.
+# ${OMT_INSTALL_DIR:-$HOME/.local/bin}/omt points at the newest install.
+# The extension host needs bun; a missing bun fails the install.
 set -eu
 
-REPO="kanashimi1/oh-my-tau"
-TAG="${OMT_VERSION:-v0.12.0}"
-BASE="https://github.com/${REPO}/releases/download/${TAG}"
+REPO="${OMT_REPO:-jc01rho/oh-my-tau}"
+TAG="${OMT_VERSION:-}"
+BASE="https://github.com/${REPO}/releases"
 DEST_DIR="${OMT_INSTALL_DIR:-$HOME/.local/bin}"
+OMT_HOME="${OMT_HOME:-$HOME/.local/share/omt}"
 
 os=$(uname -s)
 arch=$(uname -m)
@@ -32,6 +36,35 @@ if [ -z "$platform" ] || [ -z "$machine" ]; then
     exit 1
 fi
 
+if ! command -v bun >/dev/null 2>&1; then
+    echo "omt: bun is required for the extension host (https://bun.sh)." >&2
+    exit 1
+fi
+command -v curl >/dev/null 2>&1 || { echo "omt: curl is required" >&2; exit 1; }
+command -v tar >/dev/null 2>&1 || { echo "omt: tar is required" >&2; exit 1; }
+
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256() { sha256sum "$@"; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256() { shasum -a 256 "$@"; }
+else
+    echo "omt: sha256sum or shasum is required" >&2
+    exit 1
+fi
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
+if [ -z "$TAG" ]; then
+    tag_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' "${BASE}/latest")
+    TAG=${tag_url##*/}
+    if [ -z "$TAG" ] || [ "$TAG" = "latest" ]; then
+        echo "omt: cannot resolve the newest release under ${BASE}" >&2
+        exit 1
+    fi
+fi
+DOWNLOAD="${BASE}/download/${TAG}"
+
 # Linux: glibc build by default; the fully static musl build where glibc is
 # absent (Alpine, distroless) or when OMT_LIBC=musl. The musl build lacks only
 # the optional ONNX-based Laya judge.
@@ -46,25 +79,11 @@ if [ "$platform" = "linux" ] && [ "$libc" = "musl" ]; then
     ASSET="${ASSET}-musl"
 fi
 
-command -v curl >/dev/null 2>&1 || { echo "omt: curl is required" >&2; exit 1; }
-if command -v sha256sum >/dev/null 2>&1; then
-    sha256() { sha256sum "$@"; }
-elif command -v shasum >/dev/null 2>&1; then
-    sha256() { shasum -a 256 "$@"; }
-else
-    echo "omt: sha256sum or shasum is required" >&2
-    exit 1
-fi
+curl -fsSL -o "$tmp/SHA256SUMS.txt" "${DOWNLOAD}/SHA256SUMS.txt"
 
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
-
-curl -fsSL -o "$tmp/SHA256SUMS.txt" "${BASE}/SHA256SUMS.txt"
-
-# Download one asset into $tmp and verify it against SHA256SUMS.txt.
 fetch() {
     echo "Downloading $1 ${TAG} ..."
-    curl -fL --progress-bar -o "$tmp/$1" "${BASE}/$1"
+    curl -fL --progress-bar -o "$tmp/$1" "${DOWNLOAD}/$1"
     expected=$(awk -v f="$1" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp/SHA256SUMS.txt")
     if [ -z "$expected" ]; then
         echo "omt: $1 not listed in SHA256SUMS.txt" >&2
@@ -76,20 +95,55 @@ fetch() {
         exit 1
     fi
     echo "sha256 ok: ${actual}"
-    chmod +x "$tmp/$1"
 }
 
-fetch "$ASSET"
+install_tarball() {
+    name="$1.tar.gz"
+    fetch "$name"
+    rm -rf "$tmp/unpacked"
+    mkdir -p "$tmp/unpacked"
+    tar -C "$tmp/unpacked" -xzf "$tmp/$name"
+    if [ ! -f "$tmp/unpacked/bin/omt" ]; then
+        echo "omt: ${name} has no bin/omt" >&2
+        exit 1
+    fi
+    if [ ! -f "$tmp/unpacked/ext-host/host.ts" ]; then
+        echo "omt: ${name} has no ext-host/host.ts" >&2
+        exit 1
+    fi
+    chmod +x "$tmp/unpacked/bin/omt"
+}
+
+install_tarball "$ASSET"
 # A glibc build that cannot run here (glibc too old): use the static musl build.
-if [ "$platform" = "linux" ] && [ "$libc" != "musl" ] && ! "$tmp/$ASSET" --version >/dev/null 2>&1; then
+if [ "$platform" = "linux" ] && [ "$libc" != "musl" ] && ! "$tmp/unpacked/bin/omt" --version >/dev/null 2>&1; then
     echo "omt: ${ASSET} does not run on this system (glibc too old?); using the static musl build"
     ASSET="${ASSET}-musl"
-    fetch "$ASSET"
+    install_tarball "$ASSET"
 fi
 
+version=$("$tmp/unpacked/bin/omt" --version | sed -n 's|^omt/||p')
+if [ -z "$version" ]; then
+    echo "omt: the downloaded binary did not report a version" >&2
+    exit 1
+fi
+
+prefix="${OMT_HOME}/versions/${version}"
+mkdir -p "${OMT_HOME}/versions"
+rm -rf "${prefix}.tmp"
+mv "$tmp/unpacked" "${prefix}.tmp"
+rm -rf "$prefix"
+mv "${prefix}.tmp" "$prefix"
+
 mkdir -p "$DEST_DIR"
-mv -f "$tmp/$ASSET" "$DEST_DIR/omt"
-echo "Installed ${DEST_DIR}/omt"
+ln -sf "${prefix}/bin/omt" "$DEST_DIR/omt"
+echo "Installed ${DEST_DIR}/omt -> ${prefix}/bin/omt (${version}, ext-host bundled)"
+
+if ! "$DEST_DIR/omt" --version >/dev/null 2>&1; then
+    echo "omt: ${DEST_DIR}/omt does not run after installation" >&2
+    exit 1
+fi
+echo "Verified: $("$DEST_DIR/omt" --version)"
 
 case ":${PATH}:" in
     *":${DEST_DIR}:"*) ;;
