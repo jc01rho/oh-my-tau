@@ -96,6 +96,29 @@ impl Block {
         Ok(block)
     }
 
+    /// A new block from `create`'s `file_text`. When the text opens with its
+    /// own frontmatter, that header is merged instead of nested: `description`
+    /// wins, every other header line is kept, and only the text after the
+    /// closing fence becomes the body.
+    ///
+    /// # Errors
+    /// The description is empty, too long, or does not survive a round trip.
+    pub fn from_file_text(description: &str, text: &str) -> Result<Self, RepoError> {
+        let Some((header, body, separators)) = split_frontmatter(text) else {
+            return Self::new(description, text);
+        };
+        let description = sanitize_description(description);
+        check_description(&description).map_err(RepoError::new)?;
+        let next = Self {
+            header: header_with_description(&header, &description),
+            separators,
+            body: body.to_owned(),
+            description: description.clone(),
+            read_only: false,
+        };
+        Self::checked(&next.render(), &description)
+    }
+
     /// This block with `description` replaced, every other header line kept.
     ///
     /// # Errors
@@ -103,23 +126,8 @@ impl Block {
     pub fn with_description(&self, description: &str) -> Result<Self, RepoError> {
         let description = sanitize_description(description);
         check_description(&description).map_err(RepoError::new)?;
-        let mut header = Vec::with_capacity(self.header.len());
-        let mut skipping_continuation = false;
-        for line in &self.header {
-            if skipping_continuation && (line.trim().is_empty() || line.starts_with([' ', '\t'])) {
-                continue;
-            }
-            skipping_continuation = false;
-            match top_level_entry(line) {
-                Some((key, value)) if key == "description" => {
-                    header.push(format!("description: {}", render_scalar(&description)));
-                    skipping_continuation = value.starts_with(['|', '>']);
-                }
-                _ => header.push(line.clone()),
-            }
-        }
         let next = Self {
-            header,
+            header: header_with_description(&self.header, &description),
             separators: self.separators,
             body: self.body.clone(),
             description: description.clone(),
@@ -164,6 +172,36 @@ impl Block {
             _ => Err(RepoError::new("rendered header does not round-trip")),
         }
     }
+}
+
+/// `header` with its `description` entry (and block-scalar continuation)
+/// replaced by `description`; the entry is put first when the header has none.
+fn header_with_description(header: &[String], description: &str) -> Vec<String> {
+    let line = format!("description: {}", render_scalar(description));
+    let mut out = Vec::with_capacity(header.len() + 1);
+    let mut found = false;
+    let mut skipping_continuation = false;
+    for current in header {
+        if skipping_continuation && (current.trim().is_empty() || current.starts_with([' ', '\t']))
+        {
+            continue;
+        }
+        skipping_continuation = false;
+        match top_level_entry(current) {
+            Some((key, value)) if key == "description" => {
+                if !found {
+                    out.push(line.clone());
+                    found = true;
+                }
+                skipping_continuation = value.starts_with(['|', '>']);
+            }
+            _ => out.push(current.clone()),
+        }
+    }
+    if !found {
+        out.insert(0, line);
+    }
+    out
 }
 
 /// Collapses newline runs to one space and trims, so a description is one line.
