@@ -1454,7 +1454,8 @@ pub struct Options {
     /// `--system-prompt <path|text>` (replaces the default prompt).
     pub system_prompt: Option<String>,
     /// `--append-system-prompt <path|text>` (appended in the project block).
-    pub append_system_prompt: Option<String>,
+    /// Repeatable: every value lands in argv order.
+    pub append_system_prompt: Vec<String>,
     /// `--tools <csv>`: restrict enabled tools (omp semantics).
     pub tools_csv: Option<String>,
     /// Prompt is for a subagent session.
@@ -2013,6 +2014,21 @@ pub type ToolMeta = (String, String);
 
 /// Join generated append parts with the user's append prompt
 /// (`composeAppendPrompt`).
+/// Resolves every `--append-system-prompt` value (file content or literal)
+/// and joins them in argv order; `None` when nothing is left.
+fn resolve_user_appends(values: &[String]) -> Option<String> {
+    let resolved: Vec<String> = values
+        .iter()
+        .map(|value| resolve_prompt_input(value))
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    if resolved.is_empty() {
+        None
+    } else {
+        Some(resolved.join("\n\n"))
+    }
+}
+
 fn compose_append(generated: &[String], user: Option<&str>) -> String {
     let generated = if generated.is_empty() {
         None
@@ -2086,10 +2102,7 @@ pub fn build_full(
         })
     };
 
-    let user_append = opts
-        .append_system_prompt
-        .as_deref()
-        .map(resolve_prompt_input);
+    let user_append = resolve_user_appends(&opts.append_system_prompt);
     let mut generated = opts.generated_append.clone();
     let already_has_directive = custom_prompt
         .as_deref()
@@ -2756,12 +2769,30 @@ mod tests {
         std::fs::write(agent.join("SYSTEM.md"), "discovered").unwrap();
         let opts = Options {
             system_prompt: Some("literal custom".into()),
-            append_system_prompt: Some("extra guidance".into()),
+            append_system_prompt: vec!["extra guidance".into()],
             ..Options::default()
         };
         let built = build_with(&root, &root, &agent, &opts, &[]);
         assert_eq!(built.blocks[0], "literal custom");
         assert!(built.blocks[1].ends_with("extra guidance"));
+        // Several `--append-system-prompt` values (file + literal) keep argv
+        // order inside the single user-append block.
+        let marker = root.join("owner.md");
+        std::fs::write(&marker, "from owner file").unwrap();
+        let opts = Options {
+            append_system_prompt: vec![
+                marker.to_str().unwrap().to_string(),
+                "owner authority".into(),
+                "   ".into(),
+            ],
+            ..Options::default()
+        };
+        let built = build_with(&root, &root, &agent, &opts, &[]);
+        let append = built.blocks.last().unwrap();
+        let first = append.find("from owner file").expect("file value");
+        let second = append.find("owner authority").expect("literal value");
+        assert!(first < second, "argv order: {append}");
+        assert!(!append.contains("   \n"), "blank value dropped: {append}");
         // Discovery path: user SYSTEM.md becomes block 0 verbatim (trimmed).
         let opts = Options::default();
         let built = build_with(&root, &root, &agent, &opts, &[]);
