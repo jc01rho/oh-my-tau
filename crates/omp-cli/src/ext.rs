@@ -1177,6 +1177,7 @@ impl Extensions {
         for err in &loaded.errors {
             eprintln!("omt: extension failed to load: {}: {}", err.path, err.error);
         }
+        sync_providers(&loaded.providers);
 
         let ext = Arc::new(Self {
             mcp: McpNotificationSink::new(host.clone()),
@@ -1700,6 +1701,7 @@ impl Extensions {
         for err in &loaded.errors {
             eprintln!("omt: extension failed to load: {}: {}", err.path, err.error);
         }
+        sync_providers(&loaded.providers);
         self.send_ctx().await?;
         if !self.extra.is_empty() || self.dir.is_some() {
             self.live.needs_branch.store(
@@ -2132,11 +2134,43 @@ fn emit_silent(r: Result<omp_ext::EmitResult>) {
     }
 }
 
+/// Makes the core's extension-provider registry match the providers a finished load reports
+/// alive (a registration made before notifications are served would otherwise be lost).
+fn sync_providers(providers: &[omp_ext::LoadedProvider]) {
+    let errors = omp_providers::extension::replace_all(
+        providers
+            .iter()
+            .map(|p| (p.name.clone(), p.extension.clone(), p.config.clone())),
+    );
+    for err in errors {
+        eprintln!("omt: {err}");
+    }
+}
+
 fn handle_notification(rt: &Arc<Runtime>, msg: HostMessage) {
     let HostMessage::Notification { method, params } = msg else {
         return;
     };
     match method.as_str() {
+        "provider_registered" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let extension = params
+                .get("extension")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let config = params.get("config").cloned().unwrap_or(Value::Null);
+            if let Err(e) = omp_providers::extension::upsert(name, extension, &config) {
+                eprintln!("omt: {e}");
+            }
+        }
+        "provider_unregistered" => {
+            if let Some(name) = params.get("name").and_then(Value::as_str) {
+                omp_providers::extension::remove(name);
+            }
+        }
         "append_entry" => {
             let entry = json!({
                 "extension": params.get("extension").cloned().unwrap_or(Value::Null),
