@@ -219,8 +219,8 @@ pub struct Runtime {
     pause: Mutex<crate::pause::PauseState>,
     /// Number of `pause_for_stop` calls currently between `abort()` and installing the hold.
     stop_pending: std::sync::atomic::AtomicUsize,
-    /// True while a `maybe_todo_reminder` spawned continuation is appending and starting.
-    todo_continuation: std::sync::atomic::AtomicBool,
+    /// Number of `maybe_todo_reminder` spawned continuations currently appending and starting.
+    todo_continuation: std::sync::atomic::AtomicUsize,
     /// Monotonically incremented whenever `pause_for_stop` starts so a prompt admitted before
     /// `abort()` cannot start a turn after a concurrent stop takes the hold.
     stop_epoch: std::sync::atomic::AtomicU64,
@@ -730,7 +730,7 @@ impl Runtime {
             user_interrupt: std::sync::atomic::AtomicBool::new(false),
             pause: Mutex::new(crate::pause::PauseState::default()),
             stop_pending: std::sync::atomic::AtomicUsize::new(0),
-            todo_continuation: std::sync::atomic::AtomicBool::new(false),
+            todo_continuation: std::sync::atomic::AtomicUsize::new(0),
             stop_epoch: std::sync::atomic::AtomicU64::new(0),
             prompt_admission: tokio::sync::Mutex::new(()),
             tool_list_lock: tokio::sync::Mutex::new(()),
@@ -1587,12 +1587,12 @@ impl Runtime {
         let rt = self.clone();
         let messages = messages.to_vec();
         self.todo_continuation
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(async move {
-            struct Guard<'a>(&'a std::sync::atomic::AtomicBool);
+            struct Guard<'a>(&'a std::sync::atomic::AtomicUsize);
             impl Drop for Guard<'_> {
                 fn drop(&mut self) {
-                    self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
             let guard = Guard(&rt.todo_continuation);
@@ -1640,6 +1640,7 @@ impl Runtime {
             || self
                 .todo_continuation
                 .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
             || lock(&self.retry_task)
                 .as_ref()
                 .is_some_and(|task| !task.is_finished())
@@ -2208,7 +2209,9 @@ impl Runtime {
             ));
         }
         self.ensure_session(session)?;
-        self.release_pause("input");
+        if session.is_none() {
+            self.release_pause("input");
+        }
         let stop_epoch = self.stop_epoch.load(std::sync::atomic::Ordering::SeqCst);
         // A prompt during in-flight compaction cancels it and waits for the
         // pass to settle first (TS prompt-side `abortCompaction` +
@@ -2776,6 +2779,12 @@ impl Runtime {
             Err(e) if e.code == Some("session_mismatch") => {}
             Err(e) if e.code == Some("session_paused") => {
                 self.queue_monitor_wake(&text);
+            }
+            Err(e) if crate::features::budget::prompt_refusal().is_some() => {
+                eprintln!(
+                    "omt: monitor wake dropped after budget refusal: {}",
+                    e.message
+                );
             }
             Err(e) => {
                 eprintln!(
