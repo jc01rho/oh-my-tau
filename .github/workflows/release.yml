@@ -135,7 +135,14 @@ jobs:
           # extensions on its own, so the tarball is the artifact install.sh uses.
           cp "out/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
           sh _wf/scripts/package-release.sh "out/${{ matrix.bin }}" "dist/${{ matrix.tarball }}" "${{ matrix.bin }}" .
-          (cd dist && sha256sum "${{ matrix.tarball }}" > "${{ matrix.tarball }}.sha256")
+          # sha256sum is absent on the macOS runners and shasum on the Windows
+          # ones, so pick whichever the runner provides.
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.tarball }}" > "${{ matrix.tarball }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.tarball }}" > "${{ matrix.tarball }}.sha256"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}

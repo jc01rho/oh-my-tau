@@ -41,7 +41,8 @@ The `omt web` browser UI:
 Linux x86_64/aarch64 and macOS, prebuilt tarball (verifies the release's
 sha256, unpacks `bin/omt` with its `ext-host/` under
 `~/.local/share/omt/versions/<version>/` and links `~/.local/bin/omt`;
-set `OMT_INSTALL_DIR` or `OMT_HOME` to change those):
+set `OMT_INSTALL_DIR` or `OMT_HOME` to change those). The extension host runs
+on [Bun](https://bun.sh), so the installer requires `bun` on `PATH`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jc01rho/oh-my-tau/main/install.sh | sh

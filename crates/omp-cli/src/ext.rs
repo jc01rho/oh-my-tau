@@ -139,9 +139,18 @@ pub fn host_script() -> Option<PathBuf> {
 /// lay out each shape in a temp dir.
 fn find_host_script(env: Option<&Path>, exe: &Path) -> Option<PathBuf> {
     // `OMP_RS_EXT_HOST=private` selects the per-process host elsewhere; only a
-    // file path overrides the search.
-    if let Some(p) = env.filter(|p| p.is_file()) {
-        return Some(p.to_path_buf());
+    // file path overrides the search. Any other value that is not a file is a
+    // mistake worth reporting instead of silently running a different copy.
+    if let Some(p) = env {
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+        if p != Path::new("private") {
+            eprintln!(
+                "omt: OMP_RS_EXT_HOST={} is not a file; searching for the extension host",
+                p.display()
+            );
+        }
     }
     for dir in exe.ancestors() {
         for rel in ["ext-host/host.ts", SHARE_EXT_HOST] {

@@ -130,10 +130,15 @@ fi
 
 prefix="${OMT_HOME}/versions/${version}"
 mkdir -p "${OMT_HOME}/versions"
-rm -rf "${prefix}.tmp"
+rm -rf "${prefix}.tmp" "${prefix}.old"
 mv "$tmp/unpacked" "${prefix}.tmp"
-rm -rf "$prefix"
+# Move the previous install aside first: a failure or interrupt here must not
+# leave the launcher pointing at a directory that is already gone.
+if [ -e "$prefix" ]; then
+    mv "$prefix" "${prefix}.old"
+fi
 mv "${prefix}.tmp" "$prefix"
+rm -rf "${prefix}.old"
 
 mkdir -p "$DEST_DIR"
 ln -sf "${prefix}/bin/omt" "$DEST_DIR/omt"
