@@ -23,12 +23,13 @@
 | B5 | tau | 기억 저장소 자동 연결·프롬프트 투영 없음 | `memory` 도구 미노출, 기억이 프롬프트에 없음 | 중~대 |
 | B6 | tau | 배포 바이너리가 `ext-host/host.ts`를 못 찾음(이번에 새로 확인) | 설치본에서 `--extension` 사용 불가 | 소 |
 | B7 | tau | `memory_report` RPC 없음 | 게이트웨이 메모리 측정 실패 | 소 |
+| B8 | tau | `agent_idle` 이벤트 없음, `interrupt`·`resume_session` 응답 비어 있음(부록 A 실측에서 확인) | 게이트웨이가 턴 종료를 못 보고 세션을 계속 "실행 중"으로 봄 | 소 |
 | N1 | 게이트웨이 | 버전 문자열로 엔진 기능 판정 | tau `0.12.0`이 구버전으로 판정돼 이동이 막히고 매번 reload | 소 |
 | N2 | 게이트웨이 | 프로세스 탐색 패턴에 `omt` 없음 | tau 레인을 못 찾음 | 소 |
 | N3 | 게이트웨이 | 설치기·워커 배포가 mhc 전용 | tau를 장비에 설치할 수 없음 | 중 |
 | N4 | 게이트웨이 | `omo.feedback.*` 확장 질의가 엔진 전제 | tau 레인에서 피드백 명령 실패 | 소 |
 
-카나리 시작 조건은 B1~B4, B6, N1~N3이다. B5, B7, N4는 카나리와 병행해도 되지만 전면 전환 전에는 필요하다.
+카나리 시작 조건은 B1~B4, B6, B8, N1~N3이다. B5, B7, N4는 카나리와 병행해도 되지만 전면 전환 전에는 필요하다.
 
 ---
 
@@ -104,7 +105,9 @@ registerProvider("omomeow-opus", {
 5. `abort`: `awaitIdle: true`이면 중단을 건 뒤, 에이전트 상태가 유휴(`!isStreaming && !isCompacting && !isBashRunning`)가 되는 이벤트를 구독해서 기다린다. 기본 상한은 30초이고 `awaitIdleTimeoutMs`로 바꿀 수 있다. 응답은 `{ idle: true|false }`다. `awaitIdle`이 없을 때도 `{ idle: <현재 상태> }`를 돌려주되, 기다리지는 않는다. 고정 sleep이나 폴링은 쓰지 않는다.
 6. 게이트웨이는 `abort`에 `effectId`를 붙여 보낸다. tau `rpc.rs`에는 아직 `effectId` 처리가 없다. 이번에 같은 id의 재시도에는 처음 결과를 그대로 돌려주는 작은 원장(세션별, 최근 N개)을 추가한다.
 
-**확인 필요.** mhc가 `usageTotals`에 비용을 어떤 단위로 넣는지(USD 소수인지)는 mhc `get_state`를 한 번 실측해서 맞춘다. 게이트웨이는 숫자인지만 검사한다.
+**`cost` 단위(확인됨, 부록 A-3).** mhc는 모델 단가(백만 토큰당 USD)를 `rate / 1_000_000 × 토큰 수`로 계산한 USD 소수를 메시지별 `usage.cost.total`에 넣고, 그 합을 `usageTotals.cost`로 돌려준다. tau도 같은 USD 소수를 쓴다. 캐시 적중률이 있으면 mhc처럼 `usageTotals.latestCacheHitRate`를 더한다.
+
+**mhc `get_state` 키 목록(실측, 부록 A-4).** tau가 기준으로 삼을 실제 키다. 이번에 꼭 더해야 하는 것은 게이트웨이가 읽는 `pendingMessageCount`, `isBashRunning`, `usageTotals`, `sessionFile`, `cwd`이고, 나머지는 차이 목록으로만 남긴다.
 
 **테스트.**
 - 골든 RPC: 기존 `get_state` 프레임 7곳에 새 필드를 반영하고, `interrupt_abort_mid_turn.jsonl`에 `abort awaitIdle` → `{ idle: true }` 경우를 추가한다.
@@ -123,7 +126,7 @@ registerProvider("omomeow-opus", {
 1. 성공한 적재에도 `LoadTracker`를 `Ext`에 남긴다. 지금은 실패한 적재의 되돌리기(`rollbackLoad`, 451행)에서만 쓴다.
 2. `host.ts`에 `unload_all` 요청을 추가한다. 각 확장에 `session_shutdown`(사유 `reload`)을 보낸 뒤, 그 확장의 추적 기록으로 구독을 풀고, RPC 이름, 공급자(`provider_unregistered` 알림 포함), 플래그 값, 링크 스킴을 정리하고 `exts`를 비운다. `rollbackLoad`와 같은 소유권 규칙(다른 확장이 나중에 쓴 값은 건드리지 않음)을 쓴다.
 3. Rust `Extensions::reload`는 `recover()` 전에 `unload_all`을 보낸다. 투명 재연결(새 프로세스) 경로는 비어 있는 호스트에 `unload_all`을 보내게 되는데, 아무 일도 하지 않으므로 그대로 둔다.
-4. 업스트림 TS가 재적재 때 `session_shutdown`을 보내는지는 구현 전에 `packages/coding-agent`의 reload 경로에서 확인하고, 다르면 업스트림을 따른다.
+4. 기준은 업스트림 TS가 아니라 mhc다(부록 A-5). 업스트림 `packages/coding-agent`의 RPC 모드에는 `reload` 명령이 없고, `AgentSession.reload()`는 세션 파일을 다시 여는 것(`switchSession`)이다. 게이트웨이가 보내는 `reload`는 omo/mhc가 더한 명령이고, mhc `AgentSession::reload`(`maho-core/src/agent_session.rs`)는 다음 순서로 돈다: `session_before_reload`(거부 가능) → 진행 중 턴 중단 → `session_shutdown`(사유 `reload`) → 확장 런타임 무효화 → 설정·`models.json` 다시 읽기 → 리소스 다시 찾기 → 시스템 프롬프트 다시 만들기 → 확장 런타임 새로 만들기(`session_start` 사유 `reload`) → 이전 플래그 값 복원 → 확장이 다시 등록한 공급자로 모델 범위 다시 풀기. tau도 이 순서를 따른다. 특히 `session_before_reload` 거부는 응답 `{ cancelled: true }`로 돌려주고(게이트웨이 `lane-hold.ts:64`가 이 값을 읽는다), 플래그 값은 재적재 뒤 복원한다.
 5. `reload`가 실패하면 지금처럼 `CmdError`로 돌려준다. 실패한 확장은 `rollbackLoad`로 정리되므로 다음 `reload`가 다시 깨지지 않는다.
 
 **테스트.**
@@ -141,19 +144,19 @@ registerProvider("omomeow-opus", {
 - `slug` = 경로 마지막 이름을 NFKD로 펴고, 결합 문자를 지우고, 소문자로 바꾸고, 문자·숫자 아닌 것을 `-`로 바꾸고, 연속 `-`를 줄이고, 양끝 `-`를 지우고, 40자로 자른 값(비면 `agent`)
 - `legacy` = 같은 과정을 ASCII `[a-z0-9]`만 남겨 한 값
 - 저장소 = `<기억 홈>/agents/<slug>-<hash>/repo`. 이게 git 저장소가 아니고 `<legacy>-<hash>/repo`가 git 저장소이면 legacy 쪽을 쓴다.
-- 기억 홈 = `OMO_MEMORY_HOME`, 없으면 `~/.omo/memory`
+- 기억 홈 = `MAHO_MEMORY_HOME`(공백이 아니면 cwd 기준으로 해석), 없으면 `~/.omo/memory`. mhc 2026.11.20은 `OMO_MEMORY_HOME`을 무시한다(부록 A-1 실측: `OMO_MEMORY_HOME`만 주면 실제 `~/.omo/memory`에 만든다). 게이트웨이의 자동 회상(`gateway.ts:504`)은 `OMO_MEMORY_HOME`을 읽으므로, tau는 `MAHO_MEMORY_HOME`을 먼저 보고 없으면 `OMO_MEMORY_HOME`을 본다.
 
 검증값: `/home/whrho/git/oh-my-tau` → `oh-my-tau-3eb9c32a`. 이 작업 세션이 실제로 묶인 기억 id와 같다.
 
 **설계.**
-1. `MEMORY_DIR`이 있으면 지금처럼 그 값을 쓴다. 없으면 위 규칙으로 저장소를 찾는다. 저장소가 없을 때 mhc가 새로 만드는지는 구현 전에 mhc를 실측해 확인하고 같은 동작을 한다. 확인 전까지는 만들지 않고 도구도 노출하지 않으며, 그 사실을 기동 로그에 한 줄 남긴다.
+1. `MEMORY_DIR`이 있으면 지금처럼 그 값을 쓴다. 없으면 위 규칙으로 저장소를 찾는다. 저장소가 없으면 만들지 않는다. mhc도 `repo`를 만들지 않고 `runtime/{facts-queue,locks,transcripts}`만 만든다(부록 A-1 실측). 저장소는 `/memfs init`이나 `/init`으로만 생긴다(mhc `commands/memory.rs`의 안내 문구). tau는 `runtime/` 하위 디렉터리도 만들지 않는다(그 내용을 쓰는 기능이 없다). 저장소가 없으면 도구를 노출하지 않고 기동 로그에 한 줄 남긴다.
 2. `AGENT_ID`가 없으면 `<slug>-<hash>`를 커밋 작성자 id로 쓴다.
 3. 프롬프트 투영. 세션이 시작될 때 저장소 HEAD를 고정(pin)하고 시스템 프롬프트에 기억 섹션을 만든다.
    - `system/` 아래 블록은 본문까지 넣는다. 앞머리 `expires`가 지난 블록은 뺀다.
    - 나머지 블록은 경로와 `description`만 목록으로 넣는다.
-   - 섹션 머리에 고정한 커밋을 적는다.
-4. 변경 알림. 턴을 시작할 때 HEAD가 고정값과 다르면, 프롬프트는 그대로 두고 바뀐 파일 목록만 짧은 알림으로 넣는다(고정한 프롬프트를 지키므로 캐시가 깨지지 않는다). 압축(compaction) 뒤에는 새 HEAD로 다시 고정한다.
-5. 정확한 섹션 형식과 알림 문구는 mhc가 실제로 만드는 것을 한 세션 실측해서 따른다. 내용과 순서는 위 규칙대로 하고, 겉모양은 mhc 출력을 따른다.
+   - 고정한 커밋은 프롬프트가 아니라 세션 항목(`omo-memory:projection-pin`, mhc와 같은 형식 `{version, sessionId, revision, noticedThrough, compactionId, pinnedAtMs}`)으로 남긴다. 재개·호스트 재시작·reload 뒤에도 같은 바이트를 만들기 위해서다. JSONL v3 세션을 mhc와 주고받을 때도 이 항목이 그대로 쓰인다.
+4. 변경 알림. 턴을 시작할 때 HEAD가 고정값과 다르면, 프롬프트는 그대로 두고 그 턴의 늦은 `<memory_notice>` 메시지에 한 줄을 넣는다. 문구 앞부분은 mhc 상수 `Memory changed after this session's prompt was pinned to`(`projection_pin.rs`)이고, 실제 한 줄은 부록 A-2에 있다. 바뀐 경로는 최대 20개까지 적는다. 다시 고정하는 때는 mhc와 같다: 압축 뒤, `/recompile`, 고정한 커밋이 이력 재작성으로 사라졌을 때.
+5. 섹션 형식은 mhc `memory-core/src/compile/compile.rs`와 골든 `maho-omo-memory/tests/golden/projection.txt`를 따른다(부록 A-2). 순서는 안내 문단(`Reminder: ...`과 기억 권한 규칙), `<self>`(`system/persona.md`), `<memory>`(`system/` 블록마다 `<projection>$MEMORY_DIR/...</projection>`, `<description>`, 본문, 그 뒤 `system/` 밖 경로를 묶은 `<external_projection>`), `<memory_metadata>`(`AGENT_ID`)다.
 
 **테스트.**
 - 경로 규칙 단위 테스트: 위 검증값, 한글 폴더 이름, 기호만 있는 이름(`agent`), legacy 대체. 게이트웨이 구현과 같은 결과인지 몇 개 경로로 대조한다.
@@ -184,6 +187,22 @@ registerProvider("omomeow-opus", {
 - 그 밖의 플랫폼에서는 `unsupported` 코드로 오류를 돌려준다. 가짜 숫자는 만들지 않는다.
 - 같은 보고서에 세션 수, 메시지 수, 확장 호스트 프로세스의 RSS도 넣는다.
 
+### B8. `agent_idle` 이벤트와 `interrupt`·`resume_session` 응답 (이번 실측에서 새로 확인)
+
+**현상(부록 A-6, 같은 탐침을 두 엔진에 돌린 결과).**
+- mhc는 턴이 끝나면 `agent_end` → `agent_settled` → `agent_idle`을 보낸다. tau는 `agent_end`, `prompt_result`, `session_settled`, `agent_settled`까지만 보내고 `agent_idle`이 없다(`git grep agent_idle` 결과 0건).
+- 진행 중인 턴을 Stop하면 mhc `interrupt`는 `{ interrupted: true, turnId: "1" }`, tau는 실제로 턴을 중단했는데도 `{ interrupted: false }`를 돌려준다.
+- mhc `resume_session`은 `{ resumed, pauseSeq, turnStarted, deliveredNotices, deliveredHeldInputs }`를 돌려주고, tau는 빈 `data`다.
+
+**게이트웨이 영향.** `src/relay/agentd-sessions.ts:19-26 observeActivity`는 `agent_start`에서 "실행 중", `agent_idle`이나 `session_exit`에서만 "유휴"로 바꾼다(주석: `agent_end`만으로는 재시도와 후속 입력이 남아 있을 수 있음). tau 레인은 첫 턴 뒤로 계속 "실행 중"으로 보이고, 세션 목록과 유휴 판정이 틀린다. `src/relay/runtime.ts:64`의 유휴 정리도 `agent_idle`을 쓴다.
+
+**설계.**
+1. `agent_idle`: 세션이 완전히 쉬는 순간, 곧 `agent_settled` 뒤 큐가 비고 재시도·압축·후속 입력이 없을 때 한 번 보낸다. 내용은 mhc와 같게 `{ type: "agent_idle" }`만 보낸다. `agent_settled`를 보내는 같은 지점(`runtime.rs`의 정착 판정)에서 이어서 보내면 된다.
+2. `interrupt`: 진행 중인 턴을 실제로 중단했으면 `{ interrupted: true, turnId }`, 중단할 턴이 없었으면 `{ interrupted: false }`를 돌려준다. `turnId`는 세션 안에서 1부터 늘어나는 턴 번호를 문자열로 준다(mhc 형식).
+3. `resume_session`: `{ resumed, pauseSeq, turnStarted, deliveredNotices, deliveredHeldInputs }`. 보류 중 쌓인 입력을 재개하면서 턴을 시작했으면 `turnStarted: true`다.
+
+**테스트.** 골든 `interrupt_abort_mid_turn.jsonl`과 `lane_hold_stop_reload_resume.jsonl`에 새 응답과 `agent_idle` 프레임을 반영한다. 순서 검증은 프레임 순서로 하고 시간으로 하지 않는다.
+
 ---
 
 ## 2. 게이트웨이(`omo-nyang`) 쪽
@@ -196,7 +215,7 @@ registerProvider("omomeow-opus", {
 설계:
 - `get_protocol_info`의 `engine == "oh-my-tau"`, `protocolVersion >= 2`, `capabilities`에 `move_session`이 있으면 이동을 지원한다고 판정한다. 기존 mhc/omo 판정은 그대로 둔다.
 - 이동 판정이 `--version` 셸 호출에서 시작하므로, `omt`(`binary` 이름 또는 `--version` 출력이 semver 하나뿐인 경우)는 대상 장비에서 짧게 `get_protocol_info`를 묻는 경로를 추가한다.
-- tau `get_protocol_info`에 `features: ["resume_run", ...]`을 더한다(tau 쪽 작은 변경). `resume_session`만으로 보류된 실행을 다시 잇는지를 골든 테스트로 증명한 뒤에 `resume_run`을 켠다. 그 전까지는 tau 레인도 `reload`를 하고, B4로 그 `reload`가 안전해진다.
+- `lane-hold.ts`의 `reload`는 `runPaused`(하위 작업을 멈춘 실행 울타리)가 켜져 있을 때만 돈다. 실측(부록 A-6)에서 tau와 mhc 모두 보통의 Stop은 진행 중인 턴을 중단하고 `runPaused: false`를 돌려주며, `resume_session`은 보류만 풀 뿐 중단된 턴을 다시 돌리지 않았다(mhc 응답 `turnStarted: false`). `reload`를 끼워도 결과는 같다. 따라서 일반 레인 보류·재개는 tau도 지금 엔진과 같은 동작이고, `resume_run` 판정은 `runPaused`가 생기는 경우(하위 작업 실행 울타리)에만 의미가 있다. tau에는 아직 실행 울타리(RunFence)가 없으므로 `features`에 `resume_run`을 넣지 않고, 게이트웨이는 tau를 "실행 울타리 없음"으로 보고 `runPaused`를 기다리지 않는다. 실행 울타리는 하위 작업 보류 구현 때 따로 다룬다.
 - B3의 `persistent: false` 세션은 이동 후보에서 뺀다.
 
 ### N2. 프로세스 탐색 패턴
@@ -243,12 +262,12 @@ registerProvider("omomeow-opus", {
 | 순서 | PR | 저장소 | 내용 | 의존 |
 | --- | --- | --- | --- | --- |
 | 1 | T1 | tau | B2 `--append-system-prompt` 목록화 | 없음 |
-| 2 | T2 | tau | B3 `get_state` 필드, `abort awaitIdle`, `persistent` | 없음 |
+| 2 | T2 | tau | B3 `get_state` 필드, `abort awaitIdle`, `persistent`; B8 `agent_idle`, `interrupt`·`resume_session` 응답 | 없음 |
 | 3 | T3 | tau | B4 `unload_all`과 reload 정리 | 없음 |
 | 4 | T4 | tau | B1 확장 공급자 저장소와 기동 순서 | T3(재적재 때 공급자 재정합) |
 | 5 | T5 | tau | B6 tar.gz 산출물, `install.sh`, 설치 레이아웃 탐색 | 없음 |
 | 6 | T6 | tau | B7 `memory_report`, `get_protocol_info.features` | 없음 |
-| 7 | T7 | tau | B5 기억 자동 연결과 투영 | mhc 실측 2건(저장소 생성, 섹션 형식) |
+| 7 | T7 | tau | B5 기억 자동 연결과 투영 | 없음(형식은 부록 A-2로 확정) |
 | 8 | R1 | tau | `v0.13.0` 태그와 릴리스 | T1~T6 |
 | 9 | G1 | 게이트웨이 | N1 기능 기반 엔진 판정 | T2, T6 |
 | 10 | G2 | 게이트웨이 | N2 탐색 패턴, N4 미지원 처리 | 없음 |
@@ -259,10 +278,49 @@ T1, T2, T3, T5, T6과 G2는 서로 독립이라 동시에 진행할 수 있다. 
 
 ---
 
-## 5. 열린 질문 (구현 전에 실측으로 정할 것)
+## 5. 열린 질문의 답 (2026-11-23 실측)
 
-1. mhc는 `<기억 홈>/agents/<id>/repo`가 없을 때 새로 만드는가, 아니면 기억 없이 도는가? (B5)
-2. mhc의 기억 섹션 형식과 변경 알림 문구. (B5)
-3. mhc `get_state.usageTotals.cost`의 단위. (B3)
-4. 업스트림 `packages/coding-agent`는 확장을 재적재할 때 `session_shutdown`을 보내는가? (B4)
-5. tau `resume_session`은 `reload` 없이 보류된 실행을 다시 잇는가? (N1의 `resume_run`)
+1판에서 남긴 질문 5개를 모두 실측이나 코드로 확인했다. 근거는 부록 A에 있다.
+
+| # | 질문 | 답 | 반영 |
+| --- | --- | --- | --- |
+| 1 | 기억 저장소가 없을 때 mhc가 새로 만드는가 | 만들지 않는다. `runtime/{facts-queue,locks,transcripts}`만 만든다. 기억 홈 환경변수는 `MAHO_MEMORY_HOME`이고, `OMO_MEMORY_HOME`은 무시한다 | B5 |
+| 2 | 기억 섹션 형식과 변경 알림 문구 | `Reminder` 문단, `<self>`, `<memory>`(`<projection>`·`<description>`·본문, `<external_projection>`), `<memory_metadata>`. 변경은 늦은 `<memory_notice>`의 한 줄이다 | B5 |
+| 3 | `usageTotals.cost` 단위 | USD 소수(단가 ÷ 1,000,000 × 토큰) | B3 |
+| 4 | 재적재 때 `session_shutdown`을 보내는가 | 업스트림에는 RPC `reload`가 없다. mhc `reload`는 `session_before_reload` → 중단 → `session_shutdown(reload)` → 재적재 → `session_start(reload)` 순서다 | B4 |
+| 5 | tau `resume_session`은 `reload` 없이 보류된 실행을 다시 잇는가 | 보통의 Stop은 tau와 mhc 모두 턴을 중단하고, 재개는 보류만 푼다. `reload`를 끼워도 같다. 두 엔진이 같으므로 `resume_run` 판정은 필요 없다 | N1, B8(새 블로커) |
+
+---
+
+## 부록 A. 실측 기록
+
+환경: `jc01rho-firebat`, mhc `2026.11.20-omomeow1`(설치본, 소스는 `jc01rho/mhc` 태그 `v2026.11.20-omomeow1`), tau는 이 문서 기준 커밋 `86a4067`을 디버그 빌드했다. 모든 실측은 임시 HOME과 임시 기억 홈에서 RPC 모드로 했다. 모델은 로컬 목업 OpenAI 호환 서버를 썼고, 실제 LLM은 부르지 않았다.
+
+**A-1. 기억 저장소 생성과 환경변수.**
+- 임시 작업 폴더 `proj-a`에서 `OMO_MEMORY_HOME=<임시>`만 주고 mhc를 띄워 `get_state`를 보냈다. 임시 기억 홈은 비어 있었고, 실제 `~/.omo/memory/agents/proj-a-79b0be71/`에 `runtime/{facts-queue,locks,transcripts}`가 생겼다. `repo`는 생기지 않았다. 이 탐침 디렉터리는 바로 지웠다.
+- `proj-b`에서 `MAHO_MEMORY_HOME=<임시>`로 같은 실험을 하면, 임시 홈 아래 `agents/proj-b-3437179f/runtime/...`만 생기고 `repo`는 없었다.
+- 코드 근거: mhc `memory-core/src/identity/layout.rs`의 `MEMORY_ROOT_ENV_VAR = "MAHO_MEMORY_HOME"`. 주석에는 `OMO_MEMORY_HOME`이라고 적혀 있지만 실제 상수는 `MAHO_`다. 저장소 생성은 `/memfs init`·`/init` 명령에만 있다(`commands/memory.rs`: "no memory repository ... run /memfs init or /init to create one").
+
+**A-2. 투영 형식과 변경 알림.**
+- 형식: mhc 골든 `maho-omo-memory/tests/golden/projection.txt`와 `memory-core/src/compile/compile.rs`. 순서는 `Reminder: <projection> holds local paths ...` 문단과 기억 권한 규칙, `<self>`(persona), `<memory>`, `<memory_metadata>`(`- AGENT_ID: ...`)다.
+- 변경 알림: 상수 `MEMORY_CHANGES_METADATA_TOKEN = "Memory changed after this session's prompt was pinned to"`(`projection_pin.rs`). 이 작업을 하는 mhc 세션이 실제로 받은 줄은 다음과 같다: `- Memory changed after this session's prompt was pinned to d82d9d7: updated system/agreements.md. The prompt keeps the pinned copy; read a file when it matters now.`
+- 고정 기록: 세션 항목 `omo-memory:projection-pin` `{version:1, sessionId, revision, noticedThrough, compactionId, pinnedAtMs}`.
+
+**A-3. 비용 단위.** mhc `maho-ai/src/models.rs:2193-2198`이 `(rates.x / 1_000_000.0) * tokens`로 메시지 비용을 계산하고, `maho-rpc/src/connection_handler.rs:671`이 누적값을 `usageTotals.cost`로 내보낸다. 모델 단가 표(`models.json`의 `cost`)는 백만 토큰당 USD다.
+
+**A-4. `get_state` 키 비교(같은 조건, 대기 중 세션).**
+- mhc에만 있음: `serviceTier`, `fastMode`, `retryAttempt`, `isBashRunning`, `pendingDialogs`, `sessionName`, `cwd`, `projectTrusted`, `usageTotals`, `pendingMessageCount`, `steering`, `followUp`, `ordered`, `favoriteModels`, `scopedModels`, `answeredUiRequests`, `thinkingSelection`
+- tau에만 있음: `ultra`, `interruptMode`, `queuedMessageCount`, `hasPendingAsyncWork`, `isSettled`, `queuedMessages`, `todoPhases`, `fastModeEnabled`, `tokensPerSecond`, `fastModeActive`, `systemPrompt`, `dumpTools`, `goal`
+- 게이트웨이가 실제로 읽는 것은 `pendingMessageCount`, `isBashRunning`, `usageTotals`, `sessionFile`, `cwd`, `isStreaming`, `isCompacting`, `paused`, `runPaused`다. 앞의 다섯은 B3에서 더한다. `sessionName`과 `steering`/`followUp`은 게이트웨이가 쓰지 않아서 이번 범위에서 뻔다.
+
+**A-5. reload 기준.** 업스트림 `packages/coding-agent/src/modes/rpc/rpc-mode.ts`에는 `"reload"` 명령이 없다. `AgentSession.reload()`(`session/agent-session.ts:14560`)는 `switchSession(sessionFile)`로 세션 파일을 다시 연다. 확장 재적재는 `/reload-plugins`(`reloadPluginState`)다. mhc는 RPC `reload`를 `AgentSession::reload`(`maho-core/src/agent_session.rs`의 `rebuild_runtime_for_reload`)로 처리하고, 순서는 B4 4번과 같다.
+
+**A-6. Stop → (reload) → resume_session.** 탐침은 목업 `hold` 모델로 첫 응답 조각을 보낸 뒤 서버를 붙잡아 두고, 그 사이에 `set_client_info(interactive_user)` → `prompt` → `interrupt(stop)` → [`reload`] → `resume_session`을 보낸다. 그런 다음 서버를 풀고 다음 종료 프레임을 기다린다.
+
+| 엔진 | reload | Stop 뒤 `runPaused` | 목업 요청 | 재개 뒤 새 요청 | 마지막 응답 |
+| --- | --- | --- | --- | --- | --- |
+| tau `86a4067` | 없음 | false | 1회, Stop 때 클라이언트가 끊음 | 없음 | 잘린 `R1-START ` |
+| tau `86a4067` | 있음 | false | 1회, 끊김 | 없음 | 잘린 `R1-START ` |
+| mhc `2026.11.20-omomeow1` | 없음 | false | 1회, 끊김 | 없음(`turnStarted: false`) | 잘린 `R1-START ` |
+
+tau Stop 시 이벤트 순서: `turn_end`, `agent_end`, `session_paused`, (`interrupt` 응답), `prompt_result`, `session_settled`, `agent_settled`. mhc는 여기에 `agent_idle`이 더 오고, `interrupt` 응답에 `interrupted: true`가 있다(B8).
