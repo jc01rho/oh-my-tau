@@ -879,7 +879,8 @@ pub async fn bash(
             &signal,
         ));
     }
-    let (output, code, elapsed, outcome) = run_with_dyn(
+    let foreground = env.jobs.begin_foreground();
+    let ran = run_with_dyn(
         &dir,
         &command,
         timeout,
@@ -888,7 +889,9 @@ pub async fn bash(
         None,
         env.dyn_tools(),
     )
-    .await?;
+    .await;
+    drop(foreground);
+    let (output, code, elapsed, outcome) = ran?;
     let mut text = finished_text(&output, elapsed, outcome, timeout, code, &spill, &query);
     if !notices.is_empty() {
         text = format!("{}\n{text}", notices.join("\n"));
@@ -1440,6 +1443,42 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.ends_with("[Command timed out after 1 seconds]"), "{e}");
+    }
+
+    /// A foreground call counts as running from the moment it starts until it ends, and an
+    /// abort or a failure ends it like a normal finish does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_call_is_counted_while_it_runs() {
+        let env = test_env();
+        assert!(!env.jobs.foreground_running());
+        let controller = pa_agent::abort::AbortController::new();
+        let call = tokio::spawn(bash(
+            env.clone(),
+            serde_json::json!({"command": "sleep 600"}),
+            controller.signal(),
+        ));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !env.jobs.foreground_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the call was counted");
+        assert!(!call.is_finished(), "the command is still running");
+        controller.abort();
+        let _ = call.await.unwrap();
+        assert!(
+            !env.jobs.foreground_running(),
+            "an aborted call is not counted"
+        );
+
+        let failed = bash(env.clone(), serde_json::json!({"command": "exit 3"}), sig()).await;
+        assert!(failed.is_err());
+        assert!(
+            !env.jobs.foreground_running(),
+            "a failed call is not counted"
+        );
     }
 
     #[tokio::test]

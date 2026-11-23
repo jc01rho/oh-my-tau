@@ -137,6 +137,20 @@ impl Block {
         }
     }
 
+    /// The decoded value of a top-level frontmatter key, when present.
+    #[must_use]
+    pub fn extra(&self, target_key: &str) -> Option<String> {
+        for line in &self.header {
+            let Some((key, value)) = top_level_entry(line) else {
+                continue;
+            };
+            if key == target_key {
+                return Some(decode_scalar(value));
+            }
+        }
+        None
+    }
+
     /// The file text.
     #[must_use]
     pub fn render(&self) -> String {

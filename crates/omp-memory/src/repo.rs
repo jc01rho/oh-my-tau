@@ -51,6 +51,15 @@ pub struct Committed {
     pub sha: String,
 }
 
+/// A commit read from the memory repository log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoCommit {
+    pub sha: String,
+    pub session_id: Option<String>,
+    pub sync_principals: Vec<String>,
+    pub paths: Vec<String>,
+}
+
 impl Committed {
     /// The seven-character id the tools report.
     pub fn short(&self) -> &str {
@@ -421,6 +430,135 @@ impl MemoryRepo {
     pub fn has_remote(&self) -> bool {
         self.git_ok(&["remote"])
             .is_ok_and(|remotes| !remotes.trim().is_empty())
+    }
+
+    /// Current HEAD commit sha, or `None` when the repository has no commits yet.
+    ///
+    /// # Errors
+    /// Git failed unexpectedly.
+    pub fn head(&self) -> std::result::Result<Option<String>, RepoError> {
+        let out = self.git(&["rev-parse", "-q", "--verify", "HEAD"])?;
+        if out.status.success() {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            return Ok((!sha.is_empty()).then_some(sha));
+        }
+        if out.stderr.is_empty() {
+            return Ok(None);
+        }
+        Self::succeeded(&["rev-parse", "-q", "--verify", "HEAD"], &out)?;
+        Ok(None)
+    }
+
+    /// Whether `revision` resolves to an existing commit in this repository.
+    ///
+    /// # Errors
+    /// Git failed to execute.
+    pub fn revision_exists(&self, revision: &str) -> std::result::Result<bool, RepoError> {
+        let spec = format!("{revision}^{{commit}}");
+        let out = self.git(&["rev-parse", "-q", "--verify", &spec])?;
+        Ok(out.status.success())
+    }
+
+    /// All repository-relative paths tracked in `revision`'s tree.
+    ///
+    /// # Errors
+    /// Git failed.
+    pub fn ls_tree(&self, revision: &str) -> std::result::Result<Vec<String>, RepoError> {
+        let out = self.git_ok(&["ls-tree", "-r", "-z", "--name-only", revision])?;
+        Ok(out
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// File contents at `revision:rel_path`.
+    ///
+    /// # Errors
+    /// The file does not exist at that revision or git failed.
+    pub fn show_file(
+        &self,
+        revision: &str,
+        rel_path: &str,
+    ) -> std::result::Result<String, RepoError> {
+        self.git_ok(&["show", &format!("{revision}:{rel_path}")])
+    }
+
+    /// Most recent commit Unix timestamp (seconds) per file reachable from `revision`.
+    ///
+    /// # Errors
+    /// Git failed.
+    pub fn commit_times(
+        &self,
+        revision: &str,
+    ) -> std::result::Result<std::collections::BTreeMap<String, i64>, RepoError> {
+        let out = self.git_ok(&["log", "--format=%x00%ct", "--name-only", revision])?;
+        let mut times = std::collections::BTreeMap::new();
+        let mut stamp = None;
+        for line in out.lines() {
+            if let Some(time) = line.strip_prefix('\0') {
+                stamp = time.trim().parse::<i64>().ok();
+            } else if !line.is_empty() {
+                if let Some(time) = stamp {
+                    times.entry(line.to_owned()).or_insert(time);
+                }
+            }
+        }
+        Ok(times)
+    }
+
+    /// Commits in `range` (e.g. `"base..head"` or `"head"`) with `Omo-Session` and
+    /// `Sync-Principals` trailers plus changed paths.
+    ///
+    /// # Errors
+    /// Git failed.
+    pub fn log_commits(&self, range: &str) -> std::result::Result<Vec<RepoCommit>, RepoError> {
+        let out = self.git_ok(&[
+            "log",
+            "-z",
+            "--format=%x1e%H%x1f%(trailers:key=Omo-Session,valueonly,separator=%x2c)%x1f%(trailers:key=Sync-Principals,valueonly,separator=%x2c)%x1f",
+            "--name-only",
+            range,
+        ])?;
+        let mut commits = Vec::new();
+        for record in out.split('\x1e').filter(|r| !r.is_empty()) {
+            let mut parts = record.split('\0');
+            let Some(header) = parts.next() else {
+                continue;
+            };
+            let mut fields = header.split('\x1f');
+            let sha = fields.next().unwrap_or("").trim().to_owned();
+            if sha.is_empty() {
+                continue;
+            }
+            let session_id = fields
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let sync_principals: Vec<String> = fields
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            let mut paths = Vec::new();
+            for raw_path in parts {
+                let path = raw_path.strip_prefix('\n').unwrap_or(raw_path);
+                if !path.is_empty() {
+                    paths.push(path.to_owned());
+                }
+            }
+            commits.push(RepoCommit {
+                sha,
+                session_id,
+                sync_principals,
+                paths,
+            });
+        }
+        Ok(commits)
     }
 
     fn git(&self, args: &[&str]) -> std::result::Result<Output, RepoError> {

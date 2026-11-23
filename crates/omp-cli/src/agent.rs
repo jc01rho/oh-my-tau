@@ -188,7 +188,7 @@ pub fn build_agent(
     tools.extend(crate::tools::wasm::wasm_tools(cwd));
     tools.extend(crate::features::security::session_tools(&settings, cwd));
     tools.extend(crate::tools::context_host::session_tools(&settings));
-    tools.extend(crate::tools::memory_backend::session_tools(
+    tools.extend(crate::tools::memory_backend::session_tools_startup(
         &builtin_env,
         cwd,
         &settings,

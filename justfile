@@ -60,6 +60,12 @@ golden:
 # E2E
 # ---------------------------------------------------------------------------
 
+# Parse a real `omt --mode rpc` lane's answers with the OmOMeow gateway's zod schemas.
+gateway-schema:
+    cargo build -p omp-cli --locked
+    cd tests-e2e && bun install --frozen-lockfile
+    OMT_BIN=target/debug/omt bun tests-e2e/gateway-schema.ts
+
 # Run the tests-e2e/tui parity scenarios against a fresh release `omt` build.
 #
 # Real PTY, isolated HOME, local mock provider; the TS `omp` baseline is used

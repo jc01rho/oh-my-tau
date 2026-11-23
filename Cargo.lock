@@ -2951,13 +2951,16 @@ name = "omp-memory"
 version = "0.12.0"
 dependencies = [
  "parking_lot",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]
