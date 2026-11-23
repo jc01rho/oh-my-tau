@@ -738,3 +738,53 @@ fn omp_and_omo_overlap_precedence_and_native_overlay() {
         home.join(".omp").join("agent")
     );
 }
+
+/// omt writes its own artifacts (`memory-reports`, `session-moves`, `projects`) under
+/// `~/.omp/agent`; that alone must not move the config source away from `~/.omo/agent`.
+#[test]
+fn agent_dir_ignores_omt_artifact_only_omp_dir() {
+    let root = tempdir("agent-dir-artifacts");
+    let home = root.join("home");
+    let omp_agent = home.join(".omp").join("agent");
+    let omo_agent = home.join(".omo").join("agent");
+    fs::create_dir_all(&omo_agent).unwrap();
+    fs::write(omo_agent.join("settings.json"), "{}").unwrap();
+    for artifact in [
+        "memory-reports",
+        "session-moves",
+        "projects",
+        "sessions",
+        "cache",
+    ] {
+        fs::create_dir_all(omp_agent.join(artifact)).unwrap();
+    }
+    assert_eq!(
+        omp_settings::resolve_agent_dir_with_home(&home, None),
+        omo_agent,
+        "an omp agent dir holding only omt artifacts must not shadow ~/.omo/agent"
+    );
+
+    // Without an omo agent dir the omp dir stays the answer, artifacts or not.
+    let omp_only = root.join("omp-only");
+    fs::create_dir_all(omp_only.join(".omp").join("agent").join("memory-reports")).unwrap();
+    assert_eq!(
+        omp_settings::resolve_agent_dir_with_home(&omp_only, None),
+        omp_only.join(".omp").join("agent")
+    );
+
+    // Real config in the omp dir still wins over the omo dir.
+    for marker in ["config.yml", "agent.db", "models.yml", "AGENTS.md"] {
+        fs::write(omp_agent.join(marker), "").unwrap();
+        assert_eq!(
+            omp_settings::resolve_agent_dir_with_home(&home, None),
+            omp_agent,
+            "{marker} should make ~/.omp/agent the config dir"
+        );
+        fs::remove_file(omp_agent.join(marker)).unwrap();
+    }
+    fs::create_dir_all(omp_agent.join("skills")).unwrap();
+    assert_eq!(
+        omp_settings::resolve_agent_dir_with_home(&home, None),
+        omp_agent
+    );
+}
