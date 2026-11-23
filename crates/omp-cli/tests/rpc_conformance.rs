@@ -1260,6 +1260,9 @@ fn golden_prompt_settled_and_read() {
     }));
 
     let settled = h.expect_frame(from_prompt, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    // `agent_idle` is the last settle frame and follows `agent_settled` at once: snapshotting on
+    // `agent_settled` alone recorded it or not depending on when the reader thread got to it.
+    let idle = h.expect_frame(from_prompt, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
 
     let frames_snapshot = h.inbox.0.lock().expect("inbox lock").frames.clone();
     let mut saw_agent_start = false;
@@ -1293,7 +1296,6 @@ fn golden_prompt_settled_and_read() {
             _ => {}
         }
     }
-    let idle = h.expect_frame(from_prompt, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
     assert_eq!(idle, json!({"type": "agent_idle"}));
     let order: Vec<String> = h
         .frames_since(from_prompt)

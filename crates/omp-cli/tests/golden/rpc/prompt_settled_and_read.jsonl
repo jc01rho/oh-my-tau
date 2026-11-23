@@ -7,6 +7,7 @@
 {"dir":"in","frame":{"type":"prompt_result","agentInvoked":true,"status":"completed","sessionSettled":true,"id":"gw-1"}}
 {"dir":"in","frame":{"type":"session_settled"}}
 {"dir":"in","frame":{"type":"agent_settled"}}
+{"dir":"in","frame":{"type":"agent_idle"}}
 {"dir":"out","frame":{"type":"get_last_assistant_text","id":"gw-2"}}
 {"dir":"in","frame":{"id":"gw-2","type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"MOCK-RPC-OK"}}}
 {"dir":"out","frame":{"type":"get_session_stats","id":"gw-3"}}
