@@ -1146,6 +1146,14 @@ fn golden_lane_hold_stop_reload_resume() {
 
     let (resumed, from_resume) = h.request(json!({"type": "resume_session"}));
     assert_eq!(resumed["success"], true);
+    assert_eq!(
+        resumed["data"],
+        json!({
+            "resumed": true, "pauseSeq": 2, "turnStarted": false,
+            "deliveredNotices": 0, "deliveredHeldInputs": 0,
+        }),
+        "{resumed}"
+    );
     let resumed_evt = h.expect_frame(
         from_resume,
         |f| f["type"] == "session_resumed",
@@ -1195,6 +1203,7 @@ fn golden_prompt_settled_and_read() {
                 | "prompt_result"
                 | "session_settled"
                 | "agent_settled"
+                | "agent_idle"
         ) {
             h.transcript.push(json!({"dir": "in", "frame": f}));
         }
@@ -1210,6 +1219,16 @@ fn golden_prompt_settled_and_read() {
             _ => {}
         }
     }
+    let idle = h.expect_frame(from_prompt, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
+    assert_eq!(idle, json!({"type": "agent_idle"}));
+    let order: Vec<String> = h
+        .frames_since(from_prompt)
+        .iter()
+        .filter_map(|f| f["type"].as_str().map(str::to_owned))
+        .collect();
+    let at = |name: &str| order.iter().position(|t| t == name);
+    assert!(at("agent_settled") < at("agent_idle"), "{order:?}");
+    assert_eq!(order.iter().filter(|t| *t == "agent_idle").count(), 1);
     assert!(saw_agent_start, "missing agent_start");
     assert!(saw_agent_end, "missing agent_end");
     assert!(saw_prompt_result, "missing prompt_result");
@@ -1227,6 +1246,22 @@ fn golden_prompt_settled_and_read() {
     let (state, _) = h.request(json!({"type": "get_state"}));
     assert_eq!(state["data"]["isStreaming"], false);
     assert_eq!(state["data"]["isSettled"], true);
+    assert_eq!(state["data"]["pendingMessageCount"], 0);
+    assert_eq!(state["data"]["isBashRunning"], false);
+    assert_eq!(state["data"]["persistent"], true);
+    assert!(
+        state["data"]["sessionFile"]
+            .as_str()
+            .is_some_and(|f| !f.is_empty()),
+        "{state}"
+    );
+    assert!(state["data"]["cwd"].as_str().is_some(), "{state}");
+    for key in ["input", "output", "cacheRead", "cacheWrite", "cost"] {
+        assert!(
+            state["data"]["usageTotals"][key].is_number(),
+            "{key}: {state}"
+        );
+    }
 
     let rows = h.transcript.clone();
     h.finish();
@@ -1260,10 +1295,17 @@ fn golden_interrupt_abort_and_stop_mid_turn() {
 
     let (abort_resp, from_abort) = h.request(json!({"type": "interrupt"}));
     assert_eq!(abort_resp["success"], true);
+    assert_eq!(
+        abort_resp["data"],
+        json!({"interrupted": true, "turnId": "1"}),
+        "{abort_resp}"
+    );
     let end1 = h.expect_frame(from_abort, |f| f["type"] == "agent_end", FRAME_TIMEOUT);
     let settled1 = h.expect_frame(from_abort, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    let idle1 = h.expect_frame(from_abort, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
     h.transcript.push(json!({"dir": "in", "frame": end1}));
     h.transcript.push(json!({"dir": "in", "frame": settled1}));
+    h.transcript.push(json!({"dir": "in", "frame": idle1}));
 
     let (state_after_abort, _) = h.request(json!({"type": "get_state"}));
     assert_eq!(state_after_abort["data"]["paused"], false);
@@ -1278,10 +1320,17 @@ fn golden_interrupt_abort_and_stop_mid_turn() {
 
     let (stop_resp, from_stop) = h.request(json!({"type": "interrupt", "intent": "stop"}));
     assert_eq!(stop_resp["success"], true);
+    assert_eq!(
+        stop_resp["data"],
+        json!({"interrupted": true, "turnId": "2"}),
+        "{stop_resp}"
+    );
     let paused = h.expect_frame(from_stop, |f| f["type"] == "session_paused", FRAME_TIMEOUT);
     let settled2 = h.expect_frame(from_stop, |f| f["type"] == "agent_settled", FRAME_TIMEOUT);
+    let idle2 = h.expect_frame(from_stop, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
     h.transcript.push(json!({"dir": "in", "frame": paused}));
     h.transcript.push(json!({"dir": "in", "frame": settled2}));
+    h.transcript.push(json!({"dir": "in", "frame": idle2}));
 
     let (state_after_stop, _) = h.request(json!({"type": "get_state"}));
     assert_eq!(state_after_stop["data"]["paused"], true);
@@ -1289,9 +1338,54 @@ fn golden_interrupt_abort_and_stop_mid_turn() {
 
     let (resumed, from_res) = h.request(json!({"type": "resume_session"}));
     assert_eq!(resumed["success"], true);
+    assert_eq!(
+        resumed["data"],
+        json!({
+            "resumed": true, "pauseSeq": 2, "turnStarted": false,
+            "deliveredNotices": 0, "deliveredHeldInputs": 0,
+        }),
+        "{resumed}"
+    );
     let resumed_evt = h.expect_frame(from_res, |f| f["type"] == "session_resumed", FRAME_TIMEOUT);
     h.transcript
         .push(json!({"dir": "in", "frame": resumed_evt}));
+
+    // The gateway's move path: `abort` with `awaitIdle` answers only once the turn is over.
+    let (_p3, from_p3) = h.request(json!({
+        "type": "prompt",
+        "message": "Hold turn 3",
+        "streamingBehavior": "followUp",
+    }));
+    let _start3 = h.expect_frame(from_p3, |f| f["type"] == "agent_start", FRAME_TIMEOUT);
+    let (moved, from_move) = h.request(json!({
+        "type": "abort",
+        "awaitIdle": true,
+        "effectId": "move-abort-1",
+    }));
+    assert_eq!(moved["data"], json!({"idle": true}), "{moved}");
+    let order: Vec<String> = h
+        .frames_since(from_move)
+        .iter()
+        .filter_map(|f| match f["type"].as_str() {
+            Some("response") => Some(format!("response:{}", f["command"].as_str()?)),
+            other => other.map(str::to_owned),
+        })
+        .collect();
+    let at = |name: &str| order.iter().position(|t| t == name);
+    assert!(
+        at("agent_end") < at("response:abort"),
+        "abort answered before the turn ended: {order:?}"
+    );
+    let end3 = h.expect_frame(from_move, |f| f["type"] == "agent_end", FRAME_TIMEOUT);
+    h.transcript.push(json!({"dir": "in", "frame": end3}));
+    let idle3 = h.expect_frame(from_move, |f| f["type"] == "agent_idle", FRAME_TIMEOUT);
+    h.transcript.push(json!({"dir": "in", "frame": idle3}));
+    let (retry, _) = h.request(json!({
+        "type": "abort",
+        "awaitIdle": true,
+        "effectId": "move-abort-1",
+    }));
+    assert_eq!(retry["data"], json!({"idle": true}), "{retry}");
 
     h.release_hold();
     let rows = h.transcript.clone();

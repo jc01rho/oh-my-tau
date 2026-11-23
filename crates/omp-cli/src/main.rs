@@ -9,6 +9,7 @@ mod compact;
 mod context;
 mod context_policy;
 mod dedup;
+mod effects;
 mod events;
 mod ext;
 mod features;

@@ -166,21 +166,24 @@ fn on_event(registry: &Arc<SubagentRegistry>, event: &RegistryEvent) {
 /// an idle session and queues into a running turn. The parent session is
 /// checked again right before admission, so a switch in between leaves the
 /// completion pending for its own session; a held session keeps it pending
-/// until [`flush_pending`].
-async fn deliver(rt: &Arc<Runtime>, registry: &SubagentRegistry, view: &TaskView) {
+/// until [`flush_pending`]. Whether the completion was handed over.
+async fn deliver(rt: &Arc<Runtime>, registry: &SubagentRegistry, view: &TaskView) -> bool {
     let parent = &view.record.parent_session_id;
     if !view.notification_pending() || *parent != rt.session_id() || rt.is_paused() {
-        return;
+        return false;
     }
     let epoch = view.record.run_epoch;
     if !registry.begin_notify(view.id(), epoch) {
-        return;
+        return false;
     }
     match rt
         .prompt_in_session(parent, &notification_text(view), Some("steer"))
         .await
     {
-        Ok(()) => registry.finish_notify(view.id(), epoch),
+        Ok(()) => {
+            registry.finish_notify(view.id(), epoch);
+            true
+        }
         Err(e) => {
             registry.abort_notify(view.id(), epoch);
             if !matches!(e.code, Some("session_mismatch" | "session_paused")) {
@@ -190,35 +193,52 @@ async fn deliver(rt: &Arc<Runtime>, registry: &SubagentRegistry, view: &TaskView
                     e.message
                 );
             }
+            false
         }
     }
 }
 
+/// What one [`flush_pending`] pass handed over.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Flushed {
+    /// Completions and workpool aggregates delivered to the session.
+    pub notices: usize,
+    /// The session was idle and a delivery started a turn.
+    pub turn_started: bool,
+}
+
 /// Deliver every pending completion (and deferred workpool aggregate) of the
-/// attached session (after a resume or a settle).
-pub(crate) fn flush_pending() {
+/// attached session (after a resume or a settle). The handle resolves when the
+/// pass has finished; `None` when nothing was pending.
+pub(crate) fn flush_pending() -> Option<tokio::task::JoinHandle<Flushed>> {
     let (Some(rt), Some(registry)) = (attached_runtime(), existing_registry()) else {
-        return;
+        return None;
     };
     let session = rt.session_id();
     let pending = registry.pending_notifications(&session);
     let engine = super::workpool::existing_engine()
         .filter(|engine| engine.has_deferred_aggregates(&session));
     if pending.is_empty() && engine.is_none() {
-        return;
+        return None;
     }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
+        return None;
     };
-    handle.spawn(async move {
+    Some(handle.spawn(async move {
+        let was_streaming = rt.agent.is_streaming().await;
+        let mut notices = 0;
         for view in pending {
-            deliver(&rt, &registry, &view).await;
+            notices += usize::from(deliver(&rt, &registry, &view).await);
         }
         if let Some(engine) = engine {
-            engine.flush_aggregates(&session).await;
+            notices += engine.flush_aggregates(&session).await;
         }
         publish_lifecycle(&rt, &registry).await;
-    });
+        Flushed {
+            notices,
+            turn_started: notices > 0 && !was_streaming,
+        }
+    }))
 }
 
 /// Hand a message (a workpool aggregate) to `session` the way completions

@@ -99,6 +99,14 @@ impl QueuedInput {
     }
 }
 
+/// A hold released by [`Runtime::release_pause`].
+pub(crate) struct Released {
+    /// The pause counter after the release (the `session_resumed` frame's `pauseSeq`).
+    pub(crate) seq: u64,
+    /// The pass that delivers what the hold kept back, while it runs.
+    pub(crate) flush: Option<tokio::task::JoinHandle<crate::tools::subagents::Flushed>>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct RunOutcome {
     status: &'static str,
@@ -188,6 +196,12 @@ pub struct Runtime {
     /// Fired whenever a compaction pass ends; prompts park on it behind a
     /// manual compaction (TS `waitForManualMaintenanceCleanup`).
     compaction_done: tokio::sync::Notify,
+    /// Fired when a user shell (`bash` command) ends; `abort` with `awaitIdle` parks on it.
+    bash_done: tokio::sync::Notify,
+    /// Runs started in this session (`interrupt`'s `turnId`); a session switch restarts it.
+    turn_seq: std::sync::atomic::AtomicU64,
+    /// Answers of commands that carry an `effectId` (a gateway retry gets the first answer back).
+    effects: parking_lot::Mutex<crate::effects::EffectLedger>,
     /// Bumped by every session switch (`new_session`, `load_session*`): part of
     /// the compaction guard's identity (TS `sessionId()` + generation).
     switch_generation: Arc<std::sync::atomic::AtomicU64>,
@@ -681,6 +695,9 @@ impl Runtime {
             compacting: std::sync::atomic::AtomicBool::new(false),
             compaction_guard: Mutex::new(None),
             compaction_done: tokio::sync::Notify::new(),
+            bash_done: tokio::sync::Notify::new(),
+            turn_seq: std::sync::atomic::AtomicU64::new(0),
+            effects: parking_lot::Mutex::default(),
             switch_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             switch_serial: tokio::sync::Mutex::new(()),
             summarizer: Mutex::new(None),
@@ -996,6 +1013,8 @@ impl Runtime {
             {
                 let mut p = lock(&self.prompts);
                 p.agent_starts += 1;
+                self.turn_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 p.active = true;
                 self.emit_event(frame);
             }
@@ -1982,6 +2001,15 @@ impl Runtime {
         });
     }
 
+    /// The frames that close a settled session: `session_settled` (omp's), `agent_settled` (the
+    /// gateway's "run is fully idle" marker) and `agent_idle` (what the gateway lists the session
+    /// idle on; the queue is drained and no retry, compaction or follow-up input is left).
+    fn send_settled(&self) {
+        self.send(json!({"type": "session_settled"}));
+        self.send(json!({"type": "agent_settled"}));
+        self.send(json!({"type": "agent_idle"}));
+    }
+
     /// Emit `prompt_result` frames then `session_settled` / `agent_settled` after a terminal end.
     /// Hold `self.prompts` across sending the settle frames so a concurrently admitted run's
     /// `AgentStart` cannot emit `agent_start` ahead of stale settle frames.
@@ -2015,8 +2043,7 @@ impl Runtime {
         if settle {
             // `session_settled` is omp's frame; `agent_settled` is the gateway's settle signal
             // (it reads it as the "run is fully idle" marker before it releases a lane).
-            self.send(json!({"type": "session_settled"}));
-            self.send(json!({"type": "agent_settled"}));
+            self.send_settled();
             // The gateway reads the next lifecycle record to tell a finished
             // session from one still waiting on background children.
             crate::tools::subagents::on_session_settled(self);
@@ -2319,6 +2346,7 @@ impl Runtime {
     fn bump_generation(&self) {
         self.switch_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.turn_seq.store(0, std::sync::atomic::Ordering::SeqCst);
         // A goal belongs to the session that created it.
         crate::tools::reset_session_goal();
         // A new session must not inherit the old one's watches (nor their late wakes).
@@ -2361,6 +2389,79 @@ impl Runtime {
         self.agent.wait_for_idle().await;
     }
 
+    /// A user shell (`bash` command) or a foreground `bash` tool call is running.
+    fn bash_running(&self) -> bool {
+        lock(&self.settings).running_bash.is_some()
+            || crate::tools::session_jobs().is_some_and(|jobs| jobs.foreground_running())
+    }
+
+    /// A user shell ended: wakes an `await_idle` waiting on it.
+    pub fn bash_finished(&self) {
+        self.bash_done.notify_waiters();
+    }
+
+    /// No turn, no compaction and no foreground shell.
+    pub async fn is_idle(&self) -> bool {
+        !self.agent.is_streaming().await
+            && !self.compacting.load(std::sync::atomic::Ordering::SeqCst)
+            && !self.bash_running()
+    }
+
+    /// Wait up to `limit` for [`Self::is_idle`] to hold, parked on the events that end each kind
+    /// of work (the run going idle, a compaction pass ending, a user shell ending).
+    pub async fn await_idle(&self, limit: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            // Armed before the checks below, so an end between check and wait is not missed.
+            let compaction = self.compaction_done.notified();
+            let shell = self.bash_done.notified();
+            tokio::pin!(compaction, shell);
+            compaction.as_mut().enable();
+            shell.as_mut().enable();
+            if self.agent.is_streaming().await {
+                if tokio::time::timeout_at(deadline, self.agent.wait_for_idle())
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+                continue;
+            }
+            if self.compacting.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::select! {
+                    () = &mut compaction => continue,
+                    () = tokio::time::sleep_until(deadline) => return false,
+                }
+            }
+            if self.bash_running() {
+                tokio::select! {
+                    () = &mut shell => continue,
+                    () = tokio::time::sleep_until(deadline) => return false,
+                }
+            }
+            return true;
+        }
+    }
+
+    /// The number of the turn running now (`interrupt`'s `turnId`): runs count up from 1 within
+    /// the session. `None` when no turn is running.
+    pub async fn running_turn_id(&self) -> Option<String> {
+        let streaming = self.agent.is_streaming().await;
+        let active = lock(&self.prompts).active;
+        let started = self.turn_seq.load(std::sync::atomic::Ordering::SeqCst);
+        // A run admitted but not yet announced by its `agent_start` is the next one.
+        streaming.then(|| (started + u64::from(!active)).to_string())
+    }
+
+    /// Run `run` once per `effect_id`; a retry with the same id gets the first answer.
+    pub async fn once_per_effect(
+        &self,
+        effect_id: &str,
+        run: impl std::future::Future<Output = Value>,
+    ) -> Value {
+        crate::effects::once(&self.effects, effect_id, run).await
+    }
+
     /// Apply `set_client_info` and answer its role/capability errors.
     ///
     /// # Errors
@@ -2380,8 +2481,7 @@ impl Runtime {
         let settle = p.active && p.agent_starts == starts && drained && p.open.is_empty();
         if settle {
             p.active = false;
-            self.send(json!({"type": "session_settled"}));
-            self.send(json!({"type": "agent_settled"}));
+            self.send_settled();
         }
         drop(p);
         if settle {
@@ -2436,20 +2536,26 @@ impl Runtime {
         Ok(())
     }
 
-    /// Drop every hold and announce the resume.
-    pub fn release_pause(&self, cause: &str) {
+    /// Drop every hold and announce the resume; `None` when no hold was in place.
+    pub(crate) fn release_pause(&self, cause: &str) -> Option<Released> {
         let at = crate::persist::now_iso();
         let seq = {
             let mut pause = lock(&self.pause);
             if !pause.paused() {
-                return;
+                return None;
             }
             crate::pause::release(&mut pause)
         };
         let _ = self.journal_hold("release", seq, Some(cause), &at);
         self.send(crate::pause::resumed_frame(seq, cause, &at));
         // Background completions held back during the Stop go out now.
-        crate::tools::subagents::flush_pending();
+        let flush = crate::tools::subagents::flush_pending();
+        Some(Released { seq, flush })
+    }
+
+    /// The current pause counter (`resume_session` answers it when nothing was held).
+    pub fn pause_seq(&self) -> u64 {
+        lock(&self.pause).seq
     }
 
     /// Whether a Stop hold is in place (`interrupt intent:"stop"`).
@@ -2664,6 +2770,10 @@ impl Runtime {
                 "sessionId": self.persist.session_id(),
                 "autoCompactionEnabled": st.auto_compaction,
                 "queuedMessageCount": queued,
+                "pendingMessageCount": queued,
+                "isBashRunning": st.running_bash.is_some()
+                    || crate::tools::session_jobs().is_some_and(|jobs| jobs.foreground_running()),
+                "cwd": self.cwd.display().to_string(),
                 "hasPendingAsyncWork": false,
                 "isSettled": !s.is_streaming && queued == 0 && !retrying,
                 "queuedMessages": {"steering": steering, "followUp": follow},
@@ -2687,9 +2797,13 @@ impl Runtime {
             if let Some(name) = &st.session_name {
                 v["sessionName"] = json!(name);
             }
-            if let Some(file) = self.persist.file() {
-                v["sessionFile"] = json!(file.display().to_string());
-            }
+            // The gateway needs the key on every session; `""` with `persistent: false` marks a
+            // `--no-session` run, which cannot be moved.
+            let file = self.persist.file();
+            v["sessionFile"] = json!(file
+                .as_ref()
+                .map_or_else(String::new, |f| f.display().to_string()));
+            v["persistent"] = json!(file.is_some());
             v
         };
         let mut out = Map::new();
@@ -2701,13 +2815,19 @@ impl Runtime {
         }
         let base = prompt_overhead_chars(&s.system_prompt, &s.tools);
         let window = s.model.context_window;
-        if let Some(usage) = self
+        let (usage, totals) = self
             .agent
-            .with_messages(|m| context_usage(m.iter(), window, base))
-            .await
-        {
+            .with_messages(|m| {
+                (
+                    context_usage(m.iter(), window, base),
+                    usage_totals(m.iter()),
+                )
+            })
+            .await;
+        if let Some(usage) = usage {
             out.insert("contextUsage".into(), usage);
         }
+        out.insert("usageTotals".into(), totals);
         Value::Object(out)
     }
 
@@ -5321,6 +5441,27 @@ fn estimate_tokens(m: &AgentMessage) -> u64 {
 
 /// omp `getContextUsage`: the last assistant usage plus an estimate of what followed it, or an
 /// estimate of the whole request (`overhead_chars` = system prompt + tools) before any usage exists.
+/// `get_state.usageTotals`: the session's own spend summed over its assistant messages. `cost`
+/// is USD (model rates are per million tokens, scaled per message when the usage is computed).
+fn usage_totals<'a>(messages: impl Iterator<Item = &'a AgentMessage>) -> Value {
+    let (mut input, mut output, mut cache_read, mut cache_write, mut cost) =
+        (0u64, 0u64, 0u64, 0u64, 0.0f64);
+    for m in messages {
+        if let AgentMessage::Standard(Message::Assistant(a)) = m {
+            input += a.usage.input;
+            output += a.usage.output;
+            cache_read += a.usage.cache_read;
+            cache_write += a.usage.cache_write;
+            cost += a.usage.cost.total;
+        }
+    }
+    json!({
+        "input": input, "output": output,
+        "cacheRead": cache_read, "cacheWrite": cache_write,
+        "cost": cost,
+    })
+}
+
 /// Last provider-reported usage plus an estimate of everything after it (or the whole
 /// transcript + prompt overhead when no assistant reported usage). One reverse pass, so
 /// it reads the transcript in place (`Agent::with_messages`).
@@ -7907,6 +8048,208 @@ mod pr18_review_regressions {
             env.provider.calls().len(),
             1,
             "second provider turn must never start under stop hold"
+        );
+    }
+
+    async fn rpc(rt: &Arc<Runtime>, cmd: Value) -> Value {
+        crate::rpc::handle(rt, &cmd).await
+    }
+
+    #[tokio::test]
+    async fn a_settled_run_ends_with_agent_idle_after_agent_settled() {
+        let mut env = make_env(None, None).await;
+        env.provider.push_text_turn("done");
+        env.rt
+            .prompt(Some(json!("p1")), "go", None, Vec::new())
+            .await
+            .unwrap();
+        let mut kinds = Vec::new();
+        loop {
+            let f = next_frame_matching(&mut env.rx, |_| true).await;
+            let kind = f["type"].as_str().unwrap_or_default().to_owned();
+            kinds.push(kind.clone());
+            if kind == "agent_idle" {
+                break;
+            }
+        }
+        let at = |name: &str| kinds.iter().position(|k| k == name);
+        assert!(at("agent_settled") < at("agent_idle"), "{kinds:?}");
+        assert!(at("agent_end") < at("agent_settled"), "{kinds:?}");
+    }
+
+    #[tokio::test]
+    async fn get_state_carries_what_the_gateway_reads() {
+        let mut env = make_env(None, None).await;
+        env.provider.push_text_turn("done");
+        env.rt
+            .prompt(Some(json!("p1")), "go", None, Vec::new())
+            .await
+            .unwrap();
+        next_frame_matching(&mut env.rx, |f| f["type"] == "agent_idle").await;
+
+        let state = env.rt.state().await;
+        assert_eq!(state["pendingMessageCount"], json!(0));
+        assert_eq!(state["isBashRunning"], json!(false));
+        assert_eq!(state["cwd"], json!(env.rt.cwd.display().to_string()));
+        assert_eq!(state["persistent"], json!(true));
+        assert!(
+            state["sessionFile"].as_str().is_some_and(|f| !f.is_empty()),
+            "{state}"
+        );
+        for key in ["input", "output", "cacheRead", "cacheWrite", "cost"] {
+            assert!(state["usageTotals"][key].is_number(), "{key}: {state}");
+        }
+
+        let controller = AbortController::new();
+        env.rt.set(|s| s.running_bash(Some(controller)));
+        assert_eq!(env.rt.state().await["isBashRunning"], json!(true));
+        env.rt.set(|s| s.running_bash(None));
+        assert_eq!(env.rt.state().await["isBashRunning"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn pending_message_count_counts_queued_input() {
+        let mut env = make_env(None, None).await;
+        env.provider.push_stalled_turn("working");
+        env.rt
+            .prompt(Some(json!("p1")), "start", None, Vec::new())
+            .await
+            .unwrap();
+        next_frame_matching(&mut env.rx, |f| f["type"] == "turn_start").await;
+        env.rt.steer("one");
+        env.rt.follow_up("two");
+        let state = env.rt.state().await;
+        assert_eq!(state["pendingMessageCount"], json!(2));
+        assert_eq!(state["queuedMessageCount"], json!(2));
+        env.rt.abort().await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_names_the_turn_it_stopped() {
+        let mut env = make_env(None, None).await;
+        env.provider.push_stalled_turn("working");
+        env.provider.push_stalled_turn("working again");
+        for (n, text) in [("1", "first"), ("2", "second")] {
+            env.rt.prompt(None, text, None, Vec::new()).await.unwrap();
+            next_frame_matching(&mut env.rx, |f| f["type"] == "agent_start").await;
+            let reply = rpc(&env.rt, json!({"type": "interrupt"})).await;
+            assert_eq!(
+                reply["data"],
+                json!({"interrupted": true, "turnId": n}),
+                "{reply}"
+            );
+            next_frame_matching(&mut env.rx, |f| f["type"] == "agent_idle").await;
+        }
+        let reply = rpc(&env.rt, json!({"type": "interrupt"})).await;
+        assert_eq!(reply["data"], json!({"interrupted": false}), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn abort_answers_whether_the_session_is_idle() {
+        let mut env = make_env(None, None).await;
+        env.provider.push_stalled_turn("working");
+        env.rt
+            .prompt(None, "start", None, Vec::new())
+            .await
+            .unwrap();
+        next_frame_matching(&mut env.rx, |f| f["type"] == "agent_start").await;
+        let reply = rpc(&env.rt, json!({"type": "abort", "awaitIdle": true})).await;
+        assert_eq!(reply["data"], json!({"idle": true}), "{reply}");
+        assert!(!env.rt.agent.is_streaming().await);
+        let plain = rpc(&env.rt, json!({"type": "abort"})).await;
+        assert_eq!(plain["data"], json!({"idle": true}), "{plain}");
+        let bad = rpc(
+            &env.rt,
+            json!({"type": "abort", "awaitIdle": true, "awaitIdleTimeoutMs": "soon"}),
+        )
+        .await;
+        assert_eq!(bad["success"], json!(false), "{bad}");
+        assert_eq!(bad["errorCode"], json!("invalid_params"), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn await_idle_gives_up_at_its_limit_while_a_turn_runs() {
+        let mut env = make_env(None, None).await;
+        env.provider.push_stalled_turn("working");
+        env.rt
+            .prompt(None, "start", None, Vec::new())
+            .await
+            .unwrap();
+        next_frame_matching(&mut env.rx, |f| f["type"] == "agent_start").await;
+        assert!(!env.rt.await_idle(Duration::from_millis(20)).await);
+        env.rt.abort().await;
+        assert!(env.rt.await_idle(Duration::from_secs(10)).await);
+    }
+
+    #[tokio::test]
+    async fn await_idle_waits_for_a_user_shell_to_end() {
+        let env = make_env(None, None).await;
+        env.rt.set(|s| s.running_bash(Some(AbortController::new())));
+        let waiter = {
+            let rt = env.rt.clone();
+            tokio::spawn(async move { rt.await_idle(Duration::from_secs(10)).await })
+        };
+        // A parked waiter is not yet finished; the shell ending releases it.
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        env.rt.set(|s| s.running_bash(None));
+        env.rt.bash_finished();
+        assert!(waiter.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_effect_id_retry_gets_the_first_answer_and_does_not_abort_again() {
+        let mut env = make_env(None, None).await;
+        env.provider.push_stalled_turn("working");
+        env.provider.push_stalled_turn("working again");
+        env.rt
+            .prompt(None, "first", None, Vec::new())
+            .await
+            .unwrap();
+        next_frame_matching(&mut env.rx, |f| f["type"] == "agent_start").await;
+        let abort = json!({"type": "abort", "awaitIdle": true, "effectId": "move-abort-1"});
+        let first = rpc(&env.rt, abort.clone()).await;
+        assert_eq!(first["data"], json!({"idle": true}), "{first}");
+
+        env.rt
+            .prompt(None, "second", None, Vec::new())
+            .await
+            .unwrap();
+        next_frame_matching(&mut env.rx, |f| f["type"] == "agent_start").await;
+        let retry = rpc(&env.rt, abort).await;
+        assert_eq!(retry["data"], first["data"], "{retry}");
+        assert!(
+            env.rt.agent.is_streaming().await,
+            "a retry must not abort the next turn"
+        );
+        env.rt.abort().await;
+    }
+
+    #[tokio::test]
+    async fn resume_session_reports_the_hold_it_released() {
+        let env = make_env(None, None).await;
+        env.rt
+            .set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        let stop = rpc(&env.rt, json!({"type": "interrupt", "intent": "stop"})).await;
+        assert_eq!(stop["data"], json!({"interrupted": false}), "{stop}");
+        let resumed = rpc(&env.rt, json!({"type": "resume_session"})).await;
+        assert_eq!(
+            resumed["data"],
+            json!({
+                "resumed": true, "pauseSeq": 2, "turnStarted": false,
+                "deliveredNotices": 0, "deliveredHeldInputs": 0,
+            }),
+            "{resumed}"
+        );
+        let again = rpc(&env.rt, json!({"type": "resume_session"})).await;
+        assert_eq!(
+            again["data"],
+            json!({
+                "resumed": false, "pauseSeq": 2, "turnStarted": false,
+                "deliveredNotices": 0, "deliveredHeldInputs": 0,
+            }),
+            "{again}"
         );
     }
 
