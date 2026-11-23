@@ -13,6 +13,7 @@
 pub mod auth;
 pub mod catalog;
 mod command;
+pub mod extension;
 mod fallback;
 mod judge;
 pub mod login;
@@ -231,10 +232,24 @@ pub fn resolve_in(dir: &AgentDir, model_ref: &str) -> Result<ResolvedModel> {
         }
     }
     // `!command` header values run through the shell; empty / failed values are omitted.
-    let headers: Vec<(String, String)> = headers
+    let mut headers: Vec<(String, String)> = headers
         .into_iter()
         .filter_map(|(k, v)| Some((k, resolve_config_value(&v)?)))
         .collect();
+    // TS `authHeader: true`: the resolved key also goes out as `Authorization: Bearer`.
+    let auth_header = cfg
+        .provider(&provider)
+        .and_then(|p| p.get("authHeader"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if let Some(key) = api_key.as_deref().filter(|k| auth_header && !k.is_empty()) {
+        if !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        {
+            headers.push(("Authorization".to_string(), format!("Bearer {key}")));
+        }
+    }
     model.headers = (!headers.is_empty()).then(|| headers.iter().cloned().collect());
     Ok(ResolvedModel {
         provider: model.provider.clone(),
@@ -367,6 +382,9 @@ fn role_selector(cfg: &Config, model_ref: &str) -> String {
 struct Config {
     roles: BTreeMap<String, String>,
     providers: Map<String, Value>,
+    /// Providers taken from [`extension`] registrations: their `apiKey` is the
+    /// literal key the extension passed, never an env var name or `!command`.
+    extension_providers: BTreeSet<String>,
     /// `defaultThinkingLevel` (omp default `high`).
     default_thinking: Sel,
     retry: RetryConfig,
@@ -395,11 +413,16 @@ impl Config {
             &dir.join(".no-project-layer"),
         );
         let roles: std::collections::BTreeMap<String, String> = settings.model_roles();
-        let providers = models
+        let mut providers = models
             .get("providers")
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+        let mut extension_providers = BTreeSet::new();
+        for (name, config) in extension::snapshot() {
+            providers.insert(name.clone(), Value::Object(config));
+            extension_providers.insert(name);
+        }
         let default_thinking = settings
             .get_string("defaultThinkingLevel")
             .as_deref()
@@ -421,6 +444,7 @@ impl Config {
         Ok(Self {
             roles,
             providers,
+            extension_providers,
             default_thinking,
             retry: RetryConfig::from_settings(&settings),
             chains,
@@ -460,6 +484,9 @@ impl Config {
     fn provider_key(&self, p: &str) -> Option<String> {
         let pc = self.provider(p)?;
         match pc.get("apiKey").and_then(Value::as_str) {
+            Some(raw) if self.extension_providers.contains(p) => {
+                (!raw.is_empty()).then(|| raw.to_string())
+            }
             Some(raw) => resolve_config_value(raw),
             None => (pc.get("auth").and_then(Value::as_str) == Some("none")).then(String::new),
         }
@@ -1440,6 +1467,53 @@ mod tests {
         assert_eq!(resolved_flag(&m, "thinkingFormat"), Some(json!("qwen")));
         // The resolved ladder is materialized onto the model (qwen: reasoning effort ladder).
         assert!(m.model.thinking_level_map.is_some());
+    }
+
+    /// An extension registration overlays the `models.yml` provider of the same name, keeps its
+    /// `apiKey` literal (never read as an env var name), honors `authHeader`, and the file's
+    /// definition comes back once it is unregistered.
+    #[test]
+    fn extension_provider_overlays_models_yml() {
+        let _guard = extension::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(
+            t.path().join("models.yml"),
+            "providers:\n  fxext:\n    baseUrl: http://127.0.0.1:1/file\n    apiKey: file-key\n    api: openai-completions\n    models:\n      - id: from-file\n",
+        )
+        .unwrap();
+        let dir = AgentDir(t.path().to_path_buf());
+        // `PATH` is always set: a literal key equal to an env var name must stay literal.
+        extension::upsert(
+            "fxext",
+            "provider_ext",
+            &json!({
+                "baseUrl": "http://127.0.0.1:2/ext",
+                "apiKey": "PATH",
+                "api": "openai-responses",
+                "authHeader": true,
+                "models": [{"id": "from-ext", "reasoning": true, "maxTokens": 128_000}],
+            }),
+        )
+        .unwrap();
+        let m = resolve_in(&dir, "fxext/from-ext").unwrap();
+        assert_eq!(m.base_url, "http://127.0.0.1:2/ext");
+        assert_eq!(m.api, "openai-responses");
+        assert_eq!(m.api_key.as_deref(), Some("PATH"));
+        assert!(m
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "Bearer PATH"));
+        assert!(resolve_in(&dir, "fxext/from-file")
+            .unwrap()
+            .base_url
+            .ends_with("/ext"));
+        assert!(extension::remove("fxext"));
+        let m = resolve_in(&dir, "fxext/from-file").unwrap();
+        assert_eq!(m.base_url, "http://127.0.0.1:1/file");
+        assert_eq!(m.api_key.as_deref(), Some("file-key"));
+        assert!(m.headers.is_empty());
     }
 
     /// A `models.db` row known only by id (`contextWindow`/`maxTokens: null`, no thinking — what TS
