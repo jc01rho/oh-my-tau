@@ -219,6 +219,8 @@ pub struct Runtime {
     pause: Mutex<crate::pause::PauseState>,
     /// Number of `pause_for_stop` calls currently between `abort()` and installing the hold.
     stop_pending: std::sync::atomic::AtomicUsize,
+    /// True while a `maybe_todo_reminder` spawned continuation is appending and starting.
+    todo_continuation: std::sync::atomic::AtomicBool,
     /// Monotonically incremented whenever `pause_for_stop` starts so a prompt admitted before
     /// `abort()` cannot start a turn after a concurrent stop takes the hold.
     stop_epoch: std::sync::atomic::AtomicU64,
@@ -728,6 +730,7 @@ impl Runtime {
             user_interrupt: std::sync::atomic::AtomicBool::new(false),
             pause: Mutex::new(crate::pause::PauseState::default()),
             stop_pending: std::sync::atomic::AtomicUsize::new(0),
+            todo_continuation: std::sync::atomic::AtomicBool::new(false),
             stop_epoch: std::sync::atomic::AtomicU64::new(0),
             prompt_admission: tokio::sync::Mutex::new(()),
             tool_list_lock: tokio::sync::Mutex::new(()),
@@ -1583,7 +1586,16 @@ impl Runtime {
         self.emit_event(frame.clone());
         let rt = self.clone();
         let messages = messages.to_vec();
+        self.todo_continuation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(async move {
+            struct Guard<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for Guard<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let guard = Guard(&rt.todo_continuation);
             // TS `agent.appendMessage` + `sessionManager.appendMessage`, before
             // the scheduled continue (`scheduleAgentContinue`).
             rt.agent.append_messages(vec![reminder.clone()]).await;
@@ -1592,6 +1604,7 @@ impl Runtime {
             seed_resumed_message(&rt.persist, &reminder, None);
             if let Err(e) = rt.continue_after_retry().await {
                 eprintln!("omt: todo reminder continuation failed: {e:#}");
+                drop(guard);
                 rt.settle_terminal(frame, &messages, None);
             }
         });
@@ -1618,6 +1631,21 @@ impl Runtime {
             tool_name,
             update,
         ));
+    }
+
+    /// Whether a post-turn settlement pass (compaction, retry backoff, or todo reminder
+    /// continuation) still owns draining queued input after the run went non-streaming.
+    fn turn_settlement_pending(&self) -> bool {
+        self.compacting.load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .todo_continuation
+                .load(std::sync::atomic::Ordering::SeqCst)
+            || lock(&self.retry_task)
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+            || lock(&self.post_turn_task)
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
     }
 
     /// TS `#drainStrandedQueuedMessages` + `#canAutoContinueForFollowUp`: once the
@@ -2078,15 +2106,16 @@ impl Runtime {
         let mut p = lock(&self.prompts);
         let mut remaining = Vec::new();
         let mut reports = claimed;
+        let same_run = p.agent_starts == expected_starts;
         for t in p.open.drain(..) {
-            if t.waiting && drained {
+            if t.waiting && drained && same_run {
                 reports.push(t);
             } else {
                 remaining.push(t);
             }
         }
         p.open = remaining;
-        let settle = p.active && p.agent_starts == expected_starts && drained && p.open.is_empty();
+        let settle = p.active && same_run && drained && p.open.is_empty();
         if settle {
             p.active = false;
         }
@@ -2234,6 +2263,11 @@ impl Runtime {
                 waiting: true,
             });
             self.emit_queue_update();
+            // If the active run settled while notices were prepared, its own
+            // `drain_stranded_queue` pass already finished before this enqueue.
+            if !self.agent.is_streaming().await && !self.turn_settlement_pending() {
+                self.drain_stranded_queue();
+            }
             return Ok(());
         }
         self.user_interrupt
@@ -2690,8 +2724,9 @@ impl Runtime {
         *pending = Some(joined);
     }
 
-    /// Put a `monitor` wake into the next turn: queued behind a live run, or the start of a turn
-    /// on an idle session. A held lane (`interrupt stop`) only queues it: a monitor never lifts a hold.
+    /// Put a `monitor` wake into the session: queued as steering during a running turn (injected at
+    /// the next tool boundary), or starts a turn on an idle session. A held lane (`interrupt stop`)
+    /// only queues it: a monitor never lifts a hold.
     #[cfg(test)]
     pub async fn inject_monitor_wake(self: &Arc<Self>, text: &str) {
         let generation = self.switch_generation();
@@ -2721,13 +2756,30 @@ impl Runtime {
             Some(prev) if self.remove_queued(&prev, "followUp") => format!("{prev}\n{text}"),
             _ => text.to_owned(),
         };
-        let text = text.as_str();
-        if let Err(e) = self.prompt(None, text, Some("followUp"), Vec::new()).await {
-            eprintln!(
-                "omt: monitor wake could not start a turn, queued instead: {}",
-                e.message
-            );
-            self.follow_up(text);
+        let session = self.session_id();
+        let res = match self.prompt_in_session(&session, &text, Some("steer")).await {
+            Err(e)
+                if !matches!(e.code, Some("session_mismatch" | "session_paused"))
+                    && self.agent.is_streaming().await =>
+            {
+                // A turn started during non-streaming setup awaits: retry so it lands in steering.
+                self.prompt_in_session(&session, &text, Some("steer")).await
+            }
+            other => other,
+        };
+        match res {
+            Ok(()) => {}
+            Err(e) if e.code == Some("session_mismatch") => {}
+            Err(e) if e.code == Some("session_paused") => {
+                self.queue_monitor_wake(&text);
+            }
+            Err(e) => {
+                eprintln!(
+                    "omt: monitor wake could not start a turn, queued instead: {}",
+                    e.message
+                );
+                self.steer(&text);
+            }
         }
     }
 
@@ -8490,6 +8542,185 @@ mod pr18_review_regressions {
             .expect("wait_settled must not hang after rejecting last ticket");
         let _ = next_frame_matching(&mut env.rx, |f| f["type"] == "session_settled").await;
         let _ = next_frame_matching(&mut env.rx, |f| f["type"] == "agent_settled").await;
+    }
+
+    #[tokio::test]
+    async fn monitor_wake_injects_as_steer_at_tool_boundary_during_streaming_turn() {
+        struct GateTool {
+            entered: Arc<tokio::sync::Notify>,
+            proceed: Arc<tokio::sync::Notify>,
+        }
+        impl pa_agent::types::AgentTool for GateTool {
+            fn name(&self) -> &'static str {
+                "gate_tool"
+            }
+            fn description(&self) -> &'static str {
+                "blocks until released"
+            }
+            fn parameters(&self) -> &Value {
+                static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+                SCHEMA.get_or_init(|| json!({"type": "object", "properties": {}}))
+            }
+            fn execute(
+                self: Arc<Self>,
+                _id: String,
+                _params: Value,
+                _signal: pa_agent::abort::AbortSignal,
+                _on_update: pa_agent::types::AgentToolUpdateCallback,
+            ) -> pa_agent::BoxFut<'static, anyhow::Result<pa_agent::types::AgentToolResult>>
+            {
+                let entered = self.entered.clone();
+                let proceed = self.proceed.clone();
+                Box::pin(async move {
+                    entered.notify_one();
+                    proceed.notified().await;
+                    Ok(pa_agent::types::AgentToolResult::text("gate ok"))
+                })
+            }
+        }
+
+        let mut env = make_env(None, None).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        env.rt
+            .agent
+            .set_tools(vec![Arc::new(GateTool {
+                entered: entered.clone(),
+                proceed: proceed.clone(),
+            })])
+            .await;
+
+        env.provider
+            .push_tool_call_turn(None, vec![("call_gate_1", "gate_tool", json!({}))]);
+        env.provider.push_text_turn("saw monitor at boundary");
+
+        env.rt
+            .prompt(Some(json!("p1")), "start", Some("followUp"), Vec::new())
+            .await
+            .unwrap();
+
+        entered.notified().await;
+        env.rt
+            .inject_monitor_wake("<system-reminder>\nMonitor event(step): done\n</system-reminder>")
+            .await;
+
+        let (steering, follow_up) = env.rt.queued_previews();
+        assert_eq!(steering.len(), 1, "expected wake in steering: {steering:?}");
+        assert!(
+            follow_up.is_empty(),
+            "wake must not sit in followUp: {follow_up:?}"
+        );
+
+        proceed.notify_one();
+        next_frame_matching(&mut env.rx, |f| f["type"] == "agent_idle").await;
+
+        let calls = env.provider.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "must complete in one run with 2 model calls"
+        );
+        let second_call = &calls[1].messages;
+        let last_msg = second_call.last().expect("message after tool result");
+        assert!(matches!(last_msg, Message::User(_)), "{last_msg:?}");
+        let last_text = message_text(&AgentMessage::Standard(last_msg.clone()));
+        assert!(
+            last_text.contains("Monitor event(step): done"),
+            "steer wake must precede second model call: {last_text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_wake_after_user_abort_wakes_idle_session() {
+        let mut env = make_env(None, None).await;
+        env.provider.push_stalled_turn("working");
+        env.provider.push_text_turn("woken after abort");
+
+        env.rt
+            .prompt(Some(json!("p1")), "start", Some("followUp"), Vec::new())
+            .await
+            .unwrap();
+        next_frame_matching(&mut env.rx, |f| f["type"] == "turn_start").await;
+        env.rt.abort().await;
+        next_frame_matching(&mut env.rx, |f| f["type"] == "agent_idle").await;
+
+        env.rt
+            .inject_monitor_wake(
+                "<system-reminder>\nMonitor event(after-abort): hit\n</system-reminder>",
+            )
+            .await;
+        next_frame_matching(&mut env.rx, |f| f["type"] == "agent_idle").await;
+
+        let calls = env.provider.calls();
+        assert_eq!(calls.len(), 2, "monitor wake must start a turn after abort");
+        assert!(
+            calls[1].messages.iter().any(|m| {
+                matches!(m, Message::User(_))
+                    && message_text(&AgentMessage::Standard(m.clone()))
+                        .contains("Monitor event(after-abort): hit")
+            }),
+            "second model call must carry the monitor wake"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_prompts_now_defers_waiting_ticket_when_next_run_already_started() {
+        let mut env = make_env(None, None).await;
+        {
+            let mut p = lock(&env.rt.prompts);
+            p.agent_starts = 2;
+            p.active = true;
+            p.open.push(Ticket {
+                id: Some(json!("queued-p2")),
+                starts_at_begin: 0,
+                waiting: true,
+            });
+        }
+        let outcome = RunOutcome {
+            status: "completed",
+            error: None,
+        };
+        env.rt.report_prompts_now(&outcome, Vec::new(), 1);
+        assert!(
+            lock(&env.rt.prompts)
+                .open
+                .iter()
+                .any(|t| t.id == Some(json!("queued-p2"))),
+            "ticket belonging to run 2 must not close on run 1's report"
+        );
+        while let Ok(f) = env.rx.try_recv() {
+            assert_ne!(f["type"], "agent_settled");
+            assert_ne!(f["type"], "prompt_result");
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_wake_does_not_release_concurrent_stop_hold() {
+        let mut env = make_env(None, None).await;
+        env.rt
+            .set_client_info(&json!({"width": 80, "capabilities": ["interactive_user"]}))
+            .unwrap();
+        env.provider.push_text_turn("should stay held");
+
+        env.rt.pause_for_stop().await.unwrap();
+        next_frame_matching(&mut env.rx, |f| f["type"] == "session_paused").await;
+
+        env.rt
+            .inject_monitor_wake("<system-reminder>\nMonitor event(held): wait\n</system-reminder>")
+            .await;
+
+        assert_eq!(env.rt.state().await["paused"], json!(true));
+        let (steering, follow_up) = env.rt.queued_previews();
+        assert!(
+            steering.is_empty(),
+            "held wake must stay out of steering: {steering:?}"
+        );
+        assert_eq!(
+            follow_up.len(),
+            1,
+            "held wake must queue in followUp: {follow_up:?}"
+        );
+        assert_eq!(env.provider.calls().len(), 0, "hold must not start a turn");
     }
 }
 
