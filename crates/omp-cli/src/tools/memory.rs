@@ -196,15 +196,56 @@ pub fn tools_for(repo: &MemoryRepo) -> Vec<Arc<dyn AgentTool>> {
     .collect()
 }
 
-/// The tools for the repository `MEMORY_DIR` names, or none when it is unset
-/// or not a git repository.
+/// The tools for the bound memory repository of the process working directory.
 #[must_use]
 pub fn session_tools() -> Vec<Arc<dyn AgentTool>> {
-    let root = std::env::var_os("MEMORY_DIR").map(PathBuf::from);
-    let identity = std::env::var("AGENT_ID").ok();
-    session_tools_in(root, identity.as_deref())
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    session_tools_for(&cwd, false)
 }
 
+/// Discover the memory repository for `cwd` (`MEMORY_DIR` or `<memory_home>/agents/<slug>-<hash>/repo`)
+/// without creating directories on disk. When absent and `log_missing` is set, logs one startup line.
+#[must_use]
+pub fn session_tools_for(cwd: &Path, log_missing: bool) -> Vec<Arc<dyn AgentTool>> {
+    session_tools_for_with(cwd, log_missing, &|key| std::env::var(key).ok())
+}
+
+pub(crate) fn session_tools_for_with<F>(
+    cwd: &Path,
+    log_missing: bool,
+    env: &F,
+) -> Vec<Arc<dyn AgentTool>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match omp_memory::identity::discover_memory_repo_with(cwd, env) {
+        omp_memory::identity::MemoryRepoLookup::Found(bound) => tools_for(&bound.repo),
+        omp_memory::identity::MemoryRepoLookup::NotFound {
+            primary,
+            legacy,
+            reason,
+        } => {
+            if log_missing {
+                eprintln!(
+                    "omt: memory repository not found for {} (checked {}, legacy {}); memory tools disabled ({reason})",
+                    cwd.display(),
+                    primary.display(),
+                    legacy.display()
+                );
+                tracing::info!(
+                    cwd = %cwd.display(),
+                    primary = %primary.display(),
+                    legacy = %legacy.display(),
+                    %reason,
+                    "memory repo tools unavailable"
+                );
+            }
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
 fn session_tools_in(root: Option<PathBuf>, identity: Option<&str>) -> Vec<Arc<dyn AgentTool>> {
     let Some(root) = root.filter(|r| !r.as_os_str().is_empty()) else {
         return Vec::new();
@@ -381,5 +422,48 @@ mod tests {
             .run(&json!({"reason": "bad", "input": "not a patch"}))
             .unwrap_err();
         assert!(err.to_string().starts_with("memory apply_patch: "), "{err}");
+    }
+
+    #[test]
+    fn auto_discovers_tools_without_memory_dir_and_creates_nothing_when_missing() {
+        let base = std::env::temp_dir().join(format!(
+            "omt-memory-auto-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mem_home = base.join("mem-home");
+        let project = base.join("한글 프로젝트");
+        std::fs::create_dir_all(&project).unwrap();
+        let ids = omp_memory::identity::memory_agent_ids(&project);
+        let env = |key: &str| match key {
+            "MAHO_MEMORY_HOME" => Some(mem_home.display().to_string()),
+            "HOME" => Some(base.display().to_string()),
+            _ => None,
+        };
+
+        assert!(session_tools_for_with(&project, false, &env).is_empty());
+        assert!(!mem_home.exists());
+
+        let repo_dir = mem_home.join("agents").join(&ids.id).join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "core.hooksPath", ".git/hooks"],
+        ] {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&repo_dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let tools = session_tools_for_with(&project, false, &env);
+        let names: Vec<_> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(names, ["memory", "memory_apply_patch"]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

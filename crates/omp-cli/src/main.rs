@@ -15,6 +15,7 @@ mod features;
 mod herdr;
 mod host;
 mod images;
+mod memory_projection;
 mod methodology;
 mod model;
 mod move_cmd;
@@ -431,7 +432,17 @@ async fn async_main() -> Result<()> {
         // The dump is a whole session's prompt: install the discovered rulebook
         // as the process-global `rule://` book, exactly as a live session does.
         sysprompt::install_active_rules(&cwd);
-        let built = sysprompt::build(&cwd, &sp_opts, &metas);
+        let mut built = sysprompt::build(&cwd, &sp_opts, &metas);
+        if let Some(sentinel) = memory_projection::dump_system_prompt_block(&cwd) {
+            if let Some(last) = built.blocks.last_mut() {
+                if let Ok(updated) = omp_memory::projection::replace_memory_block(last, &sentinel)
+                {
+                    *last = updated;
+                }
+            } else {
+                built.blocks.push(sentinel);
+            }
+        }
         for (i, block) in built.blocks.iter().enumerate() {
             if i > 0 {
                 println!();

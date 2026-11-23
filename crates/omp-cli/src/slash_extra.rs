@@ -382,6 +382,11 @@ pub fn extra_catalog() -> Vec<Value> {
             },
             "source": "builtin",
         }),
+        json!({
+            "name": "recompile",
+            "description": "Bust the compiled memory prompt cache so the next run recompiles from HEAD",
+            "source": "builtin",
+        }),
     ]
 }
 
@@ -512,6 +517,18 @@ pub async fn dispatch_extra(rt: &Arc<Runtime>, name: &str, args: &str) -> Option
         "restart" => Some(crate::features::restart::command(rt, args).await),
         "btw" => Some(crate::features::btw::command(rt, args).await),
         "collab" => Some(collab_command(rt, args).await),
+        "recompile" => {
+            let text = match rt.request_memory_recompile() {
+                Some(agent_id) => format!(
+                    "memory prompt cache cleared for {agent_id}; the next agent run recompiles from HEAD (the current run keeps its prompt)"
+                ),
+                None => "No memory repository is bound for this session.".to_owned(),
+            };
+            output(rt, &text);
+            Some(Outcome::Handled {
+                agent_invoked: false,
+            })
+        }
         _ => None,
     }
 }
