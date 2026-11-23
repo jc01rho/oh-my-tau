@@ -38,16 +38,22 @@ The `omt web` browser UI:
 
 ## Install
 
-Linux x86_64, prebuilt binary (verifies the release's sha256, installs to
-`~/.local/bin/omt`; set `OMT_INSTALL_DIR` to change it):
+Linux x86_64/aarch64 and macOS, prebuilt tarball (verifies the release's
+sha256, unpacks `bin/omt` with its `ext-host/` under
+`~/.local/share/omt/versions/<version>/` and links `~/.local/bin/omt`;
+set `OMT_INSTALL_DIR` or `OMT_HOME` to change those). The extension host runs
+on [Bun](https://bun.sh), so the installer requires `bun` on `PATH`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kanashimi1/oh-my-tau/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jc01rho/oh-my-tau/main/install.sh | sh
 ```
 
-Or download `omt-linux-x64` from the
-[releases](https://github.com/kanashimi1/oh-my-tau/releases), check it against
-`SHA256SUMS.txt` and put it on `PATH` as `omt`. Other platforms: build from source.
+Or download `omt-linux-x64.tar.gz` from the
+[releases](https://github.com/jc01rho/oh-my-tau/releases), check it against
+`SHA256SUMS.txt`, unpack it anywhere and run `bin/omt` in place. The tarball
+carries the Bun extension host, so `--extension` works from the unpacked
+directory; the bare `omt-linux-x64` asset is the same binary without it.
+Other platforms: build from source.
 
 ## Build from source
 

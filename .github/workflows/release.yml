@@ -31,35 +31,49 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             asset: omt-linux-x64
+            tarball: omt-linux-x64.tar.gz
+            bin: omt
             strip: objcopy
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             asset: omt-linux-arm64
+            tarball: omt-linux-arm64.tar.gz
+            bin: omt
             strip: objcopy
           # Fully static Linux builds (any distro, incl. Alpine); no ONNX Runtime.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             asset: omt-linux-x64-musl
+            tarball: omt-linux-x64-musl.tar.gz
+            bin: omt
             strip: copy
             musl: true
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             asset: omt-linux-arm64-musl
+            tarball: omt-linux-arm64-musl.tar.gz
+            bin: omt
             strip: copy
             musl: true
           - target: x86_64-apple-darwin
             runner: macos-14  # Intel runners are retired; cross-compile on Apple silicon
             asset: omt-macos-x64
+            tarball: omt-macos-x64.tar.gz
+            bin: omt
             strip: strip
             # No prebuilt ONNX Runtime for Intel macOS: build without the Laya ONNX heads.
             cargo_args: --no-default-features
           - target: aarch64-apple-darwin
             runner: macos-14
             asset: omt-macos-arm64
+            tarball: omt-macos-arm64.tar.gz
+            bin: omt
             strip: strip
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             asset: omt-windows-x64.exe
+            tarball: omt-windows-x64.tar.gz
+            bin: omt.exe
             strip: none
     runs-on: ${{ matrix.runner }}
     steps:
@@ -80,9 +94,8 @@ jobs:
         run: |
           echo "MACOSX_DEPLOYMENT_TARGET=13.4" >> "$GITHUB_ENV"
           echo "OMT_MAC_LINK=-C link-arg=$(xcrun clang --print-resource-dir)/lib/darwin/libclang_rt.osx.a" >> "$GITHUB_ENV"
-      # Build tooling from the workflow's commit (fixes apply to re-runs of older tags).
+      # Build and packaging tooling from the workflow's commit (fixes apply to re-runs of older tags).
       - uses: actions/checkout@v4
-        if: matrix.musl
         with:
           ref: ${{ github.sha }}
           path: _wf
@@ -110,18 +123,33 @@ jobs:
       - name: Package
         shell: sh
         run: |
-          mkdir -p dist
+          mkdir -p dist out
           case "${{ matrix.strip }}" in
-            copy)    cp "target/${{ matrix.target }}/release/omt" "dist/${{ matrix.asset }}" ;;
-            objcopy) objcopy --strip-debug "target/${{ matrix.target }}/release/omt" "dist/${{ matrix.asset }}" ;;
-            strip)   strip "target/${{ matrix.target }}/release/omt" && cp "target/${{ matrix.target }}/release/omt" "dist/${{ matrix.asset }}" ;;
-            *)       cp "target/${{ matrix.target }}/release/omt.exe" "dist/${{ matrix.asset }}" ;;
+            copy)    cp "target/${{ matrix.target }}/release/omt" "out/${{ matrix.bin }}" ;;
+            objcopy) objcopy --strip-debug "target/${{ matrix.target }}/release/omt" "out/${{ matrix.bin }}" ;;
+            strip)   cp "target/${{ matrix.target }}/release/omt" "out/${{ matrix.bin }}" && strip "out/${{ matrix.bin }}" ;;
+            *)       cp "target/${{ matrix.target }}/release/omt.exe" "out/${{ matrix.bin }}" ;;
           esac
-          chmod +x "dist/${{ matrix.asset }}"
+          chmod +x "out/${{ matrix.bin }}"
+          # The bare binary stays for scripts that download it directly; it cannot run
+          # extensions on its own, so the tarball is the artifact install.sh uses.
+          cp "out/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          sh _wf/scripts/package-release.sh "out/${{ matrix.bin }}" "dist/${{ matrix.tarball }}" "${{ matrix.bin }}" .
+          # sha256sum is absent on the macOS runners and shasum on the Windows
+          # ones, so pick whichever the runner provides.
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.tarball }}" > "${{ matrix.tarball }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.tarball }}" > "${{ matrix.tarball }}.sha256"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.tarball }}
+            dist/${{ matrix.tarball }}.sha256
 
   release:
     needs: build
@@ -157,7 +185,10 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum omt-* > SHA256SUMS.txt
+          # Per-tarball .sha256 files exist already; the combined list covers the
+          # assets themselves so `install.sh` can verify either shape.
+          sha256sum $(ls omt-* | grep -v '\.sha256$') > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}

@@ -12,13 +12,15 @@
 
 카나리 대상 워커 1대(예: `linux5` 또는 테스트 전용 워커)에서 아래를 모두 통과한 뒤에만 2절의 설정 전환을 진행한다.
 
-1. **배포 바이너리 동일성 및 버전 확인**
-   - `ubuntu-24.04` 이상(glibc >= 2.38)은 `omt-linux-x64` / `omt-linux-arm64`, EL9(glibc 2.34) 등 구형 glibc 장비는 정적 바이너리 `omt-linux-x64-musl`을 사용한다(musl 빌드는 ONNX 런타임 미포함).
-   - 배포 대상 경로(예: `/home/<user>/.local/bin/omt`)의 바이너리 해시(`sha256sum /home/<user>/.local/bin/omt`)가 릴리즈 아티팩트 `.sha256`과 일치하는지 확인하고 실행한다:
+1. **배포 산출물 및 버전 확인**
+   - `ubuntu-24.04` 이상(glibc >= 2.38)은 `omt-linux-x64.tar.gz` / `omt-linux-arm64.tar.gz`, EL9(glibc 2.34) 등 구형 glibc 장비는 정적 빌드 `omt-linux-x64-musl.tar.gz`를 쓴다(musl 빌드는 ONNX 런타임 미포함).
+   - 설치본은 `~/.local/share/omt/versions/<version>/`에 `bin/omt`와 `ext-host/`를 함께 두고 `~/.local/bin/omt`가 그것을 가리킨다. 설치는 `install.sh`로 한다(`bun`이 없으면 설치기가 실패한다).
+   - 설치된 실행 파일은 심링크이므로 해시는 실제 프리픽스 파일로 확인한다:
      ```bash
-     sha256sum /home/<user>/.local/bin/omt
-     /home/<user>/.local/bin/omt --version
-     /home/<user>/.local/bin/omt --mode rpc --help
+     readlink -f ~/.local/bin/omt
+     sha256sum "$(readlink -f ~/.local/bin/omt)"
+     ~/.local/bin/omt --version
+     ~/.local/bin/omt --mode rpc --help
      ```
 2. **`bun` `PATH` 등록 및 확장 호스트 확인**
    - `omo-nyang`은 워커 기동 시 `-e <root>/src/model-provider.ts` 확장을 붙이고, 사전 적합성 테스트의 라이브 `extension_request` 검증 역시 `PATH`에서 `bun`을 찾는다. `config.json`의 `worker.bun` 설정만으로는 사전 검증 셸의 `PATH`가 채워지지 않으므로, 사전 확인 셸에서도 `bun`이 `PATH`에 있어야 한다:
@@ -26,7 +28,7 @@
      export PATH="/home/<user>/.bun/bin:$PATH"
      command -v bun && bun --version
      ```
-   - `ext-host/host.ts`는 `omt` 실행 바이너리 상대/소스 경로(또는 `OMP_RS_EXT_HOST`)에서 로드된다.
+   - `ext-host/host.ts`는 설치 프리픽스에서 찾는다(`<prefix>/ext-host/host.ts`, `<prefix>/share/omt/ext-host/host.ts`). 소스 체크아웃에서 빌드한 바이너리나 `OMP_RS_EXT_HOST`로도 지정할 수 있다. 설치 레이아웃 자체는 `cargo test -p omp-cli --test release_layout`로 확인한다.
 3. **배포된 `omt` 바이너리 대상 RPC 적합성 골든 스위트 통과**
    - `CARGO_BIN_EXE_omt` 기본 빌드 대신 실제로 워커가 실행할 배포 바이너리 경로를 `OMT_CONFORMANCE_BIN`으로 지정해 스위트를 실행한다(또는 릴리즈 체크섬과 동일한 소스 빌드 바이너리임을 1단계에서 확인한다).
    - `--nocapture` 출력에 `skipping live extension_request`가 찍히지 않고 라이브 확장 검사까지 모두 실행·통과해야 한다:
