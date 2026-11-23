@@ -2799,6 +2799,13 @@ impl Runtime {
         });
     }
 
+    /// Messages in the transcript, counted in place (no copy of the transcript).
+    pub async fn message_count(&self) -> usize {
+        self.agent
+            .with_messages(|messages| messages.iter().count())
+            .await
+    }
+
     pub async fn messages(&self) -> Vec<Value> {
         // Shared snapshot: serialize outside the state lock, without a deep copy first.
         self.agent
