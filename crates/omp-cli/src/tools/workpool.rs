@@ -510,16 +510,19 @@ impl WorkpoolEngine {
         })
     }
 
-    pub async fn flush_aggregates(self: &Arc<Self>, session: &str) {
+    /// Retry the deferred aggregates of `session`; how many were delivered.
+    pub async fn flush_aggregates(self: &Arc<Self>, session: &str) -> usize {
         let ids: Vec<String> = self
             .lock()
             .values()
             .filter(|p| p.parent_session_id == session)
             .map(|p| p.pool_id.clone())
             .collect();
+        let mut delivered = 0;
         for id in ids {
-            self.maybe_finish(&id).await;
+            delivered += usize::from(self.maybe_finish(&id).await);
         }
+        delivered
     }
 
     fn owned<'a>(
@@ -930,20 +933,21 @@ impl WorkpoolEngine {
 
     /// Deliver the aggregate once the pool is finished (exactly one attempt
     /// per generation; a deferred one stays pending).
-    async fn maybe_finish(self: &Arc<Self>, pool_id: &str) {
+    /// Deliver the pool's aggregate once it is finished; whether this call delivered it.
+    async fn maybe_finish(self: &Arc<Self>, pool_id: &str) -> bool {
         let (session, message, generation) = {
             let mut pools = self.lock();
             let Some(pool) = pools.get_mut(pool_id) else {
-                return;
+                return false;
             };
             if !pool.finished() {
-                return;
+                return false;
             }
             let attempted = pool.aggregate.as_ref().is_some_and(|a| {
                 a.generation == pool.generation && a.delivery != DeliveryState::Pending
             });
             if attempted {
-                return;
+                return false;
             }
             pool.aggregate = Some(Aggregate {
                 generation: pool.generation,
@@ -958,6 +962,7 @@ impl WorkpoolEngine {
             )
         };
         let outcome = (self.deliverer)(session, message).await;
+        let delivered = matches!(outcome, Delivery::Delivered);
         {
             let mut pools = self.lock();
             if let Some(pool) = pools.get_mut(pool_id) {
@@ -979,6 +984,7 @@ impl WorkpoolEngine {
             }
         }
         self.bump();
+        delivered
     }
 }
 
